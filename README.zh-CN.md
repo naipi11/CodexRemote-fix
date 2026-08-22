@@ -43,8 +43,8 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 ## 快速开始
 
-1. 从 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 下载 `CodexRemote-fix-2.4.20-setup.exe` 和 `CodexRemote-fix-2.4.20-setup.exe.sha256.txt`，并核对 SHA-256。
-2. 运行 `CodexRemote-fix-2.4.20-setup.exe`，无需管理员权限。
+1. 从 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 下载 `CodexRemote-fix-2.4.21-setup.exe` 和 `CodexRemote-fix-2.4.21-setup.exe.sha256.txt`，并核对 SHA-256。
+2. 运行 `CodexRemote-fix-2.4.21-setup.exe`，无需管理员权限。
    Windows 10 用户请确认已安装 .NET Framework 4.8，原生 TrayHost 需要该组件。
 3. 托盘守护程序会自动启动，并创建桌面快捷方式 **CodexRemote-fix**。托盘图标为绿色时，打开 **设置 → 连接 → 控制其他设备** 即可注册或使用。
 
@@ -55,6 +55,12 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 已验证：Windows 11 · Codex Desktop `26.818.2441.0` · Node.js `22.23.1`；
 隐藏的控制器标签、原生托盘菜单、双语菜单切换和常驻守护程序均可用。
+
+## v2.4.21 更新内容
+
+- 修复 TrayHost 父端读取线程的释放竞态：即使受控 Codex 会话已正常运行，托盘图标也不会再因此消失。
+- TrayHost 关闭时会先等待后台管道线程退出，再释放同步句柄。
+- 新增原生回归测试，覆盖远端故障与资源释放并发场景。
 
 ## v2.4.20 更新内容
 
@@ -107,8 +113,8 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 每个带 tag 的发布都会附带 Windows 安装包及其 SHA-256 校验文件。
 `.github/workflows/release.yml` 会在 tag 上自动构建安装包，因此后续每次更新都会
-为 2.4.20 发布提供可直接运行的 `CodexRemote-fix-2.4.20-setup.exe`
-及 `CodexRemote-fix-2.4.20-setup.exe.sha256.txt`。
+为 2.4.21 发布提供可直接运行的 `CodexRemote-fix-2.4.21-setup.exe`
+及 `CodexRemote-fix-2.4.21-setup.exe.sha256.txt`。
 
 GitHub Release 正文只发布英文更新说明；本 README 继续保留中英文使用说明。
 完整历史见 [CHANGELOG.md](CHANGELOG.md)。
