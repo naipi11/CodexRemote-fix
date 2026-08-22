@@ -85,9 +85,14 @@ try{
         Assert-CcodEqual $false $reset.source.restartOrdinary 'Reset DoNotRestart false crossed the real powershell.exe child as Boolean'
 
         $restartRequest=New-CcodRestartControllerRequest -RuntimeId 'runtime-1' -TimeoutSeconds 45 -SupervisorIdentity $identity -TransactionId 'ebd973bd-9b64-4cf3-a282-d080be72ff34'
-        $restartWorkflow=Invoke-CcodRestartInstalledWorkflow -Resolved $resolved -RestartRequest $restartRequest -ApplyRequest $startRequest
+        $restartStarts=[Collections.Generic.List[string]]::new();$restartWaits=[Collections.Generic.List[string]]::new()
+        $restartWorkflow=Invoke-CcodRestartInstalledWorkflow -Resolved $resolved -RestartRequest $restartRequest -InstallRoot $root -TimeoutSeconds 45 `
+            -StartOrdinary {param($ResolvedValue)$restartStarts.Add($ResolvedValue.RuntimeId);[pscustomobject]@{Outcome='Started';Snapshot=$null;Process=$null}}.GetNewClosure() `
+            -WaitForActive {param($InstallRoot,$RuntimeId,$TimeoutSeconds,$PreviousPid)$restartWaits.Add("$RuntimeId|$TimeoutSeconds|$PreviousPid");$true}.GetNewClosure()
         Assert-CcodEqual 'Closed' $restartWorkflow.Close.outcome 'explicit restart closes the verified existing Codex session first'
-        Assert-CcodEqual 'Activated' $restartWorkflow.Apply.outcome 'explicit restart then starts the controlled Codex session'
+        Assert-CcodEqual 'Started' $restartWorkflow.Start.Outcome 'explicit restart launches one ordinary Codex instance for the supervisor to take over'
+        Assert-CcodEqual 'runtime-1' ($restartStarts -join ',') 'explicit restart starts the verified active runtime package exactly once'
+        Assert-CcodEqual 'runtime-1|45|' ($restartWaits -join ',') 'explicit restart waits for the supervisor to confirm the new controlled session'
     }
 
     Invoke-CcodTest 'keeps a successful reset successful when the optional device-key backup fails' {
@@ -113,14 +118,15 @@ try{
     }
 
     Invoke-CcodTest 'dispatches only to a manifest-verified active runtime' {
-        $installRoot=Join-Path $root 'installed';$staging=Join-Path $installRoot 'staging';$controller=Join-Path $staging 'src\persistence\SessionController.ps1';$stateModule=Join-Path $staging 'src\persistence\modules\StateStore.psm1'
+        $installRoot=Join-Path $root 'installed';$staging=Join-Path $installRoot 'staging';$controller=Join-Path $staging 'src\persistence\SessionController.ps1';$stateModule=Join-Path $staging 'src\persistence\modules\StateStore.psm1';$processModule=Join-Path $staging 'src\persistence\modules\ProcessControl.psm1'
         [IO.Directory]::CreateDirectory((Split-Path $controller -Parent))|Out-Null;[IO.Directory]::CreateDirectory((Split-Path $stateModule -Parent))|Out-Null
-        [IO.File]::WriteAllText($controller,'# installed controller',[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllText($stateModule,'# installed state',[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($controller,'# installed controller',[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllText($stateModule,'# installed state',[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllText($processModule,'# installed process control',[Text.UTF8Encoding]::new($false))
         $manifest=New-CcodRuntimeManifest -RuntimeDirectory $staging -ProjectVersion '2.0.0';$runtime=Join-Path (Join-Path $installRoot 'runtime') $manifest.runtimeId;[IO.Directory]::CreateDirectory((Split-Path $runtime -Parent))|Out-Null;[IO.Directory]::Move($staging,$runtime)
         Write-CcodAtomicJson -Path (Join-Path $runtime 'manifest.json') -Value $manifest;Set-CcodActiveRuntime -InstallRoot $installRoot -NewRuntimeId $manifest.runtimeId|Out-Null
         $start=Resolve-CcodStartInstalledController -InstallRoot $installRoot;$reset=Resolve-CcodResetInstalledController -InstallRoot $installRoot
         Assert-CcodEqual ([IO.Path]::GetFullPath((Join-Path $runtime 'src\persistence\SessionController.ps1'))) $start.Controller 'Start targets verified active controller'
         Assert-CcodEqual $start.Controller $reset.Controller 'Reset targets the same verified runtime'
+        Assert-CcodEqual ([IO.Path]::GetFullPath((Join-Path $runtime 'src\persistence\modules\ProcessControl.psm1'))) $start.ProcessControl 'Start targets verified active process control'
         [IO.File]::AppendAllText($start.Controller,'tampered',[Text.UTF8Encoding]::new($false))
         Assert-CcodThrows {Resolve-CcodStartInstalledController -InstallRoot $installRoot} '*'
     }

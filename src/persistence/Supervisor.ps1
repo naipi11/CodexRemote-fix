@@ -278,7 +278,7 @@ function Get-CcodSupervisorDefaultAdapters {
     $defaults.GetQueueCount={param($Queue)[int]$Queue.Count}
     $defaults.TryDequeue={param($Queue)$value=$null;$ok=$Queue.TryDequeue([ref]$value);[pscustomobject][ordered]@{Succeeded=[bool]$ok;Value=$value}}
     $defaults.NewTray={param($Queue,$OnTick,$Catalog,$LanguageMode,$SystemCultureName)New-CcodTrayHostContext -CommandQueue $Queue -OnTick $OnTick -Catalog $Catalog -LanguageMode $LanguageMode -SystemCultureName $SystemCultureName}
-    $defaults.SetTrayPresentation={param($Tray,$Presentation,$Catalog,$LanguageMode,$SystemCultureName)Set-CcodTrayHostPresentation -Context $Tray -Presentation $Presentation -Catalog $Catalog -LanguageMode $LanguageMode -SystemCultureName $SystemCultureName}
+    $defaults.SetTrayPresentation={param($Tray,$Presentation,$Catalog,$LanguageMode,$SystemCultureName,$WaitForAcknowledgement)Set-CcodTrayHostPresentation -Context $Tray -Presentation $Presentation -Catalog $Catalog -LanguageMode $LanguageMode -SystemCultureName $SystemCultureName -WaitForAcknowledgement:([bool]$WaitForAcknowledgement)}
     $defaults.StopTrayTimer={param($Tray)if($null -ne $Tray -and $null -ne $Tray.PSObject.Properties['Client']){return};$Tray.Timer.Stop()}
     $defaults.RequestUiExit={
         param($Tray)
@@ -679,7 +679,7 @@ function Write-CcodSupervisorUiFailure {
 }
 
 function Set-CcodSupervisorCurrentTrayPresentation {
-    param($HostState,[hashtable]$Adapters,[AllowNull()][string]$SystemCultureName=$null)
+    param($HostState,[hashtable]$Adapters,[AllowNull()][string]$SystemCultureName=$null,[switch]$WaitForAcknowledgement)
     if($null -eq $HostState.Tray -or $HostState.UiLanguageMode -isnot [string] -or
        -not (Test-CcodSupervisorUiCatalog $HostState.UiCatalog $HostState.UiLanguageMode)){throw 'UI state is invalid'}
     $culture=$SystemCultureName
@@ -694,7 +694,7 @@ function Set-CcodSupervisorCurrentTrayPresentation {
     }
     $presentation=Invoke-CcodSupervisorAdapter $Adapters.GetTrayPresentation @($arguments) 1
     if($null -eq $presentation){throw 'tray presentation is invalid'}
-    Invoke-CcodSupervisorAdapter $Adapters.SetTrayPresentation @($HostState.Tray,$presentation,$HostState.UiCatalog,$HostState.UiLanguageMode,$culture) 0
+    Invoke-CcodSupervisorAdapter $Adapters.SetTrayPresentation @($HostState.Tray,$presentation,$HostState.UiCatalog,$HostState.UiLanguageMode,$culture,[bool]$WaitForAcknowledgement) 0
 }
 
 function Invoke-CcodSupervisorCommand {
@@ -715,7 +715,7 @@ function Invoke-CcodSupervisorCommand {
             $persisted=$true
             $HostState.UiLanguageMode=$Command.Value;$HostState.UiCatalog=$newCatalog
             $trayUpdateAttempted=$true
-            Set-CcodSupervisorCurrentTrayPresentation $HostState $Adapters $culture
+            Set-CcodSupervisorCurrentTrayPresentation $HostState $Adapters $culture -WaitForAcknowledgement
         }catch{
             $recoveryMode=$oldMode;$recoveryCatalog=$oldCatalog;$preferenceRollbackFailed=$false;$preferenceConfirmationFailed=$false;$trayRollbackFailed=$false
             if($persisted){
@@ -733,7 +733,7 @@ function Invoke-CcodSupervisorCommand {
             }
             $HostState.UiLanguageMode=$recoveryMode;$HostState.UiCatalog=$recoveryCatalog
             if($trayUpdateAttempted){
-                try{Set-CcodSupervisorCurrentTrayPresentation $HostState $Adapters $culture}
+                try{Set-CcodSupervisorCurrentTrayPresentation $HostState $Adapters $culture -WaitForAcknowledgement}
                 catch{$trayRollbackFailed=$true}
             }
             Write-CcodSupervisorUiFailure $HostState $Adapters 'LanguageChange' 'CCOD_UI_LANGUAGE_CHANGE_FAILED'

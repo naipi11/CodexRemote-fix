@@ -120,7 +120,7 @@ function New-CcodSupervisorFake {
     $adapters.GetQueueCount={param($Queue)[int]$Queue.Count}.GetNewClosure()
     $adapters.TryDequeue={param($Queue)$world.TryDequeueSawRealQueue=[object]::ReferenceEquals($Queue,$world.CommandQueue);if($Queue.Count){[pscustomobject][ordered]@{Succeeded=$true;Value=$Queue.Dequeue()}}else{[pscustomobject][ordered]@{Succeeded=$false;Value=$null}}}.GetNewClosure()
     $adapters.NewTray={param($Queue,$OnTick,$Catalog,$LanguageMode,$SystemCultureName)$world.NewTraySawRealQueue=[object]::ReferenceEquals($Queue,$world.CommandQueue);$world.Calls.Add('New:Tray');if($world.FailAt -ceq 'NewTray'){throw 'PRIVATE_TRAY_SECRET'};$world.OnTick=$OnTick;$world.TrayArguments=[pscustomobject][ordered]@{Queue=$Queue;OnTick=$OnTick;Catalog=$Catalog;LanguageMode=$LanguageMode;SystemCultureName=$SystemCultureName};[pscustomobject]@{Kind='Tray';Timer=[pscustomobject]@{Kind='Timer'};ApplicationContext=[pscustomobject]@{Kind='App'}}}.GetNewClosure()
-    $adapters.SetTrayPresentation={param($Tray,$Presentation,$Catalog,$LanguageMode,$SystemCultureName)$world.Calls.Add('Set:Presentation');if($world.FailAt -ceq 'SetTrayPresentation'){throw 'PRIVATE_PRESENTATION_SECRET'};$world.PresentationArguments.Add([pscustomobject][ordered]@{Tray=$Tray;Presentation=$Presentation;Catalog=$Catalog;LanguageMode=$LanguageMode;SystemCultureName=$SystemCultureName})}.GetNewClosure()
+    $adapters.SetTrayPresentation={param($Tray,$Presentation,$Catalog,$LanguageMode,$SystemCultureName,$WaitForAcknowledgement)$world.Calls.Add('Set:Presentation');if($world.FailAt -ceq 'SetTrayPresentation'){throw 'PRIVATE_PRESENTATION_SECRET'};$world.PresentationArguments.Add([pscustomobject][ordered]@{Tray=$Tray;Presentation=$Presentation;Catalog=$Catalog;LanguageMode=$LanguageMode;SystemCultureName=$SystemCultureName;WaitForAcknowledgement=[bool]$WaitForAcknowledgement})}.GetNewClosure()
     $adapters.StopTrayTimer={param($Tray)$world.Calls.Add('Stop:Timer');if($world.FailAt -ceq 'StopTimer'){throw 'PRIVATE_TIMER_SECRET'}}.GetNewClosure()
     $adapters.RequestUiExit={param($Tray)$world.Calls.Add('Exit:UI')}.GetNewClosure()
     $adapters.CloseTray={param($Tray)$world.Calls.Add('Close:Tray');if($world.FailAt -ceq 'CloseTray'){throw 'PRIVATE_TRAY_CLOSE_SECRET'};[pscustomobject][ordered]@{SchemaVersion=1;Closed=$true;CleanupCodes=@()}}.GetNewClosure()
@@ -395,6 +395,7 @@ Invoke-CcodTest 'commits one valid UI language command before refreshing the exi
     Assert-CcodTrue ([object]::ReferenceEquals($tray,$render.Tray)) 'tray is not recreated'
     Assert-CcodTrue ([object]::ReferenceEquals($script:TestEnglishCatalog,$render.Catalog)) 'new validated catalog is rendered'
     Assert-CcodEqual 'en-US' $render.LanguageMode 'render receives exact new mode'
+    Assert-CcodEqual $true $render.WaitForAcknowledgement 'language render waits for the native TrayHost acknowledgement before returning'
     Assert-CcodTrue ([object]::ReferenceEquals($oldState,$hostState.State) -and [object]::ReferenceEquals($oldQueue,$hostState.CommandQueue)) 'controller state and bounded queue remain running'
     $calls=@($world.Calls)
     Assert-CcodTrue ([Array]::IndexOf($calls,'Get:UiCatalog:en-US') -lt [Array]::IndexOf($calls,'Persist:UiLanguage:en-US')) 'catalog validation precedes persistence'

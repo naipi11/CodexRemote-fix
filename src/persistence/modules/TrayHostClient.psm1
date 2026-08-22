@@ -83,16 +83,25 @@ function New-CcodTrayHostContext {
         $options=[TrayHostStartOptions]::new();$options.ExePath=$exe;$options.RuntimeId=$runtimeId;$options.ParentPid=$process.Id;$options.ParentCreationFileTimeUtc=$process.StartTime.ToFileTimeUtc();$options.InitialPresentation=$initial
         $client=[TrayHostParentClient]::Start($options)
     }finally{$process.Dispose()}
-    return [pscustomobject][ordered]@{Client=$client;CommandQueue=$CommandQueue;OnTick=$OnTick;Catalog=$Catalog;LanguageMode=$LanguageMode;SystemCultureName=$SystemCultureName;RuntimeId=$runtimeId;CurrentRevision=[UInt64]1;MenuOpen=$false;Exited=$false;LastError=$null;ApplicationContext=[pscustomobject]@{}}
+    return [pscustomobject][ordered]@{Client=$client;CommandQueue=$CommandQueue;OnTick=$OnTick;Catalog=$Catalog;LanguageMode=$LanguageMode;SystemCultureName=$SystemCultureName;RuntimeId=$runtimeId;CurrentRevision=[UInt64]1;LastAcknowledgedRevision=[UInt64]1;MenuOpen=$false;Exited=$false;LastError=$null;ApplicationContext=[pscustomobject]@{}}
 }
 
 function Set-CcodTrayHostPresentation {
-    param($Context,$Presentation,$Catalog,[string]$LanguageMode,[string]$SystemCultureName)
+    param($Context,$Presentation,$Catalog,[string]$LanguageMode,[string]$SystemCultureName,[switch]$WaitForAcknowledgement)
     if($null -eq $Context -or $null -eq $Context.Client){throw 'CCOD_TRAYHOST_CONTEXT_INVALID'}
     $revision=[UInt64]([UInt64]$Context.CurrentRevision + [UInt64]1)
     $snapshot=New-CcodTrayHostSnapshot $Presentation $Catalog $LanguageMode $SystemCultureName $revision $Context.RuntimeId
     if(-not $Context.Client.TryPublish($snapshot)){throw 'CCOD_TRAYHOST_PRESENTATION_FAILED'}
     $Context.Catalog=$Catalog;$Context.LanguageMode=$LanguageMode;$Context.SystemCultureName=$SystemCultureName;$Context.CurrentRevision=$revision
+    if($WaitForAcknowledgement){
+        $deadline=[DateTime]::UtcNow.AddMilliseconds(1250)
+        while([UInt64]$Context.LastAcknowledgedRevision -lt $revision -and [DateTime]::UtcNow -lt $deadline){
+            Receive-CcodTrayHostEvents $Context
+            if([UInt64]$Context.LastAcknowledgedRevision -ge $revision){break}
+            [void]$Context.Client.WaitForActivity([TimeSpan]::FromMilliseconds(25))
+        }
+        if([UInt64]$Context.LastAcknowledgedRevision -lt $revision){throw 'CCOD_TRAYHOST_PRESENTATION_ACK_TIMEOUT'}
+    }
 }
 
 function Receive-CcodTrayHostEvents {
@@ -102,7 +111,7 @@ function Receive-CcodTrayHostEvents {
         if(-not $Context.Client.TryDequeueEvent([ref]$event)){break}
         if($null -eq $event){continue}
         switch($event.Kind.ToString()){
-            'PresentationAck'{}
+            'PresentationAck' {if($event.Revision -is [UInt64] -or $event.Revision -is [long] -or $event.Revision -is [int]){if([UInt64]$event.Revision -gt [UInt64]$Context.LastAcknowledgedRevision){$Context.LastAcknowledgedRevision=[UInt64]$event.Revision}}}
             'Action' {
                 $kind=switch($event.Command){ApplyNow{'ApplyNow'}ManualRetry{'ManualRetry'}SetAutomation{'SetAutomationEnabled'}SetCandidateOptIn{'SetCandidateCompatibleOptIn'}SetLanguageSystem{'SetUiLanguage'}SetLanguageChinese{'SetUiLanguage'}SetLanguageEnglish{'SetUiLanguage'}OpenLogs{'OpenLogs'}ConfirmUninstall{'Uninstall'}default{$null}}
                 if($null -ne $kind){$value=$null;if($kind -ceq 'SetAutomationEnabled'){$value=[bool]$event.BoolValue}elseif($kind -ceq 'SetCandidateCompatibleOptIn'){$value=[bool]$event.BoolValue}elseif($kind -ceq 'SetUiLanguage'){$value=switch($event.Command){SetLanguageSystem{'System'}SetLanguageChinese{'zh-CN'}default{'en-US'}};$queueValue=[pscustomobject][ordered]@{Kind=$kind;Value=$value;EnqueuedAtUtc=[DateTime]::UtcNow.ToString('o',[Globalization.CultureInfo]::InvariantCulture)};[void]$Context.CommandQueue.Enqueue($queueValue);continue};$queueValue=[pscustomobject][ordered]@{Kind=$kind;Value=$value;EnqueuedAtUtc=[DateTime]::UtcNow.ToString('o',[Globalization.CultureInfo]::InvariantCulture)};[void]$Context.CommandQueue.Enqueue($queueValue)}

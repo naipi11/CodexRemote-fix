@@ -69,6 +69,8 @@ supervisor are working.
 - The installer never closes or restarts Codex automatically; choosing **Later** leaves the current session untouched.
 - The installer now stops the prior CodexRemote-fix supervisor from its persistent runtime, validates the packaged TrayHost payload, and shows the prompt only after the new runtime is active.
 - Choosing **Restart now** safely closes the current Codex session and launches a fresh controlled session after explicit user confirmation.
+- Runtime activation now continues in a background worker, so the setup window can finish without freezing during the handoff.
+- Tray language changes wait for the native menu host to acknowledge the new presentation before returning.
 
 ## What's new in v2.4.19
 

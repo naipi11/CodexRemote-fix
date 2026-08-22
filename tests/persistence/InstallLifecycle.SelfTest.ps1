@@ -1114,7 +1114,7 @@ $results += Invoke-CcodTest 'installer exposes CodexRemote-fix as the searchable
     Assert-CcodTrue ($lines -ccontains 'SetupIconFile=..\assets\codexremote-fix\codexremote-fix.ico') 'setup uses the CodexRemote-fix icon'
     Assert-CcodTrue ($lines -ccontains 'UninstallDisplayIcon={app}\assets\CodexRemote-fix.ico') 'Apps and Features uses the installed CodexRemote-fix icon'
     Assert-CcodTrue ($lines -ccontains 'OutputBaseFilename=CodexRemote-fix-{#ProjectVersion}-setup') 'build output uses the public release name'
-    Assert-CcodTrue ($content -cmatch "RegKeyExists\(HKCU64, 'Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\\{\{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F\}_is1'\)") 'upgrade detection reads the v2.1.6 Inno uninstall key'
+    Assert-CcodTrue ($content -cmatch 'Activate-CcodRemoteFix\.ps1') 'installer delegates upgrades to the durable activation worker instead of relying on uninstall metadata'
 
     $primaryEntries = @($content -split "`r?`n" | Where-Object { $_ -cmatch '^Name: "\{(group|userdesktop)\}\\CodexRemote-fix";' })
     Assert-CcodEqual 2 $primaryEntries.Count 'Start menu and desktop each expose one primary CodexRemote-fix entry'
@@ -1148,19 +1148,15 @@ $results += Invoke-CcodTest 'installer publishes the exact CodexRemote-fix 2.4.2
 
 $results += Invoke-CcodTest 'installer stops the running supervisor before replacing the installed version' {
     $installerScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
-    $prepareScript = Join-Path $repositoryRoot 'Prepare-CcodRemoteUpgrade.ps1'
+    $activationScript = Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1'
     $promptScript = Join-Path $repositoryRoot 'Prompt-CcodRestart.ps1'
-    Assert-CcodTrue (Test-Path -LiteralPath $prepareScript -PathType Leaf) 'pre-upgrade supervisor stopper exists'
+    Assert-CcodTrue (Test-Path -LiteralPath $activationScript -PathType Leaf) 'post-install activation worker exists'
     Assert-CcodTrue (Test-Path -LiteralPath $promptScript -PathType Leaf) 'post-install Codex restart prompt exists'
     Assert-CcodTrue ($installerScript -cmatch '(?m)^CloseApplications=no\r?$') 'installer never lets Restart Manager close Codex'
-    Assert-CcodTrue ($installerScript -cmatch '(?m)^function PrepareToInstall\(') 'installer runs the pre-upgrade hook'
-    Assert-CcodTrue ($installerScript -cmatch '(?m)^function HasPersistentRuntime\(') 'installer detects a persistent runtime even if the uninstall key is unavailable'
-    Assert-CcodTrue ($installerScript -cmatch 'if HasExistingRuntime\(\) and not WizardSilent then') 'silent upgrades do not block on the informational existing-installation dialog'
-    Assert-CcodTrue ($installerScript -cmatch 'Prepare-CcodRemoteUpgrade\.ps1') 'installer bundles and invokes the pre-upgrade supervisor stopper'
-    Assert-CcodTrue ($installerScript -cmatch '(?m)^function InstallPersistentRuntimeOrAbort\(') 'installer checks the persistent runtime activation result before continuing'
-    Assert-CcodTrue ($installerScript -cmatch '(?m)^procedure ShowRuntimeActivationFailure\(') 'silent upgrades have a dedicated non-blocking runtime activation error path'
+    Assert-CcodTrue ($installerScript -cmatch 'Activate-CcodRemoteFix\.ps1') 'installer bundles the activation worker'
+    Assert-CcodTrue ($installerScript -cmatch '(?s)CurStepChanged.*Activate-CcodRemoteFix\.ps1.*ewNoWait') 'installer launches activation asynchronously so the setup window stays responsive'
+    Assert-CcodTrue ($installerScript -cnotmatch 'Prepare-CcodRemoteUpgrade\.ps1') 'installer does not pre-stop the supervisor outside the gated runtime activation transaction'
     Assert-CcodTrue ($installerScript -cnotmatch '(?ms)^\[Run\]\s*\r?\nFilename: "powershell\.exe"; Parameters: ".*Install-CodexControlOtherDevices\.ps1') 'installer does not silently ignore its runtime installer exit code through a Run entry'
-    Assert-CcodTrue ($installerScript -cmatch '(?s)CurStepChanged.*InstallPersistentRuntimeOrAbort.*Prompt-CcodRestart\.ps1') 'installer prompts only after the persistent runtime activation succeeds'
 }
 
 $results += Invoke-CcodTest 'pre-upgrade supervisor stopper exits cleanly when no old runtime is present' {
@@ -1179,6 +1175,24 @@ $results += Invoke-CcodTest 'post-install restart prompt does nothing when the u
         $output = @(& (Join-Path $repositoryRoot 'Prompt-CcodRestart.ps1') -AppRoot $repositoryRoot -InstallRoot $root -Choice Later 2>&1)
         Assert-CcodEqual 0 $LASTEXITCODE 'later choice exits successfully'
         Assert-CcodTrue (($output -join "`n") -notmatch '(?i)Start-CodexControlOtherDevices') 'later choice does not launch the restart wrapper'
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+$results += Invoke-CcodTest 'activation worker installs first and prompts only after a successful runtime activation' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-worker-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        $marker = Join-Path $root 'marker.txt'
+        $installScript = Join-Path $root 'Install-CodexControlOtherDevices.ps1'
+        $promptScript = Join-Path $root 'Prompt-CcodRestart.ps1'
+        [IO.File]::WriteAllText($installScript, "[IO.File]::AppendAllText('$marker','install,',[Text.UTF8Encoding]::new(`$false)); exit 0", [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($promptScript, "param([string]`$AppRoot,[string]`$InstallRoot);[IO.File]::AppendAllText('$marker','prompt',[Text.UTF8Encoding]::new(`$false)); exit 0", [Text.UTF8Encoding]::new($false))
+        $output = @(& (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -AppRoot $root -InstallRoot $root -Prompt 2>&1)
+        Assert-CcodEqual 0 $LASTEXITCODE 'activation worker exits successfully after the runtime activation and prompt complete'
+        Assert-CcodEqual 'install,prompt' ([IO.File]::ReadAllText($marker, [Text.UTF8Encoding]::new($false))) 'activation worker prompts only after the installer succeeds'
+        Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $root 'logs\post-install-activation.log') -PathType Leaf) 'activation worker writes a durable activation result'
     } finally {
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
     }

@@ -14,6 +14,8 @@ No unreleased changes.
 - The installer never closes or restarts Codex automatically; **Later** leaves the current session untouched.
 - The installer now stops the persistent prior supervisor, validates the packaged TrayHost payload, and prompts only after the new runtime is active.
 - **Restart now** safely closes the current Codex session and launches a fresh controlled session after explicit confirmation.
+- Runtime activation runs in a background worker so the setup window remains responsive.
+- Tray language changes wait for native-host acknowledgement before completing.
 
 ### 简体中文
 
@@ -21,6 +23,8 @@ No unreleased changes.
 - 安装器不会自动关闭或重启 Codex；选择“稍后”会保持当前会话不受影响。
 - 安装器会关闭持久运行时中的旧 Supervisor，验证打包 TrayHost，并且只在新运行时已激活后提示。
 - 只有明确选择“立即重启”后，才会安全关闭当前 Codex 并启动新的受控会话。
+- 运行时激活改由后台工作器执行，安装窗口可保持响应。
+- 托盘语言切换会等待原生宿主确认新快照后完成。
 
 ## v2.4.19
 

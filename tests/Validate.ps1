@@ -81,6 +81,7 @@ foreach ($required in @(
     'NOTICE.md',
     'SECURITY.md',
     'package.json',
+    'Activate-CcodRemoteFix.ps1',
     'docs\CLEANROOM.md',
     'docs\TECHNICAL.md',
     'Install-CodexControlOtherDevices.ps1',

@@ -60,8 +60,8 @@ Source: "..\Uninstall-CodexControlOtherDevices.ps1"; DestDir: "{app}"; Flags: ig
 Source: "..\Start-CodexControlOtherDevices.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Reset-CodexControlOtherDevices.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Test-CodexControlOtherDevices.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Prepare-CcodRemoteUpgrade.ps1"; DestDir: "{tmp}"; Flags: dontcopy
-Source: "..\Prompt-CcodRestart.ps1"; DestDir: "{tmp}"; Flags: dontcopy
+Source: "..\Activate-CcodRemoteFix.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\Prompt-CcodRestart.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 [InstallDelete]
 Type: files; Name: "{userprograms}\Codex Control other devices\Codex Control other devices for Windows.lnk"
@@ -84,97 +84,15 @@ Name: "{group}\Uninstall CodexRemote-fix"; Filename: "{app}\unins000.exe"; IconF
 Name: "{userdesktop}\CodexRemote-fix"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{localappdata}\CodexControlOtherDevices\bootstrap.ps1"" -InstallRoot ""{localappdata}\CodexControlOtherDevices"""; WorkingDir: "{localappdata}\CodexControlOtherDevices"; IconFilename: "{app}\assets\CodexRemote-fix.ico"
 
 [Code]
-function IsAppInstalled(): Boolean;
-begin
-  Result := RegKeyExists(HKCU64, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}_is1');
-end;
-
-function HasPersistentRuntime(): Boolean;
-begin
-  Result := FileExists(ExpandConstant('{localappdata}\CodexControlOtherDevices\active.json'));
-end;
-
-function HasExistingRuntime(): Boolean;
-begin
-  Result := IsAppInstalled() or HasPersistentRuntime();
-end;
-
-function InitializeSetup(): Boolean;
-begin
-  if HasExistingRuntime() and not WizardSilent then
-    MsgBox('CodexRemote-fix is already installed. The current supervisor will be stopped safely before the new runtime replaces the old one; device keys and state are preserved.', mbInformation, MB_OK);
-  Result := True;
-end;
-
-function PrepareToInstall(var NeedsRestart: Boolean): String;
-var
-  ResultCode: Integer;
-  ScriptPath: String;
-  Parameters: String;
-begin
-  Result := '';
-  NeedsRestart := False;
-  if not HasExistingRuntime() then
-    Exit;
-  try
-    ExtractTemporaryFile('Prepare-CcodRemoteUpgrade.ps1');
-    ScriptPath := ExpandConstant('{tmp}\Prepare-CcodRemoteUpgrade.ps1');
-    Parameters := '-NoProfile -ExecutionPolicy Bypass -File "' + ScriptPath + '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') + '"';
-    if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-      Result := 'Could not start the previous CodexRemote-fix shutdown helper.'
-    else if ResultCode <> 0 then
-      Result := 'The previous CodexRemote-fix supervisor could not be stopped safely.';
-  except
-    Result := 'The previous CodexRemote-fix supervisor could not be stopped safely.';
-  end;
-end;
-
-procedure ShowRuntimeActivationFailure(const Message: String);
-begin
-  if not WizardSilent then
-    MsgBox(Message, mbError, MB_OK);
-end;
-
-function InstallPersistentRuntimeOrAbort(): Boolean;
-var
-  ResultCode: Integer;
-  Parameters: String;
-begin
-  Result := False;
-  try
-    WizardForm.StatusLabel.Caption := 'Activating the new CodexRemote-fix runtime...';
-    Parameters := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\Install-CodexControlOtherDevices.ps1') + '" -EnableCandidateCompatibleUpdates';
-    if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then begin
-      ShowRuntimeActivationFailure('CodexRemote-fix could not start its runtime upgrade. The existing runtime was kept unchanged; no Codex restart was attempted.');
-      Exit;
-    end;
-    if ResultCode <> 0 then begin
-      ShowRuntimeActivationFailure('CodexRemote-fix could not activate the new runtime. The existing runtime was kept unchanged; no Codex restart was attempted. Close CodexRemote-fix from the tray and run the installer again.');
-      Exit;
-    end;
-    Result := True;
-  except
-    ShowRuntimeActivationFailure('CodexRemote-fix could not activate the new runtime. The existing runtime was kept unchanged; no Codex restart was attempted.');
-  end;
-end;
-
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
-  ScriptPath: String;
   Parameters: String;
 begin
   if CurStep <> ssPostInstall then
     Exit;
-  if not InstallPersistentRuntimeOrAbort() then
-    Abort;
-  if WizardSilent then
-    Exit;
-  try
-    ExtractTemporaryFile('Prompt-CcodRestart.ps1');
-    ScriptPath := ExpandConstant('{tmp}\Prompt-CcodRestart.ps1');
-    Parameters := '-NoProfile -ExecutionPolicy Bypass -File "' + ScriptPath + '" -AppRoot "' + ExpandConstant('{app}') + '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') + '"';
-    Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  except
-  end;
+  Parameters := '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ExpandConstant('{app}\Activate-CcodRemoteFix.ps1') + '" -AppRoot "' + ExpandConstant('{app}') + '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') + '"';
+  if not WizardSilent then
+    Parameters := Parameters + ' -Prompt';
+  Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE, ewNoWait, ResultCode);
 end;
