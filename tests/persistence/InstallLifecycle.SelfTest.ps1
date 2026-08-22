@@ -1198,6 +1198,27 @@ $results += Invoke-CcodTest 'activation worker installs first and prompts only a
     }
 }
 
+$results += Invoke-CcodTest 'activation worker preserves an activated runtime when optional restart confirmation fails' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-restart-warning-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        $marker = Join-Path $root 'marker.txt'
+        $installScript = Join-Path $root 'Install-CodexControlOtherDevices.ps1'
+        $promptScript = Join-Path $root 'Prompt-CcodRestart.ps1'
+        [IO.File]::WriteAllText($installScript, "[IO.File]::AppendAllText('$marker','install,',[Text.UTF8Encoding]::new(`$false)); exit 0", [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($promptScript, "param([string]`$AppRoot,[string]`$InstallRoot);[IO.File]::AppendAllText('$marker','prompt',[Text.UTF8Encoding]::new(`$false)); exit 1", [Text.UTF8Encoding]::new($false))
+        $output = @(& (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -AppRoot $root -InstallRoot $root -Prompt -NoUi 2>&1)
+        Assert-CcodEqual 0 $LASTEXITCODE 'restart confirmation failure does not invalidate a completed runtime activation'
+        Assert-CcodEqual 'install,prompt' ([IO.File]::ReadAllText($marker, [Text.UTF8Encoding]::new($false))) 'restart is attempted only after activation succeeds'
+        $activationLog = Get-Content -LiteralPath (Join-Path $root 'logs\post-install-activation.log') -Raw
+        Assert-CcodTrue ($activationLog -match '"code":"RUNTIME_ACTIVATED"') 'activation log preserves the completed runtime activation record'
+        Assert-CcodTrue ($activationLog -match '"code":"RESTART_UNCONFIRMED"') 'activation log records restart confirmation separately'
+        Assert-CcodTrue ($activationLog -notmatch '"code":"FAILED"') 'restart confirmation failure is not mislabeled as runtime activation failure'
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 $results += Invoke-CcodTest 'post-install restart prompt requests an explicit controlled Codex restart after Yes' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-restart-prompt-yes-' + [guid]::NewGuid().ToString('N'))
     try {

@@ -20,9 +20,8 @@ function Resolve-CcodStartInstalledController {
     $validation=Test-CcodRuntimeManifest -RuntimeDirectory $runtime -ExpectedRuntimeId $active.activeRuntime
     if(-not $validation.Valid){throw "Installed runtime validation failed: $($validation.Code). Repair or reinstall CodexRemote-fix."}
     $controller=Join-Path $runtime 'src\persistence\SessionController.ps1'
-    $processControl=Join-Path $runtime 'src\persistence\modules\ProcessControl.psm1'
-    if(-not (Test-Path -LiteralPath $controller -PathType Leaf) -or -not (Test-Path -LiteralPath $processControl -PathType Leaf)){throw 'The verified active runtime does not contain the required restart files. Repair or reinstall.'}
-    [pscustomobject]@{RuntimeId=$active.activeRuntime;RuntimeRoot=$runtime;Controller=[IO.Path]::GetFullPath($controller);ProcessControl=[IO.Path]::GetFullPath($processControl)}
+    if(-not (Test-Path -LiteralPath $controller -PathType Leaf)){throw 'The verified active runtime does not contain the required restart files. Repair or reinstall.'}
+    [pscustomobject]@{RuntimeId=$active.activeRuntime;RuntimeRoot=$runtime;Controller=[IO.Path]::GetFullPath($controller)}
 }
 
 function Get-CcodStartSupervisorIdentity {
@@ -44,7 +43,7 @@ function New-CcodRestartControllerRequest {
     param([string]$RuntimeId,[int]$TimeoutSeconds,$SupervisorIdentity=(Get-CcodStartSupervisorIdentity),[string]$TransactionId=([guid]::NewGuid().ToString('D')))
     [pscustomobject][ordered]@{
         schemaVersion=1;action='Recover';transactionId=$TransactionId;runtimeId=$RuntimeId;supervisorIdentity=$SupervisorIdentity;source=$null;existingOnly=$true
-        rendererPort=$null;mainPort=$null;timeoutMilliseconds=[int]($TimeoutSeconds*1000);restartOrdinary=$false
+        rendererPort=$null;mainPort=$null;timeoutMilliseconds=[int]($TimeoutSeconds*1000);restartOrdinary=$true
     }
 }
 
@@ -75,58 +74,24 @@ function Invoke-CcodStartInstalledController {
     }
 }
 
-function Start-CcodRestartOrdinary {
-    param($Resolved)
-    Import-Module $Resolved.ProcessControl -Force
-    return Start-CcodProcess -Mode Ordinary
-}
-
-function Wait-CcodRestartActivation {
-    param([string]$InstallRoot,[string]$RuntimeId,[int]$TimeoutSeconds,[AllowNull()][int]$PreviousPid)
-    $statusPath=Join-Path $InstallRoot 'state\status.json'
-    $deadline=[DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    while([DateTime]::UtcNow -lt $deadline){
-        try{
-            if([IO.File]::Exists($statusPath)){
-                $status=Get-Content -LiteralPath $statusPath -Raw|ConvertFrom-Json -ErrorAction Stop
-                $session=$status.session
-                if($null -ne $session -and $session.runtimeId -ceq $RuntimeId -and $session.sessionState -ceq 'Active' -and
-                   $null -ne $session.codex -and ($session.codex.pid -is [int] -or $session.codex.pid -is [long]) -and ($null -eq $PreviousPid -or $session.codex.pid -ne $PreviousPid)){return $true}
-            }
-        }catch{}
-        Start-Sleep -Milliseconds 200
-    }
-    return $false
-}
-
 function Invoke-CcodRestartInstalledWorkflow {
-    param(
-        $Resolved,
-        $RestartRequest,
-        [string]$InstallRoot,
-        [int]$TimeoutSeconds,
-        [scriptblock]$StartOrdinary={param($ResolvedValue)Start-CcodRestartOrdinary -Resolved $ResolvedValue},
-        [scriptblock]$WaitForActive={param($Root,$RuntimeId,$Seconds,$PreviousPid)Wait-CcodRestartActivation -InstallRoot $Root -RuntimeId $RuntimeId -TimeoutSeconds $Seconds -PreviousPid $PreviousPid}
-    )
-    $close=Invoke-CcodStartInstalledController -Resolved $Resolved -Request $RestartRequest
-    if($close.outcome -notin @('Closed','NoAction')){throw "Codex restart could not safely close the current session: $($close.outcome)"}
-    $previousPid=$null
-    if($null -ne $close.special -and $close.special.PSObject.Properties['pid'] -and $close.special.pid -is [int]){$previousPid=[int]$close.special.pid}
-    $start=& $StartOrdinary $Resolved
-    if($null -eq $start -or $start.Outcome -notin @('Started','Adopted')){throw 'Codex restart could not launch an ordinary Codex session.'}
-    if(-not (& $WaitForActive $InstallRoot $Resolved.RuntimeId $TimeoutSeconds $previousPid)){throw 'Codex restarted, but CodexRemote-fix did not confirm the new controlled session in time.'}
-    return [pscustomobject][ordered]@{Close=$close;Start=$start}
+    param($Resolved,$RestartRequest,$ApplyRequest)
+    $recovery=Invoke-CcodStartInstalledController -Resolved $Resolved -Request $RestartRequest
+    if($recovery.outcome -notin @('Recovered','NoAction','Closed')){throw "Codex restart could not safely recover the current session: $($recovery.outcome)"}
+    $apply=Invoke-CcodStartInstalledController -Resolved $Resolved -Request $ApplyRequest
+    if($apply.outcome -notin @('Activated','NoAction')){throw "Codex restart did not activate the controlled session: $($apply.outcome)"}
+    return [pscustomobject][ordered]@{Recovery=$recovery;Apply=$apply}
 }
 
 if($MyInvocation.InvocationName -ne '.'){
     $installRoot=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'CodexControlOtherDevices'))
     $resolved=Resolve-CcodStartInstalledController -InstallRoot $installRoot
+    $request=New-CcodStartControllerRequest -RuntimeId $resolved.RuntimeId -RendererDebugPort $RendererDebugPort -MainInspectorPort $MainInspectorPort -TimeoutSeconds $TimeoutSeconds
     if($RestartCodex){
         $restart=New-CcodRestartControllerRequest -RuntimeId $resolved.RuntimeId -TimeoutSeconds $TimeoutSeconds
-        $workflow=Invoke-CcodRestartInstalledWorkflow -Resolved $resolved -RestartRequest $restart -InstallRoot $installRoot -TimeoutSeconds $TimeoutSeconds
-        $result=$workflow.Start
+        $workflow=Invoke-CcodRestartInstalledWorkflow -Resolved $resolved -RestartRequest $restart -ApplyRequest $request
+        $result=$workflow.Apply
     }else{
-        $request=New-CcodStartControllerRequest -RuntimeId $resolved.RuntimeId -RendererDebugPort $RendererDebugPort -MainInspectorPort $MainInspectorPort -TimeoutSeconds $TimeoutSeconds
         $result=Invoke-CcodStartInstalledController -Resolved $resolved -Request $request
     }
     Write-Host ''

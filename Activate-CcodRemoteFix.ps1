@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory)][string]$AppRoot,
     [Parameter(Mandatory)][string]$InstallRoot,
-    [switch]$Prompt
+    [switch]$Prompt,
+    [switch]$NoUi
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,7 +29,7 @@ function Write-CcodActivationRecord {
 }
 
 function Show-CcodActivationFailure {
-    if (-not $Prompt) { return }
+    if (-not $Prompt -or $NoUi) { return }
     try {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
         [Windows.Forms.MessageBox]::Show(
@@ -53,17 +54,28 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'CCOD_ACTIVATION_RUNTIME_FAILED' }
     Write-CcodActivationRecord -Code 'RUNTIME_ACTIVATED'
 
-    if ($Prompt) {
-        $promptScript = Join-Path $root 'Prompt-CcodRestart.ps1'
-        if (-not [IO.File]::Exists($promptScript)) { throw 'CCOD_ACTIVATION_PROMPT_SCRIPT_MISSING' }
-        $null = & $powershell -NoProfile -ExecutionPolicy Bypass -File $promptScript -AppRoot $root -InstallRoot $stateRoot 2>$null
-        if ($LASTEXITCODE -ne 0) { throw 'CCOD_ACTIVATION_RESTART_FAILED' }
-    }
-
-    Write-CcodActivationRecord -Code 'COMPLETED'
-    exit 0
 } catch {
     Write-CcodActivationRecord -Code 'FAILED'
     Show-CcodActivationFailure
     exit 1
 }
+
+if ($Prompt) {
+    $restartConfirmed = $false
+    try {
+        $promptScript = Join-Path $root 'Prompt-CcodRestart.ps1'
+        if ([IO.File]::Exists($promptScript)) {
+            $null = & $powershell -NoProfile -ExecutionPolicy Bypass -File $promptScript -AppRoot $root -InstallRoot $stateRoot 2>$null
+            $restartConfirmed = ($LASTEXITCODE -eq 0)
+        }
+    } catch {
+        $restartConfirmed = $false
+    }
+    if (-not $restartConfirmed) {
+        Write-CcodActivationRecord -Code 'RESTART_UNCONFIRMED'
+        exit 0
+    }
+}
+
+Write-CcodActivationRecord -Code 'COMPLETED'
+exit 0

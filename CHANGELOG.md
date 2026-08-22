@@ -1,6 +1,6 @@
 # CodexRemote-fix release notes
 
-This file keeps the short bilingual summary for every published release.
+This file keeps the release record. GitHub Release bodies are generated from the English section only.
 
 ## Unreleased
 
@@ -16,6 +16,8 @@ No unreleased changes.
 - **Restart now** safely closes the current Codex session and launches a fresh controlled session after explicit confirmation.
 - Runtime activation runs in a background worker so the setup window remains responsive.
 - Tray language changes wait for native-host acknowledgement before completing.
+- Reissued the installer with a verified restart chain: recover a proven ordinary Codex session first, then activate the controlled session.
+- If restart confirmation fails after activation, the new runtime remains active and the event is recorded as `RESTART_UNCONFIRMED` rather than a false activation failure.
 
 ### 简体中文
 
@@ -25,6 +27,8 @@ No unreleased changes.
 - 只有明确选择“立即重启”后，才会安全关闭当前 Codex 并启动新的受控会话。
 - 运行时激活改由后台工作器执行，安装窗口可保持响应。
 - 托盘语言切换会等待原生宿主确认新快照后完成。
+- 重新发布安装包：重启链路会先恢复并确认普通 Codex 会话，再激活受控会话。
+- 如果激活完成后无法确认重启，新运行时仍保持已激活状态，并记录为 `RESTART_UNCONFIRMED`，不再误报激活失败。
 
 ## v2.4.19
 
