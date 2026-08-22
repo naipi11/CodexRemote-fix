@@ -71,6 +71,8 @@ supervisor are working.
 - Choosing **Restart now** safely closes the current Codex session and launches a fresh controlled session after explicit user confirmation.
 - Runtime activation now continues in a background worker, so the setup window can finish without freezing during the handoff.
 - Tray language changes wait for the native menu host to acknowledge the new presentation before returning.
+- The reissued installer verifies an ordinary Codex recovery before controlled activation, preventing a single-instance launch race.
+- If restart confirmation cannot be completed, the new runtime stays active and the user is asked to restart Codex manually instead of receiving a false activation-failure message.
 
 ## What's new in v2.4.19
 

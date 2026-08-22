@@ -64,6 +64,8 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 - 只有用户明确选择“立即重启”后，才会安全关闭当前 Codex 并启动新的受控会话。
 - 运行时激活改为后台工作器执行，安装窗口可正常结束，不会在交接阶段卡死。
 - 托盘语言切换会等待原生菜单宿主确认新快照后才返回。
+- 重新发布的安装包会先验证普通 Codex 会话已经恢复，再进行受控激活，避免单实例启动竞争。
+- 如无法确认已重启，新 runtime 仍保持激活状态，并提示用户手动重启 Codex，不再误报激活失败。
 
 ## v2.4.19 更新内容
 
@@ -108,7 +110,7 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 为 2.4.20 发布提供可直接运行的 `CodexRemote-fix-2.4.20-setup.exe`
 及 `CodexRemote-fix-2.4.20-setup.exe.sha256.txt`。
 
-每次发布都会在本 README 和 GitHub Release 正文中追加简短的中英文更新说明。
+GitHub Release 正文只发布英文更新说明；本 README 继续保留中英文使用说明。
 完整历史见 [CHANGELOG.md](CHANGELOG.md)。
 
 Codex Desktop 更新后，请到 [Releases](https://github.com/naipi11/CodexRemote-fix/releases)
