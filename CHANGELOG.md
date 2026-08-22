@@ -6,6 +6,20 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.4.21
+
+### English
+
+- Fixed a TrayHost parent-reader disposal race that could terminate the persistent supervisor after the remote-control session had already become active.
+- The parent now waits for TrayHost reader, writer, and stderr threads to leave their pipe operations before disposing synchronization handles.
+- Added a native regression test for a remote-fault shutdown race, preventing the `System.ObjectDisposedException` observed in the parent reader.
+
+### 简体中文
+
+- 修复 TrayHost 父端读取线程的释放竞态：远程控制会话已生效后，持久 Supervisor 不会再因该竞态退出。
+- 父端现在会等待 TrayHost 的读取、写入和 stderr 线程退出管道操作后，才释放同步句柄。
+- 新增原生回归测试，覆盖远端故障与关闭并发场景，防止 ParentReader 出现 `System.ObjectDisposedException`。
+
 ## v2.4.20
 
 ### English

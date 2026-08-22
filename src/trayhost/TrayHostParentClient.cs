@@ -27,6 +27,8 @@ public sealed class TrayHostStartReceipt
 public sealed class TrayHostParentClient : IDisposable
 {
     internal static Func<ProcessStartInfo, Process> TestProcessFactory = null;
+    internal static Action TestBeforeReaderStopSignal = null;
+    internal static Action TestBeforeWaitHandleDispose = null;
 
     private readonly object _eventGate = new object();
     private readonly object _writeGate = new object();
@@ -42,8 +44,9 @@ public sealed class TrayHostParentClient : IDisposable
     private SessionKeys _keys;
     private ulong _writeSequence;
     private ulong _readSequence;
-    private bool _shutdownRequested;
-    private bool _disposed;
+    private volatile bool _shutdownRequested;
+    private int _disposeGate;
+    private int _disposed;
     private Thread _writerThread;
     private Thread _readerThread;
     private Thread _stderrThread;
@@ -109,8 +112,8 @@ public sealed class TrayHostParentClient : IDisposable
 
     public bool TryPublish(PresentationSnapshot snapshot)
     {
-        if (_disposed || snapshot == null || _transport.GetHealth() != TrayHostHealth.Ready) { return false; }
-        bool accepted = _transport.TrySetLatestPresentation(snapshot); if (accepted) { _work.Set(); } return accepted;
+        if (IsClosing() || snapshot == null || _transport.GetHealth() != TrayHostHealth.Ready) { return false; }
+        bool accepted = _transport.TrySetLatestPresentation(snapshot); if (accepted) { SignalWork(); } return accepted;
     }
 
     public bool TryDequeueEvent(out TrayHostEvent value)
@@ -120,25 +123,31 @@ public sealed class TrayHostParentClient : IDisposable
 
     public bool BeginShutdown(ShutdownReason reason, ulong finalRevision)
     {
-        if (_disposed || _shutdownRequested) { return false; }
-        _shutdownRequested = true; _transport.MarkStopping();
-        bool accepted = _transport.TryEnqueueControl(new TrayHostControl(TrayHostControlKind.Shutdown, reason, finalRevision));
-        if (accepted) { _work.Set(); } return accepted;
+        if (IsClosing()) { return false; }
+        return BeginShutdownCore(reason, finalRevision);
     }
 
-    public bool WaitForStopped(TimeSpan timeout) { return _stopped.WaitOne(timeout); }
-    public bool WaitForActivity(TimeSpan timeout) { return _work.WaitOne(timeout); }
+    private bool BeginShutdownCore(ShutdownReason reason, ulong finalRevision)
+    {
+        if (_shutdownRequested || _transport == null || _transport.GetHealth() != TrayHostHealth.Ready) { return false; }
+        _shutdownRequested = true; _transport.MarkStopping();
+        bool accepted = _transport.TryEnqueueControl(new TrayHostControl(TrayHostControlKind.Shutdown, reason, finalRevision));
+        if (accepted) { SignalWork(); } return accepted;
+    }
+
+    public bool WaitForStopped(TimeSpan timeout) { try { return _stopped.WaitOne(timeout); } catch (ObjectDisposedException) { return true; } }
+    public bool WaitForActivity(TimeSpan timeout) { if (IsDisposing()) { return false; } try { return _work.WaitOne(timeout); } catch (ObjectDisposedException) { return false; } }
     public TrayHostHealth GetHealth() { return _transport == null ? TrayHostHealth.Stopped : _transport.GetHealth(); }
 
     private void WriterLoop()
     {
         try
         {
-            while (!_disposed)
+            while (!IsDisposing())
             {
                 _work.WaitOne(250);
                 TrayHostOutbound outbound;
-                while (!_disposed && _transport.TryDequeueOutbound(out outbound))
+                while (!IsDisposing() && _transport.TryDequeueOutbound(out outbound))
                 {
                     if (outbound.Kind == TrayHostOutboundKind.Presentation) { WriteAuthenticated(TrayHostMessageType.Presentation, TrayHostWire.WritePresentation(outbound.Presentation)); }
                     else if (outbound.Kind == TrayHostOutboundKind.Action) { WriteAuthenticated(TrayHostMessageType.Action, TrayHostWire.WriteAction(outbound.Action)); }
@@ -146,7 +155,7 @@ public sealed class TrayHostParentClient : IDisposable
                 }
             }
         }
-        catch (Exception error) { HandleTransportFailure(error); }
+        catch (Exception error) { if (IsDisposing() || _shutdownRequested) { SignalStopped(); } else { HandleTransportFailure(error); } }
     }
 
     private void WriteControl(TrayHostControl control)
@@ -159,17 +168,22 @@ public sealed class TrayHostParentClient : IDisposable
     {
         try
         {
-            while (!_disposed)
+            while (!IsDisposing())
             {
                 ProtocolFrame frame = ReadAuthenticated();
                 if (frame.MessageType == TrayHostMessageType.PresentationAck) { EnqueueEvent(TrayHostEvent.Ack(TrayHostWire.ReadRevision(frame.Payload))); }
                 else if (frame.MessageType == TrayHostMessageType.Action) { EnqueueEvent(TrayHostEvent.Action(TrayHostWire.ReadAction(frame.Payload))); }
-                else if (frame.MessageType == TrayHostMessageType.ShutdownAck) { EnqueueEvent(TrayHostEvent.Exited()); _transport.Dispose(); _stopped.Set(); return; }
+                else if (frame.MessageType == TrayHostMessageType.ShutdownAck) { EnqueueEvent(TrayHostEvent.Exited()); _transport.Dispose(); SignalStopped(); return; }
                 else if (frame.MessageType == TrayHostMessageType.Fault) { EnqueueEvent(TrayHostEvent.Fault("CCOD_TRAYHOST_REMOTE_FAULT")); }
                 else if (frame.MessageType == TrayHostMessageType.Pong) { _work.Set(); }
             }
         }
-        catch (Exception error) { if (!_shutdownRequested) { HandleTransportFailure(error); } else { _stopped.Set(); } }
+        catch (Exception error)
+        {
+            if (IsDisposing()) { InvokeTestHook(TestBeforeReaderStopSignal); SignalStopped(); }
+            else if (!_shutdownRequested) { HandleTransportFailure(error); }
+            else { SignalStopped(); }
+        }
     }
 
     private void StderrLoop()
@@ -177,7 +191,7 @@ public sealed class TrayHostParentClient : IDisposable
         try
         {
             byte[] buffer = new byte[1024]; int read;
-            while (!_disposed && (read = _childError.Read(buffer, 0, buffer.Length)) > 0) { byte[] copy = new byte[read]; Buffer.BlockCopy(buffer, 0, copy, 0, read); _transport.RecordStderr(copy); }
+            while (!IsDisposing() && (read = _childError.Read(buffer, 0, buffer.Length)) > 0) { byte[] copy = new byte[read]; Buffer.BlockCopy(buffer, 0, copy, 0, read); _transport.RecordStderr(copy); }
         }
         catch { }
     }
@@ -195,8 +209,29 @@ public sealed class TrayHostParentClient : IDisposable
         return ProtocolCodec.ReadAuthenticated(_childOutput, ProtocolDirection.HostToParent, _keys.HostEpoch, _readSequence++, _keys.HostToParent);
     }
 
-    private void EnqueueEvent(TrayHostEvent value) { lock (_eventGate) { if (_events.Count < 32) { _events.Enqueue(value); } } _work.Set(); }
-    private void HandleTransportFailure(Exception error) { _transport.MarkPipeBroken("CCOD_TRAYHOST_TRANSPORT_FAILED"); EnqueueEvent(TrayHostEvent.Fault("CCOD_TRAYHOST_TRANSPORT_FAILED")); _stopped.Set(); }
+    private bool IsDisposing() { return Volatile.Read(ref _disposed) != 0; }
+    private bool IsClosing() { return Volatile.Read(ref _disposeGate) != 0; }
+    private void SignalWork() { try { _work.Set(); } catch (ObjectDisposedException) { } }
+    private void SignalStopped() { try { _stopped.Set(); } catch (ObjectDisposedException) { } }
+    private static void InvokeTestHook(Action hook) { if (hook != null) { hook(); } }
+    private void EnqueueEvent(TrayHostEvent value) { lock (_eventGate) { if (_events.Count < 32) { _events.Enqueue(value); } } SignalWork(); }
+    private void HandleTransportFailure(Exception error)
+    {
+        if (IsDisposing()) { SignalStopped(); return; }
+        _transport.MarkPipeBroken("CCOD_TRAYHOST_TRANSPORT_FAILED"); EnqueueEvent(TrayHostEvent.Fault("CCOD_TRAYHOST_TRANSPORT_FAILED")); SignalStopped();
+    }
+
+    private bool JoinBackgroundThreads(TimeSpan timeout)
+    {
+        DateTime deadline = DateTime.UtcNow.Add(timeout); bool complete = true;
+        foreach (Thread thread in new Thread[] { _writerThread, _readerThread, _stderrThread })
+        {
+            if (thread == null || thread == Thread.CurrentThread || !thread.IsAlive) { continue; }
+            int remaining = (int)Math.Max(0, (deadline - DateTime.UtcNow).TotalMilliseconds);
+            if (remaining == 0 || !thread.Join(remaining)) { complete = false; }
+        }
+        return complete;
+    }
 
     private static void ValidateOptions(TrayHostStartOptions options)
     {
@@ -205,18 +240,24 @@ public sealed class TrayHostParentClient : IDisposable
 
     public void Dispose()
     {
-        if (_disposed) { return; }
-        if (!_shutdownRequested && _transport != null && _transport.GetHealth() == TrayHostHealth.Ready) { BeginShutdown(ShutdownReason.ParentFault, 1UL); }
+        if (Interlocked.CompareExchange(ref _disposeGate, 1, 0) != 0) { return; }
+        if (!_shutdownRequested && _transport != null && _transport.GetHealth() == TrayHostHealth.Ready) { BeginShutdownCore(ShutdownReason.ParentFault, 1UL); }
         if (_shutdownRequested) { _stopped.WaitOne(TimeSpan.FromSeconds(2)); }
-        _disposed = true; _work.Set();
+        Interlocked.Exchange(ref _disposed, 1);
+        SignalWork();
         try { if (_job != null) { _job.Terminate(1U); } } catch { }
         try { if (_childInput != null) { _childInput.Close(); } } catch { }
         try { if (_childOutput != null) { _childOutput.Close(); } } catch { }
         try { if (_childError != null) { _childError.Close(); } } catch { }
         try { if (_process != null && !_process.HasExited) { _process.WaitForExit(2000); } } catch { }
+        bool workersStopped = JoinBackgroundThreads(TimeSpan.FromSeconds(2));
         try { if (_job != null) { _job.Dispose(); } } catch { }
         try { if (_process != null) { _process.Dispose(); } } catch { }
         if (_transport != null) { _transport.Dispose(); }
-        _work.Dispose(); _stopped.Dispose();
+        if (workersStopped)
+        {
+            InvokeTestHook(TestBeforeWaitHandleDispose);
+            _work.Dispose(); _stopped.Dispose();
+        }
     }
 }
