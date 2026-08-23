@@ -160,6 +160,32 @@ try {
         Assert-CcodThrows { Read-CcodActiveRuntime -InstallRoot $installRoot } 'CCOD_RUNTIME_ID_INVALID'
     }
 
+    Invoke-CcodTest 'includes the lifecycle worker and coordinator in the staged runtime closure' {
+        $sourceFiles=@(& $installLifecycleModule {param($sourceRoot)Get-CcodLifecycleSourceFiles -SourceRoot $sourceRoot} $repositoryRoot)
+        foreach($relative in @('src\persistence\LifecycleWorker.ps1','src\persistence\SessionController.ps1','src\persistence\modules\LifecycleCoordinator.psm1','src\persistence\modules\LifecycleEpoch.psm1','src\persistence\modules\ProcessControl.psm1','src\persistence\modules\SessionEngine.psm1','src\persistence\modules\WorkerRuntime.psm1')){
+            $matches=@($sourceFiles|Where-Object{$_.Relative -ceq $relative})
+            Assert-CcodEqual 1 $matches.Count "$relative is staged exactly once"
+            Assert-CcodTrue ([IO.File]::Exists($matches[0].Source)) "$relative resolves to a regular source file"
+        }
+    }
+
+    Invoke-CcodTest 'resolves only the exact active manifest worker and generation' {
+        $installRoot=Join-Path $root 'worker-context';New-Item -ItemType Directory -Path $installRoot|Out-Null
+        $staging=Join-Path $installRoot 'staging';New-Item -ItemType Directory -Path (Join-Path $staging 'src\persistence') -Force|Out-Null
+        $worker=Join-Path $staging 'src\persistence\LifecycleWorker.ps1'
+        [IO.File]::WriteAllText($worker,"# lifecycle worker`r`n",[Text.UTF8Encoding]::new($false))
+        $manifest=New-CcodRuntimeManifest -RuntimeDirectory $staging -ProjectVersion '2.5.0'
+        $runtime=Join-Path (Join-Path $installRoot 'runtime') $manifest.runtimeId;[IO.Directory]::CreateDirectory((Split-Path $runtime -Parent))|Out-Null
+        [IO.Directory]::Move($staging,$runtime);Write-CcodAtomicJson -Path (Join-Path $runtime 'manifest.json') -Value $manifest
+        Write-CcodAtomicJson -Path (Join-Path $installRoot 'active.json') -Value ([ordered]@{schemaVersion=2;activeRuntime=$manifest.runtimeId;previousRuntime=$null;generation=[UInt64]4;updatedAtUtc='2030-02-03T04:05:06.0000000Z'})
+        $installedWorker=[IO.Path]::GetFullPath((Join-Path $runtime 'src\persistence\LifecycleWorker.ps1'))
+        $context=Resolve-CcodActiveRuntimeContext -InstallRoot ([IO.Path]::GetFullPath($installRoot)) -ExpectedRuntimeId $manifest.runtimeId -ExpectedGeneration 4 -ExpectedScriptPath $installedWorker -ScriptRelativePath 'src/persistence/LifecycleWorker.ps1'
+        Assert-CcodEqual 'InstallRoot,RuntimeRoot,RuntimeId,RuntimeGeneration,ScriptPath,Manifest' (($context.PSObject.Properties.Name)-join ',') 'active worker context exact shape'
+        Assert-CcodEqual 4 ([UInt64]$context.RuntimeGeneration) 'active generation is retained'
+        Assert-CcodThrows { Resolve-CcodActiveRuntimeContext -InstallRoot ([IO.Path]::GetFullPath($installRoot)) -ExpectedRuntimeId $manifest.runtimeId -ExpectedGeneration 5 -ExpectedScriptPath $installedWorker -ScriptRelativePath 'src/persistence/LifecycleWorker.ps1' } 'CCOD_RUNTIME_UNAUTHORIZED'
+        Assert-CcodThrows { Resolve-CcodActiveRuntimeContext -InstallRoot ([IO.Path]::GetFullPath($installRoot)) -ExpectedRuntimeId $manifest.runtimeId -ExpectedGeneration 4 -ExpectedScriptPath (Join-Path $runtime 'src\persistence\SessionController.ps1') -ScriptRelativePath 'src/persistence/LifecycleWorker.ps1' } 'CCOD_RUNTIME_UNAUTHORIZED'
+    }
+
     Invoke-CcodTest 'maps a legacy schema-one pointer to generation one before the next schema-two commit' {
         $installRoot = Join-Path $root 'schema-one-migration'
         New-Item -ItemType Directory -Path $installRoot | Out-Null

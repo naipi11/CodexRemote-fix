@@ -367,6 +367,39 @@ function Read-CcodActiveRuntime {
     return [pscustomobject][ordered]@{ schemaVersion=2; activeRuntime=$active.activeRuntime; previousRuntime=$active.previousRuntime; generation=$generation; updatedAtUtc=$active.updatedAtUtc }
 }
 
+function Resolve-CcodActiveRuntimeContext {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$ExpectedRuntimeId,
+        [Parameter(Mandatory)][UInt64]$ExpectedGeneration,
+        [Parameter(Mandatory)][string]$ExpectedScriptPath,
+        [Parameter(Mandatory)][string]$ScriptRelativePath
+    )
+    try {
+        $root=[IO.Path]::GetFullPath($InstallRoot)
+        if(-not [IO.Path]::IsPathRooted($InstallRoot) -or $root -cne $InstallRoot -or $ExpectedGeneration -eq 0){throw 'input'}
+        Assert-CcodRuntimeId $ExpectedRuntimeId|Out-Null
+        $relative=Assert-CcodManifestRelativePath $ScriptRelativePath
+        $active=Read-CcodActiveRuntime -InstallRoot $root
+        if($active.activeRuntime -cne $ExpectedRuntimeId -or [UInt64]$active.generation -ne $ExpectedGeneration){throw 'active mismatch'}
+        $runtimeRoot=Get-CcodRuntimeDirectoryForId -InstallRoot $root -RuntimeId $ExpectedRuntimeId
+        $validation=Test-CcodRuntimeManifest -RuntimeDirectory $runtimeRoot -ExpectedRuntimeId $ExpectedRuntimeId
+        if(-not $validation.Valid){throw 'manifest'}
+        $scriptPath=[IO.Path]::GetFullPath((Join-Path $runtimeRoot $relative.Replace('/','\')))
+        $expected=[IO.Path]::GetFullPath($ExpectedScriptPath)
+        if(-not [IO.Path]::IsPathRooted($ExpectedScriptPath) -or $expected -cne $ExpectedScriptPath -or $expected -cne $scriptPath -or -not [IO.File]::Exists($scriptPath)){throw 'script'}
+        $records=@($validation.Manifest.files|Where-Object{$_.path -ceq $relative})
+        if($records.Count -ne 1){throw 'manifest script'}
+        return [pscustomobject][ordered]@{
+            InstallRoot=$root;RuntimeRoot=$runtimeRoot;RuntimeId=$ExpectedRuntimeId;RuntimeGeneration=[UInt64]$ExpectedGeneration
+            ScriptPath=$scriptPath;Manifest=$validation.Manifest
+        }
+    } catch {
+        Throw-CcodRuntimeError 'CCOD_RUNTIME_UNAUTHORIZED' 'The requested worker is not the exact active manifest runtime and generation' $ExpectedScriptPath
+    }
+}
+
 function Set-CcodActiveRuntime {
     [CmdletBinding()]
     param(
@@ -418,4 +451,4 @@ function Set-CcodActiveRuntime {
     return [pscustomobject]$pointer
 }
 
-Export-ModuleMember -Function Get-CcodRuntimeId, New-CcodRuntimeManifest, Test-CcodRuntimeManifest, Read-CcodActiveRuntime, Set-CcodActiveRuntime
+Export-ModuleMember -Function Get-CcodRuntimeId, New-CcodRuntimeManifest, Test-CcodRuntimeManifest, Read-CcodActiveRuntime, Resolve-CcodActiveRuntimeContext, Set-CcodActiveRuntime

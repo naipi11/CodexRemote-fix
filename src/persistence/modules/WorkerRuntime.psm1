@@ -53,10 +53,74 @@ function Write-CcodWorkerRequest {
     Write-CcodAtomicJson -Path $Path -Value $Request
 }
 
+function Test-CcodWorkerCanonicalUtc {
+    param($Value)
+    $parsed=[DateTime]::MinValue
+    return $Value -is [string] -and [DateTime]::TryParseExact($Value,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$parsed) -and
+        $parsed.Kind -eq [DateTimeKind]::Utc -and $parsed.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture) -ceq $Value
+}
+
+function Test-CcodWorkerCanonicalGuid {
+    param($Value)
+    $parsed=[guid]::Empty
+    return $Value -is [string] -and [guid]::TryParseExact($Value,'D',[ref]$parsed) -and $parsed.ToString('D') -ceq $Value
+}
+
+function Test-CcodWorkerExactProperties {
+    param($Value,[string[]]$Expected)
+    return $null -ne $Value -and $Value -is [pscustomobject] -and (@($Value.PSObject.Properties.Name)-join "`0") -ceq ($Expected-join "`0") -and
+        @($Value.PSObject.Properties|Where-Object{$_.MemberType -ne [Management.Automation.PSMemberTypes]::NoteProperty}).Count -eq 0
+}
+
+function New-CcodLifecycleWorkerRequest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$TransactionId,
+        [Parameter(Mandatory)][ValidateSet('Inspect','Close','RequestOrdinaryLaunch','ObserveOrdinary','Apply','VerifyRemote')][string]$Action,
+        [Parameter(Mandatory)][string]$RuntimeId,
+        [Parameter(Mandatory)][UInt64]$RuntimeGeneration,
+        [Parameter(Mandatory)][UInt64]$LeaseEpoch,
+        [Parameter(Mandatory)]$OwnerIdentity,
+        [Parameter(Mandatory)][string]$NotBeforeUtc,
+        [Parameter(Mandatory)][ValidateRange(1,600000)][int]$TimeoutMilliseconds
+    )
+    $request=[pscustomobject][ordered]@{
+        schemaVersion=1;transactionId=$TransactionId;action=$Action;runtimeId=$RuntimeId
+        runtimeGeneration=$RuntimeGeneration;leaseEpoch=$LeaseEpoch;ownerIdentity=$OwnerIdentity
+        notBeforeUtc=$NotBeforeUtc;timeoutMilliseconds=$TimeoutMilliseconds
+    }
+    if(-not(Test-CcodWorkerCanonicalGuid $request.transactionId) -or $request.runtimeId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$' -or
+        $request.runtimeGeneration -eq 0 -or $request.leaseEpoch -eq 0 -or -not(Test-CcodWorkerCanonicalUtc $request.notBeforeUtc) -or
+        -not(Test-CcodWorkerExactProperties $request.ownerIdentity @('pid','creationTimeUtc')) -or
+        ($request.ownerIdentity.pid -isnot [int] -and $request.ownerIdentity.pid -isnot [long]) -or $request.ownerIdentity.pid -lt 1 -or $request.ownerIdentity.pid -gt [int]::MaxValue -or
+        -not(Test-CcodWorkerCanonicalUtc $request.ownerIdentity.creationTimeUtc)){
+        Throw-CcodWorkerRuntimeError 'CCOD_WORKER_REQUEST_INVALID' 'Lifecycle worker request is invalid' $request
+    }
+    return $request
+}
+
+function Assert-CcodLifecycleWorkerResult {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Result,[Parameter(Mandatory)]$ExpectedRequest)
+    $fields=@('schemaVersion','transactionId','action','ok','outcome','observation','error')
+    if(-not(Test-CcodWorkerExactProperties $Result $fields) -or $Result.schemaVersion -isnot [int] -or $Result.schemaVersion -ne 1 -or
+        $Result.transactionId -isnot [string] -or $Result.transactionId -cne $ExpectedRequest.transactionId -or
+        $Result.action -isnot [string] -or $Result.action -cne $ExpectedRequest.action -or $Result.ok -isnot [bool] -or
+        $Result.outcome -isnot [string] -or [string]::IsNullOrWhiteSpace($Result.outcome) -or $Result.observation -isnot [string] -or [string]::IsNullOrWhiteSpace($Result.observation)){
+        Throw-CcodWorkerRuntimeError 'CCOD_WORKER_RESULT_INVALID' 'Lifecycle worker result is invalid or uncorrelated' $Result
+    }
+    if($Result.ok){if($null -ne $Result.error){Throw-CcodWorkerRuntimeError 'CCOD_WORKER_RESULT_INVALID' 'Successful lifecycle result contains an error' $Result}}
+    elseif(-not(Test-CcodWorkerExactProperties $Result.error @('code','stage','message')) -or $Result.error.code -isnot [string] -or $Result.error.code -cnotmatch '^CCOD_[A-Z0-9_]+$' -or
+        $Result.error.stage -isnot [string] -or $Result.error.message -isnot [string]){
+        Throw-CcodWorkerRuntimeError 'CCOD_WORKER_RESULT_INVALID' 'Failed lifecycle result has no stable error' $Result
+    }
+    return $Result
+}
+
 function Start-CcodWorkerProcess {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][ValidateSet('Controller', 'StaticProbe')][string]$Kind,
+        [Parameter(Mandatory)][ValidateSet('Controller', 'StaticProbe', 'Lifecycle')][string]$Kind,
         [Parameter(Mandatory)][string]$ScriptPath,
         [Parameter(Mandatory)][string]$RequestPath,
         [Parameter(Mandatory)][string]$ResultPath,
@@ -264,6 +328,8 @@ function Get-CcodChatGptProcessIds {
 Export-ModuleMember -Function @(
     'Get-CcodWorkerLeafState',
     'Write-CcodWorkerRequest',
+    'New-CcodLifecycleWorkerRequest',
+    'Assert-CcodLifecycleWorkerResult',
     'Start-CcodWorkerProcess',
     'Get-CcodWorkerPoll',
     'Read-CcodWorkerResult',

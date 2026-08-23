@@ -170,6 +170,7 @@ function Get-CcodLifecycleSourceFiles {
         'src\persistence\Supervisor.ps1',
         'src\persistence\SessionController.ps1',
         'src\persistence\StaticProbeWorker.ps1',
+        'src\persistence\LifecycleWorker.ps1',
         'Test-CodexControlOtherDevices.ps1',
         'Start-CodexControlOtherDevices.ps1',
         'Reset-CodexControlOtherDevices.ps1'

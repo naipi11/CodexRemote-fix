@@ -98,6 +98,19 @@ $results += Invoke-CcodTest 'worker request and result round-trip through atomic
     }
 }
 
+$results += Invoke-CcodTest 'lifecycle worker request constructor and result validator enforce exact correlation' {
+    $owner=[pscustomobject][ordered]@{pid=401;creationTimeUtc='2030-02-03T04:05:06.0000000Z'}
+    $request=New-CcodLifecycleWorkerRequest -TransactionId '11111111-2222-3333-4444-555555555555' -Action Apply -RuntimeId '2.5.0-a' `
+        -RuntimeGeneration 4 -LeaseEpoch 9 -OwnerIdentity $owner -NotBeforeUtc '2030-02-03T04:05:10.0000000Z' -TimeoutMilliseconds 45000
+    Assert-CcodEqual 'schemaVersion,transactionId,action,runtimeId,runtimeGeneration,leaseEpoch,ownerIdentity,notBeforeUtc,timeoutMilliseconds' (($request.PSObject.Properties.Name)-join ',') 'lifecycle request exact shape'
+    Assert-CcodTrue ($request.runtimeGeneration -is [UInt64]) 'runtime generation retains UInt64 type'
+    Assert-CcodTrue ($request.leaseEpoch -is [UInt64]) 'lease epoch retains UInt64 type'
+    $result=[pscustomobject][ordered]@{schemaVersion=1;transactionId=$request.transactionId;action='Apply';ok=$true;outcome='Activated';observation='Special';error=$null}
+    Assert-CcodLifecycleWorkerResult -Result $result -ExpectedRequest $request|Out-Null
+    $result.transactionId='aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    Assert-CcodThrows { Assert-CcodLifecycleWorkerResult -Result $result -ExpectedRequest $request } 'CCOD_WORKER_RESULT_INVALID'
+}
+
 $results += Invoke-CcodTest 'worker process lifecycle starts polls waits and terminates' {
     $root = New-CcodWorkerTempRoot
     $workerScript = Join-Path $root 'worker.ps1'
@@ -124,7 +137,7 @@ $results += Invoke-CcodTest 'worker process lifecycle starts polls waits and ter
         [IO.File]::WriteAllText($workerScript, $scriptText, [Text.UTF8Encoding]::new($false))
 
         $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        $receipt = Start-CcodWorkerProcess -Kind 'StaticProbe' -ScriptPath $workerScript -RequestPath $requestPath -ResultPath $resultPath -StderrPath $stderrPath -PowerShellPath $powershell
+        $receipt = Start-CcodWorkerProcess -Kind 'Lifecycle' -ScriptPath $workerScript -RequestPath $requestPath -ResultPath $resultPath -StderrPath $stderrPath -PowerShellPath $powershell
         Assert-CcodTrue ($receipt.ProcessId -is [int] -and $receipt.ProcessId -ge 1) 'worker start returns a real pid'
         Assert-CcodTrue ($receipt.CreationTimeUtc -cmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$') 'worker start returns canonical creation time'
         Assert-CcodTrue ($null -ne $receipt.Handle) 'worker start returns a process handle'
