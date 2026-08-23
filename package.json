@@ -1,6 +1,6 @@
 {
   "name": "codexremote-fix",
-  "version": "2.4.21",
+  "version": "2.4.22",
   "private": true,
   "description": "CodexRemote-fix persistent current-user tray supervisor for Windows",
   "license": "MIT",

@@ -6,6 +6,20 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.4.22
+
+### English
+
+- Fixed **Restart now** closing Codex without reopening it by activating the ordinary packaged app through Windows' native Application Activation Manager.
+- Ordinary launches now use the exact Codex AUMID `OpenAI.Codex_2p2nqsd0c76g0!App`; controlled launches with debugging arguments keep their existing verified executable path.
+- Added a regression test that rejects direct WindowsApps executable launches for ordinary Codex recovery.
+
+### 简体中文
+
+- 修复选择 **立即重启** 后只关闭 Codex、没有重新启动的问题：普通打包应用改由 Windows 原生 Application Activation Manager 激活。
+- 普通启动使用精确 Codex AUMID `OpenAI.Codex_2p2nqsd0c76g0!App`；携带调试参数的受控启动继续使用现有验证路径。
+- 新增回归测试，禁止普通 Codex 恢复流程直接运行 WindowsApps 中的可执行文件。
+
 ## v2.4.21
 
 ### English
