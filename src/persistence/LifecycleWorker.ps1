@@ -234,13 +234,13 @@ function Invoke-CcodLifecycleWorker {
     $adapter=Get-CcodLifecycleWorkerAdapters $Adapters;$request=$null;$requestValid=$false;$bootstrap=$null;$context=$null;$canPublish=$false;$result=$null;$stage='RuntimeAuthorization';$stale=$false
     try{
         $scriptPath=& $adapter.GetScriptPath;$bootstrap=& $adapter.GetBootstrapContext $scriptPath
-        $stage='PathValidation';Assert-CcodLifecycleWorkerPaths $bootstrap $RequestPath $ResultPath $null $Adapters;$canPublish=$true
+        $stage='PathValidation';Assert-CcodLifecycleWorkerPaths $bootstrap $RequestPath $ResultPath $null $Adapters
         $stage='RequestValidation';$request=& $adapter.ReadRequest $RequestPath;Assert-CcodLifecycleWorkerRequest $request|Out-Null;$requestValid=$true
-        $stage='PathValidation';$canPublish=$false;Assert-CcodLifecycleWorkerPaths $bootstrap $RequestPath $ResultPath $request $Adapters;$canPublish=$true
+        $stage='PathValidation';Assert-CcodLifecycleWorkerPaths $bootstrap $RequestPath $ResultPath $request $Adapters
         $stage='RuntimeAuthorization';$context=& $adapter.ResolveRuntime $scriptPath $request.runtimeId $request.runtimeGeneration
         if($null-eq$context -or $context.RuntimeId -cne $request.runtimeId -or [UInt64]$context.RuntimeGeneration -ne [UInt64]$request.runtimeGeneration){Throw-CcodLifecycleWorkerError 'CCOD_LIFECYCLE_WORKER_RUNTIME_UNAUTHORIZED' 'Lifecycle request does not match active runtime generation' $request}
         Assert-CcodLifecycleWorkerRuntimeClosure $context|Out-Null
-        $stage='Fence';[void](& $adapter.AssertFence $context $request)
+        $stage='Fence';[void](& $adapter.AssertFence $context $request);$canPublish=$true
         $stage='Operation'
         switch($request.action){
             'RequestOrdinaryLaunch'{$receipt=& $adapter.RequestOrdinaryLaunch $request $context;if(-not(Test-CcodLifecycleWorkerExactObject $receipt @('outcome','requestedAtUtc','launcherPid'))-or$receipt.outcome-cne'LaunchRequested'-or$receipt.requestedAtUtc-cne$request.notBeforeUtc){Throw-CcodLifecycleWorkerError 'CCOD_LIFECYCLE_WORKER_RESULT_INVALID' 'Launch receipt is invalid' $receipt};$result=[pscustomobject][ordered]@{schemaVersion=1;transactionId=$request.transactionId;action=$request.action;ok=$true;outcome='LaunchRequested';observation='NoCodex';error=$null}}
@@ -252,7 +252,10 @@ function Invoke-CcodLifecycleWorker {
         $code=Get-CcodLifecycleWorkerFailureCode $_ $stage;if($code -ceq 'CCOD_LIFECYCLE_FENCE_STALE'){$stale=$true}
         $result=New-CcodLifecycleWorkerErrorResult $(if($requestValid){$request}else{$null}) $code $stage
     }
-    if(-not$canPublish -or $stale){return [pscustomobject][ordered]@{Result=$result;ExitCode=1}}
+    if(-not$canPublish -or $stale){
+        try{& $adapter.WriteStderr $(if($null-ne$result.error-and$result.error.code-is[string]){$result.error.code}else{'CCOD_LIFECYCLE_OPERATION_FAILED'})}catch{}
+        return [pscustomobject][ordered]@{Result=$result;ExitCode=1}
+    }
     try{
         if($requestValid){Assert-CcodLifecycleWorkerPublicResult $result $request|Out-Null;$stage='Fence';[void](& $adapter.AssertFence $context $request)}
         $stage='ResultValidation';& $adapter.WriteResult $ResultPath $result

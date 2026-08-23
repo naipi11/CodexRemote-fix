@@ -27,7 +27,7 @@ function New-CcodCoordinatorFixture {
 }
 
 function Assert-CcodCoordinatorStep {
-    param($Step,[string]$Kind,[string]$Next,[string]$Action,[AllowNull()][string]$Deadline,[AllowNull()][string]$ErrorCode,[string]$Message)
+    param($Step,[string]$Kind,[AllowNull()]$Next,[string]$Action,[AllowNull()]$Deadline,[AllowNull()]$ErrorCode,[string]$Message)
     Assert-CcodEqual 'kind,nextPhase,workerAction,deadlineUtc,errorCode' (($Step.PSObject.Properties.Name) -join ',') "$Message exact step shape"
     Assert-CcodEqual $Kind $Step.kind "$Message kind"
     Assert-CcodEqual $Next $Step.nextPhase "$Message next phase"
@@ -75,10 +75,10 @@ $results += Invoke-CcodTest 'repair is idempotent and safe exit never selects Ap
 
 $results += Invoke-CcodTest 'coordinator never invents an edge outside the durable transaction graph' {
     $edges=[ordered]@{
-        Requested=@('Requested','CloseRequested','SupersededByUpgrade','CancelledBeforeClose');CloseRequested=@('CloseRequested','CloseConfirmed','CloseFailed')
-        CloseConfirmed=@('CloseConfirmed','OrdinaryLaunchRequested','RepairRequested');OrdinaryLaunchRequested=@('OrdinaryLaunchRequested','OrdinaryObserved','WaitingForManualLaunch','OrdinaryLaunchFailed','OrdinaryObservationTimedOut')
-        WaitingForManualLaunch=@('WaitingForManualLaunch','OrdinaryObserved','LaunchWindowExpired');OrdinaryObserved=@('OrdinaryObserved','RepairRequested')
-        RepairRequested=@('RepairRequested','RemoteVerified','RepairFailed','VerificationFailed');RemoteVerified=@('RemoteVerified','Completed')
+        Requested=@('CloseRequested','SupersededByUpgrade','CancelledBeforeClose');CloseRequested=@('CloseConfirmed','CloseFailed')
+        CloseConfirmed=@('OrdinaryLaunchRequested','RepairRequested');OrdinaryLaunchRequested=@('OrdinaryObserved','WaitingForManualLaunch','OrdinaryLaunchFailed','OrdinaryObservationTimedOut')
+        WaitingForManualLaunch=@('OrdinaryObserved','LaunchWindowExpired');OrdinaryObserved=@('RepairRequested')
+        RepairRequested=@('RemoteVerified','RepairFailed','VerificationFailed');RemoteVerified=@('Completed')
     }
     foreach($kind in @('RestartAndRepair','CheckAndRepair','SafeExit')){
         foreach($phase in $edges.Keys){
@@ -86,7 +86,7 @@ $results += Invoke-CcodTest 'coordinator never invents an edge outside the durab
             if($phase -ceq 'OrdinaryLaunchRequested'){$request.automaticLaunchAttempts=3}
             foreach($observation in @('NoCodex','Ordinary','Special','RemoteVerified','ObservationTimedOut')){
                 $step=Get-CcodLifecycleStep -Request $request -Observation $observation -NowUtc '2030-02-03T04:06:00.0000000Z'
-                Assert-CcodTrue ($edges[$phase] -ccontains $step.nextPhase) "$kind $phase/$observation uses legal next phase $($step.nextPhase)"
+                Assert-CcodTrue ($null -eq $step.nextPhase -or $edges[$phase] -ccontains $step.nextPhase) "$kind $phase/$observation uses legal next phase $($step.nextPhase)"
             }
         }
     }
@@ -140,7 +140,52 @@ $results += Invoke-CcodTest 'terminal lifecycle phases are exact no-ops' {
     foreach ($phase in @('Completed','CloseFailed','OrdinaryLaunchFailed','OrdinaryObservationTimedOut','LaunchWindowExpired','RepairFailed','VerificationFailed','CancelledBeforeClose','SupersededByUpgrade')) {
         $request = New-CcodCoordinatorFixture -Phase $phase -ErrorCode $(if($phase -ceq 'Completed'){$null}else{'CCOD_TERMINAL'})
         $step = Get-CcodLifecycleStep -Request $request -Observation NoCodex -NowUtc '2030-02-03T04:06:00.0000000Z'
-        Assert-CcodCoordinatorStep $step Terminal $phase None $null $request.error "terminal $phase"
+        Assert-CcodCoordinatorStep $step Terminal $null None $null $request.error "terminal $phase"
+    }
+}
+
+$results += Invoke-CcodTest 'retry launch receipts receive fresh immediate deadlines without extending manual expiry' {
+    foreach($attempt in @(1,2)){
+        $request=New-CcodCoordinatorFixture -Phase OrdinaryLaunchRequested -AutomaticLaunchAttempts $attempt -LaunchRequestedAtUtc '2030-02-03T04:05:10.0000000Z' -ManualLaunchExpiresAtUtc '2030-02-03T04:15:10.0000000Z'
+        $now=$(if($attempt -eq 1){'2030-02-03T04:06:01.0000000Z'}else{'2030-02-03T04:07:02.0000000Z'})
+        $want=$(if($attempt -eq 1){'2030-02-03T04:06:46.0000000Z'}else{'2030-02-03T04:07:47.0000000Z'})
+        $step=Get-CcodLifecycleStep -Request $request -Observation LaunchRequested -NowUtc $now
+        Assert-CcodCoordinatorStep $step Waiting $null ObserveOrdinary $want $null "attempt $($attempt+1) fresh immediate window"
+        Assert-CcodEqual '2030-02-03T04:15:10.0000000Z' $request.manualLaunchExpiresAtUtc "attempt $($attempt+1) does not extend manual expiry"
+    }
+}
+
+$results += Invoke-CcodTest 'reducer rejects wrong phase action outcome replay and attempt overflow before mutation' {
+    $cases=@(
+        @{Name='wrong phase/action';Request=(New-CcodCoordinatorFixture -Phase CloseRequested);Result=[pscustomobject][ordered]@{schemaVersion=1;transactionId='11111111-2222-3333-4444-555555555555';action='Apply';ok=$true;outcome='Activated';observation='Special';error=$null}},
+        @{Name='incompatible close outcome';Request=(New-CcodCoordinatorFixture -Phase CloseRequested);Result=[pscustomobject][ordered]@{schemaVersion=1;transactionId='11111111-2222-3333-4444-555555555555';action='Close';ok=$true;outcome='Activated';observation='Special';error=$null}},
+        @{Name='incompatible apply observation';Request=(New-CcodCoordinatorFixture -Phase RepairRequested);Result=[pscustomobject][ordered]@{schemaVersion=1;transactionId='11111111-2222-3333-4444-555555555555';action='Apply';ok=$true;outcome='Activated';observation='RemoteVerified';error=$null}},
+        @{Name='terminal replay';Request=(New-CcodCoordinatorFixture -Phase Completed);Result=[pscustomobject][ordered]@{schemaVersion=1;transactionId='11111111-2222-3333-4444-555555555555';action='Close';ok=$true;outcome='Closed';observation='NoCodex';error=$null}},
+        @{Name='attempt overflow';Request=(New-CcodCoordinatorFixture -Phase OrdinaryLaunchRequested -AutomaticLaunchAttempts 3 -LaunchRequestedAtUtc '2030-02-03T04:05:10.0000000Z' -ManualLaunchExpiresAtUtc '2030-02-03T04:15:10.0000000Z');Result=[pscustomobject][ordered]@{schemaVersion=1;transactionId='11111111-2222-3333-4444-555555555555';action='RequestOrdinaryLaunch';ok=$true;outcome='LaunchRequested';observation='NoCodex';error=$null}}
+    )
+    foreach($case in $cases){
+        $before=$case.Request|ConvertTo-Json -Depth 16 -Compress
+        Assert-CcodThrows {Reduce-CcodLifecycleWorkerResult -Request $case.Request -Result $case.Result -NowUtc '2030-02-03T04:06:00.0000000Z'|Out-Null} 'CCOD_LIFECYCLE_WORKER_RESULT_INVALID'
+        Assert-CcodEqual $before ($case.Request|ConvertTo-Json -Depth 16 -Compress) "$($case.Name) leaves request unchanged"
+    }
+    $closeRequest=New-CcodCoordinatorFixture -Phase CloseRequested
+    $closeResult=[pscustomobject][ordered]@{schemaVersion=1;transactionId=$closeRequest.transactionId;action='Close';ok=$true;outcome='Closed';observation='NoCodex';error=$null}
+    $closed=Reduce-CcodLifecycleWorkerResult -Request $closeRequest -Result $closeResult -NowUtc '2030-02-03T04:06:00.0000000Z'
+    Assert-CcodEqual CloseConfirmed $closed.phase 'first close result advances legally'
+    Assert-CcodThrows {Reduce-CcodLifecycleWorkerResult -Request $closed -Result $closeResult -NowUtc '2030-02-03T04:06:01.0000000Z'|Out-Null} 'CCOD_LIFECYCLE_WORKER_RESULT_INVALID'
+}
+
+$results += Invoke-CcodTest 'waiting retry and terminal steps never encode invented self edges' {
+    $cases=@(
+        @{Request=(New-CcodCoordinatorFixture -Phase CloseRequested);Observation='Special'},
+        @{Request=(New-CcodCoordinatorFixture -Phase OrdinaryLaunchRequested -AutomaticLaunchAttempts 1 -LaunchRequestedAtUtc '2030-02-03T04:05:10.0000000Z' -ManualLaunchExpiresAtUtc '2030-02-03T04:15:10.0000000Z');Observation='ObservationTimedOut'},
+        @{Request=(New-CcodCoordinatorFixture -Phase WaitingForManualLaunch -AutomaticLaunchAttempts 3 -LaunchRequestedAtUtc '2030-02-03T04:05:10.0000000Z' -ManualLaunchExpiresAtUtc '2030-02-03T04:15:10.0000000Z');Observation='NoCodex'},
+        @{Request=(New-CcodCoordinatorFixture -Phase RepairRequested);Observation='Special'},
+        @{Request=(New-CcodCoordinatorFixture -Phase Completed);Observation='RemoteVerified'}
+    )
+    foreach($case in $cases){
+        $step=Get-CcodLifecycleStep -Request $case.Request -Observation $case.Observation -NowUtc '2030-02-03T04:06:00.0000000Z'
+        Assert-CcodEqual $null $step.nextPhase "$($case.Request.phase)/$($case.Observation) has no persisted transition this tick"
     }
 }
 

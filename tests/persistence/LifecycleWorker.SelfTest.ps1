@@ -63,6 +63,21 @@ try {
             $run=Invoke-CcodLifecycleWorker -RequestPath $h.RequestPath -ResultPath $h.ResultPath -Adapters $h.Adapters
             Assert-CcodEqual 1 $run.ExitCode "$case exits nonzero"
             Assert-CcodEqual 0 ($h.World.ControllerCalls+$h.World.LaunchCalls+$h.World.ObserveCalls) "$case dispatches no operation"
+            Assert-CcodEqual 0 $h.World.Writes "$case cannot publish before full authorization and fence"
+        }
+    }
+
+    $results += Invoke-CcodTest 'invalid request bytes never enable fence-free result publication' {
+        foreach($case in @('Malformed','MissingField','WrongCorrelation')){
+            $h=New-CcodLifecycleWorkerHarness -Name ("invalid-$case");$roots.Add($h.Install)
+            if($case -ceq 'Malformed'){[IO.File]::WriteAllText($h.RequestPath,'{"schemaVersion":1,broken',[Text.UTF8Encoding]::new($false))}
+            elseif($case -ceq 'MissingField'){$raw=$h.Request|ConvertTo-Json -Depth 12|ConvertFrom-Json;$raw.PSObject.Properties.Remove('timeoutMilliseconds');[IO.File]::WriteAllText($h.RequestPath,($raw|ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($false))}
+            else{$h.Request.transactionId='aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';[IO.File]::WriteAllText($h.RequestPath,($h.Request|ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($false))}
+            $run=Invoke-CcodLifecycleWorker -RequestPath $h.RequestPath -ResultPath $h.ResultPath -Adapters $h.Adapters
+            Assert-CcodEqual 1 $run.ExitCode "$case exits nonzero"
+            Assert-CcodEqual 0 $h.World.FenceCalls "$case never reaches a lifecycle fence"
+            Assert-CcodEqual 0 $h.World.Writes "$case writes no result file"
+            Assert-CcodEqual 0 ($h.World.ControllerCalls+$h.World.LaunchCalls+$h.World.ObserveCalls) "$case dispatches nothing"
         }
     }
 

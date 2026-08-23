@@ -25,6 +25,7 @@ function Assert-CcodCoordinatorRequest {
         $module = Get-Module LifecycleTransaction | Select-Object -First 1
         if ($null -eq $module) { throw 'LifecycleTransaction module is unavailable' }
         & $module { param($Value) Assert-CcodLifecycleRequest -Request $Value } $Request
+        if([UInt64]$Request.automaticLaunchAttempts -gt [UInt64]$script:CcodMaximumAutomaticLaunchAttempts){throw 'automaticLaunchAttempts exceeds the lifecycle policy'}
     } catch {
         Throw-CcodLifecycleCoordinatorError 'CCOD_LIFECYCLE_COORDINATOR_INVALID' ("Lifecycle coordinator request is invalid: {0}" -f $_.Exception.Message) $Request
     }
@@ -46,7 +47,7 @@ function Add-CcodCoordinatorMilliseconds {
 }
 
 function New-CcodLifecycleStepResult {
-    param([string]$Kind,[string]$NextPhase,[string]$WorkerAction,[AllowNull()][string]$DeadlineUtc,[AllowNull()][string]$ErrorCode)
+    param([string]$Kind,[AllowNull()]$NextPhase,[string]$WorkerAction,[AllowNull()]$DeadlineUtc,[AllowNull()]$ErrorCode)
     if($script:CcodLifecycleCoordinatorActions -cnotcontains $WorkerAction){Throw-CcodLifecycleCoordinatorError 'CCOD_LIFECYCLE_COORDINATOR_INVALID' 'Lifecycle worker action is invalid' $WorkerAction}
     return [pscustomobject][ordered]@{kind=$Kind;nextPhase=$NextPhase;workerAction=$WorkerAction;deadlineUtc=$DeadlineUtc;errorCode=$ErrorCode}
 }
@@ -61,7 +62,7 @@ function Get-CcodLifecycleStep {
     Assert-CcodCoordinatorRequest $Request
     $now=ConvertTo-CcodCoordinatorUtc $NowUtc 'NowUtc'
     if($script:CcodLifecycleCoordinatorObservations -cnotcontains $Observation){Throw-CcodLifecycleCoordinatorError 'CCOD_LIFECYCLE_COORDINATOR_INVALID' 'Lifecycle observation is invalid' $Observation}
-    if($script:CcodLifecycleCoordinatorTerminal -ccontains $Request.phase){return New-CcodLifecycleStepResult Terminal $Request.phase None $null $Request.error}
+    if($script:CcodLifecycleCoordinatorTerminal -ccontains $Request.phase){return New-CcodLifecycleStepResult Terminal $null None $null $Request.error}
 
     if($Request.kind -ceq 'CheckAndRepair' -and $Request.phase -ceq 'Requested' -and $Observation -ceq 'RemoteVerified'){
         return New-CcodLifecycleStepResult Completed CancelledBeforeClose None $null $null
@@ -75,7 +76,7 @@ function Get-CcodLifecycleStep {
         'CloseRequested' {
             if($Observation -ceq 'CloseFailed' -or $Observation -ceq 'Error'){return New-CcodLifecycleStepResult Failed CloseFailed None $null $(if($Request.error){$Request.error}else{'CCOD_CLOSE_FAILED'})}
             if(@('Closed','NoCodex','Ordinary') -ccontains $Observation){return New-CcodLifecycleStepResult Progress CloseConfirmed None $null $null}
-            return New-CcodLifecycleStepResult Operation CloseRequested Close $null $null
+            return New-CcodLifecycleStepResult Operation $null Close $null $null
         }
         'CloseConfirmed' {
             if($Observation -ceq 'Ordinary'){
@@ -88,12 +89,11 @@ function Get-CcodLifecycleStep {
         'OrdinaryLaunchRequested' {
             if($Observation -ceq 'Ordinary'){return New-CcodLifecycleStepResult Progress OrdinaryObserved None $null $null}
             if($Observation -ceq 'LaunchRequested'){
-                $base=if($null -eq $Request.launchRequestedAtUtc){$NowUtc}else{$Request.launchRequestedAtUtc}
-                return New-CcodLifecycleStepResult Waiting OrdinaryLaunchRequested ObserveOrdinary (Add-CcodCoordinatorMilliseconds $base $script:CcodImmediateLaunchTimeoutMilliseconds) $null
+                return New-CcodLifecycleStepResult Waiting $null ObserveOrdinary ($now.AddMilliseconds($script:CcodImmediateLaunchTimeoutMilliseconds).ToString('o',[Globalization.CultureInfo]::InvariantCulture)) $null
             }
             if($Request.automaticLaunchAttempts -lt $script:CcodMaximumAutomaticLaunchAttempts){
                 $deadline=$now.AddMilliseconds($script:CcodImmediateLaunchTimeoutMilliseconds).ToString('o',[Globalization.CultureInfo]::InvariantCulture)
-                return New-CcodLifecycleStepResult Operation OrdinaryLaunchRequested RequestOrdinaryLaunch $deadline $null
+                return New-CcodLifecycleStepResult Operation $null RequestOrdinaryLaunch $deadline $null
             }
             $expires=$Request.manualLaunchExpiresAtUtc
             if($null -eq $expires){
@@ -108,7 +108,7 @@ function Get-CcodLifecycleStep {
             $expires=$Request.manualLaunchExpiresAtUtc
             if($null -eq $expires){Throw-CcodLifecycleCoordinatorError 'CCOD_LIFECYCLE_COORDINATOR_INVALID' 'Manual launch phase requires an expiry' $Request}
             if($now -ge (ConvertTo-CcodCoordinatorUtc $expires 'manualLaunchExpiresAtUtc')){return New-CcodLifecycleStepResult Failed LaunchWindowExpired None $null CODEX_LAUNCH_WINDOW_EXPIRED}
-            return New-CcodLifecycleStepResult Waiting WaitingForManualLaunch ObserveOrdinary $expires $null
+            return New-CcodLifecycleStepResult Waiting $null ObserveOrdinary $expires $null
         }
         'OrdinaryObserved' {
             if($Request.kind -ceq 'SafeExit'){return New-CcodLifecycleStepResult Progress RepairRequested None $null $null}
@@ -119,7 +119,7 @@ function Get-CcodLifecycleStep {
             if($Observation -ceq 'RemoteVerified'){return New-CcodLifecycleStepResult Progress RemoteVerified None $null $null}
             if($Observation -ceq 'ApplyFailed'){return New-CcodLifecycleStepResult Failed RepairFailed None $null $(if($Request.error){$Request.error}else{'CCOD_REPAIR_FAILED'})}
             if(@('VerificationFailed','Error') -ccontains $Observation){return New-CcodLifecycleStepResult Failed VerificationFailed None $null $(if($Request.error){$Request.error}else{'CCOD_VERIFICATION_FAILED'})}
-            return New-CcodLifecycleStepResult Operation RepairRequested VerifyRemote $null $null
+            return New-CcodLifecycleStepResult Operation $null VerifyRemote $null $null
         }
         'RemoteVerified' { return New-CcodLifecycleStepResult Completed Completed None $null $null }
         default { Throw-CcodLifecycleCoordinatorError 'CCOD_LIFECYCLE_COORDINATOR_INVALID' 'Lifecycle phase is unsupported' $Request.phase }
@@ -145,9 +145,43 @@ function Assert-CcodCoordinatorWorkerResult {
     }
 }
 
+function Assert-CcodCoordinatorWorkerResultForPhase {
+    param($Request,$Result)
+    $allowed=$false
+    switch($Request.phase){
+        'Requested'{$allowed=$Result.action -ceq 'Inspect'}
+        'CloseRequested'{$allowed=$Result.action -ceq 'Close'}
+        'OrdinaryLaunchRequested'{$allowed=@('RequestOrdinaryLaunch','ObserveOrdinary') -ccontains $Result.action}
+        'WaitingForManualLaunch'{$allowed=$Result.action -ceq 'ObserveOrdinary'}
+        'RepairRequested'{$allowed=@('Apply','VerifyRemote') -ccontains $Result.action}
+        default{$allowed=$false}
+    }
+    if(-not $allowed){Throw-CcodLifecycleCoordinatorError 'CCOD_LIFECYCLE_WORKER_RESULT_INVALID' 'Lifecycle worker action is not valid for the current phase' $Result}
+    if(-not $Result.ok){
+        if($Result.outcome -cne 'Error' -or $Result.observation -cne 'Error'){Throw-CcodLifecycleCoordinatorError 'CCOD_LIFECYCLE_WORKER_RESULT_INVALID' 'Failed lifecycle worker tuple is incompatible' $Result}
+        return
+    }
+    $compatible=switch($Result.action){
+        'Inspect'{$Result.outcome -ceq 'Inspected' -and @('RemoteVerified','Special','Ordinary','NoCodex') -ccontains $Result.observation}
+        'Close'{$Result.outcome -ceq 'Closed' -and $Result.observation -ceq 'NoCodex'}
+        'RequestOrdinaryLaunch'{$Result.outcome -ceq 'LaunchRequested' -and $Result.observation -ceq 'NoCodex' -and [UInt64]$Request.automaticLaunchAttempts -lt [UInt64]$script:CcodMaximumAutomaticLaunchAttempts}
+        'ObserveOrdinary'{($Result.outcome -ceq 'OrdinaryObserved' -and $Result.observation -ceq 'Ordinary') -or ($Result.outcome -ceq 'ObservationTimedOut' -and $Result.observation -ceq 'ObservationTimedOut')}
+        'Apply'{@('Activated','NoAction') -ccontains $Result.outcome -and $Result.observation -ceq 'Special'}
+        'VerifyRemote'{$Result.outcome -ceq 'Inspected' -and @('RemoteVerified','Special','Ordinary','NoCodex') -ccontains $Result.observation}
+        default{$false}
+    }
+    if(-not $compatible){Throw-CcodLifecycleCoordinatorError 'CCOD_LIFECYCLE_WORKER_RESULT_INVALID' 'Lifecycle worker outcome and observation are incompatible with the current operation' $Result}
+}
+
 function Copy-CcodCoordinatorRequest {
     param($Request)
     return ($Request|ConvertTo-Json -Depth 16|ConvertFrom-Json)
+}
+
+function New-CcodCoordinatorReducedRequest {
+    param($Request,[AllowNull()]$NextPhase,[string]$NowUtc)
+    if($null -ne $NextPhase){return Move-CcodLifecyclePhase -Request $Request -NextPhase $NextPhase -NowUtc $NowUtc}
+    $clone=Copy-CcodCoordinatorRequest $Request;$clone.updatedAtUtc=$NowUtc;return $clone
 }
 
 function Reduce-CcodLifecycleWorkerResult {
@@ -156,30 +190,37 @@ function Reduce-CcodLifecycleWorkerResult {
     Assert-CcodCoordinatorRequest $Request
     [void](ConvertTo-CcodCoordinatorUtc $NowUtc 'NowUtc')
     Assert-CcodCoordinatorWorkerResult $Request $Result
-    $next=Copy-CcodCoordinatorRequest $Request
-    $next.updatedAtUtc=$NowUtc
+    Assert-CcodCoordinatorWorkerResultForPhase $Request $Result
     if(-not $Result.ok){
-        $next.error=$Result.error.code
-        switch($Result.action){
-            'Close'{$next.phase='CloseFailed'}
-            'RequestOrdinaryLaunch'{$next.phase='OrdinaryLaunchFailed'}
-            'ObserveOrdinary'{$next.phase=if($Request.phase -ceq 'WaitingForManualLaunch'){'LaunchWindowExpired'}else{'OrdinaryObservationTimedOut'}}
-            'Apply'{$next.phase='RepairFailed'}
-            default{$next.phase='VerificationFailed'}
+        $failurePhase=switch($Result.action){
+            'Inspect'{'CancelledBeforeClose'}
+            'Close'{'CloseFailed'}
+            'RequestOrdinaryLaunch'{'OrdinaryLaunchFailed'}
+            'ObserveOrdinary'{$(if($Request.phase -ceq 'WaitingForManualLaunch'){'LaunchWindowExpired'}else{'OrdinaryObservationTimedOut'})}
+            'Apply'{'RepairFailed'}
+            default{'VerificationFailed'}
         }
+        $next=New-CcodCoordinatorReducedRequest $Request $failurePhase $NowUtc;$next.error=$Result.error.code
+        Assert-CcodCoordinatorRequest $next
         return $next
     }
-    $next.error=$null
+    $nextPhase=$null;$stableError=$null
     switch($Result.action){
-        'Inspect'{if($Result.observation -ceq 'RemoteVerified'){$next.phase='CancelledBeforeClose'}}
-        'Close'{$next.phase='CloseConfirmed'}
+        'Inspect'{if($Result.observation -ceq 'RemoteVerified'){$nextPhase='CancelledBeforeClose'}}
+        'Close'{$nextPhase='CloseConfirmed'}
         'RequestOrdinaryLaunch'{
-            $next.phase='OrdinaryLaunchRequested';$next.automaticLaunchAttempts=[int]$Request.automaticLaunchAttempts+1
-            if($null -eq $Request.launchRequestedAtUtc){$next.launchRequestedAtUtc=$NowUtc;$next.manualLaunchExpiresAtUtc=Add-CcodCoordinatorMilliseconds $NowUtc $script:CcodManualLaunchWindowMilliseconds}
+            $nextPhase=$null
         }
-        'ObserveOrdinary'{if($Result.observation -ceq 'Ordinary'){$next.phase='OrdinaryObserved'}}
-        'Apply'{$next.phase='RepairRequested'}
-        'VerifyRemote'{if($Result.observation -ceq 'RemoteVerified'){$next.phase='RemoteVerified'}}
+        'ObserveOrdinary'{if($Result.observation -ceq 'Ordinary'){$nextPhase='OrdinaryObserved'}}
+        'Apply'{$nextPhase=$null}
+        'VerifyRemote'{if($Result.observation -ceq 'RemoteVerified'){$nextPhase='RemoteVerified'}else{$nextPhase='VerificationFailed';$stableError='CCOD_VERIFICATION_FAILED'}}
+    }
+    $next=New-CcodCoordinatorReducedRequest $Request $nextPhase $NowUtc
+    $next.error=$stableError
+    if($Result.action -ceq 'RequestOrdinaryLaunch'){
+        $next.automaticLaunchAttempts=[int]$Request.automaticLaunchAttempts+1
+        if($next.automaticLaunchAttempts -gt $script:CcodMaximumAutomaticLaunchAttempts){Throw-CcodLifecycleCoordinatorError 'CCOD_LIFECYCLE_WORKER_RESULT_INVALID' 'Lifecycle automatic launch attempts would overflow' $Result}
+        if($null -eq $Request.launchRequestedAtUtc){$next.launchRequestedAtUtc=$NowUtc;$next.manualLaunchExpiresAtUtc=Add-CcodCoordinatorMilliseconds $NowUtc $script:CcodManualLaunchWindowMilliseconds}
     }
     Assert-CcodCoordinatorRequest $next
     return $next
