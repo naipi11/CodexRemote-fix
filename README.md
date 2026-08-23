@@ -46,8 +46,8 @@ that existing page and leaves the Codex UI, account authorization, and enrollmen
 
 ## Quick start
 
-1. Download `CodexRemote-fix-2.4.23-setup.exe` and `CodexRemote-fix-2.4.23-setup.exe.sha256.txt` from the [Releases](https://github.com/naipi11/CodexRemote-fix/releases) page, then verify the SHA-256.
-2. Run `CodexRemote-fix-2.4.23-setup.exe`; no administrator rights are required.
+1. Download `CodexRemote-fix-2.4.24-setup.exe` and `CodexRemote-fix-2.4.24-setup.exe.sha256.txt` from the [Releases](https://github.com/naipi11/CodexRemote-fix/releases) page, then verify the SHA-256.
+2. Run `CodexRemote-fix-2.4.24-setup.exe`; no administrator rights are required.
    Windows 10 users should ensure that .NET Framework 4.8 is installed for the native TrayHost.
 3. The tray supervisor starts automatically and creates the desktop shortcut **CodexRemote-fix**. When the tray icon is green, open **Settings → Connections → Control other devices** to enroll or use the device.
 
@@ -62,6 +62,12 @@ needed after upgrading.
 Verified on Windows 11 · Codex Desktop `26.818.2441.0` · Node.js `22.23.1`:
 the hidden controller tab, native tray menu, bilingual menu switching, and persistent
 supervisor are working.
+
+## What's new in v2.4.24
+
+- Fixed upgrades leaving the controlled Codex session active but no tray supervisor running.
+- The installer now waits for the previous `IgnoreNew` scheduled-task instance to stop before starting the new Supervisor.
+- Added a bounded lifecycle regression test for this upgrade race.
 
 ## What's new in v2.4.23
 
@@ -132,8 +138,8 @@ supervisor are working.
 
 Every tagged release ships a Windows installer and its SHA-256 checksum as release assets.
 The `.github/workflows/release.yml` workflow builds the installer from the tag automatically,
-so the 2.4.23 release includes the ready-to-run `CodexRemote-fix-2.4.23-setup.exe`
-and `CodexRemote-fix-2.4.23-setup.exe.sha256.txt`.
+so the 2.4.24 release includes the ready-to-run `CodexRemote-fix-2.4.24-setup.exe`
+and `CodexRemote-fix-2.4.24-setup.exe.sha256.txt`.
 
 Each release appends a short English change summary to the GitHub release body. The README and
 [CHANGELOG.md](CHANGELOG.md) retain the bilingual documentation history.
