@@ -26,10 +26,10 @@ function New-CcodUiActionFixture {
     $manifest=New-CcodRuntimeManifest -RuntimeDirectory $staging -ProjectVersion '7.0.0'
     $runtimeRoot=Join-Path (Join-Path $installRoot 'runtime') $manifest.runtimeId
     [IO.Directory]::Move($staging,$runtimeRoot)
-    Write-CcodAtomicJson -Path (Join-Path $runtimeRoot 'manifest.json') -Value $manifest
-    Write-CcodAtomicJson -Path (Join-Path $installRoot 'active.json') -Value ([ordered]@{
-        schemaVersion=1;activeRuntime=$manifest.runtimeId;previousRuntime=$null;updatedAtUtc='2030-02-03T04:05:06.0000000Z'
-    })
+    [IO.File]::WriteAllText((Join-Path $runtimeRoot 'manifest.json'),($manifest|ConvertTo-Json -Depth 16),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $installRoot 'active.json'),(([ordered]@{
+        schemaVersion=2;activeRuntime=$manifest.runtimeId;previousRuntime=$null;generation=[UInt64]1;updatedAtUtc='2030-02-03T04:05:06.0000000Z'
+    }|ConvertTo-Json -Depth 8)),[Text.UTF8Encoding]::new($false))
     [pscustomobject][ordered]@{
         InstallRoot=[IO.Path]::GetFullPath($installRoot)
         RuntimeRoot=[IO.Path]::GetFullPath($runtimeRoot)
@@ -256,10 +256,10 @@ try{
 
         $manifestEscape=New-CcodUiActionFixture 'escaped manifest path'
         $record=$manifestEscape.Manifest.files[0]
-        Write-CcodAtomicJson -Path (Join-Path $manifestEscape.RuntimeRoot 'manifest.json') -Value ([ordered]@{
+        [IO.File]::WriteAllText((Join-Path $manifestEscape.RuntimeRoot 'manifest.json'),(([ordered]@{
             schemaVersion=1;projectVersion='7.0.0';runtimeId=$manifestEscape.RuntimeId
             files=@([ordered]@{path='../outside.ps1';length=$record.length;sha256=$record.sha256})
-        })
+        }|ConvertTo-Json -Depth 8)),[Text.UTF8Encoding]::new($false))
         $cases.Add([pscustomobject]@{Name='escaped manifest path';Fixture=$manifestEscape;ErrorId='CCOD_PATH_OUTSIDE_ROOT';Mutate={param($Adapters,$Fixture)}})
 
         $wrongHost=New-CcodUiActionFixture 'wrong host'

@@ -2,7 +2,6 @@ Set-StrictMode -Version Latest
 
 Import-Module (Join-Path $PSScriptRoot 'PersistenceIO.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'KernelObjects.psm1') -Force
-Import-Module (Join-Path $PSScriptRoot 'RuntimeManifest.psm1') -Force
 
 $script:CcodLifecycleEpochProperties = @('schemaVersion','epoch')
 $script:CcodLifecycleOwnershipProperties = @('schemaVersion','lease','epoch','runtimeId','runtimeGeneration','ownerIdentity','released')
@@ -99,6 +98,60 @@ function Assert-CcodLifecycleEpochOwnerIdentity {
     }
 }
 
+function Get-CcodLifecycleEpochFileSecurity {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        if ($null -eq $identity.User) { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_ACL_INVALID' 'Current user SID is unavailable for lifecycle epoch state' $null }
+        $security = [Security.AccessControl.FileSecurity]::new()
+        $security.SetOwner($identity.User)
+        $security.SetAccessRuleProtection($true, $false)
+        foreach ($sidValue in @($identity.User.Value, 'S-1-5-18', 'S-1-5-32-544')) {
+            $sid = [Security.Principal.SecurityIdentifier]::new($sidValue)
+            $rule = [Security.AccessControl.FileSystemAccessRule]::new($sid, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)
+            [void]$security.AddAccessRule($rule)
+        }
+        return $security
+    } finally { $identity.Dispose() }
+}
+
+function Assert-CcodLifecycleEpochFileAcl {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not [IO.File]::Exists($Path)) { return }
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        $security = [IO.File]::GetAccessControl($Path)
+        $rules = @($security.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+        $owner = $security.GetOwner([Security.Principal.SecurityIdentifier])
+        if ($null -eq $identity.User -or $null -eq $owner -or $owner.Value -cne $identity.User.Value -or -not $security.AreAccessRulesProtected -or $rules.Count -ne 3) {
+            Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_ACL_INVALID' 'Lifecycle epoch file ACL is not the required protected current-user ACL' $Path
+        }
+        $expected = @($identity.User.Value, 'S-1-5-18', 'S-1-5-32-544')
+        foreach ($rule in $rules) {
+            if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or $rule.IsInherited -or
+                $rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl -or $expected -cnotcontains $rule.IdentityReference.Value) {
+                Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_ACL_INVALID' 'Lifecycle epoch file ACL is not the required protected current-user ACL' $Path
+            }
+        }
+    } catch {
+        if ((Get-CcodLifecycleEpochErrorId $_) -ceq 'CCOD_LIFECYCLE_EPOCH_ACL_INVALID') { throw }
+        Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_ACL_INVALID' 'Lifecycle epoch file ACL could not be proven' $Path
+    } finally { $identity.Dispose() }
+}
+
+function New-CcodLifecycleEpochSecureFile {
+    param([Parameter(Mandatory)][string]$Path)
+
+    return [IO.FileStream]::new(
+        $Path,
+        [IO.FileMode]::CreateNew,
+        [Security.AccessControl.FileSystemRights]::FullControl,
+        [IO.FileShare]::None,
+        4096,
+        [IO.FileOptions]::WriteThrough,
+        (Get-CcodLifecycleEpochFileSecurity))
+}
+
 function Get-CcodLifecycleEpochAdapters {
     param([hashtable]$Adapters)
 
@@ -121,15 +174,27 @@ function Get-CcodLifecycleEpochAdapters {
             catch { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' 'Lifecycle epoch is malformed or unsupported' $path }
         }
         WriteEpoch = {
-            param($InstallRoot, $Epoch)
+            param($InstallRoot, $Epoch, $CreateEpochFile)
             $path = Get-CcodLifecycleEpochPath -InstallRoot $InstallRoot
             $initializationPath = Get-CcodLifecycleEpochInitializationPath -InstallRoot $InstallRoot
+            $atomicAdapters = @{ CreateNewFile = $CreateEpochFile }
             if (-not [IO.File]::Exists($initializationPath)) {
-                Write-CcodAtomicJson -Path $initializationPath -Value ([ordered]@{ schemaVersion = 1 })
+                Write-CcodAtomicJson -Path $initializationPath -Value ([ordered]@{ schemaVersion = 1 }) -Adapters $atomicAdapters
             }
-            Write-CcodAtomicJson -Path $path -Value ([ordered]@{ schemaVersion = 1; epoch = [UInt64]$Epoch })
+            Write-CcodAtomicJson -Path $path -Value ([ordered]@{ schemaVersion = 1; epoch = [UInt64]$Epoch }) -Adapters $atomicAdapters
         }
-        ReadActiveRuntime = { param($InstallRoot) Read-CcodActiveRuntime -InstallRoot $InstallRoot }
+        AssertEpochFileAcl = { param($Path) Assert-CcodLifecycleEpochFileAcl -Path $Path }
+        CreateEpochFile = { param($Path) New-CcodLifecycleEpochSecureFile -Path $Path }
+        ReadActiveRuntime = {
+            param($InstallRoot)
+            $runtimePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'RuntimeManifest.psm1'))
+            $runtimeModule = Get-Module | Where-Object { $null -ne $_.Path -and [IO.Path]::GetFullPath($_.Path) -ceq $runtimePath } | Select-Object -First 1
+            if ($null -eq $runtimeModule) {
+                try { $runtimeModule = Import-Module -Name $runtimePath -PassThru -ErrorAction Stop }
+                catch { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_FENCE_STALE' 'The exact runtime manifest module is unavailable for lifecycle fencing' $InstallRoot }
+            }
+            return & $runtimeModule { param($Root) Read-CcodActiveRuntime -InstallRoot $Root } $InstallRoot
+        }
         GetProcessIdentity = {
             param($Pid)
             $process = $null
@@ -159,6 +224,13 @@ function Read-CcodLifecycleEpoch {
     param([Parameter(Mandatory)][string]$InstallRoot, [switch]$AllowInitial, [hashtable]$Adapters)
 
     $resolved = Get-CcodLifecycleEpochAdapters -Adapters $Adapters
+    $epochPath = Get-CcodLifecycleEpochPath -InstallRoot $InstallRoot
+    $initializationPath = Get-CcodLifecycleEpochInitializationPath -InstallRoot $InstallRoot
+    foreach ($path in @($initializationPath, $epochPath)) {
+        if (-not [IO.File]::Exists($path)) { continue }
+        try { & $resolved.AssertEpochFileAcl $path }
+        catch { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_ACL_INVALID' 'Lifecycle epoch ACL proof failed' $InstallRoot }
+    }
     try { $raw = & $resolved.ReadEpoch $InstallRoot ([bool]$AllowInitial) }
     catch {
         if ((Get-CcodLifecycleEpochErrorId $_) -like 'CCOD_LIFECYCLE_EPOCH_*') { throw }
@@ -179,8 +251,14 @@ function Write-CcodLifecycleEpoch {
     param([Parameter(Mandatory)][string]$InstallRoot, [Parameter(Mandatory)][UInt64]$Epoch, [hashtable]$Adapters)
 
     $resolved = Get-CcodLifecycleEpochAdapters -Adapters $Adapters
-    try { & $resolved.WriteEpoch $InstallRoot $Epoch }
-    catch { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_WRITE_FAILED' 'Lifecycle epoch could not be persisted atomically' $InstallRoot }
+    try {
+        & $resolved.WriteEpoch $InstallRoot $Epoch $resolved.CreateEpochFile
+        & $resolved.AssertEpochFileAcl (Get-CcodLifecycleEpochInitializationPath -InstallRoot $InstallRoot)
+        & $resolved.AssertEpochFileAcl (Get-CcodLifecycleEpochPath -InstallRoot $InstallRoot)
+    } catch {
+        if ((Get-CcodLifecycleEpochErrorId $_) -ceq 'CCOD_LIFECYCLE_EPOCH_ACL_INVALID') { throw }
+        Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_WRITE_FAILED' 'Lifecycle epoch could not be persisted atomically' $InstallRoot
+    }
 }
 
 function Assert-CcodLifecycleOwnershipReceipt {

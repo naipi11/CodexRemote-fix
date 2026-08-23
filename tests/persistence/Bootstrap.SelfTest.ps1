@@ -96,7 +96,8 @@ function Add-CcodTestRuntime {
     param(
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$SupervisorScript,
-        [AllowNull()][string]$RuntimeId
+        [AllowNull()][string]$RuntimeId,
+        [bool]$IncludeFenceModules = $true
     )
 
     if ([string]::IsNullOrWhiteSpace($RuntimeId)) {
@@ -113,12 +114,14 @@ function Add-CcodTestRuntime {
     New-Item -ItemType Directory -Path $kernelDirectory -Force | Out-Null
     $kernelPath = Join-Path $kernelDirectory 'KernelObjects.psm1'
     [IO.File]::Copy($kernelObjectsModule, $kernelPath, $true)
+    if ($IncludeFenceModules) {
+        foreach ($moduleName in @('PersistenceIO.psm1','LifecycleEpoch.psm1','RuntimeManifest.psm1')) {
+            [IO.File]::Copy((Join-Path $repositoryRoot ('src\persistence\modules\' + $moduleName)), (Join-Path $kernelDirectory $moduleName), $true)
+        }
+    }
+    $manifest = New-CcodRuntimeManifest -RuntimeDirectory $runtimeDirectory -ProjectVersion '0.0.0-bootstrap-test'
     if ([string]::IsNullOrWhiteSpace($RuntimeId)) {
-        $files = @(
-            [pscustomobject]@{ path = 'src/persistence/Supervisor.ps1'; length = [int64](Get-Item -LiteralPath $supervisorPath).Length; sha256 = Get-CcodTestFileSha256 -Path $supervisorPath },
-            [pscustomobject]@{ path = 'src/persistence/modules/KernelObjects.psm1'; length = [int64](Get-Item -LiteralPath $kernelPath).Length; sha256 = Get-CcodTestFileSha256 -Path $kernelPath }
-        )
-        $RuntimeId = Get-CcodRuntimeId -ProjectVersion '0.0.0-bootstrap-test' -Files $files
+        $RuntimeId = $manifest.runtimeId
         $targetDirectory = Join-Path $Root "runtime\$RuntimeId"
         if ($targetDirectory -cne $runtimeDirectory) {
             [IO.Directory]::Move($runtimeDirectory, $targetDirectory)
@@ -126,15 +129,8 @@ function Add-CcodTestRuntime {
             $supervisorPath = Join-Path $runtimeDirectory 'src\persistence\Supervisor.ps1'
             $kernelPath = Join-Path $runtimeDirectory 'src\persistence\modules\KernelObjects.psm1'
         }
-    }
-    $manifest = [ordered]@{
-        schemaVersion = 1
-        projectVersion = '0.0.0-bootstrap-test'
-        runtimeId = $RuntimeId
-        files = @(
-            [ordered]@{ path = 'src/persistence/Supervisor.ps1'; length = [int64](Get-Item -LiteralPath $supervisorPath).Length; sha256 = Get-CcodTestFileSha256 -Path $supervisorPath },
-            [ordered]@{ path = 'src/persistence/modules/KernelObjects.psm1'; length = [int64](Get-Item -LiteralPath $kernelPath).Length; sha256 = Get-CcodTestFileSha256 -Path $kernelPath }
-        )
+    } else {
+        $manifest.runtimeId = $RuntimeId
     }
     [IO.File]::WriteAllText(
         (Join-Path $runtimeDirectory 'manifest.json'),
@@ -148,15 +144,18 @@ function Set-CcodTestActivePointer {
     param(
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$ActiveRuntime,
-        [AllowNull()][string]$PreviousRuntime
+        [AllowNull()][string]$PreviousRuntime,
+        [int]$SchemaVersion = 1,
+        [UInt64]$Generation = 1
     )
 
     $pointer = [ordered]@{
-        schemaVersion = 1
+        schemaVersion = $SchemaVersion
         activeRuntime = $ActiveRuntime
         previousRuntime = $PreviousRuntime
-        updatedAtUtc = [DateTime]::UtcNow.ToString('o')
     }
+    if ($SchemaVersion -eq 2) { $pointer.generation = $Generation }
+    $pointer.updatedAtUtc = [DateTime]::UtcNow.ToString('o')
     [IO.File]::WriteAllText(
         (Join-Path $Root 'active.json'),
         ($pointer | ConvertTo-Json -Depth 5),
@@ -177,9 +176,10 @@ function Invoke-CcodBootstrapUnderTest {
         [int]$ReadyTimeoutSeconds = 3
     )
 
-    & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $bootstrapScript `
+    $output = & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $bootstrapScript `
         -InstallRoot $Root -ReadyToken $ReadyToken -ReadyTimeoutSeconds $ReadyTimeoutSeconds 2>&1
-    return [int]$LASTEXITCODE
+    $exitCode = [int]$LASTEXITCODE
+    return $exitCode
 }
 
 $results = @()
@@ -224,6 +224,46 @@ $results += Invoke-CcodTest 'keeps a ready active runtime and does not rewrite t
     } finally {
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
     }
+}
+
+$results += Invoke-CcodTest 'launches a schema-two active pointer without downgrading its generation' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-" + [guid]::NewGuid().ToString('N'))
+    try {
+        New-CcodBootstrapFixture -Root $root | Out-Null
+        $activeId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'Ready' -MarkerPath (Join-Path $root 'schema2.started'))
+        Set-CcodTestActivePointer -Root $root -ActiveRuntime $activeId -PreviousRuntime $null -SchemaVersion 2 -Generation 9
+        Assert-CcodExactEqual 0 (Invoke-CcodBootstrapUnderTest -Root $root -ReadyToken (New-CcodBootstrapToken)) 'schema-two active pointer launches'
+        $pointer = Read-CcodTestActivePointer -Root $root
+        Assert-CcodExactEqual 2 $pointer.schemaVersion 'healthy schema-two pointer is never downgraded'
+        Assert-CcodExactEqual ([UInt64]9) ([UInt64]$pointer.generation) 'healthy schema-two generation remains exact'
+    } finally { if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force } }
+}
+
+$results += Invoke-CcodTest 'launches a healthy legacy active runtime without requiring fallback fence modules' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-" + [guid]::NewGuid().ToString('N'))
+    try {
+        New-CcodBootstrapFixture -Root $root | Out-Null
+        $activeId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'Ready' -MarkerPath (Join-Path $root 'legacy.started')) -IncludeFenceModules $false
+        Set-CcodTestActivePointer -Root $root -ActiveRuntime $activeId -PreviousRuntime $null -SchemaVersion 1
+        Assert-CcodExactEqual 0 (Invoke-CcodBootstrapUnderTest -Root $root -ReadyToken (New-CcodBootstrapToken)) 'healthy legacy active runtime launches without pointer mutation'
+        $pointer = Read-CcodTestActivePointer -Root $root
+        Assert-CcodExactEqual 1 $pointer.schemaVersion 'healthy legacy active pointer remains unchanged'
+    } finally { if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force } }
+}
+
+$results += Invoke-CcodTest 'preserves schema-two generation when fallback promotes the previous runtime' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-" + [guid]::NewGuid().ToString('N'))
+    try {
+        New-CcodBootstrapFixture -Root $root | Out-Null
+        $activeId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'ExitEarly' -MarkerPath (Join-Path $root 'schema2-active.started'))
+        $previousId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'Ready' -MarkerPath (Join-Path $root 'schema2-previous.started'))
+        Set-CcodTestActivePointer -Root $root -ActiveRuntime $activeId -PreviousRuntime $previousId -SchemaVersion 2 -Generation 9
+        Assert-CcodExactEqual 0 (Invoke-CcodBootstrapUnderTest -Root $root -ReadyToken (New-CcodBootstrapToken)) 'schema-two fallback launches verified previous runtime'
+        $pointer = Read-CcodTestActivePointer -Root $root
+        Assert-CcodExactEqual 2 $pointer.schemaVersion 'fallback retains schema two'
+        Assert-CcodExactEqual ([UInt64]10) ([UInt64]$pointer.generation) 'fallback increments generation rather than discarding it'
+        Assert-CcodExactEqual $previousId $pointer.activeRuntime 'fallback commits the ready previous runtime'
+    } finally { if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force } }
 }
 
 $results += Invoke-CcodTest 'does not launch a supervisor while the account transition lease is held' {

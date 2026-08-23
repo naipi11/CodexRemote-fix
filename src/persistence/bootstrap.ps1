@@ -125,14 +125,24 @@ function Read-CcodBootstrapActivePointer {
 
     $path = Assert-CcodBootstrapContained -Root $InstallRoot -Path (Join-Path $InstallRoot 'active.json') -AllowMissingLeaf
     $value = Read-CcodBootstrapJson -Path $path -Kind 'active.json'
-    if ($null -eq $value.PSObject.Properties['schemaVersion'] -or $value.schemaVersion -isnot [int] -or $value.schemaVersion -ne 1 -or
+    if ($null -eq $value.PSObject.Properties['schemaVersion'] -or $value.schemaVersion -isnot [int] -or $value.schemaVersion -notin @(1,2) -or
         $null -eq $value.PSObject.Properties['activeRuntime'] -or $value.activeRuntime -isnot [string] -or
         [string]::IsNullOrWhiteSpace($value.activeRuntime) -or
         $null -eq $value.PSObject.Properties['previousRuntime'] -or
         ($null -ne $value.previousRuntime -and $value.previousRuntime -isnot [string]) -or
         $null -eq $value.PSObject.Properties['updatedAtUtc'] -or $value.updatedAtUtc -isnot [string] -or
         [string]::IsNullOrWhiteSpace($value.updatedAtUtc)) {
-        Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'active.json is not a valid schema-1 pointer' $path
+        Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'active.json is not a valid active runtime pointer' $path
+    }
+    [UInt64]$generation = 1
+    if ($value.schemaVersion -eq 2) {
+        if ($null -eq $value.PSObject.Properties['generation'] -or $value.generation -isnot [byte] -and $value.generation -isnot [uint16] -and $value.generation -isnot [uint32] -and $value.generation -isnot [uint64] -and $value.generation -isnot [int16] -and $value.generation -isnot [int32] -and $value.generation -isnot [int64] -and $value.generation -isnot [decimal]) {
+            Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'active.json has an invalid generation' $path
+        }
+        try { $generation = [UInt64]$value.generation } catch { Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'active.json has an invalid generation' $path }
+        if ($generation -eq 0 -or ($value.generation -is [decimal] -and [decimal]::Truncate($value.generation) -ne $value.generation)) {
+            Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'active.json has an invalid generation' $path
+        }
     }
     Assert-CcodBootstrapRuntimeId -RuntimeId $value.activeRuntime | Out-Null
     if ($null -ne $value.previousRuntime -and -not [string]::IsNullOrWhiteSpace($value.previousRuntime)) {
@@ -141,6 +151,8 @@ function Read-CcodBootstrapActivePointer {
     return [pscustomobject]@{
         ActiveRuntime = [string]$value.activeRuntime
         PreviousRuntime = if ($null -eq $value.previousRuntime -or [string]::IsNullOrWhiteSpace($value.previousRuntime)) { $null } else { [string]$value.previousRuntime }
+        SchemaVersion = [int]$value.schemaVersion
+        Generation = $generation
     }
 }
 
@@ -308,7 +320,8 @@ function Test-CcodBootstrapRuntime {
             }
         }
         $computedRuntimeId = Get-CcodBootstrapRuntimeId -ProjectVersion ([string]$manifest.projectVersion) -Files $actualFiles
-        if ($computedRuntimeId -cne $manifestRuntimeId -or -not $manifestPaths.Contains('src/persistence/Supervisor.ps1')) {
+        $requiredRuntimeFiles = @('src/persistence/Supervisor.ps1')
+        if ($computedRuntimeId -cne $manifestRuntimeId -or @($requiredRuntimeFiles | Where-Object { -not $manifestPaths.Contains($_) }).Count -ne 0) {
             return New-CcodBootstrapRuntimeValidation -Valid $false -Code 'CCOD_BOOTSTRAP_RUNTIME_ID_MISMATCH' -RuntimeDirectory $runtimeDirectory -SupervisorPath $null
         }
         $supervisorPath = Assert-CcodBootstrapContained -Root $runtimeDirectory -Path (Join-Path $runtimeDirectory 'src\persistence\Supervisor.ps1')
@@ -334,18 +347,61 @@ function Import-CcodBootstrapKernelObjects {
 
     foreach ($runtimeId in $candidates) {
         $validation = Test-CcodBootstrapRuntime -InstallRoot $InstallRoot -RuntimeId $runtimeId
-        if (-not $validation.Valid) { continue }
+        if (-not $validation.Valid) {
+            Write-CcodBootstrapLog -InstallRoot $InstallRoot -Message ("Runtime {0} rejected while locating kernel objects: {1}" -f $runtimeId, $validation.Code)
+            continue
+        }
         $modulePath = Assert-CcodBootstrapContained -Root $validation.RuntimeDirectory -Path (Join-Path $validation.RuntimeDirectory 'src\persistence\modules\KernelObjects.psm1') -AllowMissingLeaf
         if (-not [IO.File]::Exists($modulePath)) { continue }
         try {
-            Import-Module -Name $modulePath -Force -ErrorAction Stop
-            return
+            return Import-Module -Name $modulePath -Force -PassThru -ErrorAction Stop
         } catch {
             Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_KERNEL_IMPORT_FAILED' 'The verified runtime kernel-object module could not be loaded' $modulePath
         }
     }
 
     Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_KERNEL_MISSING' 'No verified runtime contains the kernel-object module required for launch serialization' $InstallRoot
+}
+
+function Invoke-CcodBootstrapFencedPointerPromotion {
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)]$Pointer,
+        [Parameter(Mandatory)]$Validation,
+        [Parameter(Mandatory)][string]$NewRuntimeId,
+        [Parameter(Mandatory)][string]$UserSid,
+        [Parameter(Mandatory)][int]$SessionId
+    )
+
+    $runtimeDirectory = $Validation.RuntimeDirectory
+    $lifecyclePath = Assert-CcodBootstrapContained -Root $runtimeDirectory -Path (Join-Path $runtimeDirectory 'src\persistence\modules\LifecycleEpoch.psm1')
+    $manifestPath = Assert-CcodBootstrapContained -Root $runtimeDirectory -Path (Join-Path $runtimeDirectory 'src\persistence\modules\RuntimeManifest.psm1')
+    if (-not [IO.File]::Exists($lifecyclePath) -or -not [IO.File]::Exists($manifestPath)) {
+        Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_FENCE_MODULE_MISSING' 'Verified fallback runtime is missing lifecycle fence modules' $runtimeDirectory
+    }
+    $lifecycleModule = $null
+    $runtimeModule = $null
+    $ownership = $null
+    $process = [Diagnostics.Process]::GetCurrentProcess()
+    try {
+        $runtimeModule = Import-Module -Name $manifestPath -Force -PassThru -ErrorAction Stop
+        $lifecycleModule = $runtimeModule.NestedModules | Where-Object { $null -ne $_.Path -and [IO.Path]::GetFullPath($_.Path) -ceq [IO.Path]::GetFullPath($lifecyclePath) } | Select-Object -First 1
+        if ($null -eq $lifecycleModule) { Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_FENCE_MODULE_MISSING' 'Verified runtime did not load its exact lifecycle fence module' $lifecyclePath }
+        $ownerIdentity = [pscustomobject][ordered]@{ pid=[int]$process.Id; creationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o') }
+        $ownership = & $lifecycleModule {
+            param($Root,$RuntimeId,$Generation,$Owner,$Sid,$Session)
+            Enter-CcodLifecycleOwnership -InstallRoot $Root -RuntimeId $RuntimeId -RuntimeGeneration $Generation -OwnerIdentity $Owner -UserSid $Sid -SessionId $Session
+        } $InstallRoot $Pointer.ActiveRuntime ([UInt64]$Pointer.Generation) $ownerIdentity $UserSid $SessionId
+        return & $runtimeModule { param($Root,$RuntimeId,$Lease) Set-CcodActiveRuntime -InstallRoot $Root -NewRuntimeId $RuntimeId -Ownership $Lease } $InstallRoot $NewRuntimeId $ownership
+    } catch {
+        $fenceErrorId = Get-CcodBootstrapErrorId -ErrorRecord $_
+        Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_FENCE_FAILED' ("Verified fallback runtime could not prove lifecycle ownership before active pointer mutation: {0} {1}" -f $fenceErrorId, $_.Exception.Message) $runtimeDirectory
+    } finally {
+        if ($null -ne $ownership -and $null -ne $lifecycleModule) {
+            try { & $lifecycleModule { param($Lease) Exit-CcodLifecycleOwnership -Ownership $Lease | Out-Null } $ownership } catch { }
+        }
+        $process.Dispose()
+    }
 }
 
 function New-CcodBootstrapReadyToken {
@@ -632,6 +688,7 @@ $root = $null
 $readyEvent = $null
 $child = $null
 $launchLease = $null
+$kernelModule = $null
 $identity = $null
 $currentProcess = $null
 try {
@@ -648,8 +705,8 @@ try {
     }
 
     $initialPointer = Read-CcodBootstrapActivePointer -InstallRoot $root
-    Import-CcodBootstrapKernelObjects -InstallRoot $root -Pointer $initialPointer
-    $launchLease = Enter-CcodMutex -Kind 'AccountTransition' -UserSid $userSid -TimeoutMilliseconds ([int]($ReadyTimeoutSeconds * 1000))
+    $kernelModule = Import-CcodBootstrapKernelObjects -InstallRoot $root -Pointer $initialPointer
+    $launchLease = & $kernelModule { param($Sid,$Timeout) Enter-CcodMutex -Kind 'AccountTransition' -UserSid $Sid -TimeoutMilliseconds $Timeout } $userSid ([int]($ReadyTimeoutSeconds * 1000))
     if ($launchLease.Outcome -cne 'Acquired') {
         Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_LAUNCH_BUSY' 'An installation transition is in progress; bootstrap will retry through the scheduled task' $root
     }
@@ -680,16 +737,10 @@ try {
         $outcome = Wait-CcodBootstrapReady -Event $readyEvent -Process $child -TimeoutSeconds $ReadyTimeoutSeconds
         if ($outcome -ceq 'Ready') {
             if ($runtimeId -cne $pointer.ActiveRuntime) {
-                $updated = [ordered]@{
-                    schemaVersion = 1
-                    activeRuntime = $runtimeId
-                    previousRuntime = $pointer.ActiveRuntime
-                    updatedAtUtc = [DateTime]::UtcNow.ToString('o')
-                }
-                Write-CcodBootstrapAtomicJson -Path (Join-Path $root 'active.json') -Value $updated
+                $updated = Invoke-CcodBootstrapFencedPointerPromotion -InstallRoot $root -Pointer $pointer -Validation $validation -NewRuntimeId $runtimeId -UserSid $userSid -SessionId $sessionId
                 Write-CcodBootstrapLog -InstallRoot $root -Message ("Runtime {0} signaled ready; active pointer switched from {1}" -f $runtimeId, $pointer.ActiveRuntime)
             }
-            $released = Exit-CcodMutex -Lease $launchLease
+            $released = & $kernelModule { param($Lease) Exit-CcodMutex -Lease $Lease } $launchLease
             if ($released -isnot [bool] -or -not $released) {
                 Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_LAUNCH_RELEASE_FAILED' 'The launch serialization lease could not be released after Supervisor readiness' $root
             }
@@ -732,7 +783,7 @@ try {
         try { $readyEvent.Handle.Dispose() } catch { }
     }
     if ($null -ne $launchLease -and $launchLease.Outcome -ceq 'Acquired' -and -not $launchLease.Released) {
-        try { Exit-CcodMutex -Lease $launchLease | Out-Null } catch { }
+        try { & $kernelModule { param($Lease) Exit-CcodMutex -Lease $Lease | Out-Null } $launchLease } catch { }
     }
     if ($null -ne $currentProcess) { $currentProcess.Dispose() }
     if ($null -ne $identity) { $identity.Dispose() }

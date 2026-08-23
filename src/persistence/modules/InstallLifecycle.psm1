@@ -2,6 +2,7 @@ Set-StrictMode -Version Latest
 
 Import-Module (Join-Path $PSScriptRoot 'PersistenceIO.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'RuntimeManifest.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'LifecycleEpoch.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'StateStore.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'ScheduledTask.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'KernelObjects.psm1') -Force
@@ -717,6 +718,18 @@ function Get-CcodLifecycleAdapters {
             param($Lease)
             Exit-CcodMutex -Lease $Lease
         }
+        EnterLifecycleOwnership = {
+            param($InstallRoot, $RuntimeId, $RuntimeGeneration, $OwnerIdentity, $UserSid, $SessionId)
+            Enter-CcodLifecycleOwnership -InstallRoot $InstallRoot -RuntimeId $RuntimeId -RuntimeGeneration $RuntimeGeneration -OwnerIdentity $OwnerIdentity -UserSid $UserSid -SessionId $SessionId
+        }
+        SetActiveRuntime = {
+            param($InstallRoot, $RuntimeId, $Ownership)
+            Set-CcodActiveRuntime -InstallRoot $InstallRoot -NewRuntimeId $RuntimeId -Ownership $Ownership
+        }
+        ExitLifecycleOwnership = {
+            param($Ownership)
+            Exit-CcodLifecycleOwnership -Ownership $Ownership
+        }
         CreateSupervisorShutdownGate = {
             param($UserSid, $SessionId)
             $event = New-CcodEvent -Kind Shutdown -UserSid $UserSid -SessionId $SessionId
@@ -923,6 +936,7 @@ function Invoke-CcodInstall {
     $upgrade = $false
     $installLease = $null
     $shutdownGate = $null
+    $lifecycleOwnership = $null
     try {
         $stagingDirectory = Copy-CcodLifecycleStaging -SourceRoot $sourceRoot -InstallRoot $root -Adapters $adapters -Files $files
         $manifest = New-CcodRuntimeManifest -RuntimeDirectory $stagingDirectory -ProjectVersion $projectVersion
@@ -975,7 +989,14 @@ function Invoke-CcodInstall {
                 }
             }
         }
-        $pointer = Set-CcodActiveRuntime -InstallRoot $root -NewRuntimeId $runtimeId
+        $process = [Diagnostics.Process]::GetCurrentProcess()
+        try {
+            $ownerIdentity = [pscustomobject][ordered]@{ pid=[int]$process.Id; creationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o') }
+            $ownershipRuntimeId = if ($null -ne $existingPointer) { [string]$existingPointer.activeRuntime } else { $runtimeId }
+            [UInt64]$ownershipGeneration = if ($null -ne $existingPointer) { [UInt64]$existingPointer.generation } else { 1 }
+            $lifecycleOwnership = & $adapters.EnterLifecycleOwnership $root $ownershipRuntimeId $ownershipGeneration $ownerIdentity $identity.UserSid $identity.SessionId
+            $pointer = & $adapters.SetActiveRuntime $root $runtimeId $lifecycleOwnership
+        } finally { $process.Dispose() }
         if ($null -ne $shutdownGate) {
             & $adapters.CloseSupervisorShutdownGate $shutdownGate
             $shutdownGate = $null
@@ -994,6 +1015,9 @@ function Invoke-CcodInstall {
         }
         if ($null -ne $installLease -and $installLease.Outcome -ceq 'Acquired') {
             try { [void](& $adapters.ExitInstallLease $installLease) } catch { }
+        }
+        if ($null -ne $lifecycleOwnership -and -not $lifecycleOwnership.released) {
+            try { & $adapters.ExitLifecycleOwnership $lifecycleOwnership | Out-Null } catch { }
         }
         if ($null -ne $stagingDirectory -and [IO.Directory]::Exists($stagingDirectory)) {
             try { Remove-Item -LiteralPath $stagingDirectory -Recurse -Force -ErrorAction Stop } catch { }

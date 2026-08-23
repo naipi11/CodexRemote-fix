@@ -15,6 +15,24 @@ function New-CcodEpochTestLease {
     }
 }
 
+function Assert-CcodEpochTestFileAcl {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$UserSid)
+
+    $security = [IO.File]::GetAccessControl($Path)
+    $owner = $security.GetOwner([Security.Principal.SecurityIdentifier])
+    $rules = @($security.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    Assert-CcodEqual $UserSid $owner.Value "epoch file owner is the current user: $Path"
+    Assert-CcodEqual $true $security.AreAccessRulesProtected "epoch file DACL is protected: $Path"
+    Assert-CcodEqual 3 $rules.Count "epoch file has exactly three ACL entries: $Path"
+    $actual = @($rules | ForEach-Object { '{0}|{1}|{2}|{3}' -f $_.IdentityReference.Value,$_.AccessControlType,$_.FileSystemRights,$_.IsInherited } | Sort-Object)
+    $expected = @(
+        "$UserSid|Allow|FullControl|False",
+        'S-1-5-18|Allow|FullControl|False',
+        'S-1-5-32-544|Allow|FullControl|False'
+    ) | Sort-Object
+    Assert-CcodEqual ($expected -join "`n") ($actual -join "`n") "epoch file ACL entries are exact: $Path"
+}
+
 function New-CcodEpochAdapters {
     param(
         [UInt64]$Epoch = 0,
@@ -31,11 +49,14 @@ function New-CcodEpochAdapters {
         GetProcessIdentity = { param($Pid) $store.ProcessIdentity }.GetNewClosure()
         EnterMutex = { param($UserSid, $SessionId, $TimeoutMilliseconds) New-CcodEpochTestLease }.GetNewClosure()
         ExitMutex = { param($Lease) $Lease.Released = $true; return $true }.GetNewClosure()
+        AssertEpochFileAcl = { param($Path) }.GetNewClosure()
+        CreateEpochFile = { param($Path) }.GetNewClosure()
     }
     return [pscustomobject]@{ Store = $store; Adapters = $adapters }
 }
 
 $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-lifecycle-epoch-selftest-' + [Guid]::NewGuid().ToString('N'))
+[IO.Directory]::CreateDirectory($root) | Out-Null
 try {
     Invoke-CcodTest 'increments exactly once and rejects the stale owner after a later acquisition' {
         $fixture = New-CcodEpochAdapters
@@ -112,6 +133,8 @@ try {
             $owner = [pscustomobject][ordered]@{ pid=[int]$process.Id; creationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o') }
             $ownership = Enter-CcodLifecycleOwnership -InstallRoot $integrationRoot -RuntimeId '2.5.0-a' -RuntimeGeneration 1 -OwnerIdentity $owner -UserSid $windowsIdentity.User.Value -SessionId ([int]$process.SessionId) -TimeoutMilliseconds 1000
             Assert-CcodEqual 1 ([UInt64]$ownership.epoch) 'fresh durable state begins at epoch one through the real mutex'
+            Assert-CcodEpochTestFileAcl -Path (Join-Path $integrationRoot 'state\lifecycle-epoch.initialized.json') -UserSid $windowsIdentity.User.Value
+            Assert-CcodEpochTestFileAcl -Path (Join-Path $integrationRoot 'state\lifecycle-epoch.json') -UserSid $windowsIdentity.User.Value
             Assert-CcodEqual $true (Exit-CcodLifecycleOwnership -Ownership $ownership) 'real mutex ownership is released'
         } finally {
             $process.Dispose()
@@ -124,7 +147,7 @@ try {
         [IO.Directory]::CreateDirectory((Join-Path $maximumRoot 'state')) | Out-Null
         [IO.File]::WriteAllText((Join-Path $maximumRoot 'state\lifecycle-epoch.json'), (([ordered]@{ schemaVersion=1; epoch=[UInt64]::MaxValue }) | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
         $owner = [pscustomobject][ordered]@{pid=101;creationTimeUtc='2030-02-03T04:05:06.0000000Z'}
-        $mutexOnly = @{ EnterMutex = { param($UserSid, $SessionId, $TimeoutMilliseconds) New-CcodEpochTestLease }; ExitMutex = { param($Lease) $Lease.Released = $true; $true } }
+        $mutexOnly = @{ EnterMutex = { param($UserSid, $SessionId, $TimeoutMilliseconds) New-CcodEpochTestLease }; ExitMutex = { param($Lease) $Lease.Released = $true; $true }; AssertEpochFileAcl = { param($Path) }; CreateEpochFile = { param($Path) } }
         Assert-CcodThrows { Enter-CcodLifecycleOwnership -InstallRoot $maximumRoot -RuntimeId '2.5.0-a' -RuntimeGeneration 1 -OwnerIdentity $owner -UserSid 'S-1-5-21-1-2-3-1001' -SessionId 2 -Adapters $mutexOnly } 'CCOD_LIFECYCLE_EPOCH_EXHAUSTED'
     }
 
@@ -137,6 +160,32 @@ try {
         Exit-CcodLifecycleOwnership -Ownership $first -Adapters $mutexOnly | Out-Null
         [IO.File]::Delete((Join-Path $missingRoot 'state\lifecycle-epoch.json'))
         Assert-CcodThrows { Enter-CcodLifecycleOwnership -InstallRoot $missingRoot -RuntimeId '2.5.0-a' -RuntimeGeneration 1 -OwnerIdentity $owner -UserSid 'S-1-5-21-1-2-3-1001' -SessionId 2 -Adapters $mutexOnly } 'CCOD_LIFECYCLE_EPOCH_INVALID'
+    }
+
+    Invoke-CcodTest 'fails closed before reading an epoch file whose current-user ACL proof is rejected' {
+        $fixture = New-CcodEpochAdapters
+        [IO.Directory]::CreateDirectory((Join-Path $root 'state')) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $root 'state\lifecycle-epoch.json'), '{"schemaVersion":1,"epoch":1}', [Text.UTF8Encoding]::new($false))
+        $fixture.Adapters.AssertEpochFileAcl = { param($Path) throw [Management.Automation.ErrorRecord]::new([UnauthorizedAccessException]::new('acl mismatch'),'CCOD_TEST_ACL',[Management.Automation.ErrorCategory]::SecurityError,$Path) }
+        Assert-CcodThrows { Read-CcodLifecycleEpoch -InstallRoot $root -AllowInitial -Adapters $fixture.Adapters } 'CCOD_LIFECYCLE_EPOCH_ACL_INVALID'
+    }
+
+    Invoke-CcodTest 'fails closed when the initialization marker ACL cannot be proven' {
+        $aclRoot = Join-Path $root 'marker-acl'
+        [IO.Directory]::CreateDirectory((Join-Path $aclRoot 'state')) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $aclRoot 'state\lifecycle-epoch.initialized.json'), '{"schemaVersion":1}', [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $aclRoot 'state\lifecycle-epoch.json'), '{"schemaVersion":1,"epoch":1}', [Text.UTF8Encoding]::new($false))
+        $adapters = @{
+            AssertEpochFileAcl = { param($Path) if ($Path.EndsWith('lifecycle-epoch.initialized.json', [StringComparison]::OrdinalIgnoreCase)) { throw 'marker acl mismatch' } }
+            CreateEpochFile = { param($Path) }
+        }
+        Assert-CcodThrows { Read-CcodLifecycleEpoch -InstallRoot $aclRoot -Adapters $adapters } 'CCOD_LIFECYCLE_EPOCH_ACL_INVALID'
+    }
+
+    Invoke-CcodTest 'rejects an exact integral Decimal beyond UInt64 range' {
+        $fixture = New-CcodEpochAdapters
+        $fixture.Adapters.ReadEpoch = { param($InstallRoot, $AllowInitial) [decimal]::Parse('18446744073709551616', [Globalization.CultureInfo]::InvariantCulture) }
+        Assert-CcodThrows { Read-CcodLifecycleEpoch -InstallRoot $root -Adapters $fixture.Adapters } 'CCOD_LIFECYCLE_EPOCH_INVALID'
     }
 } catch {
     Write-Error $_

@@ -117,7 +117,8 @@ try{
         [IO.Directory]::CreateDirectory((Split-Path $controller -Parent))|Out-Null;[IO.Directory]::CreateDirectory((Split-Path $stateModule -Parent))|Out-Null
         [IO.File]::WriteAllText($controller,'# installed controller',[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllText($stateModule,'# installed state',[Text.UTF8Encoding]::new($false))
         $manifest=New-CcodRuntimeManifest -RuntimeDirectory $staging -ProjectVersion '2.0.0';$runtime=Join-Path (Join-Path $installRoot 'runtime') $manifest.runtimeId;[IO.Directory]::CreateDirectory((Split-Path $runtime -Parent))|Out-Null;[IO.Directory]::Move($staging,$runtime)
-        Write-CcodAtomicJson -Path (Join-Path $runtime 'manifest.json') -Value $manifest;Set-CcodActiveRuntime -InstallRoot $installRoot -NewRuntimeId $manifest.runtimeId|Out-Null
+        [IO.File]::WriteAllText((Join-Path $runtime 'manifest.json'),($manifest|ConvertTo-Json -Depth 16),[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $installRoot 'active.json'),(([ordered]@{schemaVersion=2;activeRuntime=$manifest.runtimeId;previousRuntime=$null;generation=[UInt64]1;updatedAtUtc='2030-02-03T04:05:06.0000000Z'}|ConvertTo-Json -Depth 5)),[Text.UTF8Encoding]::new($false))
         $start=Resolve-CcodStartInstalledController -InstallRoot $installRoot;$reset=Resolve-CcodResetInstalledController -InstallRoot $installRoot
         Assert-CcodEqual ([IO.Path]::GetFullPath((Join-Path $runtime 'src\persistence\SessionController.ps1'))) $start.Controller 'Start targets verified active controller'
         Assert-CcodEqual $start.Controller $reset.Controller 'Reset targets the same verified runtime'

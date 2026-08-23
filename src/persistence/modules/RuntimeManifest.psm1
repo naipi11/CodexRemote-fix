@@ -1,6 +1,7 @@
 Set-StrictMode -Version Latest
 
 Import-Module (Join-Path $PSScriptRoot 'PersistenceIO.psm1')
+Import-Module (Join-Path $PSScriptRoot 'LifecycleEpoch.psm1') -Force
 
 function Throw-CcodRuntimeError {
     param(
@@ -35,13 +36,49 @@ function Assert-CcodRuntimeId {
 function Get-CcodRuntimeAdapters {
     param([hashtable]$Adapters)
 
-    $resolved = @{ UtcNow = { [DateTime]::UtcNow } }
+    $resolved = @{
+        UtcNow = { [DateTime]::UtcNow }
+        AssertLifecycleFence = {
+            param($InstallRoot, $Ownership, $ExpectActivePointer, $NewRuntimeId)
+            $path = Resolve-CcodContainedPath -Root $InstallRoot -RelativePath 'active.json' -AllowMissingLeaf
+            if ([bool]$ExpectActivePointer) {
+                if (-not [IO.File]::Exists($path)) { Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Expected active pointer disappeared during lifecycle mutation' $path }
+                return Assert-CcodLifecycleFence -InstallRoot $InstallRoot -Ownership $Ownership
+            }
+            if ([IO.File]::Exists($path)) { Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Unexpected active pointer appeared during lifecycle initialization' $path }
+            if ([UInt64]$Ownership.runtimeGeneration -ne 1 -or [string]$Ownership.runtimeId -cne [string]$NewRuntimeId) {
+                Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Initial active pointer requires generation-one ownership of the new runtime' $Ownership
+            }
+            $virtualPointer = [pscustomobject][ordered]@{
+                schemaVersion=2; activeRuntime=[string]$Ownership.runtimeId; previousRuntime=$null
+                generation=[UInt64]$Ownership.runtimeGeneration; updatedAtUtc='1970-01-01T00:00:00.0000000Z'
+            }
+            $readVirtualPointer = { param($Root) $virtualPointer }.GetNewClosure()
+            return Assert-CcodLifecycleFence -InstallRoot $InstallRoot -Ownership $Ownership -Adapters @{ ReadActiveRuntime=$readVirtualPointer }
+        }
+    }
     if ($null -ne $Adapters) {
         foreach ($name in $Adapters.Keys) {
             $resolved[$name] = $Adapters[$name]
         }
     }
     return $resolved
+}
+
+function ConvertTo-CcodRuntimeGeneration {
+    param([Parameter(Mandatory)]$Value, [Parameter(Mandatory)][string]$Path)
+
+    if ($Value -is [decimal]) {
+        if ($Value -lt 1 -or [decimal]::Truncate($Value) -ne $Value) {
+            Throw-CcodRuntimeError 'CCOD_RUNTIME_GENERATION_INVALID' 'Active runtime generation must be a positive unsigned integer' $Path
+        }
+        try { return [UInt64]$Value } catch { Throw-CcodRuntimeError 'CCOD_RUNTIME_GENERATION_INVALID' 'Active runtime generation is outside the unsigned 64-bit range' $Path }
+    }
+    if ($Value -isnot [byte] -and $Value -isnot [uint16] -and $Value -isnot [uint32] -and $Value -isnot [uint64] -and
+        $Value -isnot [int16] -and $Value -isnot [int32] -and $Value -isnot [int64] -or $Value -lt 1) {
+        Throw-CcodRuntimeError 'CCOD_RUNTIME_GENERATION_INVALID' 'Active runtime generation must be a positive unsigned integer' $Path
+    }
+    return [UInt64]$Value
 }
 
 function Get-CcodRuntimeRoot {
@@ -326,12 +363,8 @@ function Read-CcodActiveRuntime {
     if ($legacy) {
         return [pscustomobject][ordered]@{ schemaVersion=2; activeRuntime=$active.activeRuntime; previousRuntime=$active.previousRuntime; generation=[UInt64]1; updatedAtUtc=$active.updatedAtUtc }
     }
-    $generation = $active.generation
-    if ($generation -isnot [byte] -and $generation -isnot [uint16] -and $generation -isnot [uint32] -and $generation -isnot [uint64] -and
-        $generation -isnot [int16] -and $generation -isnot [int32] -and $generation -isnot [int64] -or $generation -le 0) {
-        Throw-CcodRuntimeError 'CCOD_RUNTIME_GENERATION_INVALID' 'Active runtime generation must be a positive unsigned integer' $path
-    }
-    return [pscustomobject][ordered]@{ schemaVersion=2; activeRuntime=$active.activeRuntime; previousRuntime=$active.previousRuntime; generation=[UInt64]$generation; updatedAtUtc=$active.updatedAtUtc }
+    $generation = ConvertTo-CcodRuntimeGeneration -Value $active.generation -Path $path
+    return [pscustomobject][ordered]@{ schemaVersion=2; activeRuntime=$active.activeRuntime; previousRuntime=$active.previousRuntime; generation=$generation; updatedAtUtc=$active.updatedAtUtc }
 }
 
 function Set-CcodActiveRuntime {
@@ -339,10 +372,14 @@ function Set-CcodActiveRuntime {
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
         [Parameter(Mandatory)][string]$NewRuntimeId,
+        $Ownership,
         [hashtable]$Adapters
     )
 
     $Adapters = Get-CcodRuntimeAdapters -Adapters $Adapters
+    if ($null -eq $Ownership) {
+        Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_REQUIRED' 'Active runtime mutation requires proven lifecycle ownership' $InstallRoot
+    }
     Assert-CcodRuntimeId -RuntimeId $NewRuntimeId | Out-Null
     $runtimeDirectory = Get-CcodRuntimeDirectoryForId -InstallRoot $InstallRoot -RuntimeId $NewRuntimeId
     $validation = Test-CcodRuntimeManifest -RuntimeDirectory $runtimeDirectory -ExpectedRuntimeId $NewRuntimeId
@@ -351,9 +388,12 @@ function Set-CcodActiveRuntime {
     }
 
     $activePath = Resolve-CcodContainedPath -Root $InstallRoot -RelativePath 'active.json' -AllowMissingLeaf
+    $expectActivePointer = [IO.File]::Exists($activePath)
+    try { [void](& $Adapters.AssertLifecycleFence $InstallRoot $Ownership $expectActivePointer $NewRuntimeId) }
+    catch { Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Active runtime mutation lifecycle fence is stale before pointer read' $InstallRoot }
     $previousRuntime = $null
     [UInt64]$currentGeneration = 0
-    if ([IO.File]::Exists($activePath)) {
+    if ($expectActivePointer) {
         $current = Read-CcodActiveRuntime -InstallRoot $InstallRoot
         $currentGeneration = [UInt64]$current.generation
         if ($current.activeRuntime -cne $NewRuntimeId) {
@@ -365,6 +405,8 @@ function Set-CcodActiveRuntime {
     if ($currentGeneration -eq [UInt64]::MaxValue) {
         Throw-CcodRuntimeError 'CCOD_RUNTIME_GENERATION_EXHAUSTED' 'Active runtime generation cannot wrap' $activePath
     }
+    try { [void](& $Adapters.AssertLifecycleFence $InstallRoot $Ownership $expectActivePointer $NewRuntimeId) }
+    catch { Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Active runtime mutation lifecycle fence is stale before pointer commit' $InstallRoot }
     $pointer = [ordered]@{
         schemaVersion = 2
         activeRuntime = $NewRuntimeId

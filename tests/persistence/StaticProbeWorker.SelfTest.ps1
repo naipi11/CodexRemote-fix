@@ -209,6 +209,8 @@ function New-CcodAuthorizedRuntimeFixture {
     foreach ($relative in @(
         'src\persistence\StaticProbeWorker.ps1',
         'src\persistence\modules\RuntimeManifest.psm1',
+        'src\persistence\modules\LifecycleEpoch.psm1',
+        'src\persistence\modules\KernelObjects.psm1',
         'src\persistence\modules\PersistenceIO.psm1',
         'src\persistence\modules\StateStore.psm1',
         'src\persistence\modules\CompatibilityProbe.psm1',

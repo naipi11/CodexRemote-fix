@@ -140,6 +140,30 @@ function New-CcodLifecycleFake {
         $world.InstallLeaseReleased++
         $true
     }.GetNewClosure()
+    $adapters.EnterLifecycleOwnership = {
+        param($InstallRoot, $RuntimeId, $RuntimeGeneration, $OwnerIdentity, $UserSid, $SessionId)
+        [pscustomobject][ordered]@{
+            schemaVersion=1
+            lease=[pscustomobject]@{ Released=$false }
+            epoch=[UInt64]1
+            runtimeId=[string]$RuntimeId
+            runtimeGeneration=[UInt64]$RuntimeGeneration
+            ownerIdentity=$OwnerIdentity
+            released=$false
+        }
+    }.GetNewClosure()
+    $adapters.SetActiveRuntime = {
+        param($InstallRoot, $RuntimeId, $Ownership)
+        $assertFence = { param($Root, $Receipt, $ExpectActivePointer) if ($Receipt.released) { throw 'released lifecycle owner' }; $true }
+        Set-CcodActiveRuntime -InstallRoot $InstallRoot -NewRuntimeId $RuntimeId -Ownership $Ownership -Adapters @{ AssertLifecycleFence=$assertFence }
+    }.GetNewClosure()
+    $adapters.ExitLifecycleOwnership = {
+        param($Ownership)
+        if ($Ownership.released) { return $false }
+        $Ownership.released = $true
+        $Ownership.lease.Released = $true
+        $true
+    }.GetNewClosure()
     $adapters.CreateSupervisorShutdownGate = {
         param($UserSid, $SessionId)
         $world.Calls.Add("OpenShutdownGate:${UserSid}:$SessionId")
