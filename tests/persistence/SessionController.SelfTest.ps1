@@ -7,7 +7,16 @@ Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\RuntimeManifes
 . (Join-Path $repositoryRoot 'src\persistence\SessionController.ps1')
 
 function New-CcodControllerRequest([string]$Action='Inspect',[string]$TransactionId='5f496d99-c839-4458-a6a2-d37ea1afdbda'){
+    if($Action -cne 'Recover'){return New-CcodControllerV2Request -Action $Action -TransactionId $TransactionId}
     [pscustomobject][ordered]@{schemaVersion=1;action=$Action;transactionId=$TransactionId;runtimeId='runtime-1';supervisorIdentity=[pscustomobject][ordered]@{pid=11;creationTimeUtc='2030-02-03T03:00:00.0000000Z';sessionId='1'};source=$null;existingOnly=$true;rendererPort=$null;mainPort=$null;timeoutMilliseconds=30000;restartOrdinary=$true}
+}
+function New-CcodControllerV2Request([string]$Action='Inspect',[string]$TransactionId='11111111-2222-3333-4444-555555555555'){
+    [pscustomobject][ordered]@{
+        schemaVersion=2;action=$Action;transactionId=$TransactionId;runtimeId='runtime-1';runtimeGeneration=[UInt64]4;leaseEpoch=[UInt64]9
+        ownerIdentity=[pscustomobject][ordered]@{pid=401;creationTimeUtc='2030-02-03T04:05:06.0000000Z'}
+        supervisorIdentity=[pscustomobject][ordered]@{pid=11;creationTimeUtc='2030-02-03T03:00:00.0000000Z';sessionId='1'}
+        source=$null;existingOnly=$true;rendererPort=$null;mainPort=$null;timeoutMilliseconds=30000;restartOrdinary=($Action -cne 'Close')
+    }
 }
 function New-CcodControllerPaths([string]$Root){
     $stable=Join-Path $Root 'install';$state=Join-Path $stable 'state';$runtime=Join-Path $stable 'runtime\runtime-1'
@@ -88,6 +97,7 @@ function Merge-CcodControllerTestAdapters([hashtable]$Overrides){
         ExitMutex={param($Lease)Close-CcodControllerTestLease $Lease}
         ReadJournal={param($Path)$null}
         UtcNow={ [DateTime]::Parse('2030-02-03T03:00:00Z').ToUniversalTime() }
+        AssertLifecycleFence={param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity,$RuntimeId,$InstallRoot)$true}
     }
     if($null -ne $Overrides){foreach($name in $Overrides.Keys){$resolved[$name]=$Overrides[$name]}}
     return $resolved
@@ -95,12 +105,73 @@ function Merge-CcodControllerTestAdapters([hashtable]$Overrides){
 
 function Invoke-CcodLeasedTestController {
     param($Request,$Paths,[string]$ResultPath,[hashtable]$Adapters)
-    Invoke-CcodSessionController -Request $Request -Paths $Paths -ResultPath $ResultPath -Adapters (Merge-CcodControllerTestAdapters $Adapters)
+    $parameters=@{Request=$Request;Paths=$Paths;ResultPath=$ResultPath;Adapters=(Merge-CcodControllerTestAdapters $Adapters)}
+    if($null -ne $Request -and $null -ne $Request.PSObject.Properties['schemaVersion'] -and $Request.schemaVersion -eq 1 -and $null -ne $Request.PSObject.Properties['action'] -and $Request.action -ceq 'Recover'){$parameters.AllowLegacyRecover=$true}
+    Invoke-CcodSessionController @parameters
 }
 
 $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-controller-selftest-'+[guid]::NewGuid().ToString('N'))
 try{
     $paths=New-CcodControllerPaths $root;$resultPath=Join-Path $root 'result.json'
+    Invoke-CcodTest 'schema-v2 controller dispatches only the fenced Inspect Close Apply and RepairRenderer allow-list' {
+        foreach($action in @('Inspect','Close','Apply','RepairRenderer')){
+            $events=[Collections.Generic.List[string]]::new();$request=New-CcodControllerV2Request -Action $action
+            $run=Invoke-CcodLeasedTestController -Request $request -Paths $paths -ResultPath $resultPath -Adapters @{
+                EngineInvoker={param($Action,$Request,$Paths,$EngineAdapters)$events.Add("engine:$Action");& $EngineAdapters.AssertLifecycleFence $Request.runtimeGeneration $Request.leaseEpoch $Request.ownerIdentity|Out-Null;New-CcodControllerResult $Action $Request.transactionId $(if($Action -ceq 'Close'){'Closed'}else{'Inspected'})}.GetNewClosure()
+                AssertLifecycleFence={param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity,$RuntimeId,$InstallRoot)$events.Add("fence:${RuntimeGeneration}:${LeaseEpoch}:$($OwnerIdentity.pid)");$true}.GetNewClosure()
+                WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}
+            }
+            Assert-CcodTrue (@($events|Where-Object{$_ -ceq "engine:$action"}).Count -eq 1) "$action dispatches exactly once"
+            Assert-CcodTrue (@($events|Where-Object{$_ -ceq 'fence:4:9:401'}).Count -ge 3) "$action engine and both result commits revalidate the exact fence"
+            Assert-CcodEqual 0 $run.ExitCode "$action returns a safe framed result"
+        }
+        foreach($action in @('RepairStale','Recover')){
+            $invalid=New-CcodControllerV2Request -Action Inspect;$invalid.action=$action
+            $run=Invoke-CcodLeasedTestController -Request $invalid -Paths $paths -ResultPath $resultPath -Adapters @{EngineInvoker={throw 'must not dispatch'};WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}}
+            Assert-CcodEqual 'CCOD_REQUEST_INVALID' $run.Result.error.code "schema-v2 $action is outside the action allow-list"
+        }
+    }
+
+    Invoke-CcodTest 'a stale schema-v2 fence propagates before process mutation and before final result publication' {
+        $request=New-CcodControllerV2Request -Action Close;$world=[pscustomobject]@{StopCalls=0;Writes=0}
+        $staleBeforeStop=Merge-CcodControllerTestAdapters @{
+            AssertLifecycleFence={param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity,$RuntimeId,$InstallRoot)
+                $exception=[InvalidOperationException]::new('stale lifecycle owner')
+                throw [Management.Automation.ErrorRecord]::new($exception,'CCOD_LIFECYCLE_FENCE_STALE',[Management.Automation.ErrorCategory]::SecurityError,$OwnerIdentity)
+            }
+            EngineInvoker={param($Action,$Request,$Paths,$EngineAdapters)& $EngineAdapters.AssertLifecycleFence $Request.runtimeGeneration $Request.leaseEpoch $Request.ownerIdentity|Out-Null;$world.StopCalls++;New-CcodControllerResult $Action $Request.transactionId Closed}.GetNewClosure()
+            WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}
+        }
+        Assert-CcodThrows { Invoke-CcodSessionController -Request $request -Paths $paths -ResultPath $resultPath -Adapters $staleBeforeStop } 'CCOD_LIFECYCLE_FENCE_STALE'
+        Assert-CcodEqual 0 $world.StopCalls 'stale owner never stops Codex'
+
+        $finalWorld=[pscustomobject]@{Writes=0}
+        $staleFinal=Merge-CcodControllerTestAdapters @{
+            EngineInvoker={param($Action,$Request,$Paths,$EngineAdapters)New-CcodControllerResult $Action $Request.transactionId Closed}.GetNewClosure()
+            AssertLifecycleFence={param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity,$RuntimeId,$InstallRoot)
+                if($finalWorld.Writes -ge 1){$exception=[InvalidOperationException]::new('stale before final result');throw [Management.Automation.ErrorRecord]::new($exception,'CCOD_LIFECYCLE_FENCE_STALE',[Management.Automation.ErrorCategory]::SecurityError,$OwnerIdentity)}
+                $true
+            }.GetNewClosure()
+            WriteResult={param($Path,$Value)$finalWorld.Writes++}.GetNewClosure();WriteStdout={param($Line)};WriteStderr={param($Line)}
+        }
+        Assert-CcodThrows { Invoke-CcodSessionController -Request $request -Paths $paths -ResultPath $resultPath -Adapters $staleFinal } 'CCOD_LIFECYCLE_FENCE_STALE'
+        Assert-CcodEqual 1 $finalWorld.Writes 'stale owner cannot publish the final controller result'
+    }
+
+    Invoke-CcodTest 'schema-v1 Recover requires the explicit transitional compatibility switch' {
+        $request=New-CcodControllerRequest -Action Recover;$calls=[pscustomobject]@{Engine=0}
+        $blocked=Invoke-CcodSessionController -Request $request -Paths $paths -ResultPath $resultPath -Adapters (Merge-CcodControllerTestAdapters @{EngineInvoker={param($Action,$Request,$Paths)$calls.Engine++;throw 'must not dispatch'}.GetNewClosure();WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}})
+        Assert-CcodEqual 'CCOD_REQUEST_INVALID' $blocked.Result.error.code 'ordinary callers cannot enter legacy Recover'
+        Assert-CcodEqual 0 $calls.Engine 'blocked legacy request has no engine side effect'
+        $allowed=Invoke-CcodSessionController -Request $request -Paths $paths -ResultPath $resultPath -AllowLegacyRecover -Adapters (Merge-CcodControllerTestAdapters @{EngineInvoker={param($Action,$Request,$Paths)$calls.Engine++;New-CcodControllerResult $Action $Request.transactionId Recovered}.GetNewClosure();WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}})
+        Assert-CcodEqual 'Recovered' $allowed.Result.outcome 'exact wrapper compatibility request remains operational'
+        Assert-CcodEqual 1 $calls.Engine 'compatibility switch dispatches only one legacy Recover'
+        $forged=New-CcodControllerRequest -Action Recover;$forged.supervisorIdentity.creationTimeUtc='2030-02-03T03:00:01.0000000Z'
+        $rejected=Invoke-CcodSessionController -Request $forged -Paths $paths -ResultPath $resultPath -AllowLegacyRecover -Adapters (Merge-CcodControllerTestAdapters @{EngineInvoker={param($Action,$Request,$Paths)$calls.Engine++;throw 'must not dispatch'}.GetNewClosure();WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}})
+        Assert-CcodEqual 'CCOD_REQUEST_INVALID' $rejected.Result.error.code 'compatibility entry still requires the exact live supervisor identity'
+        Assert-CcodEqual 1 $calls.Engine 'compatibility naming or switch cannot bypass live identity binding'
+    }
+
     Invoke-CcodTest 'writes provisional and final atomic results before exactly one compressed stdout line' {
         $events=[Collections.Generic.List[string]]::new();$stdout=[Collections.Generic.List[string]]::new();$captured=[pscustomobject]@{Written=$null}
         $request=New-CcodControllerRequest
@@ -522,10 +593,11 @@ try{
         Assert-CcodTrue ((($poisoned.Result|ConvertTo-Json -Depth 16 -Compress)+($poisonLogs -join '')) -cnotmatch 'secret|hunter2|swordfish|device-key') 'malformed request metadata cannot bypass public and log redaction'
     }
 
-    Invoke-CcodTest 'constructs direct manual input as the same strict eleven-field request' {
+    Invoke-CcodTest 'constructs direct manual input as the same strict fenced schema-v2 request' {
         $identity=[pscustomobject][ordered]@{pid=11;creationTimeUtc='2030-02-03T03:00:00.0000000Z';sessionId='1'}
         $request=New-CcodManualControllerRequest -Action Apply -RuntimeId runtime-1 -SupervisorIdentity $identity -ExistingOnly $false -RendererPort $null -MainPort 41002 -TimeoutMilliseconds 30000 -RestartOrdinary $true -TransactionId '5f496d99-c839-4458-a6a2-d37ea1afdbda'
-        Assert-CcodEqual 'schemaVersion,action,transactionId,runtimeId,supervisorIdentity,source,existingOnly,rendererPort,mainPort,timeoutMilliseconds,restartOrdinary' (($request.PSObject.Properties.Name)-join ',') 'manual request has exact strict field order'
+        Assert-CcodEqual 'schemaVersion,action,transactionId,runtimeId,runtimeGeneration,leaseEpoch,ownerIdentity,supervisorIdentity,source,existingOnly,rendererPort,mainPort,timeoutMilliseconds,restartOrdinary' (($request.PSObject.Properties.Name)-join ',') 'manual request has exact strict field order'
+        Assert-CcodEqual 2 $request.schemaVersion 'manual request uses the fenced controller schema'
         Assert-CcodEqual $null $request.source 'manual Start does not invent a source snapshot'
         Assert-CcodEqual $false $request.existingOnly 'manual Start can authorize closed-app activation'
         $result=Invoke-CcodApplySession -Request $request -Paths $paths -Adapters @{ReadState={throw 'expected after validation'}}
@@ -535,7 +607,7 @@ try{
     Invoke-CcodTest 'routes both manual construction and strict request-file input through the lease wrapper' {
         $identity=[pscustomobject][ordered]@{pid=11;creationTimeUtc='2030-02-03T03:00:00.0000000Z';sessionId='1'}
         $manual=New-CcodManualControllerRequest -Action Inspect -RuntimeId runtime-1 -SupervisorIdentity $identity -ExistingOnly $true -RendererPort $null -MainPort $null -TimeoutMilliseconds 30000 -RestartOrdinary $true -TransactionId '5f496d99-c839-4458-a6a2-d37ea1afdbda'
-        $requestFile=Join-Path $root 'leased-request.json';Write-CcodAtomicJson -Path $requestFile -Value (New-CcodControllerRequest -TransactionId 'f81b6259-8e99-45fb-b557-c5292f05dfa3');$fromFile=Read-CcodStrictJson -Path $requestFile -ExpectedSchema 1 -Kind 'session controller request'
+        $requestFile=Join-Path $root 'leased-request.json';Write-CcodAtomicJson -Path $requestFile -Value (New-CcodControllerRequest -TransactionId 'f81b6259-8e99-45fb-b557-c5292f05dfa3');$fromFile=Read-CcodStrictJson -Path $requestFile -ExpectedSchema 2 -Kind 'session controller request'
         foreach($case in @($manual,$fromFile)){
             $events=[Collections.Generic.List[string]]::new()
             $run=Invoke-CcodLeasedTestController -Request $case -Paths $paths -ResultPath $resultPath -Adapters @{

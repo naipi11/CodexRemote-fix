@@ -15,6 +15,7 @@ $script:CcodProcessSnapshotFields = @(
     'MainPort'
 )
 $script:CcodNativeTypeName = 'Ccod.Persistence.Native.ProcessIdentityV1'
+$script:CcodOrdinaryObservationBackoffMilliseconds = @(250, 500, 1000, 2000)
 
 function Initialize-CcodProcessNativeApi {
     if ($null -ne ($script:CcodNativeTypeName -as [type])) { return }
@@ -405,6 +406,8 @@ function Get-CcodProcessAdapters {
             } finally { $client.Dispose() }
         }
         GetUtcNow = { [DateTimeOffset]::UtcNow }
+        StartStopwatch = { [Diagnostics.Stopwatch]::StartNew() }
+        GetElapsedMilliseconds = { param($Clock) [long]$Clock.ElapsedMilliseconds }
         Delay = { param($Milliseconds) Start-Sleep -Milliseconds ([int]$Milliseconds) }
         StartProcess = {
             param($FilePath, $Arguments, $WindowStyle)
@@ -1519,6 +1522,126 @@ function New-CcodStartResult {
     }
 }
 
+function Test-CcodCanonicalUtcTimestamp {
+    param([AllowNull()][object]$Value)
+    if($Value -isnot [string]){return $false}
+    $parsed=[DateTime]::MinValue
+    return [DateTime]::TryParseExact($Value,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$parsed) -and
+        $parsed.Kind -eq [DateTimeKind]::Utc -and $parsed.ToString('o',[Globalization.CultureInfo]::InvariantCulture) -ceq $Value
+}
+
+function Request-CcodOrdinaryPackagedLaunch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RequestedAtUtc,
+        [hashtable]$Adapters
+    )
+
+    if (-not (Test-CcodCanonicalUtcTimestamp -Value $RequestedAtUtc)) {
+        throw 'RequestedAtUtc must be an ISO-8601 round-trip timestamp.'
+    }
+    $adapter = Get-CcodProcessAdapters -Adapters $Adapters
+    $explorerPath = [IO.Path]::GetFullPath((Join-Path $env:WINDIR 'explorer.exe'))
+    $process = & $adapter.StartProcess $explorerPath @('shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App') $null
+    $launcherPid = $null
+    if ($null -ne $process -and $null -ne $process.PSObject.Properties['Id'] -and $process.Id -is [ValueType]) {
+        try {
+            $candidatePid = [int]$process.Id
+            if ($candidatePid -gt 0) { $launcherPid = $candidatePid }
+        } catch { $launcherPid = $null }
+    }
+    return [pscustomobject][ordered]@{
+        outcome = 'LaunchRequested'
+        requestedAtUtc = $RequestedAtUtc
+        launcherPid = $launcherPid
+    }
+}
+
+function Test-CcodVerifiedOrdinaryObservation {
+    param(
+        $Snapshot,
+        [Parameter(Mandatory)]$Package,
+        [Parameter(Mandatory)][DateTimeOffset]$NotBefore,
+        [Parameter(Mandatory)][string]$ExpectedUserSid,
+        [Parameter(Mandatory)][int]$ExpectedSessionId,
+        [Parameter(Mandatory)][hashtable]$Adapters
+    )
+
+    if ($null -eq $Snapshot -or -not (Test-CcodExactProperties -Value $Snapshot -Names $script:CcodProcessSnapshotFields) -or
+        $Snapshot.Pid -isnot [int] -or $Snapshot.Pid -lt 1 -or $Snapshot.SessionId -isnot [int] -or
+        $Snapshot.SessionId -ne $ExpectedSessionId -or $Snapshot.UserSid -isnot [string] -or $Snapshot.UserSid -cne $ExpectedUserSid -or
+        $Snapshot.Path -isnot [string] -or -not (Test-CcodOrdinalIgnoreCase $Snapshot.Path $Package.ExecutablePath) -or
+        $Snapshot.PackageFamilyName -isnot [string] -or $Snapshot.PackageFamilyName -cne $Package.FamilyName -or
+        $Snapshot.CommandLine -isnot [string] -or $Snapshot.IsTopLevel -isnot [bool] -or -not $Snapshot.IsTopLevel -or
+        $Snapshot.Mode -isnot [string] -or $Snapshot.Mode -cne 'Ordinary' -or
+        $null -ne $Snapshot.RendererPort -or $null -ne $Snapshot.MainPort) {
+        return $false
+    }
+    $created = ConvertTo-CcodDateTimeOffset -Value $Snapshot.CreationTimeUtc
+    if ($null -eq $created -or $created -lt $NotBefore) { return $false }
+    $arguments = Get-CcodParsedLaunchArguments -CommandLine $Snapshot.CommandLine -ExecutablePath $Package.ExecutablePath -Adapters $Adapters
+    return $arguments.Valid -and $arguments.IsTopLevel -and -not $arguments.HasDebugSwitch
+}
+
+function Get-CcodVerifiedOrdinaryObservation {
+    param(
+        [Parameter(Mandatory)][DateTimeOffset]$NotBefore,
+        [Parameter(Mandatory)][string]$ExpectedUserSid,
+        [Parameter(Mandatory)][int]$ExpectedSessionId,
+        $StatusEvidence,
+        [Parameter(Mandatory)][hashtable]$Adapters
+    )
+
+    $package = & $Adapters.GetPackageIdentity
+    if ($null -eq $package -or $null -eq $package.PSObject.Properties['Found'] -or $package.Found -isnot [bool] -or -not $package.Found) { return $null }
+    foreach ($name in @('FamilyName', 'ExecutablePath')) {
+        if ($null -eq $package.PSObject.Properties[$name] -or $package.$name -isnot [string] -or [string]::IsNullOrWhiteSpace($package.$name)) { return $null }
+    }
+    $candidates = @()
+    foreach ($processId in @(& $Adapters.ListProcessIds | Select-Object -Unique)) {
+        if ($processId -isnot [int] -or $processId -lt 1) { continue }
+        $first = & $Adapters.GetProcess $processId $StatusEvidence
+        if (-not (Test-CcodVerifiedOrdinaryObservation -Snapshot $first -Package $package -NotBefore $NotBefore -ExpectedUserSid $ExpectedUserSid -ExpectedSessionId $ExpectedSessionId -Adapters $Adapters)) { continue }
+        $second = & $Adapters.GetProcess $processId $StatusEvidence
+        if ($null -eq $second -or -not (Test-CcodProcessMatch -Expected $first -Actual $second) -or
+            -not (Test-CcodVerifiedOrdinaryObservation -Snapshot $second -Package $package -NotBefore $NotBefore -ExpectedUserSid $ExpectedUserSid -ExpectedSessionId $ExpectedSessionId -Adapters $Adapters)) { continue }
+        $candidates += $second
+    }
+    if ($candidates.Count -ne 1) { return $null }
+    return Copy-CcodProcessSnapshot -Snapshot $candidates[0]
+}
+
+function Wait-CcodVerifiedOrdinaryRoot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$NotBeforeUtc,
+        [Parameter(Mandatory)][string]$ExpectedUserSid,
+        [Parameter(Mandatory)][ValidateRange(0, 2147483647)][int]$ExpectedSessionId,
+        [Parameter(Mandatory)]$StatusEvidence,
+        [ValidateRange(1, 45000)][int]$TimeoutMilliseconds = 45000,
+        [hashtable]$Adapters
+    )
+
+    $notBefore = ConvertTo-CcodDateTimeOffset -Value $NotBeforeUtc
+    if (-not (Test-CcodCanonicalUtcTimestamp -Value $NotBeforeUtc) -or $null -eq $notBefore -or [string]::IsNullOrWhiteSpace($ExpectedUserSid)) { return $null }
+    $adapter = Get-CcodProcessAdapters -Adapters $Adapters
+    $clock = & $adapter.StartStopwatch
+    if ($null -eq $clock) { return $null }
+    $backoffIndex = 0
+    while ($true) {
+        $candidate = Get-CcodVerifiedOrdinaryObservation -NotBefore $notBefore -ExpectedUserSid $ExpectedUserSid -ExpectedSessionId $ExpectedSessionId -StatusEvidence $StatusEvidence -Adapters $adapter
+        if ($null -ne $candidate) { return $candidate }
+        $elapsed = & $adapter.GetElapsedMilliseconds $clock
+        if (($elapsed -isnot [int] -and $elapsed -isnot [long]) -or $elapsed -lt 0 -or $elapsed -ge $TimeoutMilliseconds) { return $null }
+        $delayIndex = [Math]::Min($backoffIndex, $script:CcodOrdinaryObservationBackoffMilliseconds.Count - 1)
+        $delay = [int]$script:CcodOrdinaryObservationBackoffMilliseconds[$delayIndex]
+        $remaining = [int]([long]$TimeoutMilliseconds - [long]$elapsed)
+        if ($delay -gt $remaining) { $delay = $remaining }
+        & $adapter.Delay $delay
+        $backoffIndex++
+    }
+}
+
 function Start-CcodProcess {
     [CmdletBinding(DefaultParameterSetName = 'Codex')]
     param(
@@ -1617,4 +1740,4 @@ function Start-CcodProcess {
     return New-CcodStartResult -Outcome 'Started' -Snapshot $null -Process $process
 }
 
-Export-ModuleMember -Function Get-CcodProcessSnapshot, Test-CcodProcessMatch, Get-CcodStalePackageProcessSnapshot, Get-CcodStalePackageRootResult, Get-CcodVerifiedProcessTree, Get-CcodVerifiedStaleProcessTree, Get-CcodTransactionProcessResult, Find-CcodTransactionProcess, Stop-CcodProcessIfMatch, Stop-CcodStaleProcessIfMatch, Request-CcodProcessGracefulCloseIfMatch, Request-CcodStaleProcessGracefulCloseIfMatch, Wait-CcodProcessExitIfMatch, Wait-CcodStaleProcessExitIfMatch, Start-CcodProcess, Get-CcodAvailableLoopbackPort, Wait-CcodPortClosed
+Export-ModuleMember -Function Get-CcodProcessSnapshot, Test-CcodProcessMatch, Get-CcodStalePackageProcessSnapshot, Get-CcodStalePackageRootResult, Get-CcodVerifiedProcessTree, Get-CcodVerifiedStaleProcessTree, Get-CcodTransactionProcessResult, Find-CcodTransactionProcess, Stop-CcodProcessIfMatch, Stop-CcodStaleProcessIfMatch, Request-CcodProcessGracefulCloseIfMatch, Request-CcodStaleProcessGracefulCloseIfMatch, Wait-CcodProcessExitIfMatch, Wait-CcodStaleProcessExitIfMatch, Start-CcodProcess, Request-CcodOrdinaryPackagedLaunch, Wait-CcodVerifiedOrdinaryRoot, Get-CcodAvailableLoopbackPort, Wait-CcodPortClosed

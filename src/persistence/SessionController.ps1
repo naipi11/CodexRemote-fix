@@ -5,7 +5,7 @@ param(
     [Parameter(ParameterSetName='Supervisor')]
     [string]$ResultPath,
     [Parameter(ParameterSetName='Manual')]
-    [ValidateSet('Inspect','Apply','RepairStale','RepairRenderer','Recover')]
+    [ValidateSet('Inspect','Close','Apply','RepairRenderer')]
     [string]$Action,
     [Parameter(ParameterSetName='Manual')]
     [bool]$ExistingOnly=$true,
@@ -29,6 +29,7 @@ $controllerModuleRoot=Join-Path $PSScriptRoot 'modules'
 $script:CcodControllerScriptPath=[IO.Path]::GetFullPath($PSCommandPath)
 Import-Module (Join-Path $controllerModuleRoot 'SessionEngine.psm1') -Force
 Import-Module (Join-Path $controllerModuleRoot 'RuntimeManifest.psm1') -Force
+Import-Module (Join-Path $controllerModuleRoot 'LifecycleEpoch.psm1') -Force
 Import-Module (Join-Path $controllerModuleRoot 'TransitionJournal.psm1') -Force
 Import-Module (Join-Path $controllerModuleRoot 'KernelObjects.psm1') -Force
 Import-Module (Join-Path $controllerModuleRoot 'PersistenceIO.psm1') -Force -Global
@@ -42,7 +43,10 @@ function Test-CcodControllerCanonicalGuid([object]$Value){
 function New-CcodControllerErrorResult {
     param($Request,[string]$Code,[string]$Stage,[string]$Message)
     $action=$null;$transactionId=$null
-    if($null -ne $Request -and $null -ne $Request.PSObject.Properties['action'] -and $Request.action -is [string] -and @('Inspect','Apply','RepairStale','RepairRenderer','Recover') -ccontains $Request.action){$action=$Request.action}
+    if($null -ne $Request -and $null -ne $Request.PSObject.Properties['action'] -and $Request.action -is [string]){
+        if(($null -ne $Request.PSObject.Properties['schemaVersion'] -and $Request.schemaVersion -eq 2 -and @('Inspect','Close','Apply','RepairRenderer') -ccontains $Request.action) -or
+           ($null -ne $Request.PSObject.Properties['schemaVersion'] -and $Request.schemaVersion -eq 1 -and $Request.action -ceq 'Recover')){$action=$Request.action}
+    }
     if($null -ne $Request -and $null -ne $Request.PSObject.Properties['transactionId'] -and (Test-CcodControllerCanonicalGuid $Request.transactionId)){$transactionId=$Request.transactionId}
     [pscustomobject][ordered]@{schemaVersion=1;action=$action;ok=$false;outcome='Error';safeState='Error';stage=$Stage;transactionId=$transactionId;package=$null;source=$null;special=$null;probes=$null;recovery=$null;error=[pscustomobject][ordered]@{code=$Code;stage=$Stage;message='The session controller failed safely. See the session log for details.'};logFile=$null}
 }
@@ -118,7 +122,15 @@ function Get-CcodControllerAdapters($Adapters){
         ExitMutex={param($Lease)Exit-CcodMutex -Lease $Lease}
         ReadJournal={param($Path)Read-CcodTransition -Path $Path}
         UtcNow={ [DateTime]::UtcNow }
-        EngineInvoker={param($Action,$Request,$Paths)switch($Action){'Inspect'{Invoke-CcodInspectSession -Request $Request -Paths $Paths}'Apply'{Invoke-CcodApplySession -Request $Request -Paths $Paths}'RepairStale'{Invoke-CcodRepairStaleSession -Request $Request -Paths $Paths}'RepairRenderer'{Invoke-CcodRepairRenderer -Request $Request -Paths $Paths}'Recover'{Invoke-CcodRecoverSession -Request $Request -Paths $Paths}default{throw 'unsupported controller action'}}}
+        EngineInvoker={param($Action,$Request,$Paths,$EngineAdapters)switch($Action){'Inspect'{Invoke-CcodInspectSession -Request $Request -Paths $Paths -Adapters $EngineAdapters}'Close'{Invoke-CcodCloseSession -Request $Request -Paths $Paths -Adapters $EngineAdapters}'Apply'{Invoke-CcodApplySession -Request $Request -Paths $Paths -Adapters $EngineAdapters}'RepairRenderer'{Invoke-CcodRepairRenderer -Request $Request -Paths $Paths -Adapters $EngineAdapters}'Recover'{Invoke-CcodRecoverSession -Request $Request -Paths $Paths -Adapters $EngineAdapters}default{throw 'unsupported controller action'}}}
+        AssertLifecycleFence={
+            param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity,$RuntimeId,$InstallRoot)
+            $ownership=[pscustomobject][ordered]@{
+                schemaVersion=1;lease=[pscustomobject][ordered]@{Released=$false};epoch=[UInt64]$LeaseEpoch;runtimeId=[string]$RuntimeId
+                runtimeGeneration=[UInt64]$RuntimeGeneration;ownerIdentity=$OwnerIdentity;released=$false
+            }
+            Assert-CcodLifecycleFence -InstallRoot $InstallRoot -Ownership $ownership
+        }
         WriteResult={param($Path,$Value)Write-CcodAtomicJson -Path $Path -Value $Value}
         WriteStdout={param($Line)[Console]::Out.WriteLine($Line)}
         WriteStderr={param($Line)[Console]::Error.WriteLine($Line)}
@@ -141,10 +153,29 @@ function Test-CcodControllerCanonicalUtc([object]$Value){
         $parsed.Kind -eq [DateTimeKind]::Utc -and $parsed.ToString('o',[Globalization.CultureInfo]::InvariantCulture) -ceq $Value
 }
 
+function Test-CcodControllerPositiveUInt64([object]$Value){
+    if($Value -isnot [byte] -and $Value -isnot [uint16] -and $Value -isnot [uint32] -and $Value -isnot [uint64] -and
+       $Value -isnot [sbyte] -and $Value -isnot [int16] -and $Value -isnot [int32] -and $Value -isnot [int64] -and $Value -isnot [decimal]){return $false}
+    try{$number=[decimal]$Value;return $number -ge 1 -and $number -le [decimal][UInt64]::MaxValue -and [decimal]::Truncate($number) -eq $number}catch{return $false}
+}
+
+function Test-CcodControllerExactProperties($Value,[string[]]$Names){
+    if($null -eq $Value -or ($Value -isnot [pscustomobject] -and $Value -isnot [Collections.IDictionary])){return $false}
+    $actual=if($Value -is [Collections.IDictionary]){@($Value.Keys)}else{@($Value.PSObject.Properties.Name)}
+    if($actual.Count -ne $Names.Count){return $false}
+    foreach($name in $Names){if($actual -cnotcontains $name){return $false}}
+    return $true
+}
+
 function Test-CcodControllerLeaseInput {
-    param($Request,$Identity,$SupervisorProcess)
+    param($Request,$Identity,$SupervisorProcess,[bool]$AllowLegacyRecover=$false)
+    $schema2=$null -ne $Request -and $null -ne $Request.PSObject.Properties['schemaVersion'] -and $Request.schemaVersion -eq 2
+    $legacyRecover=$AllowLegacyRecover -and $null -ne $Request -and $null -ne $Request.PSObject.Properties['schemaVersion'] -and $Request.schemaVersion -eq 1 -and
+        $null -ne $Request.PSObject.Properties['action'] -and $Request.action -ceq 'Recover'
+    $requestFields=if($schema2){@('schemaVersion','action','transactionId','runtimeId','runtimeGeneration','leaseEpoch','ownerIdentity','supervisorIdentity','source','existingOnly','rendererPort','mainPort','timeoutMilliseconds','restartOrdinary')}else{@('schemaVersion','action','transactionId','runtimeId','supervisorIdentity','source','existingOnly','rendererPort','mainPort','timeoutMilliseconds','restartOrdinary')}
+    if((-not $schema2 -and -not $legacyRecover) -or -not (Test-CcodControllerExactProperties $Request $requestFields)){return $false}
     if($null -eq $Request -or ($Request -isnot [pscustomobject] -and $Request -isnot [Collections.IDictionary]) -or
-        $null -eq $Request.PSObject.Properties['action'] -or $Request.action -isnot [string] -or @('Inspect','Apply','RepairStale','RepairRenderer','Recover') -cnotcontains $Request.action -or
+        $null -eq $Request.PSObject.Properties['action'] -or $Request.action -isnot [string] -or $(if($schema2){@('Inspect','Close','Apply','RepairRenderer') -cnotcontains $Request.action}else{$Request.action -cne 'Recover'}) -or
         $null -eq $Request.PSObject.Properties['transactionId'] -or -not (Test-CcodControllerCanonicalGuid $Request.transactionId) -or
         $null -eq $Request.PSObject.Properties['timeoutMilliseconds'] -or $Request.timeoutMilliseconds -isnot [int] -or $Request.timeoutMilliseconds -lt 500 -or $Request.timeoutMilliseconds -gt 120000 -or
         $null -eq $Request.PSObject.Properties['supervisorIdentity'] -or $null -eq $Request.supervisorIdentity -or
@@ -158,6 +189,12 @@ function Test-CcodControllerLeaseInput {
         $null -eq $SupervisorProcess.PSObject.Properties['Pid'] -or $SupervisorProcess.Pid -isnot [int] -or
         $null -eq $SupervisorProcess.PSObject.Properties['CreationTimeUtc'] -or $SupervisorProcess.CreationTimeUtc -isnot [string] -or
         $null -eq $SupervisorProcess.PSObject.Properties['SessionId'] -or $SupervisorProcess.SessionId -isnot [int]){return $false}
+    if($schema2){
+        if(-not (Test-CcodControllerPositiveUInt64 $Request.runtimeGeneration) -or -not (Test-CcodControllerPositiveUInt64 $Request.leaseEpoch) -or
+            -not (Test-CcodControllerExactProperties $Request.ownerIdentity @('pid','creationTimeUtc')) -or
+            ($Request.ownerIdentity.pid -isnot [int] -and $Request.ownerIdentity.pid -isnot [long]) -or $Request.ownerIdentity.pid -lt 1 -or $Request.ownerIdentity.pid -gt [int]::MaxValue -or
+            -not (Test-CcodControllerCanonicalUtc $Request.ownerIdentity.creationTimeUtc)){return $false}
+    }
     $canonicalSession=$Identity.SessionId.ToString([Globalization.CultureInfo]::InvariantCulture)
     return $Request.supervisorIdentity.sessionId -ceq $canonicalSession -and
         $SupervisorProcess.Pid -eq $Request.supervisorIdentity.pid -and
@@ -236,14 +273,36 @@ function Get-CcodControllerStableTransitionCode {
     return 'CCOD_TRANSITION_INVALID'
 }
 
+function Test-CcodControllerLifecycleFenceFailure($Failure){
+    if($null -eq $Failure){return $false}
+    $id=[string]$Failure.FullyQualifiedErrorId
+    if($id.Contains(',')){$id=$id.Split(',')[0]}
+    return $id -ceq 'CCOD_LIFECYCLE_FENCE_STALE'
+}
+
+function Assert-CcodControllerMutationFence($Request,$Paths,[hashtable]$Adapter){
+    if($null -eq $Request -or $null -eq $Request.PSObject.Properties['schemaVersion'] -or $Request.schemaVersion -ne 2){return}
+    $installRoot=Split-Path -Parent $Paths.StateRoot
+    try{[void](& $Adapter.AssertLifecycleFence $Request.runtimeGeneration $Request.leaseEpoch $Request.ownerIdentity $Request.runtimeId $installRoot)}catch{
+        if(Test-CcodControllerLifecycleFenceFailure $_){throw}
+        $exception=[InvalidOperationException]::new('The lifecycle owner is stale.')
+        throw [Management.Automation.ErrorRecord]::new($exception,'CCOD_LIFECYCLE_FENCE_STALE',[Management.Automation.ErrorCategory]::SecurityError,$Request.ownerIdentity)
+    }
+}
+
+function Write-CcodControllerFencedResult($Request,$Paths,[string]$ResultPath,$Value,[hashtable]$Adapter){
+    Assert-CcodControllerMutationFence $Request $Paths $Adapter
+    & $Adapter.WriteResult $ResultPath $Value|Out-Null
+}
+
 function Invoke-CcodSessionController {
     [CmdletBinding()]
-    param([Parameter(Mandatory)]$Request,[Parameter(Mandatory)]$Paths,[Parameter(Mandatory)][string]$ResultPath,[hashtable]$Adapters)
+    param([Parameter(Mandatory)]$Request,[Parameter(Mandatory)]$Paths,[Parameter(Mandatory)][string]$ResultPath,[switch]$AllowLegacyRecover,[hashtable]$Adapters)
     $adapter=Get-CcodControllerAdapters $Adapters;$result=$null;$intendedResult=$null;$diagnosticWritten=$false;$accountLease=$null;$sessionLease=$null;$accountLeaseAcquired=$false;$sessionLeaseAcquired=$false;$releaseFailed=$false;$provisionalRequired=$false;$initialResultWriteFailed=$false
     try{
         try{$identity=& $adapter.GetIdentity}catch{$identity=$null}
         try{$supervisorProcess=& $adapter.GetSupervisorProcess $Request.supervisorIdentity.pid}catch{$supervisorProcess=$null}
-        if(-not (Test-CcodControllerLeaseInput $Request $identity $supervisorProcess)){
+        if(-not (Test-CcodControllerLeaseInput $Request $identity $supervisorProcess ([bool]$AllowLegacyRecover))){
             $result=New-CcodControllerErrorResult $Request 'CCOD_REQUEST_INVALID' 'InputValidation' 'The request does not match this controller session.'
         }else{
             $total=[Math]::Min([int]$Request.timeoutMilliseconds,5000)
@@ -272,11 +331,13 @@ function Invoke-CcodSessionController {
                                 $result=New-CcodControllerErrorResult $Request 'CCOD_TRANSITION_REPLAY_REQUIRED' 'ReplayRequired' 'An active transition requires recovery.'
                             }else{
                                 try{
-                                    $output=@(& $adapter.EngineInvoker $Request.action $Request $Paths)
+                                    $engineAdapters=@{AssertLifecycleFence={param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity)& $adapter.AssertLifecycleFence $RuntimeGeneration $LeaseEpoch $OwnerIdentity $Request.runtimeId (Split-Path -Parent $Paths.StateRoot)}.GetNewClosure()}
+                                    $output=@(& $adapter.EngineInvoker $Request.action $Request $Paths $engineAdapters)
                                     $candidates=@($output|Where-Object{$_ -is [pscustomobject] -and $null -ne $_.PSObject.Properties['schemaVersion']})
                                     if($candidates.Count -ne 1){throw 'engine returned zero or multiple framed result objects'}
                                     $result=$candidates[0];Assert-CcodControllerEngineResult $result $Request
                                 }catch{
+                                    if(Test-CcodControllerLifecycleFenceFailure $_){throw}
                                     $result=New-CcodControllerErrorResult $Request 'CCOD_CONTROLLER_ENGINE_RESULT_INVALID' 'EngineResult' $_.Exception.Message
                                     $diagnosticWritten=Write-CcodControllerDiagnostic $result $Request $Paths $adapter
                                 }
@@ -285,6 +346,7 @@ function Invoke-CcodSessionController {
                     }
                 }
             }catch{
+                if(Test-CcodControllerLifecycleFenceFailure $_){throw}
                 $result=New-CcodControllerErrorResult $Request (Get-CcodControllerStableLeaseCode $_) 'LeaseAcquire' 'The transition lease could not be acquired safely.'
                 $diagnosticWritten=Write-CcodControllerDiagnostic $result $Request $Paths $adapter
             }
@@ -292,7 +354,8 @@ function Invoke-CcodSessionController {
         $intendedResult=$result
         $provisionalRequired=$accountLeaseAcquired -or $sessionLeaseAcquired
         $valueToPersist=if($provisionalRequired){New-CcodControllerErrorResult $Request 'CCOD_CONTROLLER_RESULT_WRITE_FAILED' 'ResultWrite' 'Controller completion has not been published.'}else{$result}
-        try{& $adapter.WriteResult $ResultPath $valueToPersist|Out-Null}catch{
+        try{Write-CcodControllerFencedResult $Request $Paths $ResultPath $valueToPersist $adapter}catch{
+            if(Test-CcodControllerLifecycleFenceFailure $_){throw}
             $initialResultWriteFailed=$true
             $result=New-CcodControllerErrorResult $Request 'CCOD_CONTROLLER_RESULT_WRITE_FAILED' 'ResultWrite' $_.Exception.Message
             if(-not $diagnosticWritten){$diagnosticWritten=Write-CcodControllerDiagnostic $result $Request $Paths $adapter}
@@ -307,7 +370,8 @@ function Invoke-CcodSessionController {
             $result=New-CcodControllerErrorResult $Request 'CCOD_KERNEL_RELEASE_FAILED' 'LeaseRelease' 'The transition lease could not be released safely.'
             $diagnosticWritten=Write-CcodControllerDiagnostic $result $Request $Paths $adapter
         }elseif(-not $initialResultWriteFailed){$result=$intendedResult}
-        try{& $adapter.WriteResult $ResultPath $result|Out-Null}catch{
+        try{Write-CcodControllerFencedResult $Request $Paths $ResultPath $result $adapter}catch{
+            if(Test-CcodControllerLifecycleFenceFailure $_){throw}
             $result=New-CcodControllerErrorResult $Request 'CCOD_CONTROLLER_RESULT_WRITE_FAILED' 'ResultWrite' 'The corrected controller result could not be persisted.'
             [void](Write-CcodControllerDiagnostic $result $Request $Paths $adapter)
             try{& $adapter.WriteStderr 'CCOD_CONTROLLER_RESULT_WRITE_FAILED: result persistence failed'|Out-Null}catch{}
@@ -357,8 +421,9 @@ function Get-CcodInstalledControllerPaths {
 }
 
 function New-CcodManualControllerRequest {
-    param([string]$Action,[string]$RuntimeId,$SupervisorIdentity,[bool]$ExistingOnly,$RendererPort,$MainPort,[int]$TimeoutMilliseconds,[bool]$RestartOrdinary,[string]$TransactionId=([guid]::NewGuid().ToString('D')))
-    [pscustomobject][ordered]@{schemaVersion=1;action=$Action;transactionId=$TransactionId;runtimeId=$RuntimeId;supervisorIdentity=$SupervisorIdentity;source=$null;existingOnly=$ExistingOnly;rendererPort=$RendererPort;mainPort=$MainPort;timeoutMilliseconds=$TimeoutMilliseconds;restartOrdinary=$RestartOrdinary}
+    param([string]$Action,[string]$RuntimeId,[UInt64]$RuntimeGeneration=1,[UInt64]$LeaseEpoch=1,$OwnerIdentity,$SupervisorIdentity,[bool]$ExistingOnly,$RendererPort,$MainPort,[int]$TimeoutMilliseconds,[bool]$RestartOrdinary,[string]$TransactionId=([guid]::NewGuid().ToString('D')))
+    if($null -eq $OwnerIdentity){$OwnerIdentity=[pscustomobject][ordered]@{pid=[int]$SupervisorIdentity.pid;creationTimeUtc=[string]$SupervisorIdentity.creationTimeUtc}}
+    [pscustomobject][ordered]@{schemaVersion=2;action=$Action;transactionId=$TransactionId;runtimeId=$RuntimeId;runtimeGeneration=$RuntimeGeneration;leaseEpoch=$LeaseEpoch;ownerIdentity=$OwnerIdentity;supervisorIdentity=$SupervisorIdentity;source=$null;existingOnly=$ExistingOnly;rendererPort=$RendererPort;mainPort=$MainPort;timeoutMilliseconds=$TimeoutMilliseconds;restartOrdinary=$RestartOrdinary}
 }
 
 if($MyInvocation.InvocationName -ne '.'){
@@ -372,8 +437,12 @@ if($MyInvocation.InvocationName -ne '.'){
         [Console]::Out.WriteLine(($failure|ConvertTo-Json -Depth 16 -Compress));exit 1
     }
     $paths=Get-CcodInstalledControllerPaths -RuntimeContext $runtimeContext
+    $allowLegacyRecover=$false
     if($PSCmdlet.ParameterSetName -ceq 'Supervisor'){
-        try{$request=Read-CcodStrictJson -Path $RequestPath -ExpectedSchema 1 -Kind 'session controller request'}catch{
+        $requestLeaf=Split-Path -Leaf $RequestPath
+        $allowLegacyRecover=$requestLeaf -cmatch '^(?:start|reset|uninstall)-[0-9a-f]{32}-request\.json$'
+        $expectedSchema=if($allowLegacyRecover){1}else{2}
+        try{$request=Read-CcodStrictJson -Path $RequestPath -ExpectedSchema $expectedSchema -Kind 'session controller request'}catch{
             $failure=New-CcodControllerErrorResult $null 'CCOD_REQUEST_INVALID' 'InputValidation' $_.Exception.Message
             try{Write-CcodAtomicJson -Path $ResultPath -Value $failure}catch{}
             [Console]::Out.WriteLine(($failure|ConvertTo-Json -Depth 16 -Compress));exit 1
@@ -395,6 +464,8 @@ if($MyInvocation.InvocationName -ne '.'){
         $resultDirectory=[IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) 'CodexControlOtherDevices'))
         [IO.Directory]::CreateDirectory($resultDirectory)|Out-Null;$ResultPath=[IO.Path]::GetFullPath((Join-Path $resultDirectory ("manual-$($request.transactionId).json")))
     }
-    $run=Invoke-CcodSessionController -Request $request -Paths $paths -ResultPath $ResultPath
+    $invokeParameters=@{Request=$request;Paths=$paths;ResultPath=$ResultPath}
+    if($allowLegacyRecover){$invokeParameters.AllowLegacyRecover=$true}
+    $run=Invoke-CcodSessionController @invokeParameters
     exit $run.ExitCode
 }
