@@ -105,9 +105,7 @@ function Merge-CcodControllerTestAdapters([hashtable]$Overrides){
 
 function Invoke-CcodLeasedTestController {
     param($Request,$Paths,[string]$ResultPath,[hashtable]$Adapters)
-    $parameters=@{Request=$Request;Paths=$Paths;ResultPath=$ResultPath;Adapters=(Merge-CcodControllerTestAdapters $Adapters)}
-    if($null -ne $Request -and $null -ne $Request.PSObject.Properties['schemaVersion'] -and $Request.schemaVersion -eq 1 -and $null -ne $Request.PSObject.Properties['action'] -and $Request.action -ceq 'Recover'){$parameters.AllowLegacyRecover=$true}
-    Invoke-CcodSessionController @parameters
+    Invoke-CcodSessionController -Request $Request -Paths $Paths -ResultPath $ResultPath -Adapters (Merge-CcodControllerTestAdapters $Adapters)
 }
 
 $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-controller-selftest-'+[guid]::NewGuid().ToString('N'))
@@ -158,18 +156,47 @@ try{
         Assert-CcodEqual 1 $finalWorld.Writes 'stale owner cannot publish the final controller result'
     }
 
-    Invoke-CcodTest 'schema-v1 Recover requires the explicit transitional compatibility switch' {
+    Invoke-CcodTest 'schema-v1 Recover has no public bypass and requires exact wrapper parent provenance' {
         $request=New-CcodControllerRequest -Action Recover;$calls=[pscustomobject]@{Engine=0}
         $blocked=Invoke-CcodSessionController -Request $request -Paths $paths -ResultPath $resultPath -Adapters (Merge-CcodControllerTestAdapters @{EngineInvoker={param($Action,$Request,$Paths)$calls.Engine++;throw 'must not dispatch'}.GetNewClosure();WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}})
         Assert-CcodEqual 'CCOD_REQUEST_INVALID' $blocked.Result.error.code 'ordinary callers cannot enter legacy Recover'
         Assert-CcodEqual 0 $calls.Engine 'blocked legacy request has no engine side effect'
-        $allowed=Invoke-CcodSessionController -Request $request -Paths $paths -ResultPath $resultPath -AllowLegacyRecover -Adapters (Merge-CcodControllerTestAdapters @{EngineInvoker={param($Action,$Request,$Paths)$calls.Engine++;New-CcodControllerResult $Action $Request.transactionId Recovered}.GetNewClosure();WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}})
-        Assert-CcodEqual 'Recovered' $allowed.Result.outcome 'exact wrapper compatibility request remains operational'
-        Assert-CcodEqual 1 $calls.Engine 'compatibility switch dispatches only one legacy Recover'
-        $forged=New-CcodControllerRequest -Action Recover;$forged.supervisorIdentity.creationTimeUtc='2030-02-03T03:00:01.0000000Z'
-        $rejected=Invoke-CcodSessionController -Request $forged -Paths $paths -ResultPath $resultPath -AllowLegacyRecover -Adapters (Merge-CcodControllerTestAdapters @{EngineInvoker={param($Action,$Request,$Paths)$calls.Engine++;throw 'must not dispatch'}.GetNewClosure();WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}})
-        Assert-CcodEqual 'CCOD_REQUEST_INVALID' $rejected.Result.error.code 'compatibility entry still requires the exact live supervisor identity'
-        Assert-CcodEqual 1 $calls.Engine 'compatibility naming or switch cannot bypass live identity binding'
+        Assert-CcodTrue (-not (Get-Command Invoke-CcodSessionController).Parameters.ContainsKey('AllowLegacyRecover')) 'public controller surface has no self-authorization switch'
+
+        $legacyRoot=[IO.Path]::GetFullPath((Join-Path $root 'legacy-temp\CodexControlOtherDevices'));$nonce='0123456789abcdef0123456789abcdef'
+        $requestPath=[IO.Path]::GetFullPath((Join-Path $legacyRoot "start-$nonce-request.json"));$legacyResultPath=[IO.Path]::GetFullPath((Join-Path $legacyRoot "start-$nonce-result.json"))
+        $runtimeRoot=[IO.Path]::GetFullPath((Join-Path $root 'install\runtime\runtime-1'));$controller=[IO.Path]::GetFullPath((Join-Path $runtimeRoot 'src\persistence\SessionController.ps1'))
+        $wrapper=[IO.Path]::GetFullPath((Join-Path $runtimeRoot 'Start-CodexControlOtherDevices.ps1'));$powershell='C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+        $runtimeContext=[pscustomobject][ordered]@{InstallRoot=[IO.Path]::GetFullPath((Join-Path $root 'install'));RuntimeRoot=$runtimeRoot;RuntimeId='runtime-1';ControllerPath=$controller;Manifest=[pscustomobject][ordered]@{files=@([pscustomobject][ordered]@{path='Start-CodexControlOtherDevices.ps1'})}}
+        $current=[pscustomobject][ordered]@{Pid=700;CreationTimeUtc='2030-02-03T03:00:01.0000000Z';SessionId=1;UserSid=$script:CcodControllerTestUserSid;Path=$powershell;CommandLine='child';ParentPid=11}
+        $parent=[pscustomobject][ordered]@{Pid=11;CreationTimeUtc='2030-02-03T03:00:00.0000000Z';SessionId=1;UserSid=$script:CcodControllerTestUserSid;Path=$powershell;CommandLine='parent';ParentPid=10}
+        $validAdapters=Merge-CcodControllerTestAdapters @{
+            GetLegacyTempRoot={$legacyRoot}.GetNewClosure();TestLegacyPathSafe={param($Path)$true};GetCurrentProcessId={700}
+            GetProcessProvenance={param($ProcessId)if([int]$ProcessId -eq 700){$current}elseif([int]$ProcessId -eq 11){$parent}else{$null}}.GetNewClosure()
+            ParseProcessCommandLine={param($CommandLine)if($CommandLine -ceq 'child'){@($powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',$controller,'-RequestPath',$requestPath,'-ResultPath',$legacyResultPath)}else{@($powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',$wrapper)}}.GetNewClosure()
+            GetApprovedPowerShellPath={$powershell}.GetNewClosure()
+            ReadJournal={param($Path)[pscustomobject]@{transactionId='1b2c5c27-e6e3-4ae4-a876-a59418519d41';stage='OrdinaryStopped'}}
+            EngineInvoker={param($Action,$Request,$Paths)$calls.Engine++;New-CcodControllerResult $Action $Request.transactionId Recovered}.GetNewClosure()
+            WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}
+        }
+        $allowed=Invoke-CcodVerifiedLegacyRecoverController -Request $request -Paths $paths -RequestPath $requestPath -ResultPath $legacyResultPath -RuntimeContext $runtimeContext -Adapters $validAdapters
+        Assert-CcodEqual 'Recovered' $allowed.Result.outcome 'manifest-bound wrapper parent provenance admits exact legacy Recover'
+        Assert-CcodEqual 1 $calls.Engine 'verified provenance dispatches exactly once'
+
+        $selfRequest=New-CcodControllerRequest -Action Recover;$selfRequest.supervisorIdentity.pid=700;$selfRequest.supervisorIdentity.creationTimeUtc=$current.CreationTimeUtc
+        $forgeries=@(
+            @{Name='filename-only';Request=$request;ResultPath=$legacyResultPath;Mutate={param($a)$a.GetProcessProvenance={param($ProcessId)$null}}},
+            @{Name='nonce mismatch';Request=$request;ResultPath=([IO.Path]::GetFullPath((Join-Path $legacyRoot 'start-ffffffffffffffffffffffffffffffff-result.json')));Mutate={param($a)}},
+            @{Name='self identity';Request=$selfRequest;ResultPath=$legacyResultPath;Mutate={param($a)}},
+            @{Name='parent command line';Request=$request;ResultPath=$legacyResultPath;Mutate={param($a)$a.ParseProcessCommandLine={param($CommandLine)if($CommandLine -ceq 'child'){@($powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',$controller,'-RequestPath',$requestPath,'-ResultPath',$legacyResultPath)}else{@($powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File','C:\Forged\Start-CodexControlOtherDevices.ps1')}}.GetNewClosure()}}
+        )
+        foreach($case in $forgeries){
+            $adapters=$validAdapters.Clone();& $case.Mutate $adapters
+            $before=$calls.Engine
+            $rejected=Invoke-CcodVerifiedLegacyRecoverController -Request $case.Request -Paths $paths -RequestPath $requestPath -ResultPath $case.ResultPath -RuntimeContext $runtimeContext -Adapters $adapters
+            Assert-CcodEqual 'CCOD_REQUEST_INVALID' $rejected.Result.error.code "$($case.Name) forgery is rejected"
+            Assert-CcodEqual $before $calls.Engine "$($case.Name) forgery never dispatches the engine"
+        }
     }
 
     Invoke-CcodTest 'writes provisional and final atomic results before exactly one compressed stdout line' {
@@ -387,15 +414,8 @@ try{
         }
     }
 
-    Invoke-CcodTest 'active journal permits only Recover and otherwise requires a fresh replay request' {
+    Invoke-CcodTest 'active journal requires a fresh lifecycle step for every schema-v2 action' {
         $active=[pscustomobject]@{transactionId='1b2c5c27-e6e3-4ae4-a876-a59418519d41';stage='OrdinaryStopped'}
-        $recoverCalls=[Collections.Generic.List[string]]::new();$recoverRequest=New-CcodControllerRequest -Action Recover
-        $recovered=Invoke-CcodLeasedTestController -Request $recoverRequest -Paths $paths -ResultPath $resultPath -Adapters @{
-            ReadJournal={param($Path)$active}.GetNewClosure();EngineInvoker={param($Action,$Request,$Paths)$recoverCalls.Add($Action);New-CcodControllerResult $Action $Request.transactionId Recovered}.GetNewClosure();WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}
-        }
-        Assert-CcodEqual 'Recover' ($recoverCalls -join ',') 'active transaction dispatches exactly one Recover'
-        Assert-CcodEqual 'Recovered' $recovered.Result.outcome 'Recover result remains Task 8 compatible'
-
         foreach($action in @('Inspect','Apply','RepairRenderer')){
             $calls=[Collections.Generic.List[string]]::new();$request=New-CcodControllerRequest -Action $action
             $blocked=Invoke-CcodLeasedTestController -Request $request -Paths $paths -ResultPath $resultPath -Adapters @{
@@ -408,7 +428,7 @@ try{
     }
 
     Invoke-CcodTest 'abandonment logs one exact warning then replays or invokes once without reacquiring' {
-        foreach($withJournal in @($true,$false)){
+        foreach($withJournal in @($false)){
             $events=[Collections.Generic.List[string]]::new();$logs=[Collections.Generic.List[string]]::new();$request=New-CcodControllerRequest -Action $(if($withJournal){'Recover'}else{'Apply'})
             $run=Invoke-CcodLeasedTestController -Request $request -Paths $paths -ResultPath $resultPath -Adapters @{
                 EnterMutex={param($Kind,$UserSid,$SessionId,$TimeoutMilliseconds)$events.Add("enter:$Kind");New-CcodControllerTestLease $Kind Acquired ($Kind -ceq 'AccountTransition')}.GetNewClosure()

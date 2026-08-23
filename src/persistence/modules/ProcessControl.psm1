@@ -1534,14 +1534,32 @@ function Request-CcodOrdinaryPackagedLaunch {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$RequestedAtUtc,
+        [Parameter(Mandatory)]$Ownership,
+        [Parameter(Mandatory)][scriptblock]$AssertLifecycleFence,
         [hashtable]$Adapters
     )
 
     if (-not (Test-CcodCanonicalUtcTimestamp -Value $RequestedAtUtc)) {
         throw 'RequestedAtUtc must be an ISO-8601 round-trip timestamp.'
     }
+    if($null -eq $Ownership -or ($Ownership -isnot [pscustomobject] -and $Ownership -isnot [Collections.IDictionary]) -or
+        -not (Test-CcodExactProperties -Value $Ownership -Names @('runtimeGeneration','leaseEpoch','ownerIdentity')) -or
+        $Ownership.runtimeGeneration -isnot [UInt64] -or $Ownership.runtimeGeneration -eq 0 -or
+        $Ownership.leaseEpoch -isnot [UInt64] -or $Ownership.leaseEpoch -eq 0 -or
+        $null -eq $Ownership.ownerIdentity -or -not (Test-CcodExactProperties -Value $Ownership.ownerIdentity -Names @('pid','creationTimeUtc')) -or
+        $Ownership.ownerIdentity.pid -isnot [int] -or $Ownership.ownerIdentity.pid -lt 1 -or
+        -not (Test-CcodCanonicalUtcTimestamp -Value $Ownership.ownerIdentity.creationTimeUtc)){
+        $exception=[InvalidOperationException]::new('Lifecycle launch ownership is invalid.')
+        throw [Management.Automation.ErrorRecord]::new($exception,'CCOD_LIFECYCLE_FENCE_STALE',[Management.Automation.ErrorCategory]::SecurityError,$Ownership)
+    }
     $adapter = Get-CcodProcessAdapters -Adapters $Adapters
     $explorerPath = [IO.Path]::GetFullPath((Join-Path $env:WINDIR 'explorer.exe'))
+    try{[void](& $AssertLifecycleFence $Ownership.runtimeGeneration $Ownership.leaseEpoch $Ownership.ownerIdentity)}catch{
+        $errorId=[string]$_.FullyQualifiedErrorId;if($errorId.Contains(',')){$errorId=$errorId.Split(',')[0]}
+        if($errorId -ceq 'CCOD_LIFECYCLE_FENCE_STALE'){throw}
+        $exception=[InvalidOperationException]::new('Lifecycle launch ownership is stale.')
+        throw [Management.Automation.ErrorRecord]::new($exception,'CCOD_LIFECYCLE_FENCE_STALE',[Management.Automation.ErrorCategory]::SecurityError,$Ownership.ownerIdentity)
+    }
     $process = & $adapter.StartProcess $explorerPath @('shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App') $null
     $launcherPid = $null
     if ($null -ne $process -and $null -ne $process.PSObject.Properties['Id'] -and $process.Id -is [ValueType]) {

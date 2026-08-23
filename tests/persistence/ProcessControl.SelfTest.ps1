@@ -906,7 +906,8 @@ try {
             Delay={param($Milliseconds)$world.Delays.Add([int]$Milliseconds);$world.Elapsed+=[int]$Milliseconds}.GetNewClosure()
         }
 
-        $receipt=Request-CcodOrdinaryPackagedLaunch -RequestedAtUtc $requestedAt -Adapters $adapters
+        $ownership=[pscustomobject][ordered]@{runtimeGeneration=[UInt64]4;leaseEpoch=[UInt64]9;ownerIdentity=[pscustomobject][ordered]@{pid=401;creationTimeUtc='2030-02-03T04:05:06.0000000Z'}}
+        $receipt=Request-CcodOrdinaryPackagedLaunch -RequestedAtUtc $requestedAt -Ownership $ownership -AssertLifecycleFence {param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity)$true} -Adapters $adapters
         Assert-CcodEqual 'outcome,requestedAtUtc,launcherPid' (($receipt.PSObject.Properties.Name)-join ',') 'launch receipt has only the request contract'
         Assert-CcodEqual 'LaunchRequested' $receipt.outcome 'Explorer receipt is only a launch request'
         Assert-CcodEqual $requestedAt $receipt.requestedAtUtc 'receipt preserves the lifecycle request time'
@@ -970,11 +971,28 @@ try {
     Invoke-CcodTest 'ordinary launch request performs exactly one AppsFolder request per operation' {
         $world=[pscustomobject]@{Starts=0}
         $adapters=@{StartProcess={param($FilePath,$Arguments,$WindowStyle)$world.Starts++;[pscustomobject]@{Id=(700+$world.Starts)}}.GetNewClosure()}
+        $ownership=[pscustomobject][ordered]@{runtimeGeneration=[UInt64]4;leaseEpoch=[UInt64]9;ownerIdentity=[pscustomobject][ordered]@{pid=401;creationTimeUtc='2030-02-03T04:05:06.0000000Z'}}
         foreach($index in 1..3){
-            $receipt=Request-CcodOrdinaryPackagedLaunch -RequestedAtUtc '2030-02-03T04:05:06.0000000Z' -Adapters $adapters
+            $receipt=Request-CcodOrdinaryPackagedLaunch -RequestedAtUtc '2030-02-03T04:05:06.0000000Z' -Ownership $ownership -AssertLifecycleFence {param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity)$true} -Adapters $adapters
             Assert-CcodEqual 'LaunchRequested' $receipt.outcome "operation $index returns only a request receipt"
         }
         Assert-CcodEqual 3 $world.Starts 'three coordinator operations produce at most three AppsFolder requests'
+    }
+
+    Invoke-CcodTest 'stale lifecycle ownership blocks ordinary AppsFolder launch before StartProcess' {
+        $world=[pscustomobject]@{Starts=0}
+        $ownership=[pscustomobject][ordered]@{runtimeGeneration=[UInt64]4;leaseEpoch=[UInt64]9;ownerIdentity=[pscustomobject][ordered]@{pid=401;creationTimeUtc='2030-02-03T04:05:06.0000000Z'}}
+        $stale={
+            param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity)
+            $exception=[InvalidOperationException]::new('stale lifecycle owner')
+            throw [Management.Automation.ErrorRecord]::new($exception,'CCOD_LIFECYCLE_FENCE_STALE',[Management.Automation.ErrorCategory]::SecurityError,$OwnerIdentity)
+        }
+        Assert-CcodThrows {
+            Request-CcodOrdinaryPackagedLaunch -RequestedAtUtc '2030-02-03T04:05:06.0000000Z' -Ownership $ownership -AssertLifecycleFence $stale -Adapters @{
+                StartProcess={param($FilePath,$Arguments,$WindowStyle)$world.Starts++;throw 'must not start'}.GetNewClosure()
+            }
+        } 'CCOD_LIFECYCLE_FENCE_STALE'
+        Assert-CcodEqual 0 $world.Starts 'stale lifecycle owner never reaches system Explorer'
     }
 
     Invoke-CcodTest 'adopts an existing ordinary root before starting recovery' {
