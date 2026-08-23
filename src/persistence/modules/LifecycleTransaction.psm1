@@ -30,6 +30,44 @@ function Throw-CcodLifecycleError {
         [InvalidOperationException]::new($Message), $Id, [Management.Automation.ErrorCategory]::InvalidData, $TargetObject)
 }
 
+function Get-CcodLifecycleMutexName {
+    param([Parameter(Mandatory)][string]$StateRoot)
+
+    try {
+        $canonicalRoot = [IO.Path]::GetFullPath($StateRoot).ToLowerInvariant()
+    } catch {
+        Throw-CcodLifecycleError 'CCOD_LIFECYCLE_STATE_INVALID' 'Lifecycle state root is invalid' $StateRoot
+    }
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = [BitConverter]::ToString($sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonicalRoot))).Replace('-', '').ToLowerInvariant()
+        return 'Local\CcodLifecycleTransaction-' + $hash
+    } finally {
+        $sha256.Dispose()
+    }
+}
+
+function Invoke-CcodLifecycleExclusive {
+    param([Parameter(Mandatory)][string]$StateRoot, [Parameter(Mandatory)][scriptblock]$Action)
+
+    $mutex = [Threading.Mutex]::new($false, (Get-CcodLifecycleMutexName -StateRoot $StateRoot))
+    $entered = $false
+    try {
+        try {
+            $entered = $mutex.WaitOne(30000)
+        } catch [Threading.AbandonedMutexException] {
+            $entered = $true
+        }
+        if (-not $entered) {
+            Throw-CcodLifecycleError 'CCOD_LIFECYCLE_LOCK_TIMEOUT' 'Lifecycle transaction lock could not be acquired' $StateRoot
+        }
+        return (& $Action)
+    } finally {
+        if ($entered) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
 function Get-CcodLifecyclePropertyNames {
     param([Parameter(Mandatory)]$Value)
 
@@ -218,7 +256,9 @@ function Write-CcodLifecycleRequest {
 
     Assert-CcodLifecycleRequest -Request $Request
     [IO.Directory]::CreateDirectory($StateRoot) | Out-Null
-    Write-CcodAtomicJson -Path (Get-CcodLifecycleRequestPath -StateRoot $StateRoot) -Value $Request
+    Invoke-CcodLifecycleExclusive -StateRoot $StateRoot -Action {
+        Write-CcodAtomicJson -Path (Get-CcodLifecycleRequestPath -StateRoot $StateRoot) -Value $Request
+    }
 }
 
 function Move-CcodLifecyclePhase {
@@ -251,14 +291,20 @@ function Complete-CcodLifecycleRequest {
         Throw-CcodLifecycleError 'CCOD_LIFECYCLE_STATE_INVALID' 'Only a terminal lifecycle request may be completed' $Request
     }
     [IO.Directory]::CreateDirectory($StateRoot) | Out-Null
-    $active = Read-CcodLifecycleRequest -StateRoot $StateRoot
-    if ($null -eq $active -or $active.transactionId -cne $Request.transactionId) {
-        Throw-CcodLifecycleError 'CCOD_LIFECYCLE_STATE_INVALID' 'Lifecycle completion does not match the active request' $Request
+    Invoke-CcodLifecycleExclusive -StateRoot $StateRoot -Action {
+        $active = Read-CcodLifecycleRequest -StateRoot $StateRoot
+        if ($null -eq $active -or $active.transactionId -cne $Request.transactionId) {
+            Throw-CcodLifecycleError 'CCOD_LIFECYCLE_STATE_INVALID' 'Lifecycle completion does not match the active request' $Request
+        }
+        $receiptPath = Get-CcodLifecycleReceiptPath -StateRoot $StateRoot -TransactionId $Request.transactionId
+        Write-CcodAtomicJson -Path $receiptPath -Value $Request
+        $current = Read-CcodLifecycleRequest -StateRoot $StateRoot
+        if ($null -eq $current -or $current.transactionId -cne $Request.transactionId) {
+            if ([IO.File]::Exists($receiptPath)) { [IO.File]::Delete($receiptPath) }
+            Throw-CcodLifecycleError 'CCOD_LIFECYCLE_STATE_INVALID' 'Lifecycle completion no longer matches the active request' $Request
+        }
+        [IO.File]::Delete((Get-CcodLifecycleRequestPath -StateRoot $StateRoot))
     }
-    $receiptPath = Get-CcodLifecycleReceiptPath -StateRoot $StateRoot -TransactionId $Request.transactionId
-    Write-CcodAtomicJson -Path $receiptPath -Value $Request
-    $requestPath = Get-CcodLifecycleRequestPath -StateRoot $StateRoot
-    if ([IO.File]::Exists($requestPath)) { [IO.File]::Delete($requestPath) }
 }
 
 Export-ModuleMember -Function New-CcodLifecycleRequest, Read-CcodLifecycleRequest, Write-CcodLifecycleRequest, Move-CcodLifecyclePhase, Complete-CcodLifecycleRequest, Get-CcodLifecycleRequestPath, Get-CcodLifecycleReceiptPath

@@ -129,6 +129,39 @@ try {
         Assert-CcodEqual $current.transactionId (Read-CcodLifecycleRequest -StateRoot $state).transactionId 'stale completion leaves the current active transaction durable'
         Assert-CcodEqual $false ([IO.File]::Exists((Get-CcodLifecycleReceiptPath -StateRoot $state -TransactionId $stale.transactionId))) 'stale completion writes no uncorrelated receipt'
     }
+
+    Invoke-CcodTest 'does not delete a replacement written after completion reads its active request' {
+        $state = Join-Path $root 'completion-interleaving'
+        [IO.Directory]::CreateDirectory($state) | Out-Null
+        $completedA = Copy-CcodLifecycleFixture (New-CcodLifecycleFixture)
+        $completedA.phase = 'Completed'
+        $completedA.updatedAtUtc = '2030-02-03T04:05:08.0000000Z'
+        Write-CcodLifecycleRequest -StateRoot $state -Request $completedA | Out-Null
+        $replacementB = Copy-CcodLifecycleFixture (New-CcodLifecycleFixture)
+        $replacementB.transactionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        $receiptPath = Get-CcodLifecycleReceiptPath -StateRoot $state -TransactionId $completedA.transactionId
+        $lifecycleModule = Get-Module LifecycleTransaction
+        $originalWriter = & $lifecycleModule { (Get-Command Write-CcodAtomicJson -CommandType Function).ScriptBlock }
+        try {
+            & $lifecycleModule {
+                param($OriginalWriter, $ReceiptPath, $StateRoot, $Replacement)
+                $script:CcodLifecycleInterleaveWriter = {
+                    param($Path, $Value)
+                    & $OriginalWriter $Path $Value
+                    if ($Path -ceq $ReceiptPath) {
+                        Write-CcodLifecycleRequest -StateRoot $StateRoot -Request $Replacement | Out-Null
+                    }
+                }.GetNewClosure()
+                Set-Item -Path Function:\Write-CcodAtomicJson -Value $script:CcodLifecycleInterleaveWriter
+            } $originalWriter $receiptPath $state $replacementB
+
+            Assert-CcodThrows { Complete-CcodLifecycleRequest -StateRoot $state -Request $completedA } 'CCOD_LIFECYCLE_STATE_INVALID'
+        } finally {
+            & $lifecycleModule { param($OriginalWriter) Set-Item -Path Function:\Write-CcodAtomicJson -Value $OriginalWriter } $originalWriter
+        }
+        Assert-CcodEqual $replacementB.transactionId (Read-CcodLifecycleRequest -StateRoot $state).transactionId 'interleaved replacement remains the active durable request'
+        Assert-CcodEqual $false ([IO.File]::Exists($receiptPath)) 'interleaved completion removes its uncommitted terminal receipt'
+    }
 } catch {
     Write-Error $_
     exit 1
