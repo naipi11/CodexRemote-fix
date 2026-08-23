@@ -2,6 +2,73 @@ Set-StrictMode -Version 2.0
 
 Import-Module (Join-Path $PSScriptRoot 'PersistenceIO.psm1') -Force
 
+function Initialize-CcodWorkerJobNative {
+    if($null-ne('CcodWorkerJobNativeV1'-as[type])){return}
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public sealed class CcodWorkerJobSafeHandleV1 : SafeHandleZeroOrMinusOneIsInvalid {
+    private CcodWorkerJobSafeHandleV1() : base(true) { }
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern bool CloseHandle(IntPtr handle);
+    protected override bool ReleaseHandle() { return CloseHandle(handle); }
+}
+
+public static class CcodWorkerJobNativeV1 {
+    private const UInt32 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    private const Int32 JobObjectExtendedLimitInformation = 9;
+
+    [StructLayout(LayoutKind.Sequential)] private struct IO_COUNTERS {
+        public UInt64 ReadOperationCount, WriteOperationCount, OtherOperationCount;
+        public UInt64 ReadTransferCount, WriteTransferCount, OtherTransferCount;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        public Int64 PerProcessUserTimeLimit, PerJobUserTimeLimit;
+        public UInt32 LimitFlags;
+        public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
+        public UInt32 ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public UInt32 PriorityClass, SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern CcodWorkerJobSafeHandleV1 CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool SetInformationJobObject(CcodWorkerJobSafeHandleV1 job, Int32 infoClass, IntPtr info, UInt32 length);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool AssignProcessToJobObject(CcodWorkerJobSafeHandleV1 job, IntPtr process);
+
+    public static CcodWorkerJobSafeHandleV1 CreateKillOnCloseJob() {
+        CcodWorkerJobSafeHandleV1 job = CreateJobObject(IntPtr.Zero, null);
+        if (job == null || job.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        Int32 length = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+        IntPtr buffer = Marshal.AllocHGlobal(length);
+        try {
+            Marshal.StructureToPtr(info, buffer, false);
+            if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, buffer, (UInt32)length)) {
+                Int32 error = Marshal.GetLastWin32Error(); job.Dispose(); throw new Win32Exception(error);
+            }
+            return job;
+        } finally { Marshal.FreeHGlobal(buffer); }
+    }
+
+    public static bool Assign(CcodWorkerJobSafeHandleV1 job, IntPtr processHandle) {
+        if (job == null || job.IsInvalid || job.IsClosed || processHandle == IntPtr.Zero) return false;
+        return AssignProcessToJobObject(job, processHandle);
+    }
+}
+'@
+}
+
 function Throw-CcodWorkerRuntimeError {
     param(
         [Parameter(Mandatory)][string]$Id,
@@ -51,6 +118,100 @@ function Write-CcodWorkerRequest {
         Throw-CcodWorkerRuntimeError 'CCOD_WORKER_PATH_INVALID' 'Worker request path must be absolute' $Path
     }
     Write-CcodAtomicJson -Path $Path -Value $Request
+}
+
+function Test-CcodWorkerRuntimeCanonicalUtc {
+    param($Value)
+    $parsed=[DateTime]::MinValue
+    return $Value-is[string] -and [DateTime]::TryParseExact($Value,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$parsed) -and $parsed.Kind-eq[DateTimeKind]::Utc -and $parsed.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)-ceq$Value
+}
+
+function Get-CcodWorkerGateSecurity {
+    param([Security.Principal.SecurityIdentifier]$UserSid)
+    $security=[Security.AccessControl.EventWaitHandleSecurity]::new();$security.SetOwner($UserSid);$security.SetAccessRuleProtection($true,$false)
+    $read=[Security.AccessControl.EventWaitHandleRights]::ReadPermissions-bor[Security.AccessControl.EventWaitHandleRights]::Synchronize
+    [void]$security.AddAccessRule([Security.AccessControl.EventWaitHandleAccessRule]::new($UserSid,$read,[Security.AccessControl.AccessControlType]::Allow))
+    foreach($sidValue in @('S-1-5-18','S-1-5-32-544')){[void]$security.AddAccessRule([Security.AccessControl.EventWaitHandleAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sidValue),[Security.AccessControl.EventWaitHandleRights]::FullControl,[Security.AccessControl.AccessControlType]::Allow))}
+    return $security
+}
+
+function Assert-CcodWorkerGateAcl {
+    param([Threading.EventWaitHandle]$Handle,[string]$UserSid)
+    try{
+        $security=$Handle.GetAccessControl();$owner=$security.GetOwner([Security.Principal.SecurityIdentifier]);$rules=@($security.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]));$read=[Security.AccessControl.EventWaitHandleRights]::ReadPermissions-bor[Security.AccessControl.EventWaitHandleRights]::Synchronize
+        if($owner.Value-cne$UserSid -or -not$security.AreAccessRulesProtected -or $rules.Count-ne3){throw 'acl'}
+        foreach($rule in $rules){
+            $expected=if($rule.IdentityReference.Value-ceq$UserSid){$read}elseif(@('S-1-5-18','S-1-5-32-544')-ccontains$rule.IdentityReference.Value){[Security.AccessControl.EventWaitHandleRights]::FullControl}else{throw 'principal'}
+            if($rule.AccessControlType-ne[Security.AccessControl.AccessControlType]::Allow -or $rule.IsInherited -or $rule.EventWaitHandleRights-ne$expected){throw 'rule'}
+        }
+    }catch{Throw-CcodWorkerRuntimeError 'CCOD_WORKER_GATE_INVALID' 'Worker startup gate ACL is invalid' $null}
+}
+
+function New-CcodWorkerGateToken {
+    $bytes=New-Object byte[] 32
+    $rng=[Security.Cryptography.RandomNumberGenerator]::Create()
+    try{$rng.GetBytes($bytes);return [BitConverter]::ToString($bytes).Replace('-','').ToLowerInvariant()}
+    finally{$rng.Dispose()}
+}
+
+function New-CcodWorkerStartupGate {
+    param([string]$Token,$ParentIdentity)
+    $windows=$null
+    try{
+        $windows=[Security.Principal.WindowsIdentity]::GetCurrent();if($null-eq$windows.User){throw 'sid'}
+        $name="Local\CodexControlOtherDevices.WorkerGate.$($windows.User.Value).$($ParentIdentity.SessionId).$Token"
+        $created=$false;$handle=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,$name,[ref]$created,(Get-CcodWorkerGateSecurity $windows.User))
+        if(-not$created){$handle.Dispose();Throw-CcodWorkerRuntimeError 'CCOD_WORKER_GATE_INVALID' 'Worker startup gate collided' $null}
+        Assert-CcodWorkerGateAcl $handle $windows.User.Value
+        return [pscustomobject][ordered]@{Name=$name;Token=$Token;Handle=$handle;Released=$false;Disposed=$false;ParentPid=[int]$ParentIdentity.Pid;ParentCreationTimeUtc=[string]$ParentIdentity.CreationTimeUtc;SessionId=[int]$ParentIdentity.SessionId;UserSid=$windows.User.Value}
+    }catch{if($_.FullyQualifiedErrorId-like'CCOD_WORKER_GATE_INVALID*'){throw};Throw-CcodWorkerRuntimeError 'CCOD_WORKER_GATE_INVALID' 'Worker startup gate could not be created' $null}
+    finally{if($null-ne$windows){$windows.Dispose()}}
+}
+
+function Get-CcodWorkerParentIdentity {
+    $process=[Diagnostics.Process]::GetCurrentProcess()
+    try{return [pscustomobject][ordered]@{Pid=[int]$process.Id;CreationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture);SessionId=[int]$process.SessionId}}
+    finally{$process.Dispose()}
+}
+
+function Get-CcodWorkerRuntimeAdapters {
+    param([hashtable]$Adapters)
+    $resolved=@{
+        NewToken={New-CcodWorkerGateToken};GetParentIdentity={Get-CcodWorkerParentIdentity}
+        CreateGate={param($Token,$ParentIdentity)New-CcodWorkerStartupGate $Token $ParentIdentity}
+        CreateJob={Initialize-CcodWorkerJobNative;[CcodWorkerJobNativeV1]::CreateKillOnCloseJob()}
+        StartProcess={param($StartInfo)[Diagnostics.Process]::Start($StartInfo)}
+        AssignProcessToJob={param($Job,$Process)[CcodWorkerJobNativeV1]::Assign($Job,$Process.Handle)}
+        SignalGate={param($Gate)$set=[bool]$Gate.Handle.Set();if($set){$Gate.Released=$true};$set}
+        KillExactProcess={param($Process)try{$Process.Kill();$true}catch{$false}}
+        DisposeGate={param($Gate)if($null-ne$Gate-and-not$Gate.Disposed){$Gate.Handle.Dispose();$Gate.Disposed=$true}}
+        DisposeJob={param($Job)if($null-ne$Job-and-not$Job.IsClosed){$Job.Dispose()}}
+    }
+    if($null-ne$Adapters){
+        if($Adapters-isnot[hashtable]){Throw-CcodWorkerRuntimeError 'CCOD_WORKER_START_FAILED' 'Worker adapters are invalid' $Adapters}
+        foreach($key in $Adapters.Keys){if(-not$resolved.ContainsKey($key)-or$Adapters[$key]-isnot[scriptblock]){Throw-CcodWorkerRuntimeError 'CCOD_WORKER_START_FAILED' 'Worker adapter is invalid' $key};$resolved[$key]=$Adapters[$key]}
+    }
+    return $resolved
+}
+
+function Wait-CcodWorkerStartupGate {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$GateName,[Parameter(Mandatory)][string]$GateToken,[Parameter(Mandatory)][int]$ExpectedParentPid,[Parameter(Mandatory)][string]$ExpectedParentCreationTimeUtc,[ValidateRange(1,30000)][int]$TimeoutMilliseconds=15000)
+    if($GateToken-cnotmatch'^[0-9a-f]{64}$' -or $ExpectedParentPid-lt1 -or -not(Test-CcodWorkerRuntimeCanonicalUtc $ExpectedParentCreationTimeUtc)){Throw-CcodWorkerRuntimeError 'CCOD_WORKER_GATE_INVALID' 'Worker startup gate binding is invalid' $null}
+    $windows=$null;$current=$null;$parent=$null;$gate=$null
+    try{
+        $windows=[Security.Principal.WindowsIdentity]::GetCurrent();$current=[Diagnostics.Process]::GetCurrentProcess();$parent=[Diagnostics.Process]::GetProcessById($ExpectedParentPid)
+        $expectedName="Local\CodexControlOtherDevices.WorkerGate.$($windows.User.Value).$($current.SessionId).$GateToken"
+        $cim=Get-CimInstance Win32_Process -Filter ("ProcessId="+$current.Id) -ErrorAction Stop
+        if($GateName-cne$expectedName -or [int]$cim.ParentProcessId-ne$ExpectedParentPid -or $parent.SessionId-ne$current.SessionId -or $parent.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)-cne$ExpectedParentCreationTimeUtc){Throw-CcodWorkerRuntimeError 'CCOD_WORKER_GATE_INVALID' 'Worker startup gate parent binding is invalid' $null}
+        $rights=[Security.AccessControl.EventWaitHandleRights]::ReadPermissions-bor[Security.AccessControl.EventWaitHandleRights]::Synchronize
+        $gate=[Threading.EventWaitHandle]::OpenExisting($GateName,$rights);Assert-CcodWorkerGateAcl $gate $windows.User.Value
+        if(-not$gate.WaitOne($TimeoutMilliseconds)){Throw-CcodWorkerRuntimeError 'CCOD_WORKER_GATE_TIMEOUT' 'Worker startup gate timed out' $null}
+        $parent.Refresh();$cim=Get-CimInstance Win32_Process -Filter ("ProcessId="+$current.Id) -ErrorAction Stop
+        if([int]$cim.ParentProcessId-ne$ExpectedParentPid -or $parent.HasExited -or $parent.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)-cne$ExpectedParentCreationTimeUtc){Throw-CcodWorkerRuntimeError 'CCOD_WORKER_GATE_INVALID' 'Worker startup gate parent changed' $null}
+        return $true
+    }catch{if($_.FullyQualifiedErrorId-like'CCOD_WORKER_GATE_*'){throw};Throw-CcodWorkerRuntimeError 'CCOD_WORKER_GATE_INVALID' 'Worker startup gate could not be validated' $null}
+    finally{if($null-ne$gate){$gate.Dispose()};if($null-ne$parent){$parent.Dispose()};if($null-ne$current){$current.Dispose()};if($null-ne$windows){$windows.Dispose()}}
 }
 
 function Test-CcodWorkerCanonicalUtc {
@@ -125,7 +286,8 @@ function Start-CcodWorkerProcess {
         [Parameter(Mandatory)][string]$RequestPath,
         [Parameter(Mandatory)][string]$ResultPath,
         [AllowNull()][string]$StderrPath,
-        [Parameter(Mandatory)][string]$PowerShellPath
+        [Parameter(Mandatory)][string]$PowerShellPath,
+        [hashtable]$Adapters
     )
 
     foreach ($path in @($ScriptPath, $RequestPath, $ResultPath)) {
@@ -136,25 +298,39 @@ function Start-CcodWorkerProcess {
     if (-not [IO.File]::Exists($ScriptPath)) {
         Throw-CcodWorkerRuntimeError 'CCOD_WORKER_SCRIPT_MISSING' 'Worker script does not exist' $ScriptPath
     }
-    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + [string]$ScriptPath + '" -RequestPath "' + [string]$RequestPath + '" -ResultPath "' + [string]$ResultPath + '"'
+    $adapter=Get-CcodWorkerRuntimeAdapters $Adapters;$parent=&$adapter.GetParentIdentity;$token=&$adapter.NewToken
+    if($token-isnot[string]-or$token-cnotmatch'^[0-9a-f]{64}$'-or$null-eq$parent-or$parent.Pid-isnot[int]-or$parent.Pid-lt1-or$parent.SessionId-isnot[int]-or$parent.SessionId-lt0-or-not(Test-CcodWorkerRuntimeCanonicalUtc $parent.CreationTimeUtc)){Throw-CcodWorkerRuntimeError 'CCOD_WORKER_START_FAILED' 'Worker startup binding is invalid' $ScriptPath}
+    $gate=$null;$job=$null;$process=$null;$assigned=$false;$success=$false
+    try{$gate=&$adapter.CreateGate $token $parent;$job=&$adapter.CreateJob}catch{
+        if($null-ne$gate){try{&$adapter.DisposeGate $gate|Out-Null}catch{}}
+        if($null-ne$job){try{&$adapter.DisposeJob $job|Out-Null}catch{}}
+        Throw-CcodWorkerRuntimeError 'CCOD_WORKER_START_FAILED' 'Worker containment could not be created' $ScriptPath
+    }
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + [string]$ScriptPath + '" -RequestPath "' + [string]$RequestPath + '" -ResultPath "' + [string]$ResultPath + '"' +
+        ' -StartupGateName "'+$gate.Name+'" -StartupGateToken '+$gate.Token+' -ExpectedParentPid '+$parent.Pid+' -ExpectedParentCreationTimeUtc "'+$parent.CreationTimeUtc+'"'
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = [string]$PowerShellPath
     $startInfo.Arguments = $arguments
     $startInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
     $startInfo.CreateNoWindow = $true
     $startInfo.UseShellExecute = $false
-    try {
-        $process = [Diagnostics.Process]::Start($startInfo)
-    } catch {
-        Throw-CcodWorkerRuntimeError 'CCOD_WORKER_START_FAILED' 'The supervisor worker could not be launched' $ScriptPath
-    }
-    if ($null -eq $process) {
-        Throw-CcodWorkerRuntimeError 'CCOD_WORKER_START_FAILED' 'The supervisor worker returned no process handle' $ScriptPath
-    }
-    return [pscustomobject][ordered]@{
-        ProcessId = [int]$process.Id
-        CreationTimeUtc = $process.StartTime.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
-        Handle = $process
+    try{
+        $process=&$adapter.StartProcess $startInfo
+        if($process-isnot[Diagnostics.Process]-or$process.Id-lt1-or$process.SessionId-ne$parent.SessionId){throw 'process'}
+        $created=$process.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)
+        $assigned=[bool](&$adapter.AssignProcessToJob $job $process);if(-not$assigned){throw 'job'}
+        $released=[bool](&$adapter.SignalGate $gate);if(-not$released-or-not$gate.Released){throw 'gate'}
+        $success=$true
+        return [pscustomobject][ordered]@{ProcessId=[int]$process.Id;CreationTimeUtc=$created;Handle=$process;JobHandle=$job;StartupGate=$gate}
+    }catch{
+        if($null-ne$process){
+            if($assigned){try{&$adapter.DisposeJob $job|Out-Null}catch{}}
+            else{try{[void](&$adapter.KillExactProcess $process)}catch{}}
+            try{[void]$process.WaitForExit(5000)}catch{}
+        }
+        Throw-CcodWorkerRuntimeError 'CCOD_WORKER_START_FAILED' 'The supervisor worker could not be safely launched' $ScriptPath
+    }finally{
+        if(-not$success){if($null-ne$process){$process.Dispose()};if($null-ne$gate){try{&$adapter.DisposeGate $gate|Out-Null}catch{}};if($null-ne$job){try{&$adapter.DisposeJob $job|Out-Null}catch{}}}
     }
 }
 
@@ -232,9 +408,13 @@ function Wait-CcodWorkerExit {
 
     $clock = [Diagnostics.Stopwatch]::StartNew()
     do {
-        $probe = Get-Process -Id $Slot.ProcessId -ErrorAction SilentlyContinue
-        if ($null -eq $probe) { return $true }
-        $probe.Dispose()
+        $handleExited=$false
+        if($null-ne$Slot.PSObject.Properties['Handle']-and$Slot.Handle-is[Diagnostics.Process]){
+            try{$Slot.Handle.Refresh();$handleExited=[bool]$Slot.Handle.HasExited}catch{$handleExited=$true}
+        }
+        $identity=Get-CcodWorkerIdentity -Pid $Slot.ProcessId
+        $identityGone=$null-eq$identity-or$identity.CreationTimeUtc-cne$Slot.CreationTimeUtc
+        if($identityGone-and($handleExited-or$null-eq$Slot.PSObject.Properties['Handle'])){return $true}
         if ($clock.ElapsedMilliseconds -ge [long]$TimeoutMilliseconds) { return $false }
         Start-Sleep -Milliseconds 100
     } while ($true)
@@ -251,7 +431,8 @@ function Get-CcodWorkerIdentity {
             Pid = [int]$probe.Id
             CreationTimeUtc = $probe.StartTime.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
         }
-    } finally {
+    } catch { return $null }
+    finally {
         $probe.Dispose()
     }
 }
@@ -263,28 +444,24 @@ function Stop-CcodWorkerProcess {
     if ($null -eq $Slot -or $Slot.ProcessId -isnot [int] -or $Slot.ProcessId -lt 1) {
         Throw-CcodWorkerRuntimeError 'CCOD_WORKER_SLOT_INVALID' 'Worker slot is invalid' $Slot
     }
-    try {
-        Stop-Process -Id $Slot.ProcessId -Force -ErrorAction Stop
-    } catch {
-        return $false
-    }
-    $clock = [Diagnostics.Stopwatch]::StartNew()
-    do {
-        $probe = Get-Process -Id $Slot.ProcessId -ErrorAction SilentlyContinue
-        if ($null -eq $probe) { return $true }
-        $probe.Dispose()
-        if ($clock.ElapsedMilliseconds -ge 5000) { return $false }
-        Start-Sleep -Milliseconds 100
-    } while ($true)
+    $jobProperty=$Slot.PSObject.Properties['JobHandle']
+    if($null-ne$jobProperty-and$null-ne$jobProperty.Value-and-not$jobProperty.Value.IsClosed){
+        try{$jobProperty.Value.Dispose()}catch{return $false}
+    }elseif($null-ne$Slot.PSObject.Properties['Handle']-and$Slot.Handle-is[Diagnostics.Process]){
+        try{$Slot.Handle.Refresh();if(-not$Slot.Handle.HasExited){$Slot.Handle.Kill()}}catch{return $false}
+    }else{return $false}
+    return Wait-CcodWorkerExit -Slot $Slot -TimeoutMilliseconds 5000
 }
 
 function Close-CcodWorkerHandle {
     [CmdletBinding()]
     param($Slot)
 
-    if ($null -ne $Slot -and $null -ne $Slot.Handle) {
-        try { $Slot.Handle.Dispose() } catch { }
-    }
+    if($null-eq$Slot){return}
+    if(-not(Wait-CcodWorkerExit -Slot $Slot -TimeoutMilliseconds 1)){Throw-CcodWorkerRuntimeError 'CCOD_WORKER_STILL_RUNNING' 'Worker containment cannot close while the exact child is alive' $Slot}
+    if($null-ne$Slot.PSObject.Properties['StartupGate']-and$null-ne$Slot.StartupGate-and-not$Slot.StartupGate.Disposed){$Slot.StartupGate.Handle.Dispose();$Slot.StartupGate.Disposed=$true}
+    if($null-ne$Slot.PSObject.Properties['JobHandle']-and$null-ne$Slot.JobHandle-and-not$Slot.JobHandle.IsClosed){$Slot.JobHandle.Dispose()}
+    if($null-ne$Slot.PSObject.Properties['Handle']-and$null-ne$Slot.Handle){$Slot.Handle.Dispose()}
 }
 
 function Remove-CcodWorkerFile {
@@ -330,6 +507,7 @@ Export-ModuleMember -Function @(
     'Write-CcodWorkerRequest',
     'New-CcodLifecycleWorkerRequest',
     'Assert-CcodLifecycleWorkerResult',
+    'Wait-CcodWorkerStartupGate',
     'Start-CcodWorkerProcess',
     'Get-CcodWorkerPoll',
     'Read-CcodWorkerResult',

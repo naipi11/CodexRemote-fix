@@ -1045,10 +1045,7 @@ function Invoke-CcodActivationSession {
         $suppressionKey=Get-CcodSuppressionKey -PackageFullName $probe.PackageFullName -AppAsarSha256 $probe.AppAsarSha256 -RuntimeId $Request.runtimeId
         $state=& $adapter.ReadState $Paths.StateRoot $suppressionKey
         if($state.StatusRebuildRequired){Throw-CcodSessionError 'CCOD_STATE_BLOCKED' 'Status requires a dedicated live rebuild before activation' $state.Damage}
-        $prior=$null
-        if($null -ne $state.VerifiedPackages -and $null -ne $state.VerifiedPackages.packages){$property=$state.VerifiedPackages.packages.PSObject.Properties[$suppressionKey];if($null -ne $property){$prior=$property.Value}}
-        $priorSucceeded=$null -ne $prior -and $prior.dynamicOutcome -ceq 'Succeeded' -and $prior.probeState -ceq 'Valid'
-        if($probe.StaticClassification -cne 'CandidateCompatible' -or -not $probe.Ready -or (-not $state.AutomaticCandidateTrialsAllowed -and -not $priorSucceeded)){Throw-CcodSessionError 'CCOD_STATE_BLOCKED' 'Package is not authorized for activation' $probe}
+        if($probe.StaticClassification -cne 'CandidateCompatible' -or -not $probe.Ready){Throw-CcodSessionError 'CCOD_STATE_BLOCKED' 'Package is not authorized for activation' $probe}
         $source=$Request.source
         if($repairStale){
             $result.source=ConvertTo-CcodSessionStaleSource $source

@@ -446,9 +446,6 @@ function Get-CcodSupervisorDecision {
     if (@('NativeModulePresent','UnknownOrIncompatible') -ccontains $effectiveClassification) {
         return New-CcodSupervisorDecision 'KeepOrdinary' $effectiveClassification $target $attemptKey $suppressionKey $effectiveClassification
     }
-    if ($effectiveClassification -ceq 'CandidateCompatible' -and -not $Context.AutomaticCandidateTrialsAllowed) {
-        return New-CcodSupervisorDecision 'KeepOrdinary' 'CandidateTrialBlocked' $target $attemptKey $suppressionKey $effectiveClassification
-    }
     return New-CcodSupervisorDecision 'ApplyOrdinary' 'Compatible' $target $attemptKey $suppressionKey $effectiveClassification
 }
 

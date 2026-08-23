@@ -357,8 +357,9 @@ $results += Invoke-CcodTest 'keeps candidate compatibility internal and requires
     $legacyCandidate = Get-CcodSupervisorDecision -Context (New-CcodSupervisorContext -CandidateCompatibleOptIn $false)
     Assert-CcodExactEqual 'ApplyOrdinary' $legacyCandidate.Action 'legacy candidate preference is migration data and cannot command protection'
     Assert-CcodExactEqual 'Compatible' $legacyCandidate.Reason 'candidate compatibility remains an internal decision'
-    $health = Get-CcodSupervisorDecision -Context (New-CcodSupervisorContext -AutomaticCandidateTrialsAllowed $false)
-    Assert-CcodExactEqual 'CandidateTrialBlocked' $health.Reason 'Task 5 aggregate blocks unhealthy first trial'
+    $health = Get-CcodSupervisorDecision -Context (New-CcodSupervisorContext -AutomationEnabled $false -CandidateCompatibleOptIn $false -AutomaticCandidateTrialsAllowed $false)
+    Assert-CcodExactEqual 'ApplyOrdinary' $health.Action 'all legacy false values remain migration data rather than guardian authority'
+    Assert-CcodExactEqual 'Compatible' $health.Reason 'internal compatible classification alone authorizes the guardian lifecycle'
     $authorized = Get-CcodSupervisorDecision -Context (New-CcodSupervisorContext)
     Assert-CcodExactEqual 'ApplyOrdinary' $authorized.Action 'authorized candidate applies'
     Assert-CcodExactEqual 'CandidateCompatible' $authorized.EffectiveClassification 'first trial remains candidate classified'

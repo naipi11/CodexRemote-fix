@@ -66,12 +66,14 @@ function New-CcodSupervisorFake {
         WorkerResult=$null;TickCount=0
         Preference=[pscustomobject][ordered]@{LanguageMode='System';FallbackUsed=$false;ErrorCode=$null};StoredLanguageMode='System';SystemCultureName='zh-CN'
         SetUiLanguageModes=[Collections.Generic.List[string]]::new();TrayArguments=$null;PresentationArguments=[Collections.Generic.List[object]]::new()
+        PresentationInputs=[Collections.Generic.List[object]]::new()
         UiFailureRecords=[Collections.Generic.List[object]]::new();TrayErrors=[Collections.Generic.List[object]]::new()
         ActiveRuntime=[pscustomobject][ordered]@{schemaVersion=2;activeRuntime='runtime-1';generation=[UInt64]7}
         LogonIdentity=[pscustomobject][ordered]@{authenticationId='00000000:00001234';userSid='S-1-5-21-111-222-333-1001';sessionId=[int]1}
         LifecycleOwnership=$null;LifecycleOwnershipEntries=0;LifecycleFenceAssertions=0;LifecycleOwnershipExits=0
         ActiveLifecycleRequest=$null;LifecycleSubmissions=[Collections.Generic.Queue[object]]::new();LifecycleSubmissionReceipts=[Collections.Generic.List[object]]::new();CompletedLifecycleRequests=[Collections.Generic.List[object]]::new()
         LifecycleWrites=[Collections.Generic.List[object]]::new();LifecycleMoves=[Collections.Generic.List[string]]::new();StartedLifecycleRequests=[Collections.Generic.List[object]]::new();AutoCompleteLifecycleWorkers=$false
+        WorkerWaitResults=[Collections.Generic.Queue[bool]]::new();WorkerTerminateResults=[Collections.Generic.Queue[bool]]::new()
     }
     $adapters=@{}
     foreach($name in Get-CcodSupervisorAdapterNames){
@@ -169,7 +171,7 @@ function New-CcodSupervisorFake {
     $adapters.GetSupervisorDecision={param($Context)$world.Calls.Add('Decision');$world.Decision}.GetNewClosure()
     $adapters.AddObservedEvent={param($Observed,$Pid,$Created)$world.Calls.Add("Observed:$Pid");$true}.GetNewClosure()
     $adapters.CompleteControllerRun={param($Result,$TransactionId,$Action,$RuntimeId)$world.Calls.Add("Reduce:$Action");[pscustomobject][ordered]@{SessionState='Idle';BlockAutomaticActions=$false;AttemptKey=$null;RecoveryIgnoreKey=$null;SuppressionKey=$null;ErrorCode=$null;Reason='Reduced'}}.GetNewClosure()
-    $adapters.GetTrayPresentation={param($Arguments)[pscustomobject][ordered]@{Color='Gray';StateKey='Waiting';SessionReadyVisible=$false;ApplyNowVisible=$true;ApplyNowEnabled=$true;ManualRetryVisible=$false;ManualRetryEnabled=$false;AutomationToggleEnabled=$true;AutomationChecked=$true;CandidateOptInToggleEnabled=$true;CandidateOptInChecked=$false;OpenLogsEnabled=$true;UninstallEnabled=$false;Busy=$false}}.GetNewClosure()
+    $adapters.GetTrayPresentation={param($Arguments)$world.PresentationInputs.Add($Arguments);[pscustomobject][ordered]@{Color='Gray';StateKey='Waiting';SessionReadyVisible=$false;ApplyNowVisible=$true;ApplyNowEnabled=$true;ManualRetryVisible=$false;ManualRetryEnabled=$false;AutomationToggleEnabled=$true;AutomationChecked=[bool]$Arguments.AutomationEnabled;CandidateOptInToggleEnabled=$true;CandidateOptInChecked=[bool]$Arguments.CandidateCompatibleOptIn;OpenLogsEnabled=$true;UninstallEnabled=$false;Busy=$false}}.GetNewClosure()
     $adapters.NewQueue={param($Kind)$world.Calls.Add("Queue:$Kind");if($Kind -ceq 'Command'){Write-Output -NoEnumerate $world.CommandQueue}else{Write-Output -NoEnumerate $world.EventQueue}}.GetNewClosure()
     $adapters.GetQueueCount={param($Queue)[int]$Queue.Count}.GetNewClosure()
     $adapters.TryDequeue={param($Queue)$world.TryDequeueSawRealQueue=[object]::ReferenceEquals($Queue,$world.CommandQueue);if($Queue.Count){[pscustomobject][ordered]@{Succeeded=$true;Value=$Queue.Dequeue()}}else{[pscustomobject][ordered]@{Succeeded=$false;Value=$null}}}.GetNewClosure()
@@ -182,7 +184,7 @@ function New-CcodSupervisorFake {
     $adapters.StopWatcher={param($Watcher)$world.Calls.Add('Stop:Watcher');if($world.FailAt -ceq 'StopWatcher'){throw 'PRIVATE_WATCHER_STOP_SECRET'};[pscustomobject][ordered]@{SchemaVersion=1;Stopped=$true;CleanupCodes=@()}}.GetNewClosure()
     $adapters.GetWorkerLeafState={param($Path)$world.Calls.Add("Leaf:$([IO.Path]::GetFileName($Path))");[pscustomobject][ordered]@{Exists=$false;IsReparse=$false}}.GetNewClosure()
     $adapters.WriteWorkerRequest={param($Path,$Request)$world.Calls.Add("Write:$($Request.action)");if($null -ne $Request.PSObject.Properties['leaseEpoch']){$world.StartedLifecycleRequests.Add($Request)}}.GetNewClosure()
-    $adapters.StartWorker={param($Kind,$ScriptPath,$RequestPath,$ResultPath,$StderrPath,$Request,$PowerShellPath)$world.Calls.Add("Start:$Kind`:$($Request.action)");[pscustomobject][ordered]@{ProcessId=501;CreationTimeUtc='2030-02-03T03:05:00.0000000Z';Handle=[pscustomobject]@{Kind='Worker'}}}.GetNewClosure()
+    $adapters.StartWorker={param($Kind,$ScriptPath,$RequestPath,$ResultPath,$StderrPath,$Request,$PowerShellPath)$world.Calls.Add("Start:$Kind`:$($Request.action)");[pscustomobject][ordered]@{ProcessId=501;CreationTimeUtc='2030-02-03T03:05:00.0000000Z';Handle=[pscustomobject]@{Kind='Worker'};JobHandle=[pscustomobject]@{Kind='Job';IsClosed=$false};StartupGate=[pscustomobject]@{Name='Fake-Gate';Token=('a'*64);Handle=[pscustomobject]@{Kind='Gate'};Released=$true;Disposed=$false}}}.GetNewClosure()
     $adapters.PollWorker={
         param($Slot)
         $world.Calls.Add("Poll:$($Slot.Kind)")
@@ -198,9 +200,9 @@ function New-CcodSupervisorFake {
         $world.Poll
     }.GetNewClosure()
     $adapters.ReadWorkerResult={param($Path)$world.Calls.Add('Read:WorkerResult');$world.WorkerResult}.GetNewClosure()
-    $adapters.WaitWorker={param($Slot,$Timeout)$world.Calls.Add("Wait:Worker:$Timeout");$true}.GetNewClosure()
+    $adapters.WaitWorker={param($Slot,$Timeout)$world.Calls.Add("Wait:Worker:$Timeout");if($world.WorkerWaitResults.Count){[bool]$world.WorkerWaitResults.Dequeue()}else{$true}}.GetNewClosure()
     $adapters.GetWorkerIdentity={param($Pid)$world.Calls.Add("WorkerIdentity:$Pid");[pscustomobject][ordered]@{Pid=$Pid;CreationTimeUtc='2030-02-03T03:05:00.0000000Z'}}.GetNewClosure()
-    $adapters.TerminateWorker={param($Slot)$world.Calls.Add("Terminate:$($Slot.ProcessId)");$true}.GetNewClosure()
+    $adapters.TerminateWorker={param($Slot)$world.Calls.Add("Terminate:$($Slot.ProcessId)");if($world.WorkerTerminateResults.Count){[bool]$world.WorkerTerminateResults.Dequeue()}else{$true}}.GetNewClosure()
     $adapters.DisposeWorker={param($Slot)$world.Calls.Add("Dispose:$($Slot.ProcessId)")}.GetNewClosure()
     $adapters.DeleteWorkerFile={param($Path)$world.Calls.Add("Delete:$([IO.Path]::GetFileName($Path))")}.GetNewClosure()
     $adapters.ClearFailedAttempt={param($StateRoot,$Package,$Hash,$Runtime,$Timestamp)$world.Calls.Add('Manual:Clear');[pscustomobject][ordered]@{Outcome='Cleared'}}.GetNewClosure()
@@ -407,6 +409,31 @@ Invoke-CcodTest 'continues cleanup after timer watcher tray event and lease fail
         Assert-CcodTrue ($fake.World.Calls.Contains('Exit:AccountSupervisor')) "$stage does not skip final account release attempt"
         Assert-CcodEqual 0 (($receipt|ConvertTo-Json -Compress).Contains('PRIVATE_')) "$stage secret is absent from cleanup receipt"
     }
+}
+
+Invoke-CcodTest 'surviving lifecycle worker keeps framing and lifecycle ownership contained' {
+    $fake=New-CcodSupervisorFake
+    $fake.World.LifecycleSubmissions.Enqueue([pscustomobject][ordered]@{schemaVersion=1;submissionId='dddddddd-eeee-ffff-0000-111111111111';kind='RestartAndRepair';origin='Installer';runtimeId='runtime-1';runtimeGeneration=[UInt64]7;createdAtUtc='2030-02-03T03:04:05.0000000Z'})
+    foreach($value in @($false,$false,$false)){$fake.World.WorkerWaitResults.Enqueue($value)}
+    foreach($value in @($false,$false)){$fake.World.WorkerTerminateResults.Enqueue($value)}
+    $fake.World.TickCount=1
+    $receipt=Invoke-CcodSupervisorHost -ReadyToken $readyToken -Adapters $fake.Adapters
+    Assert-CcodReceipt $receipt 'Stopped' 0
+    Assert-CcodTrue ($receipt.CleanupCodes-ccontains'CCOD_SUPERVISOR_WORKER_SURVIVED') 'survivor produces one stable cleanup diagnostic'
+    Assert-CcodEqual 0 @($fake.World.Calls|Where-Object{$_ -like 'Dispose:*' -or $_ -like 'Delete:*'}).Count 'survivor retains process Job gate and framing files'
+    Assert-CcodEqual 0 @($fake.World.Calls|Where-Object{$_ -like 'Exit:LifecycleOwnership:*' -or $_ -eq 'Exit:Supervisor' -or $_ -eq 'Exit:AccountSupervisor'}).Count 'survivor prevents every explicit ownership release'
+}
+
+Invoke-CcodTest 'shutdown waits and cleans a reachable StaticProbe before lifecycle ownership release' {
+    $fake=New-CcodSupervisorFake;$target=New-CcodSupervisorTestSnapshot
+    $fake.World.ProcessIds=@([int]$target.Pid);$fake.World.Snapshots[[int]$target.Pid]=$target
+    $fake.World.Decision=[pscustomobject][ordered]@{Action='InspectOrdinary';Reason='StaticProbeRequired';Target=$target;AttemptKey='71|2030-02-03T03:01:00.0000000Z';SuppressionKey=$null;EffectiveClassification=$null;RequiresController=$true}
+    $fake.World.TickCount=1
+    $receipt=Invoke-CcodSupervisorHost -ReadyToken $readyToken -Adapters $fake.Adapters
+    Assert-CcodReceipt $receipt 'Stopped' 0
+    $calls=@($fake.World.Calls);$wait=[Array]::IndexOf($calls,'Wait:Worker:2000');$dispose=[Array]::IndexOf($calls,'Dispose:501');$release=[Array]::IndexOf($calls,'Exit:LifecycleOwnership:11')
+    Assert-CcodTrue ($wait-ge0-and$dispose-gt$wait-and$release-gt$dispose) 'StaticProbe exit is proven and handles/files are cleaned before epoch release'
+    Assert-CcodEqual 2 @($calls|Where-Object{$_ -like 'Delete:static-probe-*'}).Count 'StaticProbe request and result framing are both removed'
 }
 
 Invoke-CcodTest 'rejects malformed or partial adapter sets before any lifecycle action' {
@@ -1027,6 +1054,22 @@ Invoke-CcodTest 'routes repair and apply decisions into durable lifecycle while 
             Assert-CcodTrue ($null-ne$hostState.LifecycleRequest -and $hostState.LifecycleRequest.kind-ceq'CheckAndRepair') "$($case.Decision) creates one durable CheckAndRepair request"
         }
     }
+}
+
+Invoke-CcodTest 'false migration preferences remain truthful in presentation while guardian Apply proceeds' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $hostState.State.AutomationEnabled=$false;$hostState.State.AutomaticCandidateTrialsAllowed=$false
+    $hostState.State.Settings.candidateCompatibleOptIn=$false
+    $hostState.PackageFullName='OpenAI.Codex_1.0.0.0_x64__2p2nqsd0c76g0';$hostState.AppAsarSha256=('a'*64);$hostState.Classification='CandidateCompatible'
+    $ordinary=New-CcodSupervisorTestSnapshot;$world.ProcessIds=@([int]$ordinary.Pid);$world.Snapshots[[int]$ordinary.Pid]=$ordinary
+    $fixture.Fake.Adapters.ReadState={param($StateRoot,$SuppressionKey)$hostState.State}.GetNewClosure()
+    $fixture.Fake.Adapters.GetSupervisorDecision={param($Context)$world.Calls.Add('Decision');Get-CcodSupervisorDecision -Context $Context}.GetNewClosure()
+    Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
+    Assert-CcodTrue ($null-ne$hostState.LifecycleRequest -and $hostState.LifecycleRequest.kind-ceq'CheckAndRepair') 'guardian creates the durable Apply lifecycle despite false migration values'
+    Assert-CcodTrue ($world.PresentationInputs.Count-gt0) 'one truthful presentation input is projected'
+    $presentationInput=$world.PresentationInputs[$world.PresentationInputs.Count-1]
+    Assert-CcodEqual $false $presentationInput.AutomationEnabled 'presentation preserves persisted false automation migration value'
+    Assert-CcodEqual $false $presentationInput.CandidateCompatibleOptIn 'presentation preserves persisted false candidate migration value'
 }
 
 Invoke-CcodTest 'Apply controller request carries the full process snapshot source' {

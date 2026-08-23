@@ -497,28 +497,31 @@ function Invoke-CcodSessionController {
             $total=[Math]::Min([int]$Request.timeoutMilliseconds,5000)
             try{
                 $clock=& $adapter.StartStopwatch
-                $remaining=Get-CcodControllerRemainingBudget $total $clock $adapter
-                $accountLease=& $adapter.EnterMutex 'AccountTransition' $identity.UserSid $null $remaining
-                Assert-CcodControllerLeaseResult $accountLease 'AccountTransition' $identity
-                if($accountLease.Outcome -ceq 'TimedOut'){$result=New-CcodControllerErrorResult $Request 'CCOD_TRANSITION_BUSY' 'LeaseAcquire' 'The transition lease is busy.'}
+                $delegatedLifecycle=$Request.schemaVersion -eq 2
+                if($delegatedLifecycle){Assert-CcodControllerMutationFence $Request $Paths $adapter}
                 else{
-                    $accountLeaseAcquired=$true
+                    $remaining=Get-CcodControllerRemainingBudget $total $clock $adapter
+                    $accountLease=& $adapter.EnterMutex 'AccountTransition' $identity.UserSid $null $remaining
+                    Assert-CcodControllerLeaseResult $accountLease 'AccountTransition' $identity
+                    if($accountLease.Outcome -ceq 'TimedOut'){$result=New-CcodControllerErrorResult $Request 'CCOD_TRANSITION_BUSY' 'LeaseAcquire' 'The transition lease is busy.'}
+                    else{$accountLeaseAcquired=$true}
+                }
+                if($null-eq$result){
                     $remaining=Get-CcodControllerRemainingBudget $total $clock $adapter
                     $sessionLease=& $adapter.EnterMutex 'Transition' $identity.UserSid $identity.SessionId $remaining
                     Assert-CcodControllerLeaseResult $sessionLease 'Transition' $identity
                     if($sessionLease.Outcome -ceq 'TimedOut'){$result=New-CcodControllerErrorResult $Request 'CCOD_TRANSITION_BUSY' 'LeaseAcquire' 'The transition lease is busy.'}
                     else{
                         $sessionLeaseAcquired=$true
-                        if($accountLease.Abandoned -or $sessionLease.Abandoned){[void](Write-CcodControllerAbandonedWarning $Request $Paths $adapter)}
+                        if(($accountLeaseAcquired-and$accountLease.Abandoned)-or$sessionLease.Abandoned){[void](Write-CcodControllerAbandonedWarning $Request $Paths $adapter)}
                         try{$active=& $adapter.ReadJournal $Paths.TransitionPath}catch{
                             $code=Get-CcodControllerStableTransitionCode $_
                             $result=New-CcodControllerErrorResult $Request $code 'JournalPreflight' 'The transition journal failed strict validation.'
                             $diagnosticWritten=Write-CcodControllerDiagnostic $result $Request $Paths $adapter
                         }
                         if($null -eq $result){
-                            if($null -ne $active){
-                                $result=New-CcodControllerErrorResult $Request 'CCOD_TRANSITION_REPLAY_REQUIRED' 'ReplayRequired' 'An active transition requires recovery.'
-                            }else{
+                            if($null -ne $active){$result=New-CcodControllerErrorResult $Request 'CCOD_TRANSITION_REPLAY_REQUIRED' 'ReplayRequired' 'An active transition requires recovery.'}
+                            else{
                                 try{
                                     $engineAdapters=@{AssertLifecycleFence={param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity)& $adapter.AssertLifecycleFence $RuntimeGeneration $LeaseEpoch $OwnerIdentity $Request.runtimeId (Split-Path -Parent $Paths.StateRoot)}.GetNewClosure()}
                                     $output=@(& $adapter.EngineInvoker $Request.action $Request $Paths $engineAdapters)

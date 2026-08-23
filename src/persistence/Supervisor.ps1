@@ -28,6 +28,7 @@ $script:CcodSupervisorUiKeys=@(
 $script:CcodSupervisorCleanupAllowlist=@(
     'CCOD_SUPERVISOR_LOG_FAILED','CCOD_SUPERVISOR_TIMER_STOP_FAILED','CCOD_SUPERVISOR_WORKER_WAIT_FAILED',
     'CCOD_SUPERVISOR_WORKER_TERMINATE_FAILED','CCOD_SUPERVISOR_WORKER_DISPOSE_FAILED','CCOD_SUPERVISOR_WORKER_FILE_DELETE_FAILED',
+    'CCOD_SUPERVISOR_WORKER_SURVIVED',
     'CCOD_SUPERVISOR_WATCHER_STOP_FAILED','CCOD_SUPERVISOR_QUEUE_DRAIN_FAILED','CCOD_SUPERVISOR_TRAY_CLOSE_FAILED',
     'CCOD_SUPERVISOR_READY_CLOSE_FAILED','CCOD_SUPERVISOR_SHUTDOWN_CLOSE_FAILED','CCOD_SUPERVISOR_LOCAL_RELEASE_FAILED',
     'CCOD_SUPERVISOR_LIFECYCLE_WAKE_CLOSE_FAILED','CCOD_SUPERVISOR_LIFECYCLE_RELEASE_FAILED','CCOD_SUPERVISOR_ACCOUNT_RELEASE_FAILED'
@@ -623,8 +624,8 @@ function Start-CcodSupervisorLifecycleWorkerSlot {
         Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
         Invoke-CcodSupervisorAdapter $Adapters.WriteWorkerRequest @($paths.RequestPath,$workerRequest) 0;$owned.Add($paths.RequestPath)
         $started=Invoke-CcodSupervisorAdapter $Adapters.StartWorker @('Lifecycle',$HostState.Layout.LifecycleWorkerPath,$paths.RequestPath,$paths.ResultPath,$null,$workerRequest,$HostState.Layout.PowerShellPath) 1
-        if(-not(Test-CcodSupervisorExactProperties $started @('ProcessId','CreationTimeUtc','Handle')) -or $started.ProcessId-isnot[int] -or $started.ProcessId-lt1 -or -not(Test-CcodSupervisorCanonicalUtc $started.CreationTimeUtc) -or $null-eq$started.Handle){throw 'lifecycle worker start receipt is invalid'}
-        $HostState.LifecycleWorkerSlot=[pscustomobject][ordered]@{Kind='Lifecycle';Action=$Action;RequestId=$requestState.transactionId;RuntimeId=$requestState.runtimeId;Request=$workerRequest;RequestPath=$paths.RequestPath;ResultPath=$paths.ResultPath;StderrPath=$null;ProcessId=[int]$started.ProcessId;CreationTimeUtc=$started.CreationTimeUtc;Handle=$started.Handle}
+        if(-not(Test-CcodSupervisorExactProperties $started @('ProcessId','CreationTimeUtc','Handle','JobHandle','StartupGate')) -or $started.ProcessId-isnot[int] -or $started.ProcessId-lt1 -or -not(Test-CcodSupervisorCanonicalUtc $started.CreationTimeUtc) -or $null-eq$started.Handle -or $null-eq$started.JobHandle -or $null-eq$started.StartupGate){throw 'lifecycle worker start receipt is invalid'}
+        $HostState.LifecycleWorkerSlot=[pscustomobject][ordered]@{Kind='Lifecycle';Action=$Action;RequestId=$requestState.transactionId;RuntimeId=$requestState.runtimeId;Request=$workerRequest;RequestPath=$paths.RequestPath;ResultPath=$paths.ResultPath;StderrPath=$null;ProcessId=[int]$started.ProcessId;CreationTimeUtc=$started.CreationTimeUtc;Handle=$started.Handle;JobHandle=$started.JobHandle;StartupGate=$started.StartupGate}
         return $HostState.LifecycleWorkerSlot
     }catch{foreach($path in @($owned)){try{Invoke-CcodSupervisorAdapter $Adapters.DeleteWorkerFile @($path) 0}catch{}};throw}
 }
@@ -635,6 +636,20 @@ function Clear-CcodSupervisorLifecycleWorkerSlot {
     try{Invoke-CcodSupervisorAdapter $Adapters.DisposeWorker @($slot) 0}catch{Add-CcodSupervisorCleanupCode $HostState.RuntimeCleanupCodes 'CCOD_SUPERVISOR_WORKER_DISPOSE_FAILED'}
     foreach($path in @($slot.RequestPath,$slot.ResultPath)){try{Invoke-CcodSupervisorAdapter $Adapters.DeleteWorkerFile @($path) 0}catch{Add-CcodSupervisorCleanupCode $HostState.RuntimeCleanupCodes 'CCOD_SUPERVISOR_WORKER_FILE_DELETE_FAILED'}}
     $HostState.LifecycleWorkerSlot=$null
+}
+
+function Stop-CcodSupervisorOwnedWorkerForShutdown {
+    param($HostState,[hashtable]$Adapters,[ValidateSet('LifecycleWorkerSlot','WorkerSlot')][string]$PropertyName,[Collections.Generic.List[string]]$Codes)
+    $slot=$HostState.$PropertyName;if($null-eq$slot){return $true}
+    $proven=$false
+    try{$waited=Invoke-CcodSupervisorAdapter $Adapters.WaitWorker @($slot,[int]2000) 1;if($waited-is[bool]-and$waited){$proven=$true}}catch{Add-CcodSupervisorCleanupCode $Codes 'CCOD_SUPERVISOR_WORKER_WAIT_FAILED'}
+    for($attempt=0;$attempt-lt2-and-not$proven;$attempt++){
+        try{$terminated=Invoke-CcodSupervisorAdapter $Adapters.TerminateWorker @($slot) 1;if($terminated-isnot[bool]){throw 'termination receipt'}}catch{Add-CcodSupervisorCleanupCode $Codes 'CCOD_SUPERVISOR_WORKER_TERMINATE_FAILED'}
+        try{$waited=Invoke-CcodSupervisorAdapter $Adapters.WaitWorker @($slot,[int]5000) 1;if($waited-is[bool]-and$waited){$proven=$true}}catch{Add-CcodSupervisorCleanupCode $Codes 'CCOD_SUPERVISOR_WORKER_WAIT_FAILED'}
+    }
+    if(-not$proven){Add-CcodSupervisorCleanupCode $Codes 'CCOD_SUPERVISOR_WORKER_SURVIVED';return $false}
+    if($PropertyName-ceq'LifecycleWorkerSlot'){Clear-CcodSupervisorLifecycleWorkerSlot $HostState $Adapters}else{Clear-CcodSupervisorWorkerSlot $HostState $Adapters}
+    return $true
 }
 
 function Test-CcodSupervisorLifecycleTerminal {
@@ -792,12 +807,12 @@ function Start-CcodSupervisorWorkerSlot {
         Invoke-CcodSupervisorAdapter $Adapters.WriteWorkerRequest @($paths.RequestPath,$request) 0;$ownedFiles.Add($paths.RequestPath)
         $scriptPath=if($Kind -ceq 'StaticProbe'){$HostState.Layout.StaticWorkerPath}else{$HostState.Layout.ControllerPath}
         $started=Invoke-CcodSupervisorAdapter $Adapters.StartWorker @($Kind,$scriptPath,$paths.RequestPath,$paths.ResultPath,$paths.StderrPath,$request,$HostState.Layout.PowerShellPath) 1
-        if(-not (Test-CcodSupervisorExactProperties $started @('ProcessId','CreationTimeUtc','Handle')) -or $started.ProcessId -isnot [int] -or $started.ProcessId -lt 1 -or
-           -not (Test-CcodSupervisorCanonicalUtc $started.CreationTimeUtc) -or $null -eq $started.Handle){throw 'worker start receipt is invalid'}
+        if(-not (Test-CcodSupervisorExactProperties $started @('ProcessId','CreationTimeUtc','Handle','JobHandle','StartupGate')) -or $started.ProcessId -isnot [int] -or $started.ProcessId -lt 1 -or
+           -not (Test-CcodSupervisorCanonicalUtc $started.CreationTimeUtc) -or $null -eq $started.Handle -or $null-eq$started.JobHandle -or $null-eq$started.StartupGate){throw 'worker start receipt is invalid'}
         $HostState.WorkerSlot=[pscustomobject][ordered]@{
             Kind=$Kind;Action=$request.action;RequestId=$requestId;RuntimeId=$HostState.Layout.RuntimeId;Request=$request
             RequestPath=$paths.RequestPath;ResultPath=$paths.ResultPath;StderrPath=$paths.StderrPath
-            ProcessId=[int]$started.ProcessId;CreationTimeUtc=$started.CreationTimeUtc;Handle=$started.Handle
+            ProcessId=[int]$started.ProcessId;CreationTimeUtc=$started.CreationTimeUtc;Handle=$started.Handle;JobHandle=$started.JobHandle;StartupGate=$started.StartupGate
         }
         return $HostState.WorkerSlot
     }catch{
@@ -1048,11 +1063,13 @@ function Invoke-CcodSupervisorCommand {
 function New-CcodSupervisorEngineContext {
     param($HostState)
     $state=$HostState.State
+    $automation=$false;if($null-ne$state.PSObject.Properties['AutomationEnabled']-and$state.AutomationEnabled-is[bool]){$automation=[bool]$state.AutomationEnabled}
+    $candidate=$false;if($null-ne$state.PSObject.Properties['Settings']-and$null-ne$state.Settings-and$null-ne$state.Settings.PSObject.Properties['candidateCompatibleOptIn']-and$state.Settings.candidateCompatibleOptIn-is[bool]){$candidate=[bool]$state.Settings.candidateCompatibleOptIn}
     $verified=if($null -ne $state.PSObject.Properties['VerifiedPackages']){$state.VerifiedPackages}else{$null}
     $damaged=$null -eq $verified
     if($null -ne $state.PSObject.Properties['Damage'] -and $null -ne $state.Damage){$damaged=$damaged -or @($state.Damage.PSObject.Properties).Count -gt 0}
     [pscustomobject][ordered]@{
-        AutomationEnabled=$true;CandidateCompatibleOptIn=$true
+        AutomationEnabled=$automation;CandidateCompatibleOptIn=$candidate
         AutomaticCandidateTrialsAllowed=$(if($null -ne $state.PSObject.Properties['AutomaticCandidateTrialsAllowed']){[bool]$state.AutomaticCandidateTrialsAllowed}else{$false})
         StateDamageBlocksActions=[bool]$damaged;ControllerRunning=[bool]($null -ne $HostState.WorkerSlot);ActiveTransaction=$HostState.Journal
         CurrentUserSid=$HostState.Identity.UserSid;CurrentSessionId=[int]$HostState.Identity.SessionId;RuntimeId=$HostState.Layout.RuntimeId
@@ -1308,7 +1325,7 @@ function Invoke-CcodSupervisorHost {
     if($null -eq $adapter){return New-CcodSupervisorReceipt 'StartupRejected' 2 @()}
     $codes=[Collections.Generic.List[string]]::new();$outcome='Failed';$exitCode=1
     $accountLease=$null;$localLease=$null;$accountOwned=$false;$localOwned=$false
-    $lifecycleOwnership=$null;$lifecycleOwned=$false;$lifecycleWakeEvent=$null;$readyEvent=$null;$shutdownEvent=$null;$commandQueue=$null;$eventQueue=$null;$tray=$null;$watcher=$null;$hostState=$null
+    $lifecycleOwnership=$null;$lifecycleOwned=$false;$workerCleanupSafe=$true;$lifecycleWakeEvent=$null;$readyEvent=$null;$shutdownEvent=$null;$commandQueue=$null;$eventQueue=$null;$tray=$null;$watcher=$null;$hostState=$null
     try{
         do{
             $identity=Invoke-CcodSupervisorAdapter $adapter.GetIdentity @() 1
@@ -1388,12 +1405,7 @@ function Invoke-CcodSupervisorHost {
     }catch{$outcome='Failed';$exitCode=1}
     finally{
         if($null -ne $hostState){$hostState.ShutdownRequested=$true}
-        if($null-ne$hostState -and $null-ne$hostState.LifecycleWorkerSlot){
-            $stopped=$false
-            try{$stopped=Invoke-CcodSupervisorAdapter $adapter.WaitWorker @($hostState.LifecycleWorkerSlot,[int]2000) 1}catch{Add-CcodSupervisorCleanupCode $codes 'CCOD_SUPERVISOR_WORKER_WAIT_FAILED'}
-            if($stopped-isnot[bool] -or -not$stopped){try{[void](Invoke-CcodSupervisorAdapter $adapter.TerminateWorker @($hostState.LifecycleWorkerSlot) 1)}catch{Add-CcodSupervisorCleanupCode $codes 'CCOD_SUPERVISOR_WORKER_TERMINATE_FAILED'}}
-            Clear-CcodSupervisorLifecycleWorkerSlot $hostState $adapter
-        }
+        if($null-ne$hostState){if(-not(Stop-CcodSupervisorOwnedWorkerForShutdown $hostState $adapter LifecycleWorkerSlot $codes)){$workerCleanupSafe=$false};if(-not(Stop-CcodSupervisorOwnedWorkerForShutdown $hostState $adapter WorkerSlot $codes)){$workerCleanupSafe=$false}}
         if($null -ne $tray){Invoke-CcodSupervisorCleanupStage {Invoke-CcodSupervisorAdapter $adapter.StopTrayTimer @($tray) 0} $codes 'CCOD_SUPERVISOR_TIMER_STOP_FAILED'}
         if($null -ne $watcher){Invoke-CcodSupervisorCleanupStage {Invoke-CcodSupervisorAdapter $adapter.StopWatcher @($watcher) 1|Out-Null} $codes 'CCOD_SUPERVISOR_WATCHER_STOP_FAILED'}
         if($null -ne $eventQueue){Invoke-CcodSupervisorCleanupStage {Invoke-CcodSupervisorDrainQueue $eventQueue $adapter} $codes 'CCOD_SUPERVISOR_QUEUE_DRAIN_FAILED'}
@@ -1402,9 +1414,12 @@ function Invoke-CcodSupervisorHost {
         if($null -ne $readyEvent){Invoke-CcodSupervisorCleanupStage {Invoke-CcodSupervisorAdapter $adapter.CloseEvent @($readyEvent) 0} $codes 'CCOD_SUPERVISOR_READY_CLOSE_FAILED'}
         if($null -ne $shutdownEvent){Invoke-CcodSupervisorCleanupStage {Invoke-CcodSupervisorAdapter $adapter.CloseEvent @($shutdownEvent) 0} $codes 'CCOD_SUPERVISOR_SHUTDOWN_CLOSE_FAILED'}
         if($null-ne$lifecycleWakeEvent){Invoke-CcodSupervisorCleanupStage {Invoke-CcodSupervisorAdapter $adapter.CloseEvent @($lifecycleWakeEvent) 0} $codes 'CCOD_SUPERVISOR_LIFECYCLE_WAKE_CLOSE_FAILED'}
-        if($lifecycleOwned){Invoke-CcodSupervisorCleanupStage {$released=Invoke-CcodSupervisorAdapter $adapter.ExitLifecycleOwnership @($lifecycleOwnership) 1;if($released-isnot[bool] -or -not$released -or -not$lifecycleOwnership.released){throw 'lifecycle ownership release failed'}} $codes 'CCOD_SUPERVISOR_LIFECYCLE_RELEASE_FAILED'}
-        if($localOwned){Invoke-CcodSupervisorCleanupStage {$released=Invoke-CcodSupervisorAdapter $adapter.ExitLease @($localLease) 1;if($released -isnot [bool] -or -not $released){throw 'local lease release failed'}} $codes 'CCOD_SUPERVISOR_LOCAL_RELEASE_FAILED'}
-        if($accountOwned){Invoke-CcodSupervisorCleanupStage {$released=Invoke-CcodSupervisorAdapter $adapter.ExitLease @($accountLease) 1;if($released -isnot [bool] -or -not $released){throw 'account lease release failed'}} $codes 'CCOD_SUPERVISOR_ACCOUNT_RELEASE_FAILED'}
+        if($null-ne$hostState){foreach($runtimeCode in @($hostState.RuntimeCleanupCodes)){Add-CcodSupervisorCleanupCode $codes $runtimeCode}}
+        if($workerCleanupSafe){
+            if($lifecycleOwned){Invoke-CcodSupervisorCleanupStage {$released=Invoke-CcodSupervisorAdapter $adapter.ExitLifecycleOwnership @($lifecycleOwnership) 1;if($released-isnot[bool] -or -not$released -or -not$lifecycleOwnership.released){throw 'lifecycle ownership release failed'}} $codes 'CCOD_SUPERVISOR_LIFECYCLE_RELEASE_FAILED'}
+            if($localOwned){Invoke-CcodSupervisorCleanupStage {$released=Invoke-CcodSupervisorAdapter $adapter.ExitLease @($localLease) 1;if($released -isnot [bool] -or -not $released){throw 'local lease release failed'}} $codes 'CCOD_SUPERVISOR_LOCAL_RELEASE_FAILED'}
+            if($accountOwned){Invoke-CcodSupervisorCleanupStage {$released=Invoke-CcodSupervisorAdapter $adapter.ExitLease @($accountLease) 1;if($released -isnot [bool] -or -not $released){throw 'account lease release failed'}} $codes 'CCOD_SUPERVISOR_ACCOUNT_RELEASE_FAILED'}
+        }
         $script:CcodSupervisorLogPath=$null
     }
     return New-CcodSupervisorReceipt $outcome $exitCode @($codes)

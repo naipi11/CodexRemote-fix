@@ -1,11 +1,16 @@
 [CmdletBinding()]
-param([string]$RequestPath,[string]$ResultPath)
+param([string]$RequestPath,[string]$ResultPath,[string]$StartupGateName,[string]$StartupGateToken,[int]$ExpectedParentPid,[string]$ExpectedParentCreationTimeUtc)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
 $VerbosePreference='SilentlyContinue'
 $InformationPreference='SilentlyContinue'
+
+if($MyInvocation.InvocationName-ne'.'){
+    Import-Module (Join-Path $PSScriptRoot 'modules\WorkerRuntime.psm1') -Force
+    [void](Wait-CcodWorkerStartupGate -GateName $StartupGateName -GateToken $StartupGateToken -ExpectedParentPid $ExpectedParentPid -ExpectedParentCreationTimeUtc $ExpectedParentCreationTimeUtc -TimeoutMilliseconds 15000)
+}
 
 $script:CcodLifecycleWorkerScriptPath=if([string]::IsNullOrWhiteSpace($PSCommandPath)){$null}else{[IO.Path]::GetFullPath($PSCommandPath)}
 $script:CcodLifecycleWorkerRequestFields=@('schemaVersion','transactionId','action','runtimeId','runtimeGeneration','leaseEpoch','ownerIdentity','notBeforeUtc','timeoutMilliseconds')

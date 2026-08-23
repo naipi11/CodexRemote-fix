@@ -926,6 +926,19 @@ try {
         Assert-CcodEqual 0 $foreignSourceCounters.SpecialStart 'foreign-session explicit source is never stopped or replaced'
     }
 
+    Invoke-CcodTest 'schema-v2 Apply ignores legacy false preferences when internal package compatibility is healthy' {
+        $source=New-CcodEngineSnapshot
+        $state=New-CcodEngineState
+        $state.AutomationEnabled=$false
+        $state.AutomaticCandidateTrialsAllowed=$false
+        $state.Settings.automationEnabled=$false
+        $state.Settings.candidateCompatibleOptIn=$false
+        $events=[Collections.Generic.List[string]]::new();$counters=[pscustomobject]@{SpecialStart=0;OrdinaryStart=0;Recover=0;Node=0}
+        $result=Invoke-CcodApplySession -Request (New-CcodEngineRequest -Action Apply -Source $source -TransactionId '4dd6f31d-874f-49d4-8705-c1813d5a5ae0') -Paths $paths -Adapters (New-CcodEngineAdapters -State $state -Processes @($source) -Events $events -Counters $counters)
+        Assert-CcodEqual 'Activated' $result.outcome 'healthy internal compatibility still applies under false migration preferences'
+        Assert-CcodEqual 1 $counters.SpecialStart 'false migration preferences do not suppress the schema-v2 operation'
+    }
+
     Invoke-CcodTest 'rejects damaged status before old verified history can authorize Apply' {
         $state=New-CcodEngineState
         $state.StatusRebuildRequired=$true
