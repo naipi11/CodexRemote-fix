@@ -483,14 +483,14 @@ function Write-CcodControllerFencedResult($Request,$Paths,[string]$ResultPath,$V
     & $Adapter.WriteResult $ResultPath $Value|Out-Null
 }
 
-$controllerCoreSource=@'
-    param($Request,$Paths,[string]$ResultPath,[hashtable]$Adapters)
-    $LegacyRecoverAuthorized=$false
+function Invoke-CcodSessionController {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Request,[Parameter(Mandatory)]$Paths,[Parameter(Mandatory)][string]$ResultPath,[hashtable]$Adapters)
     $adapter=Get-CcodControllerAdapters $Adapters;$result=$null;$intendedResult=$null;$diagnosticWritten=$false;$accountLease=$null;$sessionLease=$null;$accountLeaseAcquired=$false;$sessionLeaseAcquired=$false;$releaseFailed=$false;$provisionalRequired=$false;$initialResultWriteFailed=$false
     try{
         try{$identity=& $adapter.GetIdentity}catch{$identity=$null}
         try{$supervisorProcess=& $adapter.GetSupervisorProcess $Request.supervisorIdentity.pid}catch{$supervisorProcess=$null}
-        $leaseInputValid=if($LegacyRecoverAuthorized){Test-CcodControllerLegacyRecoverInput $Request $identity $supervisorProcess}else{Test-CcodControllerLeaseInput $Request $identity $supervisorProcess}
+        $leaseInputValid=Test-CcodControllerLeaseInput $Request $identity $supervisorProcess
         if(-not $leaseInputValid){
             $result=New-CcodControllerErrorResult $Request 'CCOD_REQUEST_INVALID' 'InputValidation' 'The request does not match this controller session.'
         }else{
@@ -516,7 +516,7 @@ $controllerCoreSource=@'
                             $diagnosticWritten=Write-CcodControllerDiagnostic $result $Request $Paths $adapter
                         }
                         if($null -eq $result){
-                            if($null -ne $active -and $Request.action -cne 'Recover'){
+                            if($null -ne $active){
                                 $result=New-CcodControllerErrorResult $Request 'CCOD_TRANSITION_REPLAY_REQUIRED' 'ReplayRequired' 'An active transition requires recovery.'
                             }else{
                                 try{
@@ -570,10 +570,7 @@ $controllerCoreSource=@'
     & $adapter.WriteStdout $line|Out-Null
     $safe=@('Activated','Inspected','NoAction','Recovered','Closed') -ccontains $result.outcome
     return [pscustomobject][ordered]@{Result=$result;ExitCode=if($safe){0}else{1}}
-'@
-$publicControllerInvoker=[scriptblock]::Create($controllerCoreSource)
-Set-Item -Path Function:Invoke-CcodSessionController -Value $publicControllerInvoker
-$controllerCoreSource=$null;$publicControllerInvoker=$null;$CcodControllerExecutionLegacyInvoker=$null
+}
 
 function Get-CcodControllerInstallRoot {
     $localAppData=[Environment]::GetEnvironmentVariable('LOCALAPPDATA','Process')
@@ -663,12 +660,39 @@ if($MyInvocation.InvocationName -ne '.'){
         $resolvedLegacyAdapters=Get-CcodControllerAdapters $null
         $legacyAuthorized=Test-CcodLegacyRecoverProvenance -Request $request -RequestPath $RequestPath -ResultPath $ResultPath -RuntimeContext $runtimeContext -Adapter $resolvedLegacyAdapters
         if($legacyAuthorized){
-            $legacyCoreSource=(Get-Command Invoke-CcodSessionController -CommandType Function).ScriptBlock.ToString().Replace('$LegacyRecoverAuthorized=$false','$LegacyRecoverAuthorized=$true')
-            $CcodControllerExecutionLegacyInvoker=[scriptblock]::Create($legacyCoreSource);$legacyCoreSource=$null
-            $run=& $CcodControllerExecutionLegacyInvoker $request $paths $ResultPath $resolvedLegacyAdapters
+            $legacyExecution={
+                param($LegacyRequest,$LegacyPaths,[string]$LegacyResultPath,[hashtable]$LegacyAdapter)
+                $legacyResult=$null;$accountLease=$null;$sessionLease=$null;$identity=$null;$releaseFailed=$false
+                try{
+                    $identity=& $LegacyAdapter.GetIdentity
+                    $supervisor=& $LegacyAdapter.GetSupervisorProcess $LegacyRequest.supervisorIdentity.pid
+                    if(-not (Test-CcodControllerLegacyRecoverInput $LegacyRequest $identity $supervisor)){throw 'legacy input changed after provenance'}
+                    $clock=& $LegacyAdapter.StartStopwatch;$total=[Math]::Min([int]$LegacyRequest.timeoutMilliseconds,5000)
+                    $accountLease=& $LegacyAdapter.EnterMutex 'AccountTransition' $identity.UserSid $null (Get-CcodControllerRemainingBudget $total $clock $LegacyAdapter)
+                    Assert-CcodControllerLeaseResult $accountLease 'AccountTransition' $identity
+                    if($accountLease.Outcome -cne 'Acquired'){throw 'legacy account transition lease is busy'}
+                    $sessionLease=& $LegacyAdapter.EnterMutex 'Transition' $identity.UserSid $identity.SessionId (Get-CcodControllerRemainingBudget $total $clock $LegacyAdapter)
+                    Assert-CcodControllerLeaseResult $sessionLease 'Transition' $identity
+                    if($sessionLease.Outcome -cne 'Acquired'){throw 'legacy session transition lease is busy'}
+                    $output=@(& $LegacyAdapter.EngineInvoker 'Recover' $LegacyRequest $LegacyPaths @{})
+                    $candidates=@($output|Where-Object{$_ -is [pscustomobject] -and $null -ne $_.PSObject.Properties['schemaVersion']})
+                    if($candidates.Count -ne 1){throw 'legacy engine returned invalid framing'}
+                    $legacyResult=$candidates[0];Assert-CcodControllerEngineResult $legacyResult $LegacyRequest
+                }catch{
+                    $legacyResult=New-CcodControllerErrorResult $LegacyRequest 'CCOD_CONTROLLER_ENGINE_RESULT_INVALID' 'LegacyRecover' 'Legacy recovery failed safely.'
+                }finally{
+                    if($null -ne $sessionLease -and $sessionLease.Outcome -ceq 'Acquired'){try{if(-not (& $LegacyAdapter.ExitMutex $sessionLease)){$releaseFailed=$true}}catch{$releaseFailed=$true}}
+                    if($null -ne $accountLease -and $accountLease.Outcome -ceq 'Acquired'){try{if(-not (& $LegacyAdapter.ExitMutex $accountLease)){$releaseFailed=$true}}catch{$releaseFailed=$true}}
+                }
+                if($releaseFailed){$legacyResult=New-CcodControllerErrorResult $LegacyRequest 'CCOD_KERNEL_RELEASE_FAILED' 'LeaseRelease' 'Legacy recovery lease release failed safely.'}
+                try{& $LegacyAdapter.WriteResult $LegacyResultPath $legacyResult|Out-Null}catch{$legacyResult=New-CcodControllerErrorResult $LegacyRequest 'CCOD_CONTROLLER_RESULT_WRITE_FAILED' 'ResultWrite' 'Legacy recovery result write failed safely.'}
+                & $LegacyAdapter.WriteStdout ($legacyResult|ConvertTo-Json -Depth 16 -Compress)|Out-Null
+                $safe=@('NoAction','Recovered','Closed') -ccontains $legacyResult.outcome
+                [pscustomobject][ordered]@{Result=$legacyResult;ExitCode=if($safe){0}else{1}}
+            }
+            $run=& $legacyExecution $request $paths $ResultPath $resolvedLegacyAdapters;$legacyExecution=$null
         }
         else{$run=Invoke-CcodSessionController -Request $request -Paths $paths -ResultPath $ResultPath}
     }else{$run=Invoke-CcodSessionController -Request $request -Paths $paths -ResultPath $ResultPath}
-    $CcodControllerExecutionLegacyInvoker=$null
     exit $run.ExitCode
-}else{$CcodControllerExecutionLegacyInvoker=$null}
+}

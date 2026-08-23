@@ -168,6 +168,13 @@ try{
         foreach($command in @(Get-Command -CommandType Function|Where-Object{$_.ScriptBlock.File -ceq (Join-Path $repositoryRoot 'src\persistence\SessionController.ps1')})){
             Assert-CcodTrue (-not $command.Parameters.ContainsKey('LegacyRecoverAuthorized')) "$($command.Name) cannot accept legacy authorization"
         }
+        $publicText=(Get-Command Invoke-CcodSessionController -CommandType Function).ScriptBlock.ToString()
+        Assert-CcodTrue ($publicText -cnotmatch 'LegacyRecoverAuthorized|legacy capability') 'public controller text contains no legacy authorization branch or token'
+        $reconstructed=[scriptblock]::Create($publicText.Replace('$LegacyRecoverAuthorized=$false','$LegacyRecoverAuthorized=$true'))
+        $beforeReconstruction=$calls.Engine
+        $reconstructedRun=& $reconstructed $request $paths $resultPath (Merge-CcodControllerTestAdapters @{EngineInvoker={param($Action,$Request,$Paths)$calls.Engine++;New-CcodControllerResult $Action $Request.transactionId Recovered}.GetNewClosure();WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}})
+        Assert-CcodEqual 'CCOD_REQUEST_INVALID' $reconstructedRun.Result.error.code 'prior public-text replacement cannot reconstruct legacy authority'
+        Assert-CcodEqual $beforeReconstruction $calls.Engine 'reconstructed public scriptblock cannot reach legacy engine'
 
         $legacyRoot=[IO.Path]::GetFullPath((Join-Path $root 'legacy-temp\CodexControlOtherDevices'));$nonce='0123456789abcdef0123456789abcdef'
         $requestPath=[IO.Path]::GetFullPath((Join-Path $legacyRoot "start-$nonce-request.json"));$legacyResultPath=[IO.Path]::GetFullPath((Join-Path $legacyRoot "start-$nonce-result.json"))
