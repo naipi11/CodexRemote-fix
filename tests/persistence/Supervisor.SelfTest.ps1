@@ -5,6 +5,9 @@ $supervisorPath = Join-Path $repositoryRoot 'src\persistence\Supervisor.ps1'
 $localizationPath = Join-Path $repositoryRoot 'src\persistence\modules\UiLocalization.psm1'
 $processControlPath = Join-Path $repositoryRoot 'src\persistence\modules\ProcessControl.psm1'
 $supervisorEnginePath = Join-Path $repositoryRoot 'src\persistence\modules\SupervisorEngine.psm1'
+$lifecycleTransactionPath = Join-Path $repositoryRoot 'src\persistence\modules\LifecycleTransaction.psm1'
+$lifecycleCoordinatorPath = Join-Path $repositoryRoot 'src\persistence\modules\LifecycleCoordinator.psm1'
+$workerRuntimePath = Join-Path $repositoryRoot 'src\persistence\modules\WorkerRuntime.psm1'
 $resourcesRoot = Join-Path $repositoryRoot 'src\persistence\resources'
 if (-not [IO.File]::Exists($supervisorPath)) {
     throw 'CCOD_TEST_SUPERVISOR_CONTRACT_MISSING'
@@ -13,6 +16,9 @@ if (-not [IO.File]::Exists($supervisorPath)) {
 Import-Module $localizationPath -Force
 Import-Module $processControlPath -Force
 Import-Module $supervisorEnginePath -Force
+Import-Module $lifecycleTransactionPath -Force
+Import-Module $lifecycleCoordinatorPath -Force -WarningAction SilentlyContinue
+Import-Module $workerRuntimePath -Force
 $script:TestSystemCatalog=Get-CcodUiCatalog -ResourcesRoot $resourcesRoot -LanguageMode System -SystemCultureName zh-CN
 $script:TestChineseCatalog=Get-CcodUiCatalog -ResourcesRoot $resourcesRoot -LanguageMode zh-CN -SystemCultureName zh-CN
 $script:TestEnglishCatalog=Get-CcodUiCatalog -ResourcesRoot $resourcesRoot -LanguageMode en-US -SystemCultureName zh-CN
@@ -46,6 +52,9 @@ function Assert-CcodReceipt {
 function New-CcodSupervisorFake {
     param([string]$FailAt=$null,[bool]$ShutdownSignaled=$false,[string]$FirstLeaseOutcome='Acquired',[string]$SecondLeaseOutcome='Acquired',[bool]$AccountAbandoned=$false,[bool]$LocalAbandoned=$false)
     $systemCatalog=$script:TestSystemCatalog;$chineseCatalog=$script:TestChineseCatalog;$englishCatalog=$script:TestEnglishCatalog
+    $coordinatorModule=Import-Module $lifecycleCoordinatorPath -Force -PassThru -WarningAction SilentlyContinue
+    $transactionModule=Import-Module $lifecycleTransactionPath -Force -PassThru
+    $workerRuntimeModule=Import-Module $workerRuntimePath -Force -PassThru
     $world=[pscustomobject]@{
         Calls=[Collections.Generic.List[string]]::new();FailAt=$FailAt;ShutdownSignaled=$ShutdownSignaled
         FirstLeaseOutcome=$FirstLeaseOutcome;SecondLeaseOutcome=$SecondLeaseOutcome;AccountAbandoned=$AccountAbandoned;LocalAbandoned=$LocalAbandoned
@@ -58,6 +67,11 @@ function New-CcodSupervisorFake {
         Preference=[pscustomobject][ordered]@{LanguageMode='System';FallbackUsed=$false;ErrorCode=$null};StoredLanguageMode='System';SystemCultureName='zh-CN'
         SetUiLanguageModes=[Collections.Generic.List[string]]::new();TrayArguments=$null;PresentationArguments=[Collections.Generic.List[object]]::new()
         UiFailureRecords=[Collections.Generic.List[object]]::new();TrayErrors=[Collections.Generic.List[object]]::new()
+        ActiveRuntime=[pscustomobject][ordered]@{schemaVersion=2;activeRuntime='runtime-1';generation=[UInt64]7}
+        LogonIdentity=[pscustomobject][ordered]@{authenticationId='00000000:00001234';userSid='S-1-5-21-111-222-333-1001';sessionId=[int]1}
+        LifecycleOwnership=$null;LifecycleOwnershipEntries=0;LifecycleFenceAssertions=0;LifecycleOwnershipExits=0
+        ActiveLifecycleRequest=$null;LifecycleSubmissions=[Collections.Generic.Queue[object]]::new();LifecycleSubmissionReceipts=[Collections.Generic.List[object]]::new();CompletedLifecycleRequests=[Collections.Generic.List[object]]::new()
+        LifecycleWrites=[Collections.Generic.List[object]]::new();LifecycleMoves=[Collections.Generic.List[string]]::new();StartedLifecycleRequests=[Collections.Generic.List[object]]::new();AutoCompleteLifecycleWorkers=$false
     }
     $adapters=@{}
     foreach($name in Get-CcodSupervisorAdapterNames){
@@ -70,6 +84,7 @@ function New-CcodSupervisorFake {
         StateRoot='C:\Fake\CodexControlOtherDevices\state';WorkersRoot='C:\Fake\CodexControlOtherDevices\state\workers'
         ControllerPath='C:\Fake\CodexControlOtherDevices\runtime-1\src\persistence\SessionController.ps1'
         StaticWorkerPath='C:\Fake\CodexControlOtherDevices\runtime-1\src\persistence\StaticProbeWorker.ps1'
+        LifecycleWorkerPath='C:\Fake\CodexControlOtherDevices\runtime-1\src\persistence\LifecycleWorker.ps1'
         PowerShellPath='C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe';LogDirectory='C:\Fake\CodexControlOtherDevices\logs'
         TransitionPath='C:\Fake\CodexControlOtherDevices\state\transition.json'
     }
@@ -95,10 +110,49 @@ function New-CcodSupervisorFake {
     $adapters.ExitLease={param($Lease)$world.Calls.Add("Exit:$($Lease.Kind)");if($world.FailAt -ceq "Exit$($Lease.Kind)"){throw 'PRIVATE_EXIT_SECRET'};$true}.GetNewClosure()
     $adapters.OpenReadyEvent={param($UserSid,$SessionId,$Token)$world.Calls.Add('Open:Ready');if($world.FailAt -ceq 'OpenReady'){throw 'PRIVATE_READY_SECRET'};& $newEvent 'Ready'}.GetNewClosure()
     $adapters.OpenShutdownEvent={param($UserSid,$SessionId)$world.Calls.Add('Open:Shutdown');if($world.FailAt -ceq 'OpenShutdown'){throw 'PRIVATE_SHUTDOWN_SECRET'};& $newEvent 'Shutdown'}.GetNewClosure()
+    $adapters.OpenLifecycleWakeEvent={param($UserSid,$SessionId)$world.Calls.Add('Open:LifecycleWake');if($world.FailAt -ceq 'OpenLifecycleWake'){throw 'PRIVATE_LIFECYCLE_WAKE_SECRET'};& $newEvent 'LifecycleWake'}.GetNewClosure()
+    $adapters.ResetLifecycleWakeEvent={param($Event)$world.Calls.Add('Reset:LifecycleWake')}.GetNewClosure()
     $adapters.IsEventSignaled={param($Event)$world.Calls.Add("Check:$($Event.Kind)");if($Event.Kind -ceq 'Shutdown'){[bool]$world.ShutdownSignaled}else{$false}}.GetNewClosure()
     $adapters.SignalEvent={param($Event)$world.Calls.Add("Signal:$($Event.Kind)");if($world.FailAt -ceq 'SignalReady'){throw 'PRIVATE_SIGNAL_SECRET'};$world.ReadySignals++}.GetNewClosure()
     $adapters.CloseEvent={param($Event)$world.Calls.Add("Close:$($Event.Kind)");if($world.FailAt -ceq "Close$($Event.Kind)"){throw 'PRIVATE_CLOSE_SECRET'}}.GetNewClosure()
     $adapters.ReadState={param($StateRoot)$world.Calls.Add('Read:State');$world.StateReads++;if($world.FailAt -ceq 'ReadState'){throw 'PRIVATE_STATE_SECRET'};[pscustomobject]@{AutomationEnabled=$true;Settings=[pscustomobject]@{candidateCompatibleOptIn=$false};Damage=$null}}.GetNewClosure()
+    $adapters.ReadActiveRuntime={param($InstallRoot)$world.Calls.Add('Read:ActiveRuntime');if($world.FailAt -ceq 'ReadActiveRuntime'){throw 'PRIVATE_RUNTIME_POINTER_SECRET'};$world.ActiveRuntime}.GetNewClosure()
+    $adapters.GetTrustedLogonIdentity={param($ExpectedUserSid,$ExpectedSessionId)$world.Calls.Add('Read:LogonIdentity');if($world.FailAt -ceq 'GetTrustedLogonIdentity'){throw 'PRIVATE_LOGON_SECRET'};$world.LogonIdentity}.GetNewClosure()
+    $adapters.EnterLifecycleOwnership={
+        param($InstallRoot,$RuntimeId,$RuntimeGeneration,$OwnerIdentity,$UserSid,$SessionId,$TimeoutMilliseconds)
+        $world.Calls.Add("Enter:LifecycleOwnership:$RuntimeGeneration");if($world.FailAt -ceq 'EnterLifecycleOwnership'){throw 'PRIVATE_OWNERSHIP_SECRET'};$world.LifecycleOwnershipEntries++
+        $world.LifecycleOwnership=[pscustomobject][ordered]@{schemaVersion=1;lease=[pscustomobject]@{Released=$false};epoch=[UInt64]11;runtimeId=$RuntimeId;runtimeGeneration=[UInt64]$RuntimeGeneration;ownerIdentity=$OwnerIdentity;released=$false}
+        $world.LifecycleOwnership
+    }.GetNewClosure()
+    $adapters.AssertLifecycleFence={param($InstallRoot,$Ownership)$world.Calls.Add("Fence:$($Ownership.epoch)");$world.LifecycleFenceAssertions++;$true}.GetNewClosure()
+    $adapters.ExitLifecycleOwnership={param($Ownership)$world.Calls.Add("Exit:LifecycleOwnership:$($Ownership.epoch)");$world.LifecycleOwnershipExits++;if($world.FailAt -ceq 'ExitLifecycleOwnership'){throw 'PRIVATE_OWNERSHIP_RELEASE_SECRET'};$Ownership.released=$true;$true}.GetNewClosure()
+    $adapters.ReadLifecycleRequest={param($StateRoot)$world.Calls.Add('Read:LifecycleRequest');if($world.FailAt -ceq 'ReadLifecycleRequest'){throw 'PRIVATE_LIFECYCLE_REQUEST_SECRET'};$world.ActiveLifecycleRequest}.GetNewClosure()
+    $adapters.ReceiveLifecycleSubmissions={
+        param($StateRoot,$MaximumCount)
+        $world.Calls.Add("Receive:Lifecycle:$MaximumCount")
+        if($world.LifecycleSubmissions.Count -gt 0){$world.LifecycleSubmissions.Dequeue()}else{$null}
+    }.GetNewClosure()
+    $adapters.WriteLifecycleSubmissionReceipt={
+        param($StateRoot,$SubmissionId,$Accepted,$TransactionId,$ErrorCode)
+        $world.Calls.Add("Receipt:Lifecycle:$SubmissionId`:$Accepted")
+        $world.LifecycleSubmissionReceipts.Add([pscustomobject][ordered]@{submissionId=$SubmissionId;accepted=[bool]$Accepted;transactionId=$TransactionId;errorCode=$ErrorCode})
+    }.GetNewClosure()
+    $adapters.NewLifecycleRequest={
+        param($Kind,$Origin,$RuntimeId,$RuntimeGeneration,$LeaseEpoch,$OwnerIdentity,$LogonIdentity,$NowUtc)
+        $world.Calls.Add("New:Lifecycle:$Kind")
+        & $transactionModule {param($K,$O,$R,$G,$E,$Owner,$Logon,$Now)New-CcodLifecycleRequest -Kind $K -Origin $O -RuntimeId $R -RuntimeGeneration $G -LeaseEpoch $E -OwnerIdentity $Owner -LogonIdentity $Logon -NowUtc $Now} $Kind $Origin $RuntimeId $RuntimeGeneration $LeaseEpoch $OwnerIdentity $LogonIdentity $NowUtc
+    }.GetNewClosure()
+    $adapters.WriteLifecycleRequest={param($StateRoot,$Request)$world.Calls.Add("Write:Lifecycle:$($Request.phase)");$world.ActiveLifecycleRequest=$Request;$world.LifecycleWrites.Add($Request)}.GetNewClosure()
+    $adapters.MoveLifecyclePhase={param($Request,$NextPhase,$NowUtc)$world.Calls.Add("Move:Lifecycle:$NextPhase");$world.LifecycleMoves.Add($NextPhase);& $transactionModule {param($Value,$Phase,$Now)Move-CcodLifecyclePhase -Request $Value -NextPhase $Phase -NowUtc $Now} $Request $NextPhase $NowUtc}.GetNewClosure()
+    $adapters.CompleteLifecycleRequest={param($StateRoot,$Request)$world.Calls.Add("Complete:Lifecycle:$($Request.phase)");$world.CompletedLifecycleRequests.Add($Request);$world.ActiveLifecycleRequest=$null}.GetNewClosure()
+    $adapters.GetLifecycleStep={param($Request,$Observation,$NowUtc)& $coordinatorModule {param($Value,$Observed,$Now)Get-CcodLifecycleStep -Request $Value -Observation $Observed -NowUtc $Now} $Request $Observation $NowUtc}.GetNewClosure()
+    $adapters.ReduceLifecycleWorkerResult={param($Request,$Result,$NowUtc)& $coordinatorModule {param($Value,$WorkerResult,$Now)Reduce-CcodLifecycleWorkerResult -Request $Value -Result $WorkerResult -NowUtc $Now} $Request $Result $NowUtc}.GetNewClosure()
+    $adapters.NewLifecycleWorkerRequest={
+        param($TransactionId,$Action,$RuntimeId,$RuntimeGeneration,$LeaseEpoch,$OwnerIdentity,$NotBeforeUtc,$TimeoutMilliseconds)
+        $world.Calls.Add("New:LifecycleWorker:$Action")
+        & $workerRuntimeModule {param($Id,$WorkerAction,$Runtime,$Generation,$Epoch,$Owner,$NotBefore,$Timeout)New-CcodLifecycleWorkerRequest -TransactionId $Id -Action $WorkerAction -RuntimeId $Runtime -RuntimeGeneration $Generation -LeaseEpoch $Epoch -OwnerIdentity $Owner -NotBeforeUtc $NotBefore -TimeoutMilliseconds $Timeout} $TransactionId $Action $RuntimeId $RuntimeGeneration $LeaseEpoch $OwnerIdentity $NotBeforeUtc $TimeoutMilliseconds
+    }.GetNewClosure()
+    $adapters.AssertLifecycleWorkerResult={param($Result,$ExpectedRequest)& $workerRuntimeModule {param($Value,$Expected)Assert-CcodLifecycleWorkerResult -Result $Value -ExpectedRequest $Expected|Out-Null} $Result $ExpectedRequest}.GetNewClosure()
     $adapters.ReadJournal={param($Path)$world.Calls.Add('Read:Journal');$world.JournalReads++;if($world.FailAt -ceq 'ReadJournal'){throw 'PRIVATE_JOURNAL_SECRET'};$world.ActiveJournal}.GetNewClosure()
     $adapters.ReadUiPreference={param($StateRoot)$world.Calls.Add('Read:UiPreference');if($world.FailAt -ceq 'ReadUiPreference'){throw 'PRIVATE_UI_PREFERENCE_SECRET'};$world.Preference}.GetNewClosure()
     $adapters.SetUiLanguageMode={param($StateRoot,$Mode)$world.Calls.Add("Persist:UiLanguage:$Mode");$world.SetUiLanguageModes.Add($Mode);if($world.FailAt -ceq 'SetUiLanguageMode'){throw 'PRIVATE_UI_WRITE_SECRET'};$world.StoredLanguageMode=$Mode}.GetNewClosure()
@@ -127,9 +181,22 @@ function New-CcodSupervisorFake {
     $adapters.NewWatcher={param($Queue,$OnFull)$world.NewWatcherSawRealQueue=[object]::ReferenceEquals($Queue,$world.EventQueue);$world.Calls.Add('New:Watcher');if($world.FailAt -ceq 'NewWatcher'){throw 'PRIVATE_WATCHER_SECRET'};[pscustomobject]@{Kind='Watcher';Mode='ReconciliationOnly'}}.GetNewClosure()
     $adapters.StopWatcher={param($Watcher)$world.Calls.Add('Stop:Watcher');if($world.FailAt -ceq 'StopWatcher'){throw 'PRIVATE_WATCHER_STOP_SECRET'};[pscustomobject][ordered]@{SchemaVersion=1;Stopped=$true;CleanupCodes=@()}}.GetNewClosure()
     $adapters.GetWorkerLeafState={param($Path)$world.Calls.Add("Leaf:$([IO.Path]::GetFileName($Path))");[pscustomobject][ordered]@{Exists=$false;IsReparse=$false}}.GetNewClosure()
-    $adapters.WriteWorkerRequest={param($Path,$Request)$world.Calls.Add("Write:$($Request.action)")}.GetNewClosure()
+    $adapters.WriteWorkerRequest={param($Path,$Request)$world.Calls.Add("Write:$($Request.action)");if($null -ne $Request.PSObject.Properties['leaseEpoch']){$world.StartedLifecycleRequests.Add($Request)}}.GetNewClosure()
     $adapters.StartWorker={param($Kind,$ScriptPath,$RequestPath,$ResultPath,$StderrPath,$Request,$PowerShellPath)$world.Calls.Add("Start:$Kind`:$($Request.action)");[pscustomobject][ordered]@{ProcessId=501;CreationTimeUtc='2030-02-03T03:05:00.0000000Z';Handle=[pscustomobject]@{Kind='Worker'}}}.GetNewClosure()
-    $adapters.PollWorker={param($Slot)$world.Calls.Add("Poll:$($Slot.Kind)");$world.Poll}.GetNewClosure()
+    $adapters.PollWorker={
+        param($Slot)
+        $world.Calls.Add("Poll:$($Slot.Kind)")
+        if($Slot.Kind -ceq 'Lifecycle' -and $world.AutoCompleteLifecycleWorkers){
+            $world.WorkerResult=switch($Slot.Action){
+                'Apply' {[pscustomobject][ordered]@{schemaVersion=1;transactionId=$Slot.Request.transactionId;action='Apply';ok=$true;outcome='Activated';observation='Special';error=$null}}
+                'VerifyRemote' {[pscustomobject][ordered]@{schemaVersion=1;transactionId=$Slot.Request.transactionId;action='VerifyRemote';ok=$true;outcome='Inspected';observation='RemoteVerified';error=$null}}
+                default {throw "UNEXPECTED_LIFECYCLE_ACTION_$($Slot.Action)"}
+            }
+            $json=$world.WorkerResult|ConvertTo-Json -Depth 8 -Compress
+            return [pscustomobject][ordered]@{Completed=$true;ExitCode=0;StdoutText=$json;StdoutByteCount=[Text.Encoding]::UTF8.GetByteCount($json);StdoutOverflow=$false;StderrByteCount=0;StderrOverflow=$false}
+        }
+        $world.Poll
+    }.GetNewClosure()
     $adapters.ReadWorkerResult={param($Path)$world.Calls.Add('Read:WorkerResult');$world.WorkerResult}.GetNewClosure()
     $adapters.WaitWorker={param($Slot,$Timeout)$world.Calls.Add("Wait:Worker:$Timeout");$true}.GetNewClosure()
     $adapters.GetWorkerIdentity={param($Pid)$world.Calls.Add("WorkerIdentity:$Pid");[pscustomobject][ordered]@{Pid=$Pid;CreationTimeUtc='2030-02-03T03:05:00.0000000Z'}}.GetNewClosure()
@@ -149,7 +216,9 @@ function New-CcodTickFixture {
     $fake=New-CcodSupervisorFake
     $shutdown=[pscustomobject][ordered]@{SchemaVersion=1;Name='Fake-Shutdown';Kind='Shutdown';CreatedNew=$false;Handle=[pscustomobject]@{Kind='Shutdown'};Disposed=$false}
     $state=[pscustomobject]@{AutomationEnabled=$true;AutomaticCandidateTrialsAllowed=$false;Settings=[pscustomobject]@{candidateCompatibleOptIn=$false};VerifiedPackages=[pscustomobject][ordered]@{schemaVersion=1;packages=[ordered]@{}};Damage=[pscustomobject]@{}}
-    $hostState=New-CcodSupervisorHostState -Identity $fake.Identity -Layout $fake.Layout -Clock ([pscustomobject]@{Kind='Clock'}) -ShutdownEvent $shutdown -CommandQueue $fake.World.CommandQueue -EventQueue $fake.World.EventQueue -State $state -Journal $null
+    [void](& $fake.Adapters.EnterLifecycleOwnership $fake.Layout.InstallRoot $fake.Layout.RuntimeId ([UInt64]7) ([pscustomobject][ordered]@{pid=$fake.Identity.Pid;creationTimeUtc=$fake.Identity.CreationTimeUtc}) $fake.Identity.UserSid $fake.Identity.SessionId 5000)
+    $wake=& $fake.Adapters.OpenLifecycleWakeEvent $fake.Identity.UserSid $fake.Identity.SessionId
+    $hostState=New-CcodSupervisorHostState -Identity $fake.Identity -Layout $fake.Layout -Clock ([pscustomobject]@{Kind='Clock'}) -ShutdownEvent $shutdown -LifecycleWakeEvent $wake -CommandQueue $fake.World.CommandQueue -EventQueue $fake.World.EventQueue -State $state -Journal $null -LifecycleOwnership $fake.World.LifecycleOwnership -LifecycleRequest $fake.World.ActiveLifecycleRequest -LogonIdentity $fake.World.LogonIdentity
     $hostState.Tray=[pscustomobject]@{Kind='Tray';RenderedLanguageMode='System';RenderedCatalog=$script:TestSystemCatalog;RenderedText='old-stable'}
     $hostState.UiLanguageMode='System';$hostState.UiCatalog=$script:TestSystemCatalog
     [pscustomobject]@{Fake=$fake;Host=$hostState}
@@ -215,6 +284,29 @@ function New-CcodSupervisorTestSnapshot {
     }
 }
 
+function New-CcodPersistedLifecycleRequest {
+    param(
+        [ValidateSet('RestartAndRepair','CheckAndRepair','SafeExit')][string]$Kind='CheckAndRepair',
+        [ValidateSet('Requested','WaitingForManualLaunch')][string]$Phase='Requested',
+        [string]$TransactionId='11111111-2222-3333-4444-555555555555'
+    )
+    $owner=[pscustomobject][ordered]@{pid=[int]41;creationTimeUtc='2030-02-03T03:00:00.0000000Z'}
+    $logon=[pscustomobject][ordered]@{authenticationId='00000000:00001234';userSid='S-1-5-21-111-222-333-1001';sessionId=[int]1}
+    $coordinatorModule=Import-Module $lifecycleCoordinatorPath -Force -PassThru -WarningAction SilentlyContinue
+    $transactionModule=Import-Module $lifecycleTransactionPath -Force -PassThru
+    $request=& $transactionModule {param($K,$Owner,$Logon,$Id)New-CcodLifecycleRequest -Kind $K -Origin Guardian -RuntimeId 'runtime-1' -RuntimeGeneration 7 -LeaseEpoch 11 -OwnerIdentity $Owner -LogonIdentity $Logon -NowUtc '2030-02-03T03:01:00.0000000Z' -TransactionId $Id} $Kind $owner $logon $TransactionId
+    if($Phase -ceq 'WaitingForManualLaunch'){
+        $request=& $transactionModule {param($Value)Move-CcodLifecyclePhase $Value CloseRequested '2030-02-03T03:01:01.0000000Z'} $request
+        $request=& $transactionModule {param($Value)Move-CcodLifecyclePhase $Value CloseConfirmed '2030-02-03T03:01:02.0000000Z'} $request
+        $request=& $transactionModule {param($Value)Move-CcodLifecyclePhase $Value OrdinaryLaunchRequested '2030-02-03T03:01:03.0000000Z'} $request
+        $request.automaticLaunchAttempts=3
+        $request.launchRequestedAtUtc='2030-02-03T03:01:03.0000000Z'
+        $request.manualLaunchExpiresAtUtc='2030-02-03T03:20:00.0000000Z'
+        $request=& $transactionModule {param($Value)Move-CcodLifecyclePhase $Value WaitingForManualLaunch '2030-02-03T03:01:04.0000000Z'} $request
+    }
+    return $request
+}
+
 $results=[Collections.Generic.List[string]]::new()
 function Invoke-CcodTest {
     param([string]$Name,[scriptblock]$Body)
@@ -239,7 +331,7 @@ Invoke-CcodTest 'acquires both lifetime leases and signals Ready only after all 
     Assert-CcodTrue $fake.World.NewTraySawRealQueue 'tray receives the command queue itself'
     Assert-CcodTrue $fake.World.NewWatcherSawRealQueue 'watcher receives the event queue itself'
     $calls=@($fake.World.Calls)
-    foreach($before in @('Enter:AccountSupervisor:5000','Enter:Supervisor:5000','Open:Ready','Open:Shutdown','Read:State','Read:Journal','Read:UiPreference','Get:SystemCulture','Get:UiCatalog:System','Queue:Command','Queue:Event','New:Tray','New:Watcher')){
+    foreach($before in @('Enter:AccountSupervisor:5000','Enter:Supervisor:5000','Read:ActiveRuntime','Read:LogonIdentity','Enter:LifecycleOwnership:7','Open:Ready','Open:Shutdown','Open:LifecycleWake','Read:State','Read:Journal','Read:LifecycleRequest','Read:UiPreference','Get:SystemCulture','Get:UiCatalog:System','Queue:Command','Queue:Event','New:Tray','New:Watcher')){
         Assert-CcodTrue ([Array]::IndexOf($calls,$before) -ge 0) "$before occurs"
         Assert-CcodTrue ([Array]::IndexOf($calls,$before) -lt [Array]::IndexOf($calls,'Signal:Ready')) "$before precedes Ready"
     }
@@ -247,6 +339,9 @@ Invoke-CcodTest 'acquires both lifetime leases and signals Ready only after all 
     Assert-CcodEqual 'System' $fake.World.TrayArguments.LanguageMode 'tray receives exact initial mode'
     Assert-CcodEqual 'zh-CN' $fake.World.TrayArguments.SystemCultureName 'tray receives system culture'
     Assert-CcodTrue ([Array]::IndexOf($calls,'Signal:Ready') -lt [Array]::IndexOf($calls,'Run:UI')) 'Ready precedes message loop'
+    Assert-CcodEqual 1 $fake.World.LifecycleOwnershipEntries 'Supervisor enters one lifecycle epoch'
+    Assert-CcodEqual 1 $fake.World.LifecycleOwnershipExits 'Supervisor releases one lifecycle epoch'
+    Assert-CcodTrue ([Array]::IndexOf($calls,'Exit:LifecycleOwnership:11') -lt [Array]::IndexOf($calls,'Exit:Supervisor')) 'lifecycle ownership releases before lifetime leases'
     Assert-CcodTrue ([Array]::IndexOf($calls,'Exit:Supervisor') -lt [Array]::IndexOf($calls,'Exit:AccountSupervisor')) 'leases release in reverse order'
 }
 
@@ -293,7 +388,7 @@ Invoke-CcodTest 'never signals Ready when Shutdown is already signaled' {
 }
 
 Invoke-CcodTest 'contains initialization secrets and runs every available cleanup stage' {
-    foreach($stage in @('ReadState','ReadJournal','ReadUiPreference','GetUiCatalog','NewTray','NewWatcher','SignalReady','RunUi')){
+    foreach($stage in @('ReadActiveRuntime','GetTrustedLogonIdentity','EnterLifecycleOwnership','OpenLifecycleWake','ReadState','ReadJournal','ReadLifecycleRequest','ReadUiPreference','GetUiCatalog','NewTray','NewWatcher','SignalReady','RunUi')){
         $fake=New-CcodSupervisorFake -FailAt $stage
         $receipt=Invoke-CcodSupervisorHost -ReadyToken $readyToken -Adapters $fake.Adapters
         Assert-CcodReceipt $receipt 'Failed' 1
@@ -304,7 +399,7 @@ Invoke-CcodTest 'contains initialization secrets and runs every available cleanu
 }
 
 Invoke-CcodTest 'continues cleanup after timer watcher tray event and lease failures' {
-    foreach($stage in @('StopTimer','StopWatcher','CloseTray','CloseReady','CloseShutdown','ExitSupervisor','ExitAccountSupervisor')){
+    foreach($stage in @('StopTimer','StopWatcher','CloseTray','CloseReady','CloseShutdown','CloseLifecycleWake','ExitLifecycleOwnership','ExitSupervisor','ExitAccountSupervisor')){
         $fake=New-CcodSupervisorFake -FailAt $stage
         $receipt=Invoke-CcodSupervisorHost -ReadyToken $readyToken -Adapters $fake.Adapters
         Assert-CcodReceipt $receipt 'Stopped' 0
@@ -375,10 +470,85 @@ Invoke-CcodTest 'adds the exact localization adapters and host fields at the fro
     $first=[Array]::IndexOf($names,'ReadUiPreference')
     Assert-CcodTrue ($first -ge 0) 'ReadUiPreference adapter exists'
     Assert-CcodEqual 'ReadUiPreference,SetUiLanguageMode,GetSystemCultureName,GetUiCatalog,ShowTrayError,StartUninstall' (@($names[$first..($first+5)])-join ',') 'localization and uninstall adapter order is exact'
+    foreach($name in @('ReadActiveRuntime','GetTrustedLogonIdentity','EnterLifecycleOwnership','AssertLifecycleFence','ExitLifecycleOwnership','OpenLifecycleWakeEvent','ResetLifecycleWakeEvent','ReadLifecycleRequest','ReceiveLifecycleSubmissions','WriteLifecycleSubmissionReceipt','NewLifecycleRequest','WriteLifecycleRequest','MoveLifecyclePhase','CompleteLifecycleRequest','GetLifecycleStep','ReduceLifecycleWorkerResult','NewLifecycleWorkerRequest','AssertLifecycleWorkerResult')){
+        Assert-CcodTrue ($names -ccontains $name) "$name lifecycle adapter exists"
+    }
     $fixture=New-CcodTickFixture
     $hostNames=@($fixture.Host.PSObject.Properties.Name)
     $trayIndex=[Array]::IndexOf($hostNames,'Tray')
     Assert-CcodEqual 'Tray,TrayCallbackFailureLogged,UiLanguageMode,UiCatalog,State' (@($hostNames[$trayIndex..($trayIndex+4)])-join ',') 'UI host fields occur immediately after Tray'
+    foreach($name in @('LifecycleOwnership','LifecycleRequest','LifecycleWorkerSlot','ConnectionState','ProtectionState')){Assert-CcodTrue ($hostNames -ccontains $name) "$name host field exists"}
+}
+
+Invoke-CcodTest 'accepts at most one of two simultaneous durable submissions and rejects the other while busy' {
+    $fake=New-CcodSupervisorFake
+    foreach($id in @('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee','bbbbbbbb-cccc-dddd-eeee-ffffffffffff')){
+        $fake.World.LifecycleSubmissions.Enqueue([pscustomobject][ordered]@{schemaVersion=1;submissionId=$id;kind='RestartAndRepair';origin='Installer';runtimeId='runtime-1';runtimeGeneration=[UInt64]7;createdAtUtc='2030-02-03T03:04:05.0000000Z'})
+    }
+    $fake.World.TickCount=2
+    $receipt=Invoke-CcodSupervisorHost -ReadyToken $readyToken -Adapters $fake.Adapters
+    Assert-CcodReceipt $receipt 'Stopped' 0
+    Assert-CcodEqual 2 $fake.World.LifecycleSubmissionReceipts.Count 'both submissions receive one bounded decision'
+    Assert-CcodEqual 1 @($fake.World.LifecycleSubmissionReceipts|Where-Object{$_.accepted}).Count 'only one submission is accepted'
+    Assert-CcodEqual 1 @($fake.World.LifecycleSubmissionReceipts|Where-Object{-not $_.accepted -and $_.errorCode -ceq 'CCOD_LIFECYCLE_SUPERVISOR_BUSY'}).Count 'second submission is rejected busy'
+    Assert-CcodTrue ($null -ne $fake.World.ActiveLifecycleRequest) 'one accepted lifecycle remains durable'
+    Assert-CcodEqual 1 $fake.World.LifecycleOwnershipEntries 'simultaneous submissions share one ownership epoch'
+    Assert-CcodEqual 0 @($fake.World.Calls|Where-Object{$_ -like 'Start:Controller:*'}).Count 'submission acceptance never dispatches legacy controller mutation'
+}
+
+Invoke-CcodTest 'rejects a durable submission for a stale runtime generation without creating a transaction' {
+    $fake=New-CcodSupervisorFake
+    $fake.World.LifecycleSubmissions.Enqueue([pscustomobject][ordered]@{schemaVersion=1;submissionId='cccccccc-dddd-eeee-ffff-000000000000';kind='RestartAndRepair';origin='Installer';runtimeId='runtime-1';runtimeGeneration=[UInt64]6;createdAtUtc='2030-02-03T03:04:05.0000000Z'})
+    $fake.World.TickCount=1
+    $receipt=Invoke-CcodSupervisorHost -ReadyToken $readyToken -Adapters $fake.Adapters
+    Assert-CcodReceipt $receipt 'Stopped' 0
+    Assert-CcodEqual 1 $fake.World.LifecycleSubmissionReceipts.Count 'stale generation receives one rejection'
+    Assert-CcodEqual 'CCOD_LIFECYCLE_RUNTIME_STALE' $fake.World.LifecycleSubmissionReceipts[0].errorCode 'stale generation error is stable'
+    Assert-CcodEqual $null $fake.World.ActiveLifecycleRequest 'stale generation creates no active lifecycle'
+    Assert-CcodEqual 0 @($fake.World.Calls|Where-Object{$_ -like 'Start:*'}).Count 'stale generation dispatches no worker'
+}
+
+Invoke-CcodTest 'resumes WaitingForManualLaunch after Supervisor restart and completes Apply under one epoch' {
+    $fake=New-CcodSupervisorFake
+    $fake.World.ActiveLifecycleRequest=New-CcodPersistedLifecycleRequest -Phase WaitingForManualLaunch
+    $fake.World.ActiveLifecycleRequest.leaseEpoch=[UInt64]10
+    $fake.World.ActiveLifecycleRequest.ownerIdentity=[pscustomobject][ordered]@{pid=[int]40;creationTimeUtc='2030-02-03T02:59:00.0000000Z'}
+    $ordinary=New-CcodSupervisorTestSnapshot -ProcessId 71
+    $fake.World.ProcessIds=@([int]71);$fake.World.Snapshots[[int]71]=$ordinary
+    $fake.World.AutoCompleteLifecycleWorkers=$true;$fake.World.TickCount=6
+    $receipt=Invoke-CcodSupervisorHost -ReadyToken $readyToken -Adapters $fake.Adapters
+    Assert-CcodReceipt $receipt 'Stopped' 0
+    Assert-CcodEqual 1 $fake.World.CompletedLifecycleRequests.Count 'resumed transaction reaches one terminal completion'
+    Assert-CcodEqual 'Completed' $fake.World.CompletedLifecycleRequests[0].phase 'resumed transaction completes'
+    Assert-CcodEqual 'WaitingForManualLaunch|OrdinaryObserved|RepairRequested|RepairRequested|RemoteVerified|Completed' (@($fake.World.LifecycleWrites.phase)-join '|') 'resume rebinds then persists every Task 1 reducer state including null-phase Apply result'
+    Assert-CcodEqual 'OrdinaryObserved|RepairRequested|Completed' (@($fake.World.LifecycleMoves)-join '|') 'Supervisor never calls Move for the null-phase Apply reduction'
+    Assert-CcodEqual 'Apply|VerifyRemote' (@($fake.World.StartedLifecycleRequests.action)-join '|') 'resume executes one action per lifecycle worker'
+    foreach($request in @($fake.World.StartedLifecycleRequests)){
+        Assert-CcodEqual 11 $request.leaseEpoch 'every worker request keeps the one Supervisor epoch'
+        Assert-CcodEqual 7 $request.runtimeGeneration 'every worker request keeps the active generation'
+    }
+    Assert-CcodEqual 1 $fake.World.LifecycleOwnershipEntries 'Supervisor restart enters one ownership epoch'
+    Assert-CcodEqual 0 @($fake.World.Calls|Where-Object{$_ -like 'Start:Controller:*'}).Count 'resume performs no mutation outside LifecycleWorker slot'
+}
+
+Invoke-CcodTest 'treats error-free CancelledBeforeClose as successful already-satisfied completion without mutation' {
+    foreach($case in @(
+        [pscustomobject]@{Kind='CheckAndRepair';Observation='RemoteVerified';Connection='Connected';Id='40000000-0000-0000-0000-000000000001'},
+        [pscustomobject]@{Kind='SafeExit';Observation='Ordinary';Connection='Ordinary';Id='40000000-0000-0000-0000-000000000002'},
+        [pscustomobject]@{Kind='SafeExit';Observation='NoCodex';Connection='Disconnected';Id='40000000-0000-0000-0000-000000000003'}
+    )){
+        $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+        $request=New-CcodPersistedLifecycleRequest -Kind $case.Kind -TransactionId $case.Id
+        $world.ActiveLifecycleRequest=$request;$hostState.LifecycleRequest=$request;$hostState.LifecycleObservation=$case.Observation
+        $hostState.ObservationDirty=$false;$hostState.ForceReconcile=$false;$hostState.NextObservationMilliseconds=[long]1000
+        $world.Calls.Clear();Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
+        Assert-CcodEqual 1 $world.CompletedLifecycleRequests.Count "$($case.Kind) $($case.Observation) completes once"
+        Assert-CcodEqual 'CancelledBeforeClose' $world.CompletedLifecycleRequests[0].phase 'already-satisfied phase is the legal terminal edge'
+        Assert-CcodEqual $null $world.CompletedLifecycleRequests[0].error 'already-satisfied completion carries no error'
+        Assert-CcodEqual $case.Connection $hostState.ConnectionState 'connection state remains truthful after no-op completion'
+        Assert-CcodEqual 'Running' $hostState.ProtectionState 'owned Supervisor protection remains running'
+        Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'Start:*'}).Count 'already-satisfied completion starts no worker mutation'
+    }
 }
 
 Invoke-CcodTest 'commits one valid UI language command before refreshing the existing tray in place' {
@@ -676,22 +846,24 @@ Invoke-CcodTest 'reserves the whole tick for a slot that existed at tick entry' 
     }
 }
 
-Invoke-CcodTest 'starts Recover for a fresh journal before one queued command' {
+Invoke-CcodTest 'blocks a legacy transition journal without dispatching Recover before one queued command' {
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
     $world.ActiveJournal=New-CcodTestTransition
     $world.CommandQueue.Enqueue([pscustomobject][ordered]@{Kind='OpenLogs';Value=$null;EnqueuedAtUtc='2030-02-03T03:04:05.0000000Z'})
     Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
-    Assert-CcodTrue ($world.Calls.Contains('Start:Controller:Recover')) 'journal starts Recover controller'
-    Assert-CcodEqual 1 $world.CommandQueue.Count 'higher-priority recovery leaves command queued'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'Start:Controller:*'}).Count 'Supervisor never dispatches legacy Recover'
+    Assert-CcodEqual 'LegacyTransitionBlocked' $hostState.Reason 'legacy journal fails closed with stable state'
+    Assert-CcodEqual 1 $world.CommandQueue.Count 'blocked legacy journal leaves command queued'
 }
 
-Invoke-CcodTest 'starts persisted-special Inspect before a queued command' {
+Invoke-CcodTest 'converts persisted-special inspection into one durable lifecycle before a queued command' {
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
     $hostState.SpecialNeedsInspect=$true
     $world.CommandQueue.Enqueue([pscustomobject][ordered]@{Kind='OpenLogs';Value=$null;EnqueuedAtUtc='2030-02-03T03:04:05.0000000Z'})
     Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
-    Assert-CcodTrue ($world.Calls.Contains('Start:Controller:Inspect')) 'special proof starts Inspect'
-    Assert-CcodEqual 1 $world.CommandQueue.Count 'special Inspect leaves command queued'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'Start:Controller:*'}).Count 'special proof never starts a controller worker directly'
+    Assert-CcodTrue ($null-ne$hostState.LifecycleRequest -and $hostState.LifecycleRequest.kind-ceq'CheckAndRepair') 'special proof creates one durable CheckAndRepair lifecycle'
+    Assert-CcodEqual 1 $world.CommandQueue.Count 'durable lifecycle leaves command queued'
 }
 
 Invoke-CcodTest 'bounds stale-package special reconciliation to one live process identity without clearing state or keys' {
@@ -729,7 +901,8 @@ Invoke-CcodTest 'bounds stale-package special reconciliation to one live process
     Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
     Assert-CcodEqual $null $hostState.SpecialProof 'changed live special identity clears stale suppression'
     Assert-CcodTrue ($world.Calls.Contains('Enumerate')) 'changed identity is observed before stale handling'
-    Assert-CcodTrue ($world.Calls.Contains('Start:Controller:Inspect')) 'changed identity re-enters normal current-package validation'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'Start:Controller:*'}).Count 'changed identity never re-enters direct controller validation'
+    Assert-CcodTrue ($null-ne$hostState.LifecycleRequest -and $hostState.LifecycleRequest.kind-ceq'CheckAndRepair') 'changed identity enters one durable lifecycle validation'
     Assert-CcodEqual $stateBefore ($hostState.State|ConvertTo-Json -Depth 20 -Compress) 'changed identity recovery does not clear persisted state'
     Assert-CcodEqual $attemptsBefore ($hostState.AttemptKeys|ConvertTo-Json -Compress) 'changed identity recovery does not clear key membership'
 }
@@ -795,62 +968,11 @@ Invoke-CcodTest 'uses a constrained stale reconciliation candidate for only an e
     Assert-CcodEqual 'StalePackageStatus' $hostState.Reason 'one constrained stale candidate produces the fixed reason'
     $candidateProperty=$hostState.PSObject.Properties['StaleReconciliationCandidate']
     Assert-CcodTrue ($null -ne $candidateProperty -and $null -ne $candidateProperty.Value -and $candidateProperty.Value.Pid -eq 201) 'candidate binds only the exact prior verified process identity'
-    Assert-CcodTrue ($world.Calls.Contains('Start:Controller:RepairStale')) 'one exact stale root dispatches the dedicated controller repair path'
-    $repairRequest=$hostState.WorkerSlot.Request
-    Assert-CcodEqual 'RepairStale' $repairRequest.action 'stale repair has a distinct authenticated action'
-    Assert-CcodTrue ($repairRequest.existingOnly -and $null -ne $repairRequest.source) 'stale repair cannot degrade into a source-less activation request'
-    $expectedRepairSource=@('201','2030-02-03T03:02:00.0000000Z','1','S-1-5-21-111-222-333-1001',$oldExecutable,'OpenAI.Codex_2p2nqsd0c76g0',$definitions['201'].CommandLine,'41001','41002')-join '|'
-    Assert-CcodEqual $expectedRepairSource `
-        (($repairRequest.source.Pid,$repairRequest.source.CreationTimeUtc,$repairRequest.source.SessionId,$repairRequest.source.UserSid,$repairRequest.source.Path,$repairRequest.source.PackageFamilyName,$repairRequest.source.CommandLine,$repairRequest.source.RendererPort,$repairRequest.source.MainPort)-join '|') 'request freezes exact observed stale PID creation session user native path family argv and ports'
-    $repairKey='201|2030-02-03T03:02:00.0000000Z'
-    Assert-CcodTrue $hostState.AttemptKeys.Contains($repairKey) 'dispatch consumes the exact stale lifecycle before the worker can fail'
-
-    $world.Calls.Clear();$seenStatusEvidence.Clear();$hostState.ForceReconcile=$true
-    Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
-    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'Start:*'}).Count 'same constrained candidate cannot create a second worker while the repair slot is owned'
-
-    $completionExpectedSource=[pscustomobject]@{Value=$null}
-    $fixture.Fake.Adapters.CompleteControllerRun={
-        param($Result,$TransactionId,$Action,$RuntimeId,$ExpectedSource)
-        $world.Calls.Add("Reduce:$Action")
-        $completionExpectedSource.Value=$ExpectedSource
-        [pscustomobject][ordered]@{SessionState='Error';BlockAutomaticActions=$true;AttemptKey=$repairKey;RecoveryIgnoreKey=$null;SuppressionKey=$null;ErrorCode='CCOD_STALE_PACKAGE_UNPROVEN';Reason='ControllerFailed'}
-    }.GetNewClosure()
-    $world.WorkerResult=[pscustomobject][ordered]@{ok=$false;outcome='Error';safeState='Error';special=$null}
-    $stdout=$world.WorkerResult|ConvertTo-Json -Depth 20 -Compress
-    $world.Poll=[pscustomobject][ordered]@{Completed=$true;ExitCode=[int]1;StdoutText=$stdout;StdoutByteCount=[int]$stdout.Length;StdoutOverflow=$false;StderrByteCount=[int]0;StderrOverflow=$false}
-    $world.Calls.Clear();Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
-    Assert-CcodTrue ($null -eq $hostState.WorkerSlot -and $hostState.BlockAutomaticActions) 'failed stale repair clears only the worker slot and remains blocked'
-    Assert-CcodEqual ($repairRequest.source|ConvertTo-Json -Depth 10 -Compress) ($completionExpectedSource.Value|ConvertTo-Json -Depth 10 -Compress) 'reducer receives the exact dispatched stale source contract'
-    Assert-CcodEqual $repairKey $hostState.FailedStaleRepairKey 'failed worker persists the exact dispatched stale lifecycle key'
-    $world.Calls.Clear();$world.Elapsed.Enqueue([long]1000);$hostState.ForceReconcile=$true
-    Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
-    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'Start:*'}).Count 'failed exact stale lifecycle is not redispatched on the next supervisor tick'
-
-    $candidateB=$repairRequest.source.PSObject.Copy();$candidateB.Pid=[int]202;$candidateB.CreationTimeUtc='2030-02-03T03:03:00.0000000Z'
-    $candidateBKey='202|2030-02-03T03:03:00.0000000Z';$hostState.StaleReconciliationCandidate=$candidateB;$hostState.AttemptKeys[$candidateBKey]=$true
-    $unrelatedPackage='OpenAI.Codex_2.0.0.0_x64__2p2nqsd0c76g0';$unrelatedHash=('b'*64);$unrelatedSuppression="$unrelatedPackage|$unrelatedHash|runtime-1"
-    $hostState.PackageFullName=$unrelatedPackage;$hostState.AppAsarSha256=$unrelatedHash;$hostState.SuppressionKeys[$unrelatedSuppression]=$true
-    $unrelatedRecord=[pscustomobject][ordered]@{packageFullName=$unrelatedPackage;packageVersion='2.0.0.0';appAsarSha256=$unrelatedHash;runtimeId='runtime-1';staticClassification='CandidateCompatible';dynamicOutcome='Failed';probeState='NotRun';confirmedAtUtc='2030-02-03T03:03:30.0000000Z'}
-    $state.VerifiedPackages.packages|Add-Member -NotePropertyName $unrelatedSuppression -NotePropertyValue $unrelatedRecord
-    $world.Calls.Clear()
-    Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters ([pscustomobject][ordered]@{Kind='ManualRetry';Value=$null;EnqueuedAtUtc='2030-02-03T03:04:05.0000000Z'})
-    Assert-CcodTrue (-not $hostState.AttemptKeys.Contains($repairKey)) 'explicit manual retry clears the failed request lifecycle A'
-    Assert-CcodTrue $hostState.AttemptKeys.Contains($candidateBKey) 'observation B does not redirect retry away from failed lifecycle A'
-    Assert-CcodTrue $hostState.SuppressionKeys.Contains($unrelatedSuppression) 'stale retry preserves unrelated package suppression'
-    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -eq 'Manual:Clear'}).Count 'stale retry never clears an unrelated package failed-attempt record'
-    Assert-CcodEqual $null $hostState.FailedStaleRepairKey 'successful retry consumption clears the stored failed stale key only'
-    Assert-CcodEqual $false $hostState.BlockAutomaticActions 'explicit manual retry reopens reconciliation after a stale repair failure'
-
-    [void]$hostState.AttemptKeys.Remove($candidateBKey);[void]$hostState.SuppressionKeys.Remove($unrelatedSuppression);[void]$state.VerifiedPackages.packages.PSObject.Properties.Remove($unrelatedSuppression)
-    $hostState.PackageFullName=$null;$hostState.AppAsarSha256=$null
-
-    [void]$definitions.Remove('201')
-    $definitions['202']=[pscustomobject][ordered]@{Pid=[int]202;CreationTimeUtc='2030-02-03T03:03:00.0000000Z';Path=$liveExecutable;CommandLine=('"'+$liveExecutable+'"');Arguments=@($liveExecutable)}
-    $world.Calls.Clear();$world.ProcessIds=@(202,333);$hostState.ForceReconcile=$true
-    Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
-    Assert-CcodTrue ($null -eq $candidateProperty.Value) 'changed PID and creation time clear the stale candidate'
-    Assert-CcodTrue ($world.Calls.Contains('Start:StaticProbe:StaticProbe')) 'changed current ordinary identity enters existing static validation'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'Start:Controller:*'}).Count 'stale package evidence never dispatches direct controller repair'
+    Assert-CcodTrue ($null-eq$hostState.WorkerSlot -and $null-eq$hostState.LifecycleWorkerSlot) 'stale evidence starts no mutation worker'
+    Assert-CcodEqual 'Error' $hostState.ConnectionState 'stale package evidence fails the connection closed'
+    Assert-CcodEqual 'Running' $hostState.ProtectionState 'Supervisor protection ownership remains running while stale evidence is blocked'
+    Assert-CcodTrue $hostState.BlockAutomaticActions 'stale package evidence remains blocked for explicit later migration'
     Assert-CcodEqual $stateBefore ($state|ConvertTo-Json -Depth 20 -Compress) 'candidate reconciliation does not clear persisted state'
     $keysAfter=($hostState.AttemptKeys|ConvertTo-Json -Compress)+($hostState.RecoveryIgnoreKeys|ConvertTo-Json -Compress)+($hostState.SuppressionKeys|ConvertTo-Json -Compress)
     Assert-CcodEqual $keysBefore $keysAfter 'candidate reconciliation and targeted retry preserve unrelated key or authorization membership'
@@ -887,18 +1009,23 @@ Invoke-CcodTest 'drains the command queue through the real queue object' {
     Assert-CcodTrue $world.TryDequeueSawRealQueue 'drain dequeue receives the queue object itself'
 }
 
-Invoke-CcodTest 'routes Repair StaticProbe and Apply through the one worker slot' {
+Invoke-CcodTest 'routes repair and apply decisions into durable lifecycle while StaticProbe remains read-only' {
     $cases=@(
-        [pscustomobject]@{Decision='RepairRenderer';Kind='Controller';Action='RepairRenderer';Target=$null},
+        [pscustomobject]@{Decision='RepairRenderer';Kind='Lifecycle';Action=$null;Target=$null},
         [pscustomobject]@{Decision='InspectOrdinary';Kind='StaticProbe';Action='StaticProbe';Target=(New-CcodSupervisorTestSnapshot)},
-        [pscustomobject]@{Decision='ApplyOrdinary';Kind='Controller';Action='Apply';Target=(New-CcodSupervisorTestSnapshot)}
+        [pscustomobject]@{Decision='ApplyOrdinary';Kind='Lifecycle';Action=$null;Target=(New-CcodSupervisorTestSnapshot)}
     )
     foreach($case in $cases){
         $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
         $world.Decision=[pscustomobject][ordered]@{Action=$case.Decision;Reason='Test';Target=$case.Target;AttemptKey=$(if($null -ne $case.Target){'71|2030-02-03T03:01:00.0000000Z'}else{$null});SuppressionKey=$null;EffectiveClassification=$(if($case.Decision -eq 'ApplyOrdinary'){'CandidateCompatible'}else{$null});RequiresController=$true}
         Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
-        Assert-CcodTrue ($world.Calls.Contains("Start:$($case.Kind):$($case.Action)")) "$($case.Decision) maps to exact worker"
-        Assert-CcodEqual $case.Kind $hostState.WorkerSlot.Kind "$($case.Decision) owns one slot"
+        if($case.Kind-ceq'StaticProbe'){
+            Assert-CcodTrue ($world.Calls.Contains('Start:StaticProbe:StaticProbe')) 'static inspection maps to the read-only worker'
+            Assert-CcodEqual 'StaticProbe' $hostState.WorkerSlot.Kind 'static inspection owns the legacy read-only slot'
+        }else{
+            Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'Start:Controller:*'}).Count "$($case.Decision) never starts a controller worker"
+            Assert-CcodTrue ($null-ne$hostState.LifecycleRequest -and $hostState.LifecycleRequest.kind-ceq'CheckAndRepair') "$($case.Decision) creates one durable CheckAndRepair request"
+        }
     }
 }
 

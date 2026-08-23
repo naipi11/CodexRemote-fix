@@ -313,14 +313,16 @@ $results += Invoke-CcodTest 'replays representative valid durable crash stages' 
     }
 }
 
-$results += Invoke-CcodTest 'keeps recovery ignored paused suppressed and already-attempted ordinary lifecycles' {
+$results += Invoke-CcodTest 'keeps recovery ignored suppressed and already-attempted ordinary lifecycles while ignoring the legacy automation preference' {
     $target = New-CcodSupervisorSnapshot
     $attempt = '{0}|{1}' -f $target.Pid,$target.CreationTimeUtc
     $tuple = 'OpenAI.Codex_1.0.0.0_x64__2p2nqsd0c76g0|{0}|runtime-1' -f ('a' * 64)
 
     $ignore = [ordered]@{}; $ignore[($attempt + '|aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')] = $true
     Assert-CcodExactEqual 'RecoveryIgnored' (Get-CcodSupervisorDecision -Context (New-CcodSupervisorContext -RecoveryIgnoreKeys $ignore)).Reason 'recovery lifecycle is not immediately retaken'
-    Assert-CcodExactEqual 'AutomationDisabled' (Get-CcodSupervisorDecision -Context (New-CcodSupervisorContext -AutomationEnabled $false)).Reason 'paused automation keeps ordinary'
+    $legacyPaused=Get-CcodSupervisorDecision -Context (New-CcodSupervisorContext -AutomationEnabled $false)
+    Assert-CcodExactEqual 'ApplyOrdinary' $legacyPaused.Action 'legacy automation preference is migration data and cannot pause protection'
+    Assert-CcodExactEqual 'Compatible' $legacyPaused.Reason 'legacy preference does not alter the internal compatibility decision'
 
     $suppressed = [ordered]@{}; $suppressed[$tuple] = $true
     Assert-CcodExactEqual 'DynamicSuppressed' (Get-CcodSupervisorDecision -Context (New-CcodSupervisorContext -SuppressionKeys $suppressed)).Reason 'exact tuple suppression keeps ordinary'
@@ -351,9 +353,10 @@ $results += Invoke-CcodTest 'reserves a static-probe worker for blank classifica
     }
 }
 
-$results += Invoke-CcodTest 'requires independent consent and healthy state for a first candidate trial' {
-    $consent = Get-CcodSupervisorDecision -Context (New-CcodSupervisorContext -CandidateCompatibleOptIn $false)
-    Assert-CcodExactEqual 'CandidateOptInRequired' $consent.Reason 'consent is independently required'
+$results += Invoke-CcodTest 'keeps candidate compatibility internal and requires healthy state for a first candidate trial' {
+    $legacyCandidate = Get-CcodSupervisorDecision -Context (New-CcodSupervisorContext -CandidateCompatibleOptIn $false)
+    Assert-CcodExactEqual 'ApplyOrdinary' $legacyCandidate.Action 'legacy candidate preference is migration data and cannot command protection'
+    Assert-CcodExactEqual 'Compatible' $legacyCandidate.Reason 'candidate compatibility remains an internal decision'
     $health = Get-CcodSupervisorDecision -Context (New-CcodSupervisorContext -AutomaticCandidateTrialsAllowed $false)
     Assert-CcodExactEqual 'CandidateTrialBlocked' $health.Reason 'Task 5 aggregate blocks unhealthy first trial'
     $authorized = Get-CcodSupervisorDecision -Context (New-CcodSupervisorContext)

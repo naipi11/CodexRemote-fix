@@ -431,9 +431,6 @@ function Get-CcodSupervisorDecision {
     if (Test-CcodRecoveryMembership $Context.RecoveryIgnoreKeys $attemptKey) {
         return New-CcodSupervisorDecision 'KeepOrdinary' 'RecoveryIgnored' $target $attemptKey $suppressionKey $effectiveClassification
     }
-    if (-not $Context.AutomationEnabled) {
-        return New-CcodSupervisorDecision 'KeepOrdinary' 'AutomationDisabled' $target $attemptKey $suppressionKey $effectiveClassification
-    }
     $failedHistory = $null -ne $history -and $history.packageFullName -ceq $Context.PackageFullName -and
         $history.appAsarSha256 -ceq $Context.AppAsarSha256 -and $history.runtimeId -ceq $Context.RuntimeId -and
         $history.dynamicOutcome -ceq 'Failed'
@@ -448,9 +445,6 @@ function Get-CcodSupervisorDecision {
     }
     if (@('NativeModulePresent','UnknownOrIncompatible') -ccontains $effectiveClassification) {
         return New-CcodSupervisorDecision 'KeepOrdinary' $effectiveClassification $target $attemptKey $suppressionKey $effectiveClassification
-    }
-    if ($effectiveClassification -ceq 'CandidateCompatible' -and -not $Context.CandidateCompatibleOptIn) {
-        return New-CcodSupervisorDecision 'KeepOrdinary' 'CandidateOptInRequired' $target $attemptKey $suppressionKey $effectiveClassification
     }
     if ($effectiveClassification -ceq 'CandidateCompatible' -and -not $Context.AutomaticCandidateTrialsAllowed) {
         return New-CcodSupervisorDecision 'KeepOrdinary' 'CandidateTrialBlocked' $target $attemptKey $suppressionKey $effectiveClassification
