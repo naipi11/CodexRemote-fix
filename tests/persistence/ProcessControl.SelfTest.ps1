@@ -902,6 +902,29 @@ try {
         Assert-CcodEqual 1 $calls.Package 'launch path is dynamically resolved even when adopting'
     }
 
+    Invoke-CcodTest 'activates an ordinary packaged Codex by exact AUMID instead of launching the WindowsApps executable' {
+        $calls = [pscustomobject]@{ Packaged = 0; Direct = 0; Aumid = $null }
+        $result = Start-CcodProcess -Mode Ordinary -Adapters @{
+            GetPackageIdentity = { [pscustomobject]@{ Found=$true; FullName='OpenAI.Codex_1.0.0.0_x64__2p2nqsd0c76g0'; FamilyName='OpenAI.Codex_2p2nqsd0c76g0'; Version='1.0.0.0'; ExecutablePath='C:\Codex\ChatGPT.exe' } }
+            GetCurrentSessionId = { 1 }
+            GetCurrentUserSid = { 'S-1-5-21-test' }
+            ListProcessIds = { @() }
+            GetProcess = { param($ProcessId, $StatusEvidence) $null }
+            ActivatePackagedApplication = {
+                param($AppUserModelId)
+                $calls.Packaged++
+                $calls.Aumid = $AppUserModelId
+                [pscustomobject]@{ Id = 700 }
+            }.GetNewClosure()
+            StartProcess = { param($FilePath, $Arguments, $WindowStyle) $calls.Direct++; throw 'ordinary packaged activation must not use the executable path' }.GetNewClosure()
+        }
+        Assert-CcodEqual 'Started' $result.Outcome 'ordinary packaged activation returns started'
+        Assert-CcodEqual 1 $calls.Packaged 'packaged activation boundary is called once'
+        Assert-CcodEqual 'OpenAI.Codex_2p2nqsd0c76g0!App' $calls.Aumid 'exact current Codex AUMID is used'
+        Assert-CcodEqual 0 $calls.Direct 'ordinary activation never executes the WindowsApps binary directly'
+        Assert-CcodEqual 700 $result.Process.Id 'activation receipt is preserved for diagnostics'
+    }
+
     Invoke-CcodTest 'rechecks special ports and launches Codex visibly' {
         $calls = [pscustomobject]@{ Start = 0; Availability = @(); Path = $null; Arguments = @(); WindowStyle = 'unset' }
         $command = '"C:\Codex\ChatGPT.exe" --remote-debugging-address=127.0.0.1 --remote-debugging-port=41001 --inspect=127.0.0.1:41002'
