@@ -6,6 +6,20 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.4.23
+
+### English
+
+- Replaced the embedded COM application activator with the standard Windows `explorer.exe shell:AppsFolder\<AUMID>` route.
+- Preserved reliable ordinary Codex relaunch while removing the new embedded interop signature that triggered Defender's `Program:Win32/Contebrew.A!ml` download heuristic.
+- Added regression coverage that forbids the embedded COM activator and verifies the exact AppsFolder launch request.
+
+### 简体中文
+
+- 将内嵌 COM 应用激活器替换为 Windows 标准 `explorer.exe shell:AppsFolder\<AUMID>` 路径。
+- 在保留普通 Codex 可靠重启的同时，移除触发 Defender `Program:Win32/Contebrew.A!ml` 下载启发式检测的新增互操作特征。
+- 新增回归测试，禁止内嵌 COM 激活器，并验证精确的 AppsFolder 启动请求。
+
 ## v2.4.22
 
 ### English

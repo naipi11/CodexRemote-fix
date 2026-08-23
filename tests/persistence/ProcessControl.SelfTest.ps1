@@ -925,6 +925,29 @@ try {
         Assert-CcodEqual 700 $result.Process.Id 'activation receipt is preserved for diagnostics'
     }
 
+    Invoke-CcodTest 'default packaged activation uses Explorer AppsFolder without embedding a COM activator' {
+        $source = Get-Content -LiteralPath (Join-Path $repositoryRoot 'src\persistence\modules\ProcessControl.psm1') -Raw
+        Assert-CcodTrue ($source -cnotmatch 'ApplicationActivationManager|PackagedApplicationV1|45BA127D-10A8-46EA-8AB7-56EA9078943C') 'packaged installer source contains no embedded COM activator signature'
+        Assert-CcodTrue ($source -cmatch 'shell:AppsFolder\\') 'packaged activation uses the standard Windows AppsFolder shell route'
+
+        $call = [pscustomobject]@{ Path=$null; Arguments=@(); WindowStyle='unset' }
+        $start = {
+            param($FilePath,$Arguments,$WindowStyle)
+            $call.Path=$FilePath;$call.Arguments=@($Arguments);$call.WindowStyle=$WindowStyle
+            [pscustomobject]@{ Id=701 }
+        }.GetNewClosure()
+        $module = Get-Module -Name ProcessControl -ErrorAction Stop
+        $receipt = & $module {
+            param($StartCallback)
+            $adapter = Get-CcodProcessAdapters -Adapters @{ StartProcess=$StartCallback }
+            & $adapter.ActivatePackagedApplication 'OpenAI.Codex_2p2nqsd0c76g0!App'
+        } $start
+        Assert-CcodEqual ([IO.Path]::GetFullPath((Join-Path $env:WINDIR 'explorer.exe'))) $call.Path 'AppsFolder activation uses the system Explorer path'
+        Assert-CcodEqual 'shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App' ($call.Arguments -join ',') 'AppsFolder activation carries only the exact Codex AUMID'
+        Assert-CcodEqual $null $call.WindowStyle 'AppsFolder activation is visible'
+        Assert-CcodEqual 701 $receipt.Id 'shell activation receipt is preserved'
+    }
+
     Invoke-CcodTest 'rechecks special ports and launches Codex visibly' {
         $calls = [pscustomobject]@{ Start = 0; Availability = @(); Path = $null; Arguments = @(); WindowStyle = 'unset' }
         $command = '"C:\Codex\ChatGPT.exe" --remote-debugging-address=127.0.0.1 --remote-debugging-port=41001 --inspect=127.0.0.1:41002'

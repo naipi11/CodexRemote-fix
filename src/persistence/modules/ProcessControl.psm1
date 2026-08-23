@@ -27,7 +27,6 @@ using System.Net;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
-using System.Text.RegularExpressions;
 
 namespace Ccod.Persistence.Native {
     public sealed class ProcessIdentityResult {
@@ -124,46 +123,6 @@ namespace Ccod.Persistence.Native {
                     PackageFamilyName = ReadFamily(process)
                 };
             } finally { CloseHandle(process); }
-        }
-    }
-
-    [Flags]
-    internal enum ActivateOptions : uint { None = 0 }
-
-    [ComImport]
-    [Guid("2e941141-7f97-4756-ba1d-9decde894a3d")]
-    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    internal interface IApplicationActivationManager {
-        [PreserveSig]
-        int ActivateApplication(
-            [MarshalAs(UnmanagedType.LPWStr)] string appUserModelId,
-            [MarshalAs(UnmanagedType.LPWStr)] string arguments,
-            ActivateOptions options,
-            out uint processId);
-    }
-
-    [ComImport]
-    [Guid("45BA127D-10A8-46EA-8AB7-56EA9078943C")]
-    internal class ApplicationActivationManager { }
-
-    public static class PackagedApplicationV1 {
-        public static int Activate(string appUserModelId) {
-            if (String.IsNullOrWhiteSpace(appUserModelId) ||
-                !Regex.IsMatch(appUserModelId, "^[A-Za-z0-9._-]{1,128}![A-Za-z0-9._-]{1,64}$", RegexOptions.CultureInvariant)) {
-                throw new ArgumentException("A canonical AppUserModelId is required.");
-            }
-            object raw = null;
-            try {
-                raw = new ApplicationActivationManager();
-                IApplicationActivationManager manager = (IApplicationActivationManager)raw;
-                uint processId;
-                int result = manager.ActivateApplication(appUserModelId, null, ActivateOptions.None, out processId);
-                if (result < 0) Marshal.ThrowExceptionForHR(result);
-                if (processId == 0 || processId > Int32.MaxValue) throw new InvalidOperationException("Packaged application activation returned an invalid process id.");
-                return (int)processId;
-            } finally {
-                if (raw != null && Marshal.IsComObject(raw)) Marshal.FinalReleaseComObject(raw);
-            }
         }
     }
 
@@ -458,16 +417,18 @@ function Get-CcodProcessAdapters {
             if (-not [string]::IsNullOrWhiteSpace([string]$WindowStyle)) { $parameters.WindowStyle = [string]$WindowStyle }
             Start-Process @parameters
         }
-        ActivatePackagedApplication = {
-            param($AppUserModelId)
-            Initialize-CcodProcessNativeApi
-            $processId = [Ccod.Persistence.Native.PackagedApplicationV1]::Activate([string]$AppUserModelId)
-            if ($processId -lt 1) { return $null }
-            [pscustomobject]@{ Id = [int]$processId }
-        }
     }
     if ($null -ne $Adapters) {
         foreach ($name in $Adapters.Keys) { $resolved[$name] = $Adapters[$name] }
+    }
+    if ($null -eq $Adapters -or -not $Adapters.ContainsKey('ActivatePackagedApplication')) {
+        $resolved.ActivatePackagedApplication = {
+            param($AppUserModelId)
+            if ($AppUserModelId -isnot [string] -or $AppUserModelId -cnotmatch '^[A-Za-z0-9._-]{1,128}![A-Za-z0-9._-]{1,64}$') { return $null }
+            $explorerPath = [IO.Path]::GetFullPath((Join-Path $env:WINDIR 'explorer.exe'))
+            if (-not [IO.File]::Exists($explorerPath)) { return $null }
+            & $resolved.StartProcess $explorerPath @("shell:AppsFolder\$AppUserModelId") $null
+        }.GetNewClosure()
     }
     if ($null -eq $Adapters -or -not $Adapters.ContainsKey('ProbeSpecial')) {
         $resolved.ProbeSpecial = {
