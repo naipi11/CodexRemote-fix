@@ -553,6 +553,8 @@ function Invoke-CcodLifecycleControllerRecover {
     $stderrPath = [IO.Path]::GetFullPath((Join-Path $requestDirectory "uninstall-$nonce.stderr.log"))
     try {
         [IO.File]::WriteAllText($requestPath, ($request | ConvertTo-Json -Depth 16 -Compress), [Text.UTF8Encoding]::new($false))
+        $resultPlaceholder = [IO.File]::Open($resultPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $resultPlaceholder.Dispose()
         $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
         $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $controller, '-RequestPath', $requestPath, '-ResultPath', $resultPath)
         $stdout = @(& $powershell @arguments 2>$stderrPath)

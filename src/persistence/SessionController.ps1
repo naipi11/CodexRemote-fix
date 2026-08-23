@@ -261,6 +261,28 @@ function Test-CcodLegacyWrapperTail {
     return $true
 }
 
+function Test-CcodLegacyRequestSemantics {
+    param($Request,[ValidateSet('start','reset','uninstall')][string]$Prefix,[object[]]$Arguments)
+    if($Request.action -cne 'Recover' -or $null -ne $Request.source -or $Request.existingOnly -isnot [bool] -or -not $Request.existingOnly -or
+        $null -ne $Request.rendererPort -or $null -ne $Request.mainPort -or $Request.restartOrdinary -isnot [bool] -or $Request.timeoutMilliseconds -isnot [int]){return $false}
+    switch($Prefix){
+        'start' {
+            if($Arguments -cnotcontains '-RestartCodex' -or -not $Request.restartOrdinary){return $false}
+            $timeout=30;$index=[array]::IndexOf($Arguments,'-TimeoutSeconds')
+            if($index -ge 0){if($index+1 -ge $Arguments.Count -or -not [int]::TryParse([string]$Arguments[$index+1],[ref]$timeout)){return $false}}
+            return $Request.timeoutMilliseconds -eq ($timeout*1000)
+        }
+        'reset' {
+            if($Request.timeoutMilliseconds -ne 30000){return $false}
+            return $Request.restartOrdinary -eq ($Arguments -cnotcontains '-DoNotRestart')
+        }
+        'uninstall' {
+            return $Arguments -cnotcontains '-KeepCurrentSpecialSession' -and $Request.restartOrdinary -and $Request.timeoutMilliseconds -eq 30000
+        }
+    }
+    return $false
+}
+
 function Test-CcodLegacyRecoverProvenance {
     param($Request,[string]$RequestPath,[string]$ResultPath,$RuntimeContext,[hashtable]$Adapter)
     try{
@@ -268,7 +290,7 @@ function Test-CcodLegacyRecoverProvenance {
         if(-not (& $Adapter.TestLegacyPathSafe $tempRoot)){return $false}
         foreach($path in @($RequestPath,$ResultPath)){
             if($path -isnot [string] -or -not [IO.Path]::IsPathRooted($path) -or [IO.Path]::GetFullPath($path) -cne $path -or
-                -not (Test-CcodControllerPathEqual (Split-Path -Parent $path) $tempRoot)){return $false}
+                -not (Test-CcodControllerPathEqual (Split-Path -Parent $path) $tempRoot) -or -not (& $Adapter.TestLegacyFileSafe $path)){return $false}
         }
         $requestMatch=[regex]::Match((Split-Path -Leaf $RequestPath),'^(?<prefix>start|reset|uninstall)-(?<nonce>[0-9a-f]{32})-request\.json$',[Text.RegularExpressions.RegexOptions]::CultureInvariant)
         $resultMatch=[regex]::Match((Split-Path -Leaf $ResultPath),'^(?<prefix>start|reset|uninstall)-(?<nonce>[0-9a-f]{32})-result\.json$',[Text.RegularExpressions.RegexOptions]::CultureInvariant)
@@ -311,16 +333,16 @@ function Test-CcodLegacyRecoverProvenance {
         }
         $expectedParent=@($approvedPowerShell,'-NoProfile','-ExecutionPolicy','Bypass','-File',$wrapperPath)
         if(-not (Test-CcodControllerExactArguments @($parentArguments|Select-Object -First 6) $expectedParent @(0,5)) -or
-            -not (Test-CcodLegacyWrapperTail -Prefix $prefix -Arguments @($parentArguments|Select-Object -Skip 6) -InstallRoot $RuntimeContext.InstallRoot)){return $false}
+            -not (Test-CcodLegacyWrapperTail -Prefix $prefix -Arguments @($parentArguments|Select-Object -Skip 6) -InstallRoot $RuntimeContext.InstallRoot) -or
+            -not (Test-CcodLegacyRequestSemantics -Request $Request -Prefix $prefix -Arguments @($parentArguments|Select-Object -Skip 6))){return $false}
         return $true
     }catch{return $false}
 }
 
 function Test-CcodControllerLeaseInput {
-    param($Request,$Identity,$SupervisorProcess,[bool]$LegacyRecoverAuthorized=$false)
+    param($Request,$Identity,$SupervisorProcess)
     $schema2=$null -ne $Request -and $null -ne $Request.PSObject.Properties['schemaVersion'] -and $Request.schemaVersion -eq 2
-    $legacyRecover=$LegacyRecoverAuthorized -and $null -ne $Request -and $null -ne $Request.PSObject.Properties['schemaVersion'] -and $Request.schemaVersion -eq 1 -and
-        $null -ne $Request.PSObject.Properties['action'] -and $Request.action -ceq 'Recover'
+    $legacyRecover=$false
     $requestFields=if($schema2){@('schemaVersion','action','transactionId','runtimeId','runtimeGeneration','leaseEpoch','ownerIdentity','supervisorIdentity','source','existingOnly','rendererPort','mainPort','timeoutMilliseconds','restartOrdinary')}else{@('schemaVersion','action','transactionId','runtimeId','supervisorIdentity','source','existingOnly','rendererPort','mainPort','timeoutMilliseconds','restartOrdinary')}
     if((-not $schema2 -and -not $legacyRecover) -or -not (Test-CcodControllerExactProperties $Request $requestFields)){return $false}
     if($null -eq $Request -or ($Request -isnot [pscustomobject] -and $Request -isnot [Collections.IDictionary]) -or
@@ -422,6 +444,23 @@ function Get-CcodControllerStableTransitionCode {
     return 'CCOD_TRANSITION_INVALID'
 }
 
+function Test-CcodControllerLegacyRecoverInput {
+    param($Request,$Identity,$SupervisorProcess)
+    $fields=@('schemaVersion','action','transactionId','runtimeId','supervisorIdentity','source','existingOnly','rendererPort','mainPort','timeoutMilliseconds','restartOrdinary')
+    if(-not (Test-CcodControllerExactProperties $Request $fields) -or $Request.schemaVersion -ne 1 -or $Request.action -cne 'Recover' -or
+        -not (Test-CcodControllerCanonicalGuid $Request.transactionId) -or $Request.runtimeId -isnot [string] -or [string]::IsNullOrWhiteSpace($Request.runtimeId) -or
+        $null -ne $Request.source -or $Request.existingOnly -isnot [bool] -or -not $Request.existingOnly -or $null -ne $Request.rendererPort -or $null -ne $Request.mainPort -or
+        $Request.timeoutMilliseconds -isnot [int] -or $Request.timeoutMilliseconds -lt 500 -or $Request.timeoutMilliseconds -gt 120000 -or $Request.restartOrdinary -isnot [bool] -or
+        -not (Test-CcodControllerExactProperties $Request.supervisorIdentity @('pid','creationTimeUtc','sessionId')) -or
+        $Request.supervisorIdentity.pid -isnot [int] -or $Request.supervisorIdentity.pid -lt 1 -or -not (Test-CcodControllerCanonicalUtc $Request.supervisorIdentity.creationTimeUtc) -or
+        $Request.supervisorIdentity.sessionId -isnot [string] -or $null -eq $Identity -or -not (Test-CcodControllerCanonicalSid $Identity.UserSid) -or
+        $Identity.SessionId -isnot [int] -or $null -eq $SupervisorProcess -or $SupervisorProcess.Pid -isnot [int] -or
+        $SupervisorProcess.CreationTimeUtc -isnot [string] -or $SupervisorProcess.SessionId -isnot [int]){return $false}
+    return $Request.supervisorIdentity.sessionId -ceq $Identity.SessionId.ToString([Globalization.CultureInfo]::InvariantCulture) -and
+        $SupervisorProcess.Pid -eq $Request.supervisorIdentity.pid -and $SupervisorProcess.CreationTimeUtc -ceq $Request.supervisorIdentity.creationTimeUtc -and
+        $SupervisorProcess.SessionId -eq $Identity.SessionId
+}
+
 function Test-CcodControllerLifecycleFenceFailure($Failure){
     if($null -eq $Failure){return $false}
     $id=[string]$Failure.FullyQualifiedErrorId
@@ -444,14 +483,15 @@ function Write-CcodControllerFencedResult($Request,$Paths,[string]$ResultPath,$V
     & $Adapter.WriteResult $ResultPath $Value|Out-Null
 }
 
-function Invoke-CcodSessionControllerCore {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)]$Request,[Parameter(Mandatory)]$Paths,[Parameter(Mandatory)][string]$ResultPath,[bool]$LegacyRecoverAuthorized,[hashtable]$Adapters)
+$controllerCoreSource=@'
+    param($Request,$Paths,[string]$ResultPath,[hashtable]$Adapters)
+    $LegacyRecoverAuthorized=$false
     $adapter=Get-CcodControllerAdapters $Adapters;$result=$null;$intendedResult=$null;$diagnosticWritten=$false;$accountLease=$null;$sessionLease=$null;$accountLeaseAcquired=$false;$sessionLeaseAcquired=$false;$releaseFailed=$false;$provisionalRequired=$false;$initialResultWriteFailed=$false
     try{
         try{$identity=& $adapter.GetIdentity}catch{$identity=$null}
         try{$supervisorProcess=& $adapter.GetSupervisorProcess $Request.supervisorIdentity.pid}catch{$supervisorProcess=$null}
-        if(-not (Test-CcodControllerLeaseInput $Request $identity $supervisorProcess $LegacyRecoverAuthorized)){
+        $leaseInputValid=if($LegacyRecoverAuthorized){Test-CcodControllerLegacyRecoverInput $Request $identity $supervisorProcess}else{Test-CcodControllerLeaseInput $Request $identity $supervisorProcess}
+        if(-not $leaseInputValid){
             $result=New-CcodControllerErrorResult $Request 'CCOD_REQUEST_INVALID' 'InputValidation' 'The request does not match this controller session.'
         }else{
             $total=[Math]::Min([int]$Request.timeoutMilliseconds,5000)
@@ -530,28 +570,10 @@ function Invoke-CcodSessionControllerCore {
     & $adapter.WriteStdout $line|Out-Null
     $safe=@('Activated','Inspected','NoAction','Recovered','Closed') -ccontains $result.outcome
     return [pscustomobject][ordered]@{Result=$result;ExitCode=if($safe){0}else{1}}
-}
-
-function Invoke-CcodSessionController {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)]$Request,[Parameter(Mandatory)]$Paths,[Parameter(Mandatory)][string]$ResultPath,[hashtable]$Adapters)
-    Invoke-CcodSessionControllerCore -Request $Request -Paths $Paths -ResultPath $ResultPath -LegacyRecoverAuthorized $false -Adapters $Adapters
-}
-
-function Invoke-CcodVerifiedLegacyRecoverController {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]$Request,
-        [Parameter(Mandatory)]$Paths,
-        [Parameter(Mandatory)][string]$RequestPath,
-        [Parameter(Mandatory)][string]$ResultPath,
-        [Parameter(Mandatory)]$RuntimeContext,
-        [hashtable]$Adapters
-    )
-    $resolved=Get-CcodControllerAdapters $Adapters
-    $authorized=Test-CcodLegacyRecoverProvenance -Request $Request -RequestPath $RequestPath -ResultPath $ResultPath -RuntimeContext $RuntimeContext -Adapter $resolved
-    Invoke-CcodSessionControllerCore -Request $Request -Paths $Paths -ResultPath $ResultPath -LegacyRecoverAuthorized ([bool]$authorized) -Adapters $resolved
-}
+'@
+$publicControllerInvoker=[scriptblock]::Create($controllerCoreSource)
+Set-Item -Path Function:Invoke-CcodSessionController -Value $publicControllerInvoker
+$controllerCoreSource=$null;$publicControllerInvoker=$null;$CcodControllerExecutionLegacyInvoker=$null
 
 function Get-CcodControllerInstallRoot {
     $localAppData=[Environment]::GetEnvironmentVariable('LOCALAPPDATA','Process')
@@ -637,7 +659,16 @@ if($MyInvocation.InvocationName -ne '.'){
         $resultDirectory=[IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) 'CodexControlOtherDevices'))
         [IO.Directory]::CreateDirectory($resultDirectory)|Out-Null;$ResultPath=[IO.Path]::GetFullPath((Join-Path $resultDirectory ("manual-$($request.transactionId).json")))
     }
-    if($legacyRequest){$run=Invoke-CcodVerifiedLegacyRecoverController -Request $request -Paths $paths -RequestPath $RequestPath -ResultPath $ResultPath -RuntimeContext $runtimeContext}
-    else{$run=Invoke-CcodSessionController -Request $request -Paths $paths -ResultPath $ResultPath}
+    if($legacyRequest){
+        $resolvedLegacyAdapters=Get-CcodControllerAdapters $null
+        $legacyAuthorized=Test-CcodLegacyRecoverProvenance -Request $request -RequestPath $RequestPath -ResultPath $ResultPath -RuntimeContext $runtimeContext -Adapter $resolvedLegacyAdapters
+        if($legacyAuthorized){
+            $legacyCoreSource=(Get-Command Invoke-CcodSessionController -CommandType Function).ScriptBlock.ToString().Replace('$LegacyRecoverAuthorized=$false','$LegacyRecoverAuthorized=$true')
+            $CcodControllerExecutionLegacyInvoker=[scriptblock]::Create($legacyCoreSource);$legacyCoreSource=$null
+            $run=& $CcodControllerExecutionLegacyInvoker $request $paths $ResultPath $resolvedLegacyAdapters
+        }
+        else{$run=Invoke-CcodSessionController -Request $request -Paths $paths -ResultPath $ResultPath}
+    }else{$run=Invoke-CcodSessionController -Request $request -Paths $paths -ResultPath $ResultPath}
+    $CcodControllerExecutionLegacyInvoker=$null
     exit $run.ExitCode
-}
+}else{$CcodControllerExecutionLegacyInvoker=$null}

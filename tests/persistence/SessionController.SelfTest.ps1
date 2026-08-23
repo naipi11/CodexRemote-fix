@@ -158,10 +158,16 @@ try{
 
     Invoke-CcodTest 'schema-v1 Recover has no public bypass and requires exact wrapper parent provenance' {
         $request=New-CcodControllerRequest -Action Recover;$calls=[pscustomobject]@{Engine=0}
-        $blocked=Invoke-CcodSessionController -Request $request -Paths $paths -ResultPath $resultPath -Adapters (Merge-CcodControllerTestAdapters @{EngineInvoker={param($Action,$Request,$Paths)$calls.Engine++;throw 'must not dispatch'}.GetNewClosure();WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}})
+        $blocked=Invoke-CcodSessionController -Request $request -Paths $paths -ResultPath $resultPath -Adapters (Merge-CcodControllerTestAdapters @{LegacyRecoverAuthorized=$true;Capability=[object]::new();EngineInvoker={param($Action,$Request,$Paths)$calls.Engine++;throw 'must not dispatch'}.GetNewClosure();WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}})
         Assert-CcodEqual 'CCOD_REQUEST_INVALID' $blocked.Result.error.code 'ordinary callers cannot enter legacy Recover'
         Assert-CcodEqual 0 $calls.Engine 'blocked legacy request has no engine side effect'
         Assert-CcodTrue (-not (Get-Command Invoke-CcodSessionController).Parameters.ContainsKey('AllowLegacyRecover')) 'public controller surface has no self-authorization switch'
+        Assert-CcodEqual $null (Get-Command Invoke-CcodSessionControllerCore -ErrorAction SilentlyContinue) 'dot-sourcing exposes no authorization-bearing controller core'
+        Assert-CcodEqual $null (Get-Command Invoke-CcodVerifiedLegacyRecoverController -ErrorAction SilentlyContinue) 'dot-sourcing exposes no callable verified-legacy dispatcher'
+        Assert-CcodEqual $null (Get-Variable CcodControllerExecutionLegacyInvoker -ValueOnly -ErrorAction SilentlyContinue) 'dot-sourcing retains no execution-only legacy capability closure'
+        foreach($command in @(Get-Command -CommandType Function|Where-Object{$_.ScriptBlock.File -ceq (Join-Path $repositoryRoot 'src\persistence\SessionController.ps1')})){
+            Assert-CcodTrue (-not $command.Parameters.ContainsKey('LegacyRecoverAuthorized')) "$($command.Name) cannot accept legacy authorization"
+        }
 
         $legacyRoot=[IO.Path]::GetFullPath((Join-Path $root 'legacy-temp\CodexControlOtherDevices'));$nonce='0123456789abcdef0123456789abcdef'
         $requestPath=[IO.Path]::GetFullPath((Join-Path $legacyRoot "start-$nonce-request.json"));$legacyResultPath=[IO.Path]::GetFullPath((Join-Path $legacyRoot "start-$nonce-result.json"))
@@ -170,18 +176,45 @@ try{
         $runtimeContext=[pscustomobject][ordered]@{InstallRoot=[IO.Path]::GetFullPath((Join-Path $root 'install'));RuntimeRoot=$runtimeRoot;RuntimeId='runtime-1';ControllerPath=$controller;Manifest=[pscustomobject][ordered]@{files=@([pscustomobject][ordered]@{path='Start-CodexControlOtherDevices.ps1'})}}
         $current=[pscustomobject][ordered]@{Pid=700;CreationTimeUtc='2030-02-03T03:00:01.0000000Z';SessionId=1;UserSid=$script:CcodControllerTestUserSid;Path=$powershell;CommandLine='child';ParentPid=11}
         $parent=[pscustomobject][ordered]@{Pid=11;CreationTimeUtc='2030-02-03T03:00:00.0000000Z';SessionId=1;UserSid=$script:CcodControllerTestUserSid;Path=$powershell;CommandLine='parent';ParentPid=10}
+        $leafChecks=[pscustomobject]@{Count=0}
         $validAdapters=Merge-CcodControllerTestAdapters @{
             GetLegacyTempRoot={$legacyRoot}.GetNewClosure();TestLegacyPathSafe={param($Path)$true};GetCurrentProcessId={700}
+            TestLegacyFileSafe={param($Path)$leafChecks.Count++;$true}.GetNewClosure()
             GetProcessProvenance={param($ProcessId)if([int]$ProcessId -eq 700){$current}elseif([int]$ProcessId -eq 11){$parent}else{$null}}.GetNewClosure()
-            ParseProcessCommandLine={param($CommandLine)if($CommandLine -ceq 'child'){@($powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',$controller,'-RequestPath',$requestPath,'-ResultPath',$legacyResultPath)}else{@($powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',$wrapper)}}.GetNewClosure()
+            ParseProcessCommandLine={param($CommandLine)if($CommandLine -ceq 'child'){@($powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',$controller,'-RequestPath',$requestPath,'-ResultPath',$legacyResultPath)}else{@($powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',$wrapper,'-RestartCodex')}}.GetNewClosure()
             GetApprovedPowerShellPath={$powershell}.GetNewClosure()
             ReadJournal={param($Path)[pscustomobject]@{transactionId='1b2c5c27-e6e3-4ae4-a876-a59418519d41';stage='OrdinaryStopped'}}
             EngineInvoker={param($Action,$Request,$Paths)$calls.Engine++;New-CcodControllerResult $Action $Request.transactionId Recovered}.GetNewClosure()
             WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}
         }
-        $allowed=Invoke-CcodVerifiedLegacyRecoverController -Request $request -Paths $paths -RequestPath $requestPath -ResultPath $legacyResultPath -RuntimeContext $runtimeContext -Adapters $validAdapters
-        Assert-CcodEqual 'Recovered' $allowed.Result.outcome 'manifest-bound wrapper parent provenance admits exact legacy Recover'
-        Assert-CcodEqual 1 $calls.Engine 'verified provenance dispatches exactly once'
+        $allowed=Test-CcodLegacyRecoverProvenance -Request $request -RequestPath $requestPath -ResultPath $legacyResultPath -RuntimeContext $runtimeContext -Adapter $validAdapters
+        Assert-CcodEqual $true $allowed 'manifest-bound wrapper parent provenance admits exact legacy Recover'
+        Assert-CcodEqual 2 $leafChecks.Count 'both request and result leaves are proven regular non-reparse files'
+        Assert-CcodEqual 0 $calls.Engine 'provenance checker cannot dispatch the legacy engine'
+
+        $missingRestart=$validAdapters.Clone();$missingRestart.ParseProcessCommandLine={param($CommandLine)if($CommandLine -ceq 'child'){@($powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',$controller,'-RequestPath',$requestPath,'-ResultPath',$legacyResultPath)}else{@($powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',$wrapper)}}.GetNewClosure()
+        Assert-CcodEqual $false (Test-CcodLegacyRecoverProvenance -Request $request -RequestPath $requestPath -ResultPath $legacyResultPath -RuntimeContext $runtimeContext -Adapter $missingRestart) 'Start Recover requires the parent RestartCodex semantic'
+        $unsafeLeaf=$validAdapters.Clone();$unsafeLeaf.TestLegacyFileSafe={param($Path)$false}
+        Assert-CcodEqual $false (Test-CcodLegacyRecoverProvenance -Request $request -RequestPath $requestPath -ResultPath $legacyResultPath -RuntimeContext $runtimeContext -Adapter $unsafeLeaf) 'a reparse or non-file request/result leaf rejects legacy recovery'
+
+        $testVariant={
+            param([string]$Prefix,[string]$WrapperLeaf,[string[]]$Tail,[bool]$RestartOrdinary,[int]$TimeoutMilliseconds)
+            $variantRequest=New-CcodControllerRequest -Action Recover;$variantRequest.restartOrdinary=$RestartOrdinary;$variantRequest.timeoutMilliseconds=$TimeoutMilliseconds
+            $variantRequestPath=[IO.Path]::GetFullPath((Join-Path $legacyRoot "$Prefix-$nonce-request.json"));$variantResultPath=[IO.Path]::GetFullPath((Join-Path $legacyRoot "$Prefix-$nonce-result.json"))
+            $variantWrapper=[IO.Path]::GetFullPath((Join-Path $runtimeRoot $WrapperLeaf))
+            $variantRuntime=[pscustomobject][ordered]@{InstallRoot=$runtimeContext.InstallRoot;RuntimeRoot=$runtimeRoot;RuntimeId='runtime-1';ControllerPath=$controller;Manifest=[pscustomobject][ordered]@{files=@([pscustomobject][ordered]@{path=$WrapperLeaf})}}
+            $variantAdapters=$validAdapters.Clone();$tailValue=@($Tail);$powerShellValue=$powershell;$controllerValue=$controller
+            $variantAdapters.ParseProcessCommandLine={param($CommandLine)if($CommandLine -ceq 'child'){@($powerShellValue,'-NoProfile','-ExecutionPolicy','Bypass','-File',$controllerValue,'-RequestPath',$variantRequestPath,'-ResultPath',$variantResultPath)}else{@($powerShellValue,'-NoProfile','-ExecutionPolicy','Bypass','-File',$variantWrapper)+$tailValue}}.GetNewClosure()
+            Test-CcodLegacyRecoverProvenance -Request $variantRequest -RequestPath $variantRequestPath -ResultPath $variantResultPath -RuntimeContext $variantRuntime -Adapter $variantAdapters
+        }.GetNewClosure()
+        Assert-CcodEqual $true (& $testVariant 'reset' 'Reset-CodexControlOtherDevices.ps1' @() $true 30000) 'default Reset maps exactly to restartOrdinary true'
+        Assert-CcodEqual $true (& $testVariant 'reset' 'Reset-CodexControlOtherDevices.ps1' @('-DoNotRestart') $false 30000) 'Reset DoNotRestart maps exactly to restartOrdinary false'
+        Assert-CcodEqual $false (& $testVariant 'reset' 'Reset-CodexControlOtherDevices.ps1' @('-DoNotRestart') $true 30000) 'Reset semantic mismatch is rejected'
+        Assert-CcodEqual $false (& $testVariant 'reset' 'Reset-CodexControlOtherDevices.ps1' @() $false 30000) 'default Reset cannot claim DoNotRestart semantics'
+        Assert-CcodEqual $true (& $testVariant 'start' 'Start-CodexControlOtherDevices.ps1' @('-RestartCodex','-TimeoutSeconds','60') $true 60000) 'Start timeout and restart semantics correlate exactly'
+        Assert-CcodEqual $false (& $testVariant 'start' 'Start-CodexControlOtherDevices.ps1' @('-RestartCodex','-TimeoutSeconds','60') $true 30000) 'Start timeout mismatch is rejected'
+        Assert-CcodEqual $true (& $testVariant 'uninstall' 'Uninstall-CodexControlOtherDevices.ps1' @('-InstallRoot',$runtimeContext.InstallRoot,'-Confirm:$false') $true 30000) 'Uninstall default normalization semantics correlate exactly'
+        Assert-CcodEqual $false (& $testVariant 'uninstall' 'Uninstall-CodexControlOtherDevices.ps1' @('-KeepCurrentSpecialSession') $true 30000) 'Uninstall KeepCurrentSpecialSession cannot dispatch Recover'
 
         $selfRequest=New-CcodControllerRequest -Action Recover;$selfRequest.supervisorIdentity.pid=700;$selfRequest.supervisorIdentity.creationTimeUtc=$current.CreationTimeUtc
         $forgeries=@(
@@ -193,10 +226,21 @@ try{
         foreach($case in $forgeries){
             $adapters=$validAdapters.Clone();& $case.Mutate $adapters
             $before=$calls.Engine
-            $rejected=Invoke-CcodVerifiedLegacyRecoverController -Request $case.Request -Paths $paths -RequestPath $requestPath -ResultPath $case.ResultPath -RuntimeContext $runtimeContext -Adapters $adapters
-            Assert-CcodEqual 'CCOD_REQUEST_INVALID' $rejected.Result.error.code "$($case.Name) forgery is rejected"
+            $rejected=Test-CcodLegacyRecoverProvenance -Request $case.Request -RequestPath $requestPath -ResultPath $case.ResultPath -RuntimeContext $runtimeContext -Adapter $adapters
+            Assert-CcodEqual $false $rejected "$($case.Name) forgery is rejected"
             Assert-CcodEqual $before $calls.Engine "$($case.Name) forgery never dispatches the engine"
         }
+    }
+
+    Invoke-CcodTest 'legacy provenance rejects real reparse and non-file request or result leaves where supported' {
+        $leafRoot=[IO.Path]::GetFullPath((Join-Path $root 'legacy-leaves'));[IO.Directory]::CreateDirectory($leafRoot)|Out-Null
+        $regular=[IO.Path]::GetFullPath((Join-Path $leafRoot 'regular.json'));[IO.File]::WriteAllText($regular,'{}',[Text.UTF8Encoding]::new($false))
+        $adapter=Get-CcodControllerAdapters $null
+        Assert-CcodEqual $true (& $adapter.TestLegacyFileSafe $regular) 'regular file is accepted as a legacy framing leaf'
+        Assert-CcodEqual $false (& $adapter.TestLegacyFileSafe $leafRoot) 'directory leaf is rejected'
+        $link=[IO.Path]::GetFullPath((Join-Path $leafRoot 'linked.json'));$linkCreated=$false
+        try{New-Item -ItemType SymbolicLink -Path $link -Target $regular -ErrorAction Stop|Out-Null;$linkCreated=$true}catch{}
+        if($linkCreated){Assert-CcodEqual $false (& $adapter.TestLegacyFileSafe $link) 'real symbolic-link leaf is rejected'}
     }
 
     Invoke-CcodTest 'writes provisional and final atomic results before exactly one compressed stdout line' {

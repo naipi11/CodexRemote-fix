@@ -61,6 +61,7 @@ function Invoke-CcodStartInstalledController {
     $stderrPath=[IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) ("ccod-start-$([guid]::NewGuid().ToString('N')).err")))
     try{
         [IO.File]::WriteAllText($requestPath,($Request|ConvertTo-Json -Depth 16 -Compress),[Text.UTF8Encoding]::new($false))
+        $resultPlaceholder=[IO.File]::Open($resultPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None);$resultPlaceholder.Dispose()
         $arguments=New-CcodStartControllerArguments -Controller $Resolved.Controller -RequestPath $requestPath -ResultPath $resultPath
         $stdout=@(& $powershell @arguments 2>$stderrPath);$exitCode=$LASTEXITCODE
         $lines=@($stdout|ForEach-Object{[string]$_}|Where-Object{-not [string]::IsNullOrWhiteSpace($_)})

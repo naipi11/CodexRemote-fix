@@ -15,6 +15,8 @@ function New-CcodFakeFileModeController([string]$Path){
 param([Parameter(Mandatory)][string]$RequestPath,[Parameter(Mandatory)][string]$ResultPath)
 $ErrorActionPreference='Stop'
 $request=Get-Content -LiteralPath $RequestPath -Raw|ConvertFrom-Json
+$requestItem=Get-Item -LiteralPath $RequestPath -Force;$resultItem=Get-Item -LiteralPath $ResultPath -Force
+if($requestItem.PSIsContainer -or $resultItem.PSIsContainer -or (($requestItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or (($resultItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)){exit 8}
 $expected='schemaVersion,action,transactionId,runtimeId,supervisorIdentity,source,existingOnly,rendererPort,mainPort,timeoutMilliseconds,restartOrdinary'
 if(($request.PSObject.Properties.Name -join ',') -cne $expected -or $request.existingOnly -isnot [bool] -or $request.restartOrdinary -isnot [bool]){exit 7}
 $outcome=if($request.action -ceq 'Apply'){'Activated'}elseif($request.restartOrdinary){'Recovered'}else{'Closed'}
