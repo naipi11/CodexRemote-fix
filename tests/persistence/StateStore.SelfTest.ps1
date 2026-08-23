@@ -126,6 +126,13 @@ function Assert-CcodFailedAttemptClearReceipt {
 
 $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-state-selftest-' + [Guid]::NewGuid().ToString('N'))
 try {
+    Invoke-CcodTest 'exposes trusted safe-exit persistence with the state-store contract' {
+        $commands = @('Get-CcodTrustedLogonIdentity', 'Read-CcodSafeExitIntent', 'Write-CcodSafeExitIntent', 'Test-CcodSafeExitIntentForCurrentLogon', 'Clear-CcodSafeExitIntent')
+        foreach ($name in $commands) {
+            Assert-CcodEqual 'StateStore' (Get-Command $name -ErrorAction Stop).ModuleName "state store exposes $name"
+        }
+    }
+
     Invoke-CcodTest 'initializes independent automation consent and installer-verified absolute Node paths' {
         $state = Join-Path $root 'initial'
         Initialize-CcodStateFixture -StateRoot $state
