@@ -16,6 +16,8 @@ function Get-CcodStateAdapters {
     $result = @{
         UtcNow = { [DateTime]::UtcNow }
         TestVerifiedNodeCandidate = { param($Path) Test-Path -LiteralPath $Path -PathType Leaf }
+        DirectoryExists = { param($Path) [IO.Directory]::Exists($Path) }
+        CreateDirectory = { param($Path) [IO.Directory]::CreateDirectory($Path) | Out-Null }
         BeforeFailedPackageAttemptRecheck = { param($Path, $SuppressionKey) }
         WriteAtomicJson = { param($Path, $Value) Write-CcodAtomicJson -Path $Path -Value $Value }
     }
@@ -374,12 +376,20 @@ function Initialize-CcodState {
     )
 
     $adapters = Get-CcodStateAdapters -Adapters $Adapters
-    [IO.Directory]::CreateDirectory($StateRoot) | Out-Null
+    Import-Module (Join-Path $PSScriptRoot 'LifecycleTransaction.psm1')
+    if (-not (& $adapters.DirectoryExists $StateRoot)) { & $adapters.CreateDirectory $StateRoot }
     $paths = @('settings.json', 'status.json', 'verified-packages.json', 'transition.json')
-    foreach ($leaf in $paths) {
-        if ([IO.File]::Exists((Get-CcodStatePath -StateRoot $StateRoot -Leaf $leaf))) {
-            Throw-CcodStateError 'CCOD_STATE_ALREADY_INITIALIZED' 'State initialization refuses to overwrite existing evidence; use explicit repair' $StateRoot
-        }
+    $existing = @($paths | Where-Object { [IO.File]::Exists((Get-CcodStatePath -StateRoot $StateRoot -Leaf $_)) })
+    $lifecycleRoot = Join-Path $StateRoot 'lifecycle'
+    if (-not (& $adapters.DirectoryExists $lifecycleRoot)) { & $adapters.CreateDirectory $lifecycleRoot }
+    $receiptRoot = Join-Path $lifecycleRoot 'receipts'
+    if (-not (& $adapters.DirectoryExists $receiptRoot)) { & $adapters.CreateDirectory $receiptRoot }
+    Read-CcodLifecycleRequest -StateRoot $StateRoot | Out-Null
+    if ($existing.Count -eq $paths.Count) {
+        return
+    }
+    if ($existing.Count -ne 0) {
+        Throw-CcodStateError 'CCOD_STATE_ALREADY_INITIALIZED' 'State initialization refuses to overwrite existing evidence; use explicit repair' $StateRoot
     }
 
     Write-CcodSettings -StateRoot $StateRoot -Settings (New-CcodSettings -NodeCandidates $NodeCandidates -CandidateCompatibleOptIn $CandidateCompatibleOptIn -AutomationEnabled $true -UpdatedAtUtc (Get-CcodStateTimestamp -Adapters $adapters)) -Adapters $adapters
