@@ -397,10 +397,21 @@ function Invoke-CcodBootstrapFencedPointerPromotion {
         $fenceErrorId = Get-CcodBootstrapErrorId -ErrorRecord $_
         Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_FENCE_FAILED' ("Verified fallback runtime could not prove lifecycle ownership before active pointer mutation: {0} {1}" -f $fenceErrorId, $_.Exception.Message) $runtimeDirectory
     } finally {
-        if ($null -ne $ownership -and $null -ne $lifecycleModule) {
-            try { & $lifecycleModule { param($Lease) Exit-CcodLifecycleOwnership -Ownership $Lease | Out-Null } $ownership } catch { }
+        try {
+            if ($null -ne $ownership -and $null -ne $lifecycleModule) {
+                try {
+                    $released = & $lifecycleModule { param($Lease) Exit-CcodLifecycleOwnership -Ownership $Lease } $ownership
+                    if ($released -isnot [bool] -or -not $released -or -not $ownership.released) {
+                        Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_FENCE_RELEASE_FAILED' 'Verified fallback lifecycle ownership did not prove mutex release' $runtimeDirectory
+                    }
+                } catch {
+                    if ((Get-CcodBootstrapErrorId -ErrorRecord $_) -ceq 'CCOD_BOOTSTRAP_FENCE_RELEASE_FAILED') { throw }
+                    Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_FENCE_RELEASE_FAILED' 'Verified fallback lifecycle ownership could not be released' $runtimeDirectory
+                }
+            }
+        } finally {
+            $process.Dispose()
         }
-        $process.Dispose()
     }
 }
 

@@ -111,3 +111,53 @@ The final full run was executed after the last production change. Its only diagn
 - Bootstrap does not unload the verified fence modules before releasing the outer launch lease; the process exits immediately afterward, so no long-lived module-surface expansion remains.
 - `KernelObjects.psm1` required no source edit: the existing account-transition mutex and ACL contract remained valid and its complete focused suite passed.
 - No known correctness blocker remains. The report is under `.superpowers/sdd`, which is ignored by default, so it must be force-added with this task commit.
+
+## Fix round 2 — required lifecycle-release propagation
+
+### Finding closed
+
+Bootstrap no longer suppresses `Exit-CcodLifecycleOwnership` failure after a ready fallback has promoted `active.json`. The cleanup now requires an exact Boolean success and the receipt's `released=true` mutation. A throw, false return, or unmutated receipt is normalized to `CCOD_BOOTSTRAP_FENCE_RELEASE_FAILED` and propagated through the outer bootstrap failure path. The current-process wrapper is still disposed through a nested `finally`.
+
+This forces bootstrap to stop the ready child and exit instead of waiting on a long-lived Supervisor while one recursive account-transition mutex acquisition may remain owned. Process exit then lets Windows close the remaining handle ownership.
+
+### RED evidence
+
+```text
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\Bootstrap.SelfTest.ps1
+ASSERT_EXACT: release failure exits instead of waiting for the ready long-lived Supervisor expected=[False] actual=[True]
+exit 1
+```
+
+The behavior fixture uses a manifest-verified fallback runtime whose lifecycle module injects an `Exit-CcodLifecycleOwnership` failure after successful promotion. Its Supervisor signals the real Ready event and then sleeps for 60 seconds. Before the fix, the four-second bootstrap process bound expired because release failure was swallowed and bootstrap waited for that child.
+
+### GREEN evidence
+
+```text
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\Bootstrap.SelfTest.ps1
+Bootstrap self-test passed: 15
+exit 0
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\LifecycleEpoch.SelfTest.ps1
+exit 0; 10 tests
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\RuntimeManifest.SelfTest.ps1
+exit 0; 14 tests
+
+npm run test:persistence
+exit 0
+```
+
+The new bootstrap regression proves all of the following observable behavior:
+
+- bootstrap exits nonzero before the four-second bound instead of waiting on the 60-second ready Supervisor;
+- `bootstrap.log` contains `CCOD_BOOTSTRAP_FENCE_RELEASE_FAILED` and contains no successful fallback-readiness record;
+- the outer failure cleanup stops the child;
+- immediately after bootstrap exits, a fresh process can acquire and release the account-transition mutex, proving OS cleanup removed any remaining recursive ownership.
+
+### Files and self-review
+
+- Modified production: `src/persistence/bootstrap.ps1`.
+- Modified focused test: `tests/persistence/Bootstrap.SelfTest.ps1`.
+- Appended report: `.superpowers/sdd/2026-08-23-lifecycle-and-tray-redesign/task-2-report.md`.
+- Successful fallback behavior remains unchanged and is covered by the existing schema-1/schema-2 promotion tests.
+- No new production adapter or public interface was introduced. No known blocker remains.

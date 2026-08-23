@@ -79,6 +79,19 @@ Start-Sleep -Milliseconds 300
 exit 9
 "@
         }
+        'ReadyLongLived' {
+            return @"
+param([string]`$ReadyToken)
+[IO.File]::WriteAllText('$MarkerPath',[string]`$PID)
+`$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+`$session=[Diagnostics.Process]::GetCurrentProcess().SessionId
+`$name="Local\CodexControlOtherDevices.Ready.`$sid.`$session.`$ReadyToken"
+`$event=[Threading.EventWaitHandle]::OpenExisting(`$name)
+`$event.Set() | Out-Null
+Start-Sleep -Seconds 60
+exit 0
+"@
+        }
         default { throw "Unknown fake supervisor kind: $Kind" }
     }
 }
@@ -97,7 +110,8 @@ function Add-CcodTestRuntime {
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$SupervisorScript,
         [AllowNull()][string]$RuntimeId,
-        [bool]$IncludeFenceModules = $true
+        [bool]$IncludeFenceModules = $true,
+        [bool]$FailLifecycleRelease = $false
     )
 
     if ([string]::IsNullOrWhiteSpace($RuntimeId)) {
@@ -117,6 +131,20 @@ function Add-CcodTestRuntime {
     if ($IncludeFenceModules) {
         foreach ($moduleName in @('PersistenceIO.psm1','LifecycleEpoch.psm1','RuntimeManifest.psm1')) {
             [IO.File]::Copy((Join-Path $repositoryRoot ('src\persistence\modules\' + $moduleName)), (Join-Path $kernelDirectory $moduleName), $true)
+        }
+        if ($FailLifecycleRelease) {
+            [IO.File]::AppendAllText((Join-Path $kernelDirectory 'LifecycleEpoch.psm1'), @'
+
+function Exit-CcodLifecycleOwnership {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Ownership, [hashtable]$Adapters)
+    throw [Management.Automation.ErrorRecord]::new(
+        [InvalidOperationException]::new('injected lifecycle release failure'),
+        'CCOD_LIFECYCLE_RELEASE_FAILED',
+        [Management.Automation.ErrorCategory]::CloseError,
+        $Ownership)
+}
+'@, [Text.UTF8Encoding]::new($false))
         }
     }
     $manifest = New-CcodRuntimeManifest -RuntimeDirectory $runtimeDirectory -ProjectVersion '0.0.0-bootstrap-test'
@@ -180,6 +208,39 @@ function Invoke-CcodBootstrapUnderTest {
         -InstallRoot $Root -ReadyToken $ReadyToken -ReadyTimeoutSeconds $ReadyTimeoutSeconds 2>&1
     $exitCode = [int]$LASTEXITCODE
     return $exitCode
+}
+
+function Invoke-CcodBootstrapTimed {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$ReadyToken,
+        [int]$TimeoutMilliseconds = 4000
+    )
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $powershellExecutable
+    $startInfo.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -InstallRoot "{1}" -ReadyToken {2} -ReadyTimeoutSeconds 3' -f $bootstrapScript,$Root,$ReadyToken
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        [void]$process.Start()
+        $exited = $process.WaitForExit($TimeoutMilliseconds)
+        if (-not $exited) {
+            $process.Kill()
+            $process.WaitForExit()
+        }
+        return [pscustomobject][ordered]@{
+            TimedOut = -not $exited
+            ExitCode = if ($exited) { [int]$process.ExitCode } else { $null }
+            ElapsedMilliseconds = [long]$stopwatch.ElapsedMilliseconds
+        }
+    } finally {
+        $stopwatch.Stop()
+        $process.Dispose()
+    }
 }
 
 $results = @()
@@ -264,6 +325,39 @@ $results += Invoke-CcodTest 'preserves schema-two generation when fallback promo
         Assert-CcodExactEqual ([UInt64]10) ([UInt64]$pointer.generation) 'fallback increments generation rather than discarding it'
         Assert-CcodExactEqual $previousId $pointer.activeRuntime 'fallback commits the ready previous runtime'
     } finally { if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force } }
+}
+
+$results += Invoke-CcodTest 'fails promptly when fallback lifecycle ownership cannot be released' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-" + [guid]::NewGuid().ToString('N'))
+    $supervisorPid = $null
+    $lease = $null
+    try {
+        New-CcodBootstrapFixture -Root $root | Out-Null
+        $activeId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'ExitEarly' -MarkerPath (Join-Path $root 'release-active.started'))
+        $pidPath = Join-Path $root 'release-previous.pid'
+        $previousId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'ReadyLongLived' -MarkerPath $pidPath) -FailLifecycleRelease $true
+        Set-CcodTestActivePointer -Root $root -ActiveRuntime $activeId -PreviousRuntime $previousId -SchemaVersion 2 -Generation 9
+
+        $run = Invoke-CcodBootstrapTimed -Root $root -ReadyToken (New-CcodBootstrapToken)
+        if ([IO.File]::Exists($pidPath)) { $supervisorPid = [int][IO.File]::ReadAllText($pidPath) }
+        Assert-CcodExactEqual $false $run.TimedOut 'release failure exits instead of waiting for the ready long-lived Supervisor'
+        Assert-CcodExactEqual 1 $run.ExitCode 'release failure is a stable nonzero bootstrap outcome'
+        Assert-CcodTrue ($run.ElapsedMilliseconds -lt 4000) 'release failure returns within the bounded prompt-exit window'
+        $log = [IO.File]::ReadAllText((Join-Path $root 'logs\bootstrap.log'))
+        Assert-CcodTrue ($log.Contains('CCOD_BOOTSTRAP_FENCE_RELEASE_FAILED')) 'release failure is normalized to the stable bootstrap code'
+        Assert-CcodTrue (-not $log.Contains('signaled ready; active pointer switched')) 'release failure never logs successful fallback readiness'
+
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $lease = Enter-CcodMutex -Kind AccountTransition -UserSid $sid -TimeoutMilliseconds 1000
+        Assert-CcodExactEqual 'Acquired' $lease.Outcome 'bootstrap exit lets OS cleanup release any recursive mutex ownership'
+    } finally {
+        if ($null -ne $lease -and $lease.Outcome -ceq 'Acquired' -and -not $lease.Released) { Exit-CcodMutex -Lease $lease | Out-Null }
+        if ($null -ne $supervisorPid) {
+            $leftover = Get-Process -Id $supervisorPid -ErrorAction SilentlyContinue
+            if ($null -ne $leftover) { try { $leftover.Kill(); $leftover.WaitForExit(2000) | Out-Null } finally { $leftover.Dispose() } }
+        }
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
 }
 
 $results += Invoke-CcodTest 'does not launch a supervisor while the account transition lease is held' {
