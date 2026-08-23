@@ -193,7 +193,16 @@ function Read-CcodLifecycleRequest {
     param([Parameter(Mandatory)][string]$StateRoot)
 
     $path = Get-CcodLifecycleRequestPath -StateRoot $StateRoot
-    if (-not [IO.File]::Exists($path)) { return $null }
+    try {
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    } catch [Management.Automation.ItemNotFoundException] {
+        return $null
+    } catch {
+        Throw-CcodLifecycleError 'CCOD_LIFECYCLE_STATE_INVALID' 'Lifecycle request state is invalid' $path
+    }
+    if ($item.PSIsContainer -or $item -isnot [IO.FileInfo]) {
+        Throw-CcodLifecycleError 'CCOD_LIFECYCLE_STATE_INVALID' 'Lifecycle request state is invalid' $path
+    }
     try {
         $request = Read-CcodStrictJson -Path $path -ExpectedSchema 1 -Kind 'lifecycle request'
         Assert-CcodLifecycleRequest -Request $request
@@ -242,6 +251,10 @@ function Complete-CcodLifecycleRequest {
         Throw-CcodLifecycleError 'CCOD_LIFECYCLE_STATE_INVALID' 'Only a terminal lifecycle request may be completed' $Request
     }
     [IO.Directory]::CreateDirectory($StateRoot) | Out-Null
+    $active = Read-CcodLifecycleRequest -StateRoot $StateRoot
+    if ($null -eq $active -or $active.transactionId -cne $Request.transactionId) {
+        Throw-CcodLifecycleError 'CCOD_LIFECYCLE_STATE_INVALID' 'Lifecycle completion does not match the active request' $Request
+    }
     $receiptPath = Get-CcodLifecycleReceiptPath -StateRoot $StateRoot -TransactionId $Request.transactionId
     Write-CcodAtomicJson -Path $receiptPath -Value $Request
     $requestPath = Get-CcodLifecycleRequestPath -StateRoot $StateRoot

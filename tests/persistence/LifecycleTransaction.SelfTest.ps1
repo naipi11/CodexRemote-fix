@@ -97,6 +97,38 @@ try {
         [IO.File]::WriteAllText((Get-CcodLifecycleRequestPath -StateRoot $state), '{broken', [Text.UTF8Encoding]::new($false))
         Assert-CcodThrows { Read-CcodLifecycleRequest -StateRoot $state } 'CCOD_LIFECYCLE_STATE_INVALID'
     }
+
+    Invoke-CcodTest 'fails closed when an active request path is a directory or cannot be read' {
+        $directoryState = Join-Path $root 'active-directory'
+        [IO.Directory]::CreateDirectory($directoryState) | Out-Null
+        [IO.Directory]::CreateDirectory((Get-CcodLifecycleRequestPath -StateRoot $directoryState)) | Out-Null
+        Assert-CcodThrows { Read-CcodLifecycleRequest -StateRoot $directoryState } 'CCOD_LIFECYCLE_STATE_INVALID'
+
+        $lockedState = Join-Path $root 'active-locked'
+        [IO.Directory]::CreateDirectory($lockedState) | Out-Null
+        Write-CcodLifecycleRequest -StateRoot $lockedState -Request (New-CcodLifecycleFixture) | Out-Null
+        $lock = [IO.File]::Open((Get-CcodLifecycleRequestPath -StateRoot $lockedState), [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try {
+            Assert-CcodThrows { Read-CcodLifecycleRequest -StateRoot $lockedState } 'CCOD_LIFECYCLE_STATE_INVALID'
+        } finally {
+            $lock.Dispose()
+        }
+    }
+
+    Invoke-CcodTest 'refuses an uncorrelated terminal completion without replacing its active transaction' {
+        $state = Join-Path $root 'stale-completion'
+        [IO.Directory]::CreateDirectory($state) | Out-Null
+        $current = New-CcodLifecycleFixture
+        Write-CcodLifecycleRequest -StateRoot $state -Request $current | Out-Null
+        $stale = Copy-CcodLifecycleFixture $current
+        $stale.transactionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        $stale.phase = 'Completed'
+        $stale.updatedAtUtc = '2030-02-03T04:05:08.0000000Z'
+
+        Assert-CcodThrows { Complete-CcodLifecycleRequest -StateRoot $state -Request $stale } 'CCOD_LIFECYCLE_STATE_INVALID'
+        Assert-CcodEqual $current.transactionId (Read-CcodLifecycleRequest -StateRoot $state).transactionId 'stale completion leaves the current active transaction durable'
+        Assert-CcodEqual $false ([IO.File]::Exists((Get-CcodLifecycleReceiptPath -StateRoot $state -TransactionId $stale.transactionId))) 'stale completion writes no uncorrelated receipt'
+    }
 } catch {
     Write-Error $_
     exit 1
