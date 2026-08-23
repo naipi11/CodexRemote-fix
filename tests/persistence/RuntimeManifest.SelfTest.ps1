@@ -93,11 +93,14 @@ try {
 
         Set-CcodActiveRuntime -InstallRoot $installRoot -NewRuntimeId $first.Manifest.runtimeId | Out-Null
         $initial = Read-CcodActiveRuntime -InstallRoot $installRoot
+        Assert-CcodEqual 2 $initial.schemaVersion 'new active pointers use schema version two'
+        Assert-CcodEqual 1 ([UInt64]$initial.generation) 'first activation starts generation one'
         Assert-CcodEqual $first.Manifest.runtimeId $initial.activeRuntime 'first verified runtime must become active'
         Assert-CcodEqual $null $initial.previousRuntime 'first activation has no previous runtime'
 
         Set-CcodActiveRuntime -InstallRoot $installRoot -NewRuntimeId $second.Manifest.runtimeId | Out-Null
         $rotated = Read-CcodActiveRuntime -InstallRoot $installRoot
+        Assert-CcodEqual 2 ([UInt64]$rotated.generation) 'every later activation increments generation exactly once'
         Assert-CcodEqual $second.Manifest.runtimeId $rotated.activeRuntime 'new verified runtime must become active'
         Assert-CcodEqual $first.Manifest.runtimeId $rotated.previousRuntime 'old active runtime must become previous'
 
@@ -136,6 +139,23 @@ try {
             updatedAtUtc = '2030-02-03T04:05:06.0000000Z'
         })
         Assert-CcodThrows { Read-CcodActiveRuntime -InstallRoot $installRoot } 'CCOD_RUNTIME_ID_INVALID'
+    }
+
+    Invoke-CcodTest 'maps a legacy schema-one pointer to generation one before the next schema-two commit' {
+        $installRoot = Join-Path $root 'schema-one-migration'
+        New-Item -ItemType Directory -Path $installRoot | Out-Null
+        $first = New-CcodRuntimeFixture -InstallRoot $installRoot -ProjectVersion '2.1.1' -AContent 'legacy alpha' -BContent 'legacy beta'
+        $second = New-CcodRuntimeFixture -InstallRoot $installRoot -ProjectVersion '2.1.2' -AContent 'next alpha' -BContent 'next beta'
+        Write-CcodAtomicJson -Path (Join-Path $installRoot 'active.json') -Value ([ordered]@{
+            schemaVersion = 1; activeRuntime = $first.Manifest.runtimeId; previousRuntime = $null; updatedAtUtc = '2030-02-03T04:05:06.0000000Z'
+        })
+
+        $legacy = Read-CcodActiveRuntime -InstallRoot $installRoot
+        Assert-CcodEqual 2 $legacy.schemaVersion 'legacy read exposes the fenced pointer shape'
+        Assert-CcodEqual 1 ([UInt64]$legacy.generation) 'legacy pointer deterministically maps to generation one'
+        $committed = Set-CcodActiveRuntime -InstallRoot $installRoot -NewRuntimeId $second.Manifest.runtimeId
+        Assert-CcodEqual 2 $committed.schemaVersion 'migration commit never downgrades the pointer schema'
+        Assert-CcodEqual 2 ([UInt64]$committed.generation) 'the next commit advances from migrated generation one'
     }
 
     Invoke-CcodTest 'writes an exact injected UTC timestamp when activating a verified runtime' {

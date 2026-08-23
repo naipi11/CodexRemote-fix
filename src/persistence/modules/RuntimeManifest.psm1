@@ -294,7 +294,20 @@ function Read-CcodActiveRuntime {
     param([Parameter(Mandatory)][string]$InstallRoot)
 
     $path = Resolve-CcodContainedPath -Root $InstallRoot -RelativePath 'active.json' -AllowMissingLeaf
-    $active = Read-CcodStrictJson -Path $path -ExpectedSchema 1 -Kind 'active runtime'
+    $active = $null
+    $legacy = $false
+    try {
+        $active = Read-CcodStrictJson -Path $path -ExpectedSchema 2 -Kind 'active runtime'
+    } catch {
+        if ((Get-CcodErrorId -ErrorRecord $_) -cne 'CCOD_SCHEMA_UNSUPPORTED') { throw }
+        $active = Read-CcodStrictJson -Path $path -ExpectedSchema 1 -Kind 'active runtime'
+        $legacy = $true
+    }
+    $expected = if ($legacy) { @('schemaVersion', 'activeRuntime', 'previousRuntime', 'updatedAtUtc') } else { @('schemaVersion', 'activeRuntime', 'previousRuntime', 'generation', 'updatedAtUtc') }
+    $actual = @($active.PSObject.Properties.Name)
+    if ($actual.Count -ne $expected.Count -or ($actual -join "`0") -cne ($expected -join "`0")) {
+        Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active runtime pointer has unexpected fields' $path
+    }
     foreach ($name in @('activeRuntime', 'previousRuntime', 'updatedAtUtc')) {
         if ($null -eq $active.PSObject.Properties[$name]) {
             Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' "Active runtime pointer is missing $name" $path
@@ -310,7 +323,15 @@ function Read-CcodActiveRuntime {
         }
         Assert-CcodRuntimeId -RuntimeId $active.previousRuntime | Out-Null
     }
-    return $active
+    if ($legacy) {
+        return [pscustomobject][ordered]@{ schemaVersion=2; activeRuntime=$active.activeRuntime; previousRuntime=$active.previousRuntime; generation=[UInt64]1; updatedAtUtc=$active.updatedAtUtc }
+    }
+    $generation = $active.generation
+    if ($generation -isnot [byte] -and $generation -isnot [uint16] -and $generation -isnot [uint32] -and $generation -isnot [uint64] -and
+        $generation -isnot [int16] -and $generation -isnot [int32] -and $generation -isnot [int64] -or $generation -le 0) {
+        Throw-CcodRuntimeError 'CCOD_RUNTIME_GENERATION_INVALID' 'Active runtime generation must be a positive unsigned integer' $path
+    }
+    return [pscustomobject][ordered]@{ schemaVersion=2; activeRuntime=$active.activeRuntime; previousRuntime=$active.previousRuntime; generation=[UInt64]$generation; updatedAtUtc=$active.updatedAtUtc }
 }
 
 function Set-CcodActiveRuntime {
@@ -331,18 +352,24 @@ function Set-CcodActiveRuntime {
 
     $activePath = Resolve-CcodContainedPath -Root $InstallRoot -RelativePath 'active.json' -AllowMissingLeaf
     $previousRuntime = $null
+    [UInt64]$currentGeneration = 0
     if ([IO.File]::Exists($activePath)) {
         $current = Read-CcodActiveRuntime -InstallRoot $InstallRoot
+        $currentGeneration = [UInt64]$current.generation
         if ($current.activeRuntime -cne $NewRuntimeId) {
             $previousRuntime = [string]$current.activeRuntime
         } elseif ($null -ne $current.previousRuntime -and $current.previousRuntime -cne $NewRuntimeId) {
             $previousRuntime = [string]$current.previousRuntime
         }
     }
+    if ($currentGeneration -eq [UInt64]::MaxValue) {
+        Throw-CcodRuntimeError 'CCOD_RUNTIME_GENERATION_EXHAUSTED' 'Active runtime generation cannot wrap' $activePath
+    }
     $pointer = [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         activeRuntime = $NewRuntimeId
         previousRuntime = $previousRuntime
+        generation = [UInt64]($currentGeneration + 1)
         updatedAtUtc = (& $Adapters.UtcNow).ToUniversalTime().ToString('o')
     }
     Write-CcodAtomicJson -Path $activePath -Value $pointer

@@ -1,0 +1,278 @@
+Set-StrictMode -Version Latest
+
+Import-Module (Join-Path $PSScriptRoot 'PersistenceIO.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'KernelObjects.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'RuntimeManifest.psm1') -Force
+
+$script:CcodLifecycleEpochProperties = @('schemaVersion','epoch')
+$script:CcodLifecycleOwnershipProperties = @('schemaVersion','lease','epoch','runtimeId','runtimeGeneration','ownerIdentity','released')
+
+function Throw-CcodLifecycleEpochError {
+    param([Parameter(Mandatory)][string]$Id, [Parameter(Mandatory)][string]$Message, $Target)
+
+    throw [Management.Automation.ErrorRecord]::new(
+        [InvalidOperationException]::new($Message), $Id, [Management.Automation.ErrorCategory]::InvalidData, $Target)
+}
+
+function Get-CcodLifecycleEpochErrorId {
+    param($ErrorRecord)
+
+    if ($null -eq $ErrorRecord -or $ErrorRecord.FullyQualifiedErrorId -isnot [string]) { return $null }
+    return ([string]$ErrorRecord.FullyQualifiedErrorId -split ',')[0]
+}
+
+function Get-CcodLifecycleEpochPath {
+    param([Parameter(Mandatory)][string]$InstallRoot)
+
+    return Resolve-CcodContainedPath -Root $InstallRoot -RelativePath 'state\lifecycle-epoch.json' -AllowMissingLeaf
+}
+
+function Get-CcodLifecycleEpochInitializationPath {
+    param([Parameter(Mandatory)][string]$InstallRoot)
+
+    return Resolve-CcodContainedPath -Root $InstallRoot -RelativePath 'state\lifecycle-epoch.initialized.json' -AllowMissingLeaf
+}
+
+function Get-CcodLifecycleEpochPropertyNames {
+    param($Value)
+
+    if ($Value -is [Collections.IDictionary]) { return @($Value.Keys | ForEach-Object { [string]$_ }) }
+    if ($null -eq $Value) { return @() }
+    return @($Value.PSObject.Properties | ForEach-Object { $_.Name })
+}
+
+function Assert-CcodLifecycleEpochExactProperties {
+    param([Parameter(Mandatory)]$Value, [Parameter(Mandatory)][string[]]$Expected, [Parameter(Mandatory)][string]$Kind)
+
+    if ($Value -isnot [pscustomobject] -and $Value -isnot [Collections.IDictionary]) {
+        Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' "$Kind must be an object" $Value
+    }
+    $actual = @(Get-CcodLifecycleEpochPropertyNames -Value $Value)
+    if ($actual.Count -ne $Expected.Count -or ($actual -join "`0") -cne ($Expected -join "`0")) {
+        Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' "$Kind has unexpected, missing, or reordered fields" $Value
+    }
+    foreach ($property in @($Value.PSObject.Properties)) {
+        if ($property.MemberType -notin @('NoteProperty','Property')) {
+            Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' "$Kind contains a non-data property" $Value
+        }
+    }
+}
+
+function ConvertTo-CcodLifecycleEpochUInt64 {
+    param([Parameter(Mandatory)]$Value, [Parameter(Mandatory)][string]$Name, [switch]$AllowZero)
+
+    if ($Value -is [decimal]) {
+        if ($Value -lt 0 -or [decimal]::Truncate($Value) -ne $Value) {
+            Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' "$Name must be an unsigned 64-bit integer" $Value
+        }
+        try { return [UInt64]$Value } catch { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' "$Name is outside the unsigned 64-bit range" $Value }
+    }
+    if ($Value -isnot [byte] -and $Value -isnot [uint16] -and $Value -isnot [uint32] -and $Value -isnot [uint64] -and
+        $Value -isnot [int16] -and $Value -isnot [int32] -and $Value -isnot [int64]) {
+        Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' "$Name must be an unsigned 64-bit integer" $Value
+    }
+    if ($Value -lt 0 -or (-not $AllowZero -and $Value -eq 0)) {
+        Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' "$Name must be a positive unsigned 64-bit integer" $Value
+    }
+    try { return [UInt64]$Value } catch { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' "$Name is outside the unsigned 64-bit range" $Value }
+}
+
+function Assert-CcodLifecycleEpochRuntimeId {
+    param([Parameter(Mandatory)]$Value)
+
+    if ($Value -isnot [string] -or $Value -cnotmatch '^[A-Za-z0-9._-]{1,96}$') {
+        Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_FENCE_STALE' 'Lifecycle ownership runtime ID is invalid' $Value
+    }
+}
+
+function Assert-CcodLifecycleEpochOwnerIdentity {
+    param([Parameter(Mandatory)]$OwnerIdentity)
+
+    Assert-CcodLifecycleEpochExactProperties -Value $OwnerIdentity -Expected @('pid','creationTimeUtc') -Kind 'Lifecycle owner identity'
+    $pid = ConvertTo-CcodLifecycleEpochUInt64 -Value $OwnerIdentity.pid -Name 'ownerIdentity.pid'
+    if ($pid -gt [int]::MaxValue) { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' 'ownerIdentity.pid exceeds the legal process range' $OwnerIdentity }
+    if ($OwnerIdentity.creationTimeUtc -isnot [string]) { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' 'ownerIdentity.creationTimeUtc must be canonical UTC' $OwnerIdentity }
+    $parsed = [DateTime]::MinValue
+    if (-not [DateTime]::TryParseExact($OwnerIdentity.creationTimeUtc, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed) -or
+        $parsed.Kind -ne [DateTimeKind]::Utc -or $parsed.ToUniversalTime().ToString('o') -cne $OwnerIdentity.creationTimeUtc) {
+        Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' 'ownerIdentity.creationTimeUtc must be canonical UTC' $OwnerIdentity
+    }
+}
+
+function Get-CcodLifecycleEpochAdapters {
+    param([hashtable]$Adapters)
+
+    $resolved = @{
+        ReadEpoch = {
+            param($InstallRoot, $AllowInitial)
+            $path = Get-CcodLifecycleEpochPath -InstallRoot $InstallRoot
+            $initializationPath = Get-CcodLifecycleEpochInitializationPath -InstallRoot $InstallRoot
+            if (-not [IO.File]::Exists($path)) {
+                if ($AllowInitial -and -not [IO.File]::Exists($initializationPath)) { return $null }
+                Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' 'Lifecycle epoch is missing after initialization' $path
+            }
+            try {
+                $json = [IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false))
+                if ($json -notmatch '(?s)^\s*\{\s*"schemaVersion"\s*:\s*1\s*,\s*"epoch"\s*:\s*(?:0|[1-9][0-9]*)\s*\}\s*$') {
+                    Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' 'Lifecycle epoch must contain one canonical unsigned integer' $path
+                }
+                return Read-CcodStrictJson -Path $path -ExpectedSchema 1 -Kind 'lifecycle epoch'
+            }
+            catch { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' 'Lifecycle epoch is malformed or unsupported' $path }
+        }
+        WriteEpoch = {
+            param($InstallRoot, $Epoch)
+            $path = Get-CcodLifecycleEpochPath -InstallRoot $InstallRoot
+            $initializationPath = Get-CcodLifecycleEpochInitializationPath -InstallRoot $InstallRoot
+            if (-not [IO.File]::Exists($initializationPath)) {
+                Write-CcodAtomicJson -Path $initializationPath -Value ([ordered]@{ schemaVersion = 1 })
+            }
+            Write-CcodAtomicJson -Path $path -Value ([ordered]@{ schemaVersion = 1; epoch = [UInt64]$Epoch })
+        }
+        ReadActiveRuntime = { param($InstallRoot) Read-CcodActiveRuntime -InstallRoot $InstallRoot }
+        GetProcessIdentity = {
+            param($Pid)
+            $process = $null
+            try {
+                $process = [Diagnostics.Process]::GetProcessById([int]$Pid)
+                return [pscustomobject][ordered]@{ pid = [int]$process.Id; creationTimeUtc = $process.StartTime.ToUniversalTime().ToString('o') }
+            } catch { return $null }
+            finally { if ($null -ne $process) { $process.Dispose() } }
+        }
+        EnterMutex = { param($UserSid, $SessionId, $TimeoutMilliseconds) Enter-CcodMutex -Kind AccountTransition -UserSid $UserSid -TimeoutMilliseconds $TimeoutMilliseconds }
+        ExitMutex = { param($Lease) Exit-CcodMutex -Lease $Lease }
+    }
+    if ($null -ne $Adapters) {
+        if ($Adapters -isnot [hashtable]) { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' 'Lifecycle epoch adapters must be a hashtable' $Adapters }
+        foreach ($key in $Adapters.Keys) {
+            if (-not $resolved.ContainsKey($key) -or $Adapters[$key] -isnot [scriptblock]) {
+                Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' 'Lifecycle epoch adapters are invalid' $key
+            }
+            $resolved[$key] = $Adapters[$key]
+        }
+    }
+    return $resolved
+}
+
+function Read-CcodLifecycleEpoch {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$InstallRoot, [switch]$AllowInitial, [hashtable]$Adapters)
+
+    $resolved = Get-CcodLifecycleEpochAdapters -Adapters $Adapters
+    try { $raw = & $resolved.ReadEpoch $InstallRoot ([bool]$AllowInitial) }
+    catch {
+        if ((Get-CcodLifecycleEpochErrorId $_) -like 'CCOD_LIFECYCLE_EPOCH_*') { throw }
+        Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' 'Lifecycle epoch could not be read safely' $InstallRoot
+    }
+    if ($null -eq $raw) {
+        if ($AllowInitial) { return [UInt64]0 }
+        Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' 'Lifecycle epoch is missing after initialization' $InstallRoot
+    }
+    if ($raw -is [pscustomobject] -or $raw -is [Collections.IDictionary]) {
+        Assert-CcodLifecycleEpochExactProperties -Value $raw -Expected $script:CcodLifecycleEpochProperties -Kind 'Lifecycle epoch'
+        return ConvertTo-CcodLifecycleEpochUInt64 -Value $raw.epoch -Name 'epoch' -AllowZero
+    }
+    return ConvertTo-CcodLifecycleEpochUInt64 -Value $raw -Name 'epoch' -AllowZero
+}
+
+function Write-CcodLifecycleEpoch {
+    param([Parameter(Mandatory)][string]$InstallRoot, [Parameter(Mandatory)][UInt64]$Epoch, [hashtable]$Adapters)
+
+    $resolved = Get-CcodLifecycleEpochAdapters -Adapters $Adapters
+    try { & $resolved.WriteEpoch $InstallRoot $Epoch }
+    catch { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_WRITE_FAILED' 'Lifecycle epoch could not be persisted atomically' $InstallRoot }
+}
+
+function Assert-CcodLifecycleOwnershipReceipt {
+    param([Parameter(Mandatory)]$Ownership)
+
+    Assert-CcodLifecycleEpochExactProperties -Value $Ownership -Expected $script:CcodLifecycleOwnershipProperties -Kind 'Lifecycle ownership receipt'
+    if ($Ownership.schemaVersion -isnot [int] -and $Ownership.schemaVersion -isnot [int64] -or $Ownership.schemaVersion -ne 1 -or $Ownership.released -isnot [bool]) {
+        Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_FENCE_STALE' 'Lifecycle ownership receipt is invalid' $Ownership
+    }
+    [void](ConvertTo-CcodLifecycleEpochUInt64 -Value $Ownership.epoch -Name 'ownership.epoch')
+    [void](ConvertTo-CcodLifecycleEpochUInt64 -Value $Ownership.runtimeGeneration -Name 'ownership.runtimeGeneration')
+    Assert-CcodLifecycleEpochRuntimeId -Value $Ownership.runtimeId
+    Assert-CcodLifecycleEpochOwnerIdentity -OwnerIdentity $Ownership.ownerIdentity
+    if ($null -eq $Ownership.lease) { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_FENCE_STALE' 'Lifecycle ownership lease is missing' $Ownership }
+}
+
+function Enter-CcodLifecycleOwnership {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$RuntimeId,
+        [Parameter(Mandatory)][UInt64]$RuntimeGeneration,
+        [Parameter(Mandatory)]$OwnerIdentity,
+        [Parameter(Mandatory)][string]$UserSid,
+        [Parameter(Mandatory)][int]$SessionId,
+        [int]$TimeoutMilliseconds = 15000,
+        [hashtable]$Adapters
+    )
+
+    Assert-CcodLifecycleEpochRuntimeId -Value $RuntimeId
+    if ($RuntimeGeneration -eq 0) { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_INVALID' 'Lifecycle runtime generation must be positive' $RuntimeGeneration }
+    Assert-CcodLifecycleEpochOwnerIdentity -OwnerIdentity $OwnerIdentity
+    $resolved = Get-CcodLifecycleEpochAdapters -Adapters $Adapters
+    try { $lease = & $resolved.EnterMutex $UserSid $SessionId $TimeoutMilliseconds }
+    catch { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_LEASE_FAILED' 'Lifecycle ownership mutex could not be acquired safely' $InstallRoot }
+    if ($null -eq $lease -or $lease.Outcome -cne 'Acquired') { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_LEASE_TIMEOUT' 'Lifecycle ownership mutex timed out' $InstallRoot }
+    try {
+        $current = Read-CcodLifecycleEpoch -InstallRoot $InstallRoot -AllowInitial -Adapters $resolved
+        if ($current -eq [UInt64]::MaxValue) { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_EXHAUSTED' 'Lifecycle epoch cannot wrap' $InstallRoot }
+        $next = [UInt64]($current + 1)
+        Write-CcodLifecycleEpoch -InstallRoot $InstallRoot -Epoch $next -Adapters $resolved
+        if ((Read-CcodLifecycleEpoch -InstallRoot $InstallRoot -Adapters $resolved) -ne $next) {
+            Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_EPOCH_UNPROVEN' 'Lifecycle epoch read-back does not prove the committed increment' $InstallRoot
+        }
+        return [pscustomobject][ordered]@{ schemaVersion=1; lease=$lease; epoch=$next; runtimeId=$RuntimeId; runtimeGeneration=$RuntimeGeneration; ownerIdentity=$OwnerIdentity; released=$false }
+    } catch {
+        try { [void](& $resolved.ExitMutex $lease) } catch { }
+        throw
+    }
+}
+
+function Assert-CcodLifecycleFence {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$InstallRoot, [Parameter(Mandatory)]$Ownership, [hashtable]$Adapters)
+
+    Assert-CcodLifecycleOwnershipReceipt -Ownership $Ownership
+    if ($Ownership.released -or ($null -ne $Ownership.lease.PSObject.Properties['Released'] -and [bool]$Ownership.lease.Released)) {
+        Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_FENCE_STALE' 'Lifecycle ownership has already been released' $Ownership
+    }
+    $resolved = Get-CcodLifecycleEpochAdapters -Adapters $Adapters
+    try {
+        $epoch = Read-CcodLifecycleEpoch -InstallRoot $InstallRoot -Adapters $resolved
+        $pointer = & $resolved.ReadActiveRuntime $InstallRoot
+        $identity = & $resolved.GetProcessIdentity $Ownership.ownerIdentity.pid
+    } catch {
+        Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_FENCE_STALE' 'Lifecycle fence could not be revalidated' $Ownership
+    }
+    $pointerGeneration = $null
+    if ($null -ne $pointer -and $null -ne $pointer.PSObject.Properties['generation']) {
+        try { $pointerGeneration = ConvertTo-CcodLifecycleEpochUInt64 -Value $pointer.generation -Name 'activeRuntime.generation' }
+        catch { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_FENCE_STALE' 'Active runtime generation is invalid' $Ownership }
+    }
+    if ($epoch -ne [UInt64]$Ownership.epoch -or $null -eq $pointer -or $pointer.activeRuntime -cne $Ownership.runtimeId -or
+        $null -eq $pointerGeneration -or $pointerGeneration -ne [UInt64]$Ownership.runtimeGeneration -or $null -eq $identity -or
+        $identity.pid -ne $Ownership.ownerIdentity.pid -or $identity.creationTimeUtc -cne $Ownership.ownerIdentity.creationTimeUtc) {
+        Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_FENCE_STALE' 'Lifecycle owner is stale' $Ownership
+    }
+    return $true
+}
+
+function Exit-CcodLifecycleOwnership {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Ownership, [hashtable]$Adapters)
+
+    Assert-CcodLifecycleOwnershipReceipt -Ownership $Ownership
+    if ($Ownership.released) { return $false }
+    $resolved = Get-CcodLifecycleEpochAdapters -Adapters $Adapters
+    try { $released = & $resolved.ExitMutex $Ownership.lease }
+    catch { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_RELEASE_FAILED' 'Lifecycle ownership mutex could not be released safely' $Ownership }
+    if ($released -isnot [bool] -or -not $released) { Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_RELEASE_FAILED' 'Lifecycle ownership mutex was not released' $Ownership }
+    $Ownership.released = $true
+    return $true
+}
+
+Export-ModuleMember -Function Enter-CcodLifecycleOwnership, Assert-CcodLifecycleFence, Exit-CcodLifecycleOwnership, Read-CcodLifecycleEpoch
