@@ -71,10 +71,11 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 
-public sealed class CcodTokenStatisticsResult
+public sealed class CcodProcessTokenFacts
 {
     public UInt32 AuthenticationHighPart { get; set; }
     public UInt32 AuthenticationLowPart { get; set; }
+    public string userSid { get; set; }
 }
 
 public static class CcodTrustedLogonNative
@@ -97,6 +98,12 @@ public static class CcodTrustedLogonNative
         public LUID ModifiedId;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SID_AND_ATTRIBUTES { public IntPtr Sid; public UInt32 Attributes; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TOKEN_USER { public SID_AND_ATTRIBUTES User; }
+
     [DllImport("advapi32.dll", SetLastError = true)]
     private static extern bool OpenProcessToken(IntPtr processHandle, UInt32 desiredAccess, out IntPtr tokenHandle);
     [DllImport("advapi32.dll", SetLastError = true)]
@@ -104,13 +111,16 @@ public static class CcodTrustedLogonNative
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr handle);
 
-    public static CcodTokenStatisticsResult GetCurrentTokenStatistics()
+    public static CcodProcessTokenFacts GetCurrentProcessTokenFacts()
     {
         IntPtr token = IntPtr.Zero;
         IntPtr buffer = IntPtr.Zero;
+        IntPtr userBuffer = IntPtr.Zero;
+        Process process = null;
         try
         {
-            if (!OpenProcessToken(Process.GetCurrentProcess().Handle, 0x0008U, out token) || token == IntPtr.Zero || token == new IntPtr(-1))
+            process = Process.GetCurrentProcess();
+            if (!OpenProcessToken(process.Handle, 0x0008U, out token) || token == IntPtr.Zero || token == new IntPtr(-1))
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             UInt32 length;
             GetTokenInformation(token, 10, IntPtr.Zero, 0, out length);
@@ -120,15 +130,27 @@ public static class CcodTrustedLogonNative
             if (!GetTokenInformation(token, 10, buffer, length, out length) || length < minimum)
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             TOKEN_STATISTICS statistics = (TOKEN_STATISTICS)Marshal.PtrToStructure(buffer, typeof(TOKEN_STATISTICS));
-            return new CcodTokenStatisticsResult {
+            UInt32 userLength;
+            GetTokenInformation(token, 1, IntPtr.Zero, 0, out userLength);
+            int minimumUser = Marshal.SizeOf(typeof(TOKEN_USER));
+            if (userLength < minimumUser) throw new InvalidOperationException("TOKEN_USER buffer is too short");
+            userBuffer = Marshal.AllocHGlobal(checked((int)userLength));
+            if (!GetTokenInformation(token, 1, userBuffer, userLength, out userLength) || userLength < minimumUser)
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            TOKEN_USER user = (TOKEN_USER)Marshal.PtrToStructure(userBuffer, typeof(TOKEN_USER));
+            if (user.User.Sid == IntPtr.Zero) throw new InvalidOperationException("TOKEN_USER SID is unavailable");
+            return new CcodProcessTokenFacts {
                 AuthenticationHighPart = unchecked((UInt32)statistics.AuthenticationId.HighPart),
-                AuthenticationLowPart = statistics.AuthenticationId.LowPart
+                AuthenticationLowPart = statistics.AuthenticationId.LowPart,
+                userSid = new System.Security.Principal.SecurityIdentifier(user.User.Sid).Value
             };
         }
         finally
         {
+            if (userBuffer != IntPtr.Zero) Marshal.FreeHGlobal(userBuffer);
             if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
             if (token != IntPtr.Zero && token != new IntPtr(-1)) CloseHandle(token);
+            if (process != null) process.Dispose();
         }
     }
 }
@@ -139,12 +161,8 @@ function Get-CcodTrustedLogonAdapters {
     param([hashtable]$Adapters)
 
     $resolved = @{
-        GetTokenStatistics = { Initialize-CcodTrustedLogonNative; [CcodTrustedLogonNative]::GetCurrentTokenStatistics() }
-        GetCurrentUserSid = {
-            $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-            try { if ($null -eq $identity.User) { throw 'Current user SID is unavailable' }; $identity.User.Value }
-            finally { $identity.Dispose() }
-        }
+        GetProcessTokenFacts = { Initialize-CcodTrustedLogonNative; [CcodTrustedLogonNative]::GetCurrentProcessTokenFacts() }
+        GetCurrentUserSid = { throw 'Thread identity must not be used for trusted logon facts' }
         GetCurrentSessionId = {
             $process = [Diagnostics.Process]::GetCurrentProcess()
             try { [int]$process.SessionId } finally { $process.Dispose() }
@@ -168,8 +186,8 @@ function Get-CcodTrustedLogonIdentity {
 
     try {
         $resolved = Get-CcodTrustedLogonAdapters -Adapters $Adapters
-        $statistics = & $resolved.GetTokenStatistics
-        Assert-CcodTrustedLogonExactProperties -Value $statistics -Expected @('AuthenticationHighPart','AuthenticationLowPart') -ErrorId 'CCOD_LOGON_IDENTITY_UNAVAILABLE' -Kind 'Token statistics'
+        $statistics = & $resolved.GetProcessTokenFacts
+        Assert-CcodTrustedLogonExactProperties -Value $statistics -Expected @('AuthenticationHighPart','AuthenticationLowPart','userSid') -ErrorId 'CCOD_LOGON_IDENTITY_UNAVAILABLE' -Kind 'Process token facts'
         foreach ($name in @('AuthenticationHighPart','AuthenticationLowPart')) {
             $value = $statistics.$name
             if (($value -isnot [byte] -and $value -isnot [uint16] -and $value -isnot [uint32] -and $value -isnot [int16] -and $value -isnot [int32] -and $value -isnot [int64]) -or $value -lt 0 -or $value -gt [uint32]::MaxValue) {
@@ -178,7 +196,7 @@ function Get-CcodTrustedLogonIdentity {
         }
         $identity = [pscustomobject][ordered]@{
             authenticationId = '{0:X8}:{1:X8}' -f ([uint32]$statistics.AuthenticationHighPart),([uint32]$statistics.AuthenticationLowPart)
-            userSid = (& $resolved.GetCurrentUserSid)
+            userSid = $statistics.userSid
             sessionId = [int](& $resolved.GetCurrentSessionId)
         }
         Assert-CcodTrustedLogonIdentity -Identity $identity -ErrorId 'CCOD_LOGON_IDENTITY_UNAVAILABLE'
@@ -195,17 +213,21 @@ function Get-CcodSafeExitIntentPath {
 }
 
 function Get-CcodSafeExitIntentFileSecurity {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     try {
-        if ($null -eq $identity.User) { Throw-CcodTrustedLogonError 'CCOD_SAFE_EXIT_INTENT_ACL_INVALID' 'Current user SID is unavailable for the safe-exit marker' $null }
+        Initialize-CcodTrustedLogonNative
+        $userSid = [CcodTrustedLogonNative]::GetCurrentProcessTokenFacts().userSid
+        if (-not (Test-CcodCanonicalSid -Value $userSid)) { Throw-CcodTrustedLogonError 'CCOD_SAFE_EXIT_INTENT_ACL_INVALID' 'Current user SID is unavailable for the safe-exit marker' $null }
         $security = [Security.AccessControl.FileSecurity]::new()
-        $security.SetOwner($identity.User)
+        $security.SetOwner([Security.Principal.SecurityIdentifier]::new($userSid))
         $security.SetAccessRuleProtection($true, $false)
-        foreach ($sidValue in @($identity.User.Value, 'S-1-5-18', 'S-1-5-32-544')) {
+        foreach ($sidValue in @($userSid, 'S-1-5-18', 'S-1-5-32-544')) {
             [void]$security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sidValue), [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
         }
         return $security
-    } finally { $identity.Dispose() }
+    } catch {
+        if ((Get-CcodTrustedLogonErrorId $_) -ceq 'CCOD_SAFE_EXIT_INTENT_ACL_INVALID') { throw }
+        Throw-CcodTrustedLogonError 'CCOD_SAFE_EXIT_INTENT_ACL_INVALID' 'Current process token SID is unavailable for the safe-exit marker' $null
+    }
 }
 
 function New-CcodSafeExitIntentSecureFile {
@@ -215,27 +237,40 @@ function New-CcodSafeExitIntentSecureFile {
 }
 
 function Assert-CcodSafeExitIntentFileAcl {
-    param([Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)][string]$Path, $Security, [string]$UserSid)
 
-    if (-not [IO.File]::Exists($Path)) { return }
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    if ($null -eq $Security -and -not [IO.File]::Exists($Path)) { return }
     try {
-        $security = [IO.File]::GetAccessControl($Path)
+        if ([string]::IsNullOrWhiteSpace($UserSid)) {
+            Initialize-CcodTrustedLogonNative
+            $UserSid = [CcodTrustedLogonNative]::GetCurrentProcessTokenFacts().userSid
+        }
+        $userSid = $UserSid
+        if (-not (Test-CcodCanonicalSid -Value $userSid)) { Throw-CcodTrustedLogonError 'CCOD_SAFE_EXIT_INTENT_ACL_INVALID' 'Safe-exit marker ACL could not be proven' $Path }
+        if ($null -eq $Security) { $Security = [IO.File]::GetAccessControl($Path) }
+        $security = $Security
         $rules = @($security.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
         $owner = $security.GetOwner([Security.Principal.SecurityIdentifier])
-        $expected = @($identity.User.Value, 'S-1-5-18', 'S-1-5-32-544')
-        if ($null -eq $identity.User -or $null -eq $owner -or $owner.Value -cne $identity.User.Value -or -not $security.AreAccessRulesProtected -or $rules.Count -ne 3) {
+        $expected = @($userSid, 'S-1-5-18', 'S-1-5-32-544')
+        if ($null -eq $owner -or $owner.Value -cne $userSid -or -not $security.AreAccessRulesProtected -or $rules.Count -ne $expected.Count) {
             Throw-CcodTrustedLogonError 'CCOD_SAFE_EXIT_INTENT_ACL_INVALID' 'Safe-exit marker ACL is not the required protected current-user ACL' $Path
         }
+        $counts = @{}
         foreach ($rule in $rules) {
             if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or $rule.IsInherited -or $rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl -or $expected -cnotcontains $rule.IdentityReference.Value) {
+                Throw-CcodTrustedLogonError 'CCOD_SAFE_EXIT_INTENT_ACL_INVALID' 'Safe-exit marker ACL is not the required protected current-user ACL' $Path
+            }
+            $counts[$rule.IdentityReference.Value] = 1 + $(if ($counts.ContainsKey($rule.IdentityReference.Value)) { [int]$counts[$rule.IdentityReference.Value] } else { 0 })
+        }
+        foreach ($sidValue in $expected) {
+            if (-not $counts.ContainsKey($sidValue) -or $counts[$sidValue] -ne 1) {
                 Throw-CcodTrustedLogonError 'CCOD_SAFE_EXIT_INTENT_ACL_INVALID' 'Safe-exit marker ACL is not the required protected current-user ACL' $Path
             }
         }
     } catch {
         if ((Get-CcodTrustedLogonErrorId $_) -ceq 'CCOD_SAFE_EXIT_INTENT_ACL_INVALID') { throw }
         Throw-CcodTrustedLogonError 'CCOD_SAFE_EXIT_INTENT_ACL_INVALID' 'Safe-exit marker ACL could not be proven' $Path
-    } finally { $identity.Dispose() }
+    }
 }
 
 function Get-CcodSafeExitIntentAdapters {

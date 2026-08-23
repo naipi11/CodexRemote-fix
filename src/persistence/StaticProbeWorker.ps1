@@ -20,6 +20,7 @@ $script:CcodStaticProbeRequiredFiles = @(
     'src/persistence/StaticProbeWorker.ps1',
     'src/persistence/modules/RuntimeManifest.psm1',
     'src/persistence/modules/PersistenceIO.psm1',
+    'src/persistence/modules/TrustedLogonIdentity.psm1',
     'src/persistence/modules/StateStore.psm1',
     'src/persistence/modules/CompatibilityProbe.psm1',
     'src/persistence/modules/ProcessControl.psm1',

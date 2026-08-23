@@ -13,8 +13,7 @@ function New-CcodTrustedIdentityAdapters {
     )
 
     return @{
-        GetTokenStatistics = { [pscustomobject][ordered]@{ AuthenticationHighPart=$HighPart; AuthenticationLowPart=$LowPart } }.GetNewClosure()
-        GetCurrentUserSid = { $UserSid }.GetNewClosure()
+        GetProcessTokenFacts = { [pscustomobject][ordered]@{ AuthenticationHighPart=$HighPart; AuthenticationLowPart=$LowPart; userSid=$UserSid } }.GetNewClosure()
         GetCurrentSessionId = { $SessionId }.GetNewClosure()
     }
 }
@@ -46,12 +45,24 @@ try {
         Assert-CcodEqual 2 $identity.sessionId 'identity takes the current process session'
     }
 
+    Invoke-CcodTest 'uses the SID read from the opened process token instead of an impersonated thread identity' {
+        $adapters = @{
+            GetProcessTokenFacts = { [pscustomobject][ordered]@{ AuthenticationHighPart=0; AuthenticationLowPart=999; userSid='S-1-5-21-1-2-3-1001' } }
+            GetCurrentUserSid = { throw 'thread token must never supply the trusted SID' }
+            GetCurrentSessionId = { 2 }
+        }
+
+        $identity = Get-CcodTrustedLogonIdentity -Adapters $adapters
+
+        Assert-CcodEqual 'S-1-5-21-1-2-3-1001' $identity.userSid 'only the current-process token SID becomes trusted identity evidence'
+    }
+
     Invoke-CcodTest 'fails closed when a token fact is malformed unavailable or contains extra fields' {
         $invalid = @(
-            @{ GetTokenStatistics={ throw 'token query failed' }; GetCurrentUserSid={ 'S-1-5-21-1-2-3-1001' }; GetCurrentSessionId={ 2 } },
-            @{ GetTokenStatistics={ [pscustomobject][ordered]@{ AuthenticationHighPart=0; AuthenticationLowPart=1; Unexpected=2 } }; GetCurrentUserSid={ 'S-1-5-21-1-2-3-1001' }; GetCurrentSessionId={ 2 } },
-            @{ GetTokenStatistics={ [pscustomobject][ordered]@{ AuthenticationHighPart=0; AuthenticationLowPart=1 } }; GetCurrentUserSid={ 'S-1-05-21-1-2-3-1001' }; GetCurrentSessionId={ 2 } },
-            @{ GetTokenStatistics={ [pscustomobject][ordered]@{ AuthenticationHighPart=0; AuthenticationLowPart=1 } }; GetCurrentUserSid={ 'S-1-5-21-1-2-3-1001' }; GetCurrentSessionId={ -1 } }
+            @{ GetProcessTokenFacts={ throw 'token query failed' }; GetCurrentSessionId={ 2 } },
+            @{ GetProcessTokenFacts={ [pscustomobject][ordered]@{ AuthenticationHighPart=0; AuthenticationLowPart=1; userSid='S-1-5-21-1-2-3-1001'; Unexpected=2 } }; GetCurrentSessionId={ 2 } },
+            @{ GetProcessTokenFacts={ [pscustomobject][ordered]@{ AuthenticationHighPart=0; AuthenticationLowPart=1; userSid='S-1-05-21-1-2-3-1001' } }; GetCurrentSessionId={ 2 } },
+            @{ GetProcessTokenFacts={ [pscustomobject][ordered]@{ AuthenticationHighPart=0; AuthenticationLowPart=1; userSid='S-1-5-21-1-2-3-1001' } }; GetCurrentSessionId={ -1 } }
         )
         foreach ($adapters in $invalid) {
             Assert-CcodThrows { Get-CcodTrustedLogonIdentity -Adapters $adapters } 'CCOD_LOGON_IDENTITY_UNAVAILABLE'
@@ -109,6 +120,28 @@ try {
 
         Assert-CcodEqual $true (Clear-CcodSafeExitIntent -StateRoot $state) 'explicit clear removes a validated marker'
         Assert-CcodEqual $false (Clear-CcodSafeExitIntent -StateRoot $state) 'explicit clear reports an already-missing marker'
+    }
+
+    Invoke-CcodTest 'rejects duplicate missing and wrong-identity marker ACL entries' {
+        $identity = New-CcodTrustedIdentity
+        $currentUserSid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+        foreach ($case in @('duplicate', 'missing', 'wrong-identity')) {
+            $state = New-CcodSafeExitFixtureRoot -Root $root -Name ('acl-shape-' + $case)
+            Write-CcodSafeExitIntent -StateRoot $state -LogonIdentity $identity -RuntimeId '2.5.0-a' -RecoveryTransactionId '11111111-2222-3333-4444-555555555555' -NowUtc '2030-02-03T04:05:06.0000000Z'
+            $path = Get-CcodSafeExitIntentPath $state
+            $security = [Security.AccessControl.FileSecurity]::new()
+            $security.SetOwner([Security.Principal.SecurityIdentifier]::new($currentUserSid))
+            $security.SetAccessRuleProtection($true, $false)
+            $identities = @($currentUserSid, 'S-1-5-18', 'S-1-5-32-544')
+            if ($case -eq 'duplicate') { $identities = @($currentUserSid, 'S-1-5-18', 'S-1-5-18') }
+            elseif ($case -eq 'missing') { $identities = @($currentUserSid, 'S-1-5-18') }
+            elseif ($case -eq 'wrong-identity') { $identities = @($currentUserSid, 'S-1-5-18', 'S-1-1-0') }
+            foreach ($sidValue in $identities) {
+                [void]$security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sidValue), [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
+            }
+            $module = Get-Module TrustedLogonIdentity | Select-Object -First 1
+            Assert-CcodThrows { & $module { param($MarkerPath, $Acl, $Sid) Assert-CcodSafeExitIntentFileAcl -Path $MarkerPath -Security $Acl -UserSid $Sid } $path $security $currentUserSid } 'CCOD_SAFE_EXIT_INTENT_ACL_INVALID'
+        }
     }
 } catch {
     Write-Error $_

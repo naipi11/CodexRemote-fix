@@ -212,6 +212,7 @@ function New-CcodAuthorizedRuntimeFixture {
         'src\persistence\modules\LifecycleEpoch.psm1',
         'src\persistence\modules\KernelObjects.psm1',
         'src\persistence\modules\PersistenceIO.psm1',
+        'src\persistence\modules\TrustedLogonIdentity.psm1',
         'src\persistence\modules\StateStore.psm1',
         'src\persistence\modules\CompatibilityProbe.psm1',
         'src\persistence\modules\ProcessControl.psm1',
@@ -517,6 +518,13 @@ try {
         Complete-CcodStaticProbeRuntimeAuthorization -Context $context -RuntimeApi $api|Out-Null
         foreach($forbidden in @('Start-CcodProcess','Stop-CcodProcessIfMatch','Write-CcodSettings','Write-CcodStatus','Write-CcodVerifiedPackages','Set-CcodAutomationEnabled','Set-CcodCandidateCompatibleOptIn','ProcessControl\Start-CcodProcess','ProcessControl\Stop-CcodProcessIfMatch','StateStore\Write-CcodSettings','StateStore\Write-CcodStatus','StateStore\Write-CcodVerifiedPackages')){Assert-CcodEqual $null (Get-Command $forbidden -ErrorAction SilentlyContinue) "$forbidden is unreachable after private binding"}
         foreach($path in @($api.ModulePaths.PSObject.Properties.Value)){Assert-CcodEqual 0 @(Get-Module|Where-Object{$_.Path -ceq $path}).Count "$path is unloaded after binding"}
+    }
+
+    Invoke-CcodTest 'authorizes the trusted logon module required by the StateStore import closure' {
+        $fixture=New-CcodAuthorizedRuntimeFixture -Root (Join-Path $root 'trusted-logon-runtime-closure')
+        [IO.File]::AppendAllText((Join-Path $fixture.RuntimeRoot 'src\persistence\modules\TrustedLogonIdentity.psm1'), "`n# unverified mutation", [Text.UTF8Encoding]::new($false))
+
+        Assert-CcodThrows { Get-CcodStaticProbeRuntimeAuthorization -ScriptPath $fixture.WorkerPath | Out-Null } 'CCOD_STATIC_RUNTIME_UNAUTHORIZED'
     }
 
     Invoke-CcodTest 'production defaults import the verified runtime before strict request read and atomic result write' {
