@@ -86,6 +86,8 @@ function New-CcodLifecycleFake {
         TaskInstalled = 0
         TaskRemoved = 0
         TaskStarted = 0
+        TaskIdle = $true
+        TaskIdleWaits = 0
         AutomationPaused = 0
         TransitionLeaseCalls = 0
         ShutdownSignaled = 0
@@ -120,6 +122,7 @@ function New-CcodLifecycleFake {
     $adapters.InstallSupervisorTask = { param($InstallRoot, $UserSid) $world.Calls.Add("InstallTask:$([IO.Path]::GetFileName($InstallRoot)):$UserSid"); $world.TaskInstalled++ }.GetNewClosure()
     $adapters.RemoveSupervisorTask = { $world.Calls.Add('RemoveTask'); $world.TaskRemoved++ }.GetNewClosure()
     $adapters.StartSupervisorTask = { $world.Calls.Add('StartTask'); $world.TaskStarted++ }.GetNewClosure()
+    $adapters.WaitSupervisorTaskIdle = { param($TimeoutMilliseconds) $world.Calls.Add("WaitTaskIdle:$TimeoutMilliseconds"); $world.TaskIdleWaits++; [bool]$world.TaskIdle }.GetNewClosure()
     $adapters.SignalSupervisorShutdown = { param($UserSid, $SessionId) $world.Calls.Add("SignalShutdown:${UserSid}:${SessionId}"); $world.ShutdownSignaled++ }.GetNewClosure()
     $adapters.FindSupervisorFallback = { param($InstallRoot, $Identity) $world.Calls.Add("FindSupervisorFallback:$([IO.Path]::GetFileName($InstallRoot)):$($Identity.UserSid):$($Identity.SessionId)"); $world.FallbackSupervisorLookups++; $world.FallbackSupervisor }.GetNewClosure()
     $adapters.WaitSupervisorExit = { param($SupervisorIdentity, $TimeoutMilliseconds) $world.Calls.Add("WaitSupervisor:$($SupervisorIdentity.Pid):$TimeoutMilliseconds"); [bool]$world.WaitSupervisorExit }.GetNewClosure()
@@ -199,6 +202,27 @@ function Set-CcodLifecycleTestStatus {
 }
 
 $results = @()
+
+$results += Invoke-CcodTest 'waits for the previous IgnoreNew task instance before starting the new supervisor' {
+    $module = Get-Module -Name InstallLifecycle -ErrorAction Stop
+    $calls = [Collections.Generic.List[string]]::new()
+    $adapters = @{
+        WaitSupervisorTaskIdle = { param($TimeoutMilliseconds) $calls.Add("wait:$TimeoutMilliseconds"); $true }.GetNewClosure()
+        StartSupervisorTask = { $calls.Add('start') }.GetNewClosure()
+    }
+    & $module { param($LifecycleAdapters) Start-CcodLifecycleTask -Adapters $LifecycleAdapters } $adapters
+    Assert-CcodEqual 'wait:10000,start' ($calls -join ',') 'task idle proof precedes the start request'
+
+    $blockedCalls = [Collections.Generic.List[string]]::new()
+    $blockedAdapters = @{
+        WaitSupervisorTaskIdle = { param($TimeoutMilliseconds) $blockedCalls.Add('wait'); $false }.GetNewClosure()
+        StartSupervisorTask = { $blockedCalls.Add('start'); throw 'must not start while the old IgnoreNew instance is running' }.GetNewClosure()
+    }
+    $threw = $false
+    try { & $module { param($LifecycleAdapters) Start-CcodLifecycleTask -Adapters $LifecycleAdapters } $blockedAdapters } catch { $threw = $_.FullyQualifiedErrorId -like 'CCOD_INSTALL_SUPERVISOR_TASK_BUSY*' }
+    Assert-CcodTrue $threw 'a task that remains running fails with the stable busy code'
+    Assert-CcodEqual 'wait' ($blockedCalls -join ',') 'blocked task never receives a start request'
+}
 
 $results += Invoke-CcodTest 'default installer validation uses the structural runtime payload and requires TrayHost files' {
     $source = New-CcodLifecycleTempRoot
@@ -1131,19 +1155,19 @@ $results += Invoke-CcodTest 'installer exposes CodexRemote-fix as the searchable
     Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-setup\.exe\.sha256\.txt') 'build script writes a hash beside the public setup filename'
 }
 
-$results += Invoke-CcodTest 'installer publishes the exact CodexRemote-fix 2.4.23 release artifacts' {
+$results += Invoke-CcodTest 'installer publishes the exact CodexRemote-fix 2.4.24 release artifacts' {
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
-    Assert-CcodEqual '2.4.23' ([string]$package.version) 'package version is exactly 2.4.23'
+    Assert-CcodEqual '2.4.24' ([string]$package.version) 'package version is exactly 2.4.24'
 
     $installerScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw
     $outputBase = [regex]::Match($installerScript, '(?m)^OutputBaseFilename=(.+)$').Groups[1].Value.Trim()
     $setupName = ($outputBase -replace '\{#ProjectVersion\}', [string]$package.version) + '.exe'
-    Assert-CcodEqual 'CodexRemote-fix-2.4.23-setup.exe' $setupName 'Inno output resolves to the exact public setup filename'
+    Assert-CcodEqual 'CodexRemote-fix-2.4.24-setup.exe' $setupName 'Inno output resolves to the exact public setup filename'
 
     $buildScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
     $checksumTemplate = [regex]::Match($buildScript, 'Join-Path \$dist \("([^"]+\.sha256\.txt)"\)').Groups[1].Value
     $checksumName = $checksumTemplate.Replace('$Version', [string]$package.version)
-    Assert-CcodEqual 'CodexRemote-fix-2.4.23-setup.exe.sha256.txt' $checksumName 'build script resolves to the exact public checksum filename'
+    Assert-CcodEqual 'CodexRemote-fix-2.4.24-setup.exe.sha256.txt' $checksumName 'build script resolves to the exact public checksum filename'
 }
 
 $results += Invoke-CcodTest 'installer stops the running supervisor before replacing the installed version' {
@@ -1330,16 +1354,16 @@ $results += Invoke-CcodTest 'README and release workflow publish current install
     Assert-CcodTrue ($readmeChinese -cmatch '\A(?s:<div align="center">.*?<h1>CodexRemote-fix</h1>)') 'Chinese README uses the centered public product heading'
 
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start[^\r\n]*\r?\n(.*?)(?=^## )').Groups[1].Value
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.4\.23-setup\.exe') 'English Quick Start names the exact setup artifact'
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.4\.23-setup\.exe\.sha256\.txt') 'English Quick Start names the exact checksum artifact'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.4\.24-setup\.exe') 'English Quick Start names the exact setup artifact'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.4\.24-setup\.exe\.sha256\.txt') 'English Quick Start names the exact checksum artifact'
     Assert-CcodTrue ($quickStart -cnotmatch '(?i)powershell|Install-CodexControlOtherDevices') 'English Quick Start does not teach PowerShell installation'
     Assert-CcodTrue ($quickStart -cmatch '\*\*CodexRemote-fix\*\*') 'English Quick Start names the public desktop shortcut'
 
     $quickStartChineseMatch = [regex]::Match($readmeChinese, '(?ms)^## [^\r\n]+\r?\n(?:\r?\n)?(?=1\.[^\r\n]*\[Releases\])(.*?)(?=^## |\z)')
     Assert-CcodTrue $quickStartChineseMatch.Success 'Chinese README exposes a Quick Start section'
     $quickStartChinese = $quickStartChineseMatch.Groups[1].Value
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.4\.23-setup\.exe') 'Chinese Quick Start names the exact setup artifact'
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.4\.23-setup\.exe\.sha256\.txt') 'Chinese Quick Start names the exact checksum artifact'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.4\.24-setup\.exe') 'Chinese Quick Start names the exact setup artifact'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.4\.24-setup\.exe\.sha256\.txt') 'Chinese Quick Start names the exact checksum artifact'
     Assert-CcodTrue ($quickStartChinese -cnotmatch '(?i)powershell|Install-CodexControlOtherDevices') 'Chinese Quick Start does not teach PowerShell installation'
     Assert-CcodTrue ($quickStartChinese -cmatch '\*\*CodexRemote-fix\*\*') 'Chinese Quick Start names the public desktop shortcut'
 

@@ -6,6 +6,20 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.4.24
+
+### English
+
+- Fixed upgrades leaving no tray icon even though the controlled Codex session was active.
+- The installer now waits for the previous `IgnoreNew` scheduled-task instance to leave `Running` before starting the new Supervisor.
+- Added lifecycle regression coverage and a stable `CCOD_INSTALL_SUPERVISOR_TASK_BUSY` failure when the old task cannot exit within the bounded wait.
+
+### 简体中文
+
+- 修复升级后受控 Codex 会话已经生效、但托盘图标消失的问题。
+- 安装器现在会等待旧 `IgnoreNew` 计划任务实例退出 `Running`，再启动新的 Supervisor。
+- 新增生命周期回归测试；旧任务在限定时间内无法退出时，会返回稳定错误 `CCOD_INSTALL_SUPERVISOR_TASK_BUSY`。
+
 ## v2.4.23
 
 ### English

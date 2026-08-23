@@ -666,6 +666,16 @@ function Get-CcodLifecycleAdapters {
         StartSupervisorTask = {
             Start-ScheduledTask -TaskName $script:CcodLifecycleTaskName -ErrorAction Stop | Out-Null
         }
+        WaitSupervisorTaskIdle = {
+            param($TimeoutMilliseconds)
+            $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+            while ($stopwatch.ElapsedMilliseconds -lt [long]$TimeoutMilliseconds) {
+                $task = Get-ScheduledTask -TaskName $script:CcodLifecycleTaskName -ErrorAction Stop
+                if ([string]$task.State -cne 'Running') { return $true }
+                Start-Sleep -Milliseconds 100
+            }
+            return $false
+        }
         SignalSupervisorShutdown = {
             param($UserSid, $SessionId)
             try {
@@ -784,6 +794,10 @@ function Install-CcodLifecycleTask {
 
 function Start-CcodLifecycleTask {
     param([Parameter(Mandatory)][hashtable]$Adapters)
+    $idle = & $Adapters.WaitSupervisorTaskIdle 10000
+    if ($idle -isnot [bool] -or -not $idle) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_SUPERVISOR_TASK_BUSY' 'The previous IgnoreNew supervisor task instance did not exit before restart' $script:CcodLifecycleTaskName
+    }
     & $Adapters.StartSupervisorTask
 }
 
