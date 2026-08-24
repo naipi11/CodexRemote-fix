@@ -102,6 +102,44 @@ function Set-CcodLifecycleSubmissionFixtureFileAcl {
     Assert-CcodLifecycleSubmissionFileAcl $Path
 }
 
+function Write-CcodLifecycleRequestSubmissionFailureFacts {
+    param([string]$Path,[AllowNull()][string]$ErrorCode)
+    $exists = [IO.File]::Exists($Path)
+    $readable = $false
+    $ownerCurrent = $false
+    $protected = $false
+    $ruleCount = 0
+    $exactRules = $false
+    $inheritedCount = 0
+    if ($exists) {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        try {
+            $security = [IO.File]::GetAccessControl($Path)
+            $readable = $true
+            $owner = $security.GetOwner([Security.Principal.SecurityIdentifier])
+            $rules = @($security.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+            $expected = @($identity.User.Value,'S-1-5-18','S-1-5-32-544')
+            $ownerCurrent = $null -ne $owner -and $owner.Value -ceq $identity.User.Value
+            $protected = $security.AreAccessRulesProtected
+            $ruleCount = $rules.Count
+            $inheritedCount = @($rules | Where-Object { $_.IsInherited }).Count
+            $exactRules = $rules.Count -eq 3 -and @($rules | Where-Object {
+                $_.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+                $_.IsInherited -or
+                $_.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl -or
+                $expected -cnotcontains $_.IdentityReference.Value
+            }).Count -eq 0
+        } catch {
+            $readable = $false
+        } finally {
+            $identity.Dispose()
+        }
+    }
+    $safeErrorCode = if ($ErrorCode -cmatch '^[A-Z][A-Z0-9_]{0,127}$') { $ErrorCode } else { 'INVALID' }
+    [Console]::Error.WriteLine(('CCOD_LIFECYCLE_SUBMISSION accepted=false errorCode={0}' -f $safeErrorCode))
+    [Console]::Error.WriteLine(('CCOD_LIFECYCLE_SUBMISSION_FILE exists={0} readable={1} ownerCurrent={2} protected={3} ruleCount={4} exactRules={5} inheritedCount={6}' -f $exists,$readable,$ownerCurrent,$protected,$ruleCount,$exactRules,$inheritedCount))
+}
+
 $results = [Collections.Generic.List[object]]::new()
 
 $results.Add((Invoke-CcodTest 'submits one durable request and returns only its correlated accepted receipt without controller mutation' {
@@ -116,6 +154,9 @@ $results.Add((Invoke-CcodTest 'submits one durable request and returns only its 
             Write-CcodLifecycleSubmissionReceipt -StateRoot (Join-Path $root 'state') -SubmissionId $submission.submissionId -Accepted $true -TransactionId $transactionId -ErrorCode $null -Adapters @{GetUtcNow={ [DateTime]::ParseExact($timestamp,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind) }.GetNewClosure()}
         }.GetNewClosure()
         $submitted=Submit-CcodLifecycleRequest -InstallRoot $root -Kind RestartAndRepair -Origin Installer -RuntimeId '2.5.0-a' -RuntimeGeneration 7 -TimeoutMilliseconds 5000 -Adapters (New-CcodSubmissionAdapters $submissionId $onSignal)
+        if (-not $submitted.accepted) {
+            Write-CcodLifecycleRequestSubmissionFailureFacts (Join-Path $root ('state\lifecycle\inbox\'+$submissionId+'.request.json')) $submitted.errorCode
+        }
         Assert-CcodSubmissionReceipt $submitted $submissionId $true $transactionId $null
         Assert-CcodEqual 0 $controllerCalls 'submitter never runs controller recovery or apply'
         $inbox=Join-Path $root 'state\lifecycle\inbox'

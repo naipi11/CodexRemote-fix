@@ -25,6 +25,19 @@ $cleanRoomSelfTest = Join-Path $PSScriptRoot 'CleanroomSelfTest.js'
 $packageCheckerSelfTest = Join-Path $PSScriptRoot 'PackageCheckerSelfTest.mjs'
 $persistenceSelfTest = Join-Path $PSScriptRoot 'PersistenceSelfTest.ps1'
 
+function Get-CcodValidationSafeChildMarkers {
+    param($Output)
+    $markers = [Collections.Generic.List[string]]::new()
+    foreach ($entry in @($Output)) {
+        $line = [string]$entry
+        if ($line -cmatch '^CCOD_[A-Z0-9_]+(?: [A-Za-z0-9_.:-]+=[A-Za-z0-9_.:-]+)*$') {
+            $markers.Add($line)
+        }
+    }
+    if ($markers.Count -eq 0) { return '<no-safe-child-marker>' }
+    return ($markers -join ';')
+}
+
 foreach ($script in Get-ChildItem -Recurse -File -LiteralPath $projectRoot -Filter '*.ps1') {
     $tokens = $null
     $parseErrors = $null
@@ -90,11 +103,12 @@ if ($failures.Count -eq 0) {
         # the consolidated failure report can run.
         $ErrorActionPreference = 'Continue'
         $persistenceOutput = & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $persistenceSelfTest 2>&1
+        $persistenceExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
     }
-    if ($LASTEXITCODE -ne 0) {
-        $failures.Add("Persistence self-test failed: $($persistenceOutput -join ' ')")
+    if ($persistenceExitCode -ne 0) {
+        $failures.Add("Persistence self-test failed with exit code $persistenceExitCode; $(Get-CcodValidationSafeChildMarkers $persistenceOutput)")
     }
 }
 
@@ -140,8 +154,12 @@ if (-not $SkipInstalledPackageCheck -and $failures.Count -eq 0) {
 }
 
 if ($failures.Count -gt 0) {
-    Write-Host 'Validation failed:' -ForegroundColor Red
-    foreach ($failure in $failures) { Write-Host "  - $failure" }
+    [Console]::Error.WriteLine('CCOD_VALIDATION_FAILED')
+    for ($failureIndex = 0; $failureIndex -lt $failures.Count; $failureIndex++) {
+        $failure = [string]$failures[$failureIndex]
+        if ([string]::IsNullOrWhiteSpace($failure)) { $failure = '<empty-failure-record>' }
+        [Console]::Error.WriteLine(('CCOD_VALIDATION_FAILURE[{0}] {1}' -f $failureIndex,$failure))
+    }
     exit 1
 }
 
