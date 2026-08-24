@@ -46,8 +46,8 @@ that existing page and leaves the Codex UI, account authorization, and enrollmen
 
 ## Quick start
 
-1. Download `CodexRemote-fix-2.5.2-setup.exe` and `CodexRemote-fix-2.5.2-setup.exe.sha256.txt` from the [Releases](https://github.com/naipi11/CodexRemote-fix/releases) page, then verify the SHA-256.
-2. Run `CodexRemote-fix-2.5.2-setup.exe`; no administrator rights are required.
+1. Download `CodexRemote-fix-2.5.3-setup.exe` and `CodexRemote-fix-2.5.3-setup.exe.sha256.txt` from the [Releases](https://github.com/naipi11/CodexRemote-fix/releases) page, then verify the SHA-256.
+2. Run `CodexRemote-fix-2.5.3-setup.exe`; no administrator rights are required.
    Windows 10 users should ensure that .NET Framework 4.8 is installed for the native TrayHost.
 3. The tray supervisor starts automatically and creates the desktop shortcut **CodexRemote-fix**. Setup waits until the new runtime and TrayHost are ready, then offers **Restart now** or **Later**. Choose **Restart now** only when it is safe for Codex to close and relaunch into a repaired session; choose **Later** to leave the current Codex session untouched and resume safely after a later manual or normal Codex launch. When the connection reports **Connected**, open **Settings → Connections → Control other devices** to enroll or use the device.
 
@@ -62,6 +62,11 @@ upgrade.
 Verified on Windows 11 · Codex Desktop `26.818.2441.0` · Node.js `22.23.1`:
 the hidden controller tab, native tray menu, bilingual menu switching, and persistent
 supervisor are working.
+
+## What's new in v2.5.3
+
+- Fixed fail-closed uninstall recovery when its authenticated controller result placeholder is initially empty.
+- Added regression coverage for atomically replacing the empty preclaimed controller result file.
 
 ## What's new in v2.5.2
 
@@ -157,8 +162,8 @@ The tray reports two independent, truthful status lines instead of inferring rea
 
 Every tagged release ships a Windows installer and its SHA-256 checksum as release assets.
 The `.github/workflows/release.yml` workflow builds the installer from the tag automatically,
-so the 2.5.2 release includes the ready-to-run `CodexRemote-fix-2.5.2-setup.exe`
-and `CodexRemote-fix-2.5.2-setup.exe.sha256.txt`.
+so the 2.5.3 release includes the ready-to-run `CodexRemote-fix-2.5.3-setup.exe`
+and `CodexRemote-fix-2.5.3-setup.exe.sha256.txt`.
 
 Each release appends a short English change summary to the GitHub release body. The README and
 [CHANGELOG.md](CHANGELOG.md) retain the bilingual documentation history.

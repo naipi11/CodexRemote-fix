@@ -273,7 +273,7 @@ function New-CcodAtomicOwnedFile {
 }
 
 function Get-CcodByteFingerprint {
-    param([Parameter(Mandatory)][byte[]]$Bytes)
+    param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes)
 
     $sha256 = [Security.Cryptography.SHA256]::Create()
     try {
@@ -305,7 +305,7 @@ function Test-CcodPathMatchesFingerprint {
 function Write-CcodOwnedBytes {
     param(
         [Parameter(Mandatory)]$OwnedFile,
-        [Parameter(Mandatory)][byte[]]$Bytes,
+        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes,
         [switch]$KeepOpen
     )
 
@@ -326,7 +326,7 @@ function Write-CcodOwnedBytes {
 function New-CcodAtomicRecoveryArtifact {
     param(
         [Parameter(Mandatory)][string]$Directory,
-        [Parameter(Mandatory)][byte[]]$OldBytes,
+        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$OldBytes,
         [Parameter(Mandatory)][hashtable]$Adapters
     )
 
@@ -338,7 +338,7 @@ function New-CcodAtomicRecoveryArtifact {
 function Restore-CcodAtomicOldTarget {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][byte[]]$OldBytes,
+        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$OldBytes,
         [Parameter(Mandatory)]$OldFingerprint,
         [Parameter(Mandatory)][hashtable]$Adapters
     )
