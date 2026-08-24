@@ -6,6 +6,18 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.2
+
+### English
+
+- Fixed the fail-closed uninstaller payload to include `TrustedLogonIdentity.psm1`, required by the staged `StateStore` dependency.
+- Added a regression that imports staged `InstallLifecycle` before cleanup, proving its payload-local dependency closure is complete.
+
+### 简体中文
+
+- 修复失败即停止的卸载载荷，补齐 staged `StateStore` 依赖的 `TrustedLogonIdentity.psm1`。
+- 新增回归：在清理前导入 staged `InstallLifecycle`，证明其载荷内依赖闭包完整。
+
 ## v2.5.1
 
 ### English

@@ -188,20 +188,20 @@ Invoke-CcodTest 'package scripts build provenance and workflows retain the relea
     Assert-CcodTrue ($release -cmatch '(?ms)^  publish:\r?\n    needs: build\r?\n    runs-on: windows-latest\r?\n    permissions:\r?\n      contents: write\s*$') 'only the publish job receives release-write permission'
 }
 
-Invoke-CcodTest '2.5.1 current documentation matches the lifecycle tray and uninstall contract' {
+Invoke-CcodTest '2.5.2 current documentation matches the lifecycle tray and uninstall contract' {
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
-    Assert-CcodEqual '2.5.1' ([string]$package.version) 'package metadata is the 2.5.1 release'
+    Assert-CcodEqual '2.5.2' ([string]$package.version) 'package metadata is the 2.5.2 release'
 
     $changelog = Get-Content -LiteralPath (Join-Path $repositoryRoot 'CHANGELOG.md') -Raw
-    $releaseSection = [regex]::Match($changelog, '(?ms)^## v2\.5\.1\s*\r?\n(?<body>.*?)(?=^## |\z)')
-    Assert-CcodTrue $releaseSection.Success 'v2.5.1 release section exists'
+    $releaseSection = [regex]::Match($changelog, '(?ms)^## v2\.5\.2\s*\r?\n(?<body>.*?)(?=^## |\z)')
+    Assert-CcodTrue $releaseSection.Success 'v2.5.2 release section exists'
     $releaseBody = $releaseSection.Groups['body'].Value
-    Assert-CcodTrue ($releaseBody -match '(?m)^### English\s*$') 'v2.5.1 release section is English'
-    Assert-CcodTrue ($releaseBody.Contains('Fixed a Supervisor startup contract mismatch that rejected the complete schema-two active runtime pointer immediately after installation.')) 'v2.5.1 startup release bullet is exact'
-    Assert-CcodTrue ($releaseBody.Contains('Added regression coverage that reads the canonical active pointer before Supervisor readiness, including upgrade pointers with a previous runtime.')) 'v2.5.1 regression release bullet is exact'
+    Assert-CcodTrue ($releaseBody -match '(?m)^### English\s*$') 'v2.5.2 release section is English'
+    Assert-CcodTrue ($releaseBody.Contains('Fixed the fail-closed uninstaller payload to include `TrustedLogonIdentity.psm1`, required by the staged `StateStore` dependency.')) 'v2.5.2 uninstaller release bullet is exact'
+    Assert-CcodTrue ($releaseBody.Contains('Added a regression that imports staged `InstallLifecycle` before cleanup, proving its payload-local dependency closure is complete.')) 'v2.5.2 regression release bullet is exact'
 
     $readme = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.md') -Raw
-    Assert-CcodTrue ($readme.Contains('CodexRemote-fix-2.5.1-setup.exe')) 'English Quick Start names the 2.5.1 installer'
+    Assert-CcodTrue ($readme.Contains('CodexRemote-fix-2.5.2-setup.exe')) 'English Quick Start names the 2.5.2 installer'
     Assert-CcodTrue ($readme.Contains('## Connection and protection status')) 'English README documents the current status contract'
     foreach ($state in @('Waiting for Codex', 'Checking', 'Connected', 'Repair needed', 'Error', 'Running', 'Reconnecting', 'Stopping')) {
         Assert-CcodTrue ($readme.Contains($state)) "English README documents state: $state"
@@ -215,7 +215,7 @@ Invoke-CcodTest '2.5.1 current documentation matches the lifecycle tray and unin
     Assert-CcodTrue (-not $readme.Contains('Automation, Candidate-compatible trial, Logs, and Uninstall')) 'English README no longer describes removed tray toggles'
 
     $readmeZh = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.zh-CN.md') -Raw -Encoding UTF8
-    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.1-setup.exe')) 'Chinese Quick Start names the 2.5.1 installer'
+    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.2-setup.exe')) 'Chinese Quick Start names the 2.5.2 installer'
     Assert-CcodTrue ($readmeZh -match '## \u8FDE\u63A5\u4E0E\u5B88\u62A4\u72B6\u6001') 'Chinese README documents the current status contract'
     foreach ($statePattern in @('\u7B49\u5F85 Codex', '\u6B63\u5728\u68C0\u67E5', '\u5DF2\u8FDE\u63A5', '\u9700\u8981\u4FEE\u590D', '\u9519\u8BEF', '\u8FD0\u884C\u4E2D', '\u6B63\u5728\u91CD\u8FDE', '\u6B63\u5728\u505C\u6B62')) {
         Assert-CcodTrue ($readmeZh -match $statePattern) "Chinese README documents state pattern: $statePattern"

@@ -165,6 +165,7 @@ function New-CcodVerifiedUninstallRuntimeFixture {
         'src/persistence/modules/RuntimeManifest.psm1',
         'src/persistence/modules/LifecycleEpoch.psm1',
         'src/persistence/modules/StateStore.psm1',
+        'src/persistence/modules/TrustedLogonIdentity.psm1',
         'src/persistence/modules/ScheduledTask.psm1',
         'src/persistence/modules/KernelObjects.psm1',
         'src/persistence/modules/CompatibilityProbe.psm1',
@@ -220,7 +221,7 @@ $results += Invoke-CcodTest 'production runtime verification binds the installed
         Assert-CcodEqual $fixture.RuntimeId $context.runtimeId 'verified context binds the active manifest runtime'
         Assert-CcodEqual ([uint64]7) ([uint64]$context.runtimeGeneration) 'verified context binds active generation'
         Assert-CcodEqual ([uint64]11) ([uint64]$context.leaseEpoch) 'verified context binds lifecycle epoch'
-        Assert-CcodEqual 11 @($context.payloadEntries).Count 'only the cleanup entry and its imported modules are staged'
+        Assert-CcodEqual 12 @($context.payloadEntries).Count 'only the cleanup entry and its imported modules are staged'
         [IO.File]::AppendAllText((Join-Path $fixture.RuntimeRoot 'src\persistence\modules\InstallLifecycle.psm1'),'# altered',[Text.UTF8Encoding]::new($false))
         Assert-CcodThrows { Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $repositoryRoot -InstallRoot $installRoot | Out-Null } 'CCOD_UNINSTALL_RUNTIME_INVALID'
     } finally {
@@ -256,13 +257,19 @@ $results += Invoke-CcodTest 'real external staging uses a protected current-user
         $payloadRoot = Join-Path $transactionDirectory 'payload'
         Assert-CcodUninstallBootstrapDirectoryAcl -Path $payloadRoot -UserSid $context.userSid
         $payloadFiles = @(Get-ChildItem -LiteralPath $payloadRoot -Recurse -File -Force)
-        Assert-CcodEqual 11 $payloadFiles.Count 'external payload contains the exact cleanup entry and required modules'
+        Assert-CcodEqual 12 $payloadFiles.Count 'external payload contains the exact cleanup entry and required modules'
         foreach ($entry in @($context.payloadEntries)) {
             $source = Join-Path $fixture.RuntimeRoot ($entry.Replace('/','\'))
             $staged = Join-Path $payloadRoot ($entry.Replace('/','\'))
             Assert-CcodTrue (Test-Path -LiteralPath $staged -PathType Leaf) "manifest-bound payload entry $entry is staged"
             Assert-CcodEqual (Get-CcodTestFileSha256 $source) (Get-CcodTestFileSha256 $staged) "manifest-bound payload entry $entry retains its verified hash"
         }
+        $stagedInstallLifecycle = Join-Path $payloadRoot 'src\persistence\modules\InstallLifecycle.psm1'
+        $importCommand = '$ErrorActionPreference = ''Stop''; $module = Import-Module -Name ''' + $stagedInstallLifecycle.Replace("'","''") + ''' -Force -PassThru -ErrorAction Stop; Remove-Module -Name $module.Name -Force -ErrorAction Stop'
+        $encodedImportCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($importCommand))
+        $importOutput = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedImportCommand 2>&1)
+        Assert-CcodEqual 0 $LASTEXITCODE 'staged InstallLifecycle imports its complete payload-local dependency closure before cleanup'
+        Assert-CcodEqual 0 $importOutput.Count 'successful staged InstallLifecycle import emits no untrusted output'
         Assert-CcodEqual 0 (@($payloadFiles | Where-Object { $_.Name -match 'device|key|credential' })).Count 'external payload has no device key or credential material'
         $stagedBootstrap = Join-Path $payloadRoot 'src\persistence\UninstallBootstrap.ps1'
         $transaction.phase = 'ReadyForInno'
