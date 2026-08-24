@@ -576,6 +576,50 @@ Invoke-CcodTest 'resumes WaitingForManualLaunch after Supervisor restart and com
     Assert-CcodEqual 0 @($fake.World.Calls|Where-Object{$_ -like 'Start:Controller:*'}).Count 'resume performs no mutation outside LifecycleWorker slot'
 }
 
+Invoke-CcodTest 'rejects a nonzero lifecycle worker exit even when its result frame claims success' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $transactionModule=Import-Module $lifecycleTransactionPath -Force -PassThru
+    $request=New-CcodPersistedLifecycleRequest -Kind RestartAndRepair
+    foreach($phase in @('CloseRequested','CloseConfirmed','RepairRequested')){
+        $request=& $transactionModule {param($Value,$NextPhase) Move-CcodLifecyclePhase -Request $Value -NextPhase $NextPhase -NowUtc '2030-02-03T03:01:05.0000000Z'} $request $phase
+    }
+    $world.ActiveLifecycleRequest=$request;$hostState.LifecycleRequest=$request
+    Start-CcodSupervisorLifecycleWorkerSlot $hostState $fixture.Fake.Adapters 'Apply' $null | Out-Null
+    $world.WorkerResult=[pscustomobject][ordered]@{schemaVersion=1;transactionId=$request.transactionId;action='Apply';ok=$true;outcome='Activated';observation='Special';error=$null}
+    $json=$world.WorkerResult|ConvertTo-Json -Depth 8 -Compress
+    $world.Poll=[pscustomobject][ordered]@{Completed=$true;ExitCode=[int]1;StdoutText=$json;StdoutByteCount=[Text.Encoding]::UTF8.GetByteCount($json);StdoutOverflow=$false;StderrByteCount=0;StderrOverflow=$false}
+    $failure=$null
+    try{Invoke-CcodSupervisorPollLifecycleSlot $hostState $fixture.Fake.Adapters}catch{$failure=$_}
+    Assert-CcodTrue ($null-ne$failure) 'a worker that exits nonzero cannot publish a successful lifecycle result'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -eq 'Reduce:Lifecycle:Apply'}).Count 'nonzero successful frame is never reduced'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -eq 'Write:Lifecycle:RepairRequested'}).Count 'nonzero successful frame does not advance durable lifecycle state'
+    Assert-CcodEqual 'RepairRequested' $hostState.LifecycleRequest.phase 'nonzero successful frame leaves the durable request unchanged'
+    Assert-CcodEqual 1 $world.LifecycleOwnershipResumes 'Supervisor safely reacquires ownership before rejecting the frame'
+}
+
+Invoke-CcodTest 'reclaims exact stale lifecycle worker framing left by a killed prior Supervisor job' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $request=New-CcodPersistedLifecycleRequest -Kind RestartAndRepair
+    $world.ActiveLifecycleRequest=$request;$hostState.LifecycleRequest=$request
+    $paths=New-CcodSupervisorLifecycleWorkerPaths $hostState $request.transactionId
+    $stale=[ordered]@{($paths.RequestPath)=$true;($paths.ResultPath)=$true}
+    $deleted=[Collections.Generic.List[string]]::new()
+    $fixture.Fake.Adapters.GetWorkerLeafState={
+        param($Path)
+        [pscustomobject][ordered]@{Exists=[bool]$stale[$Path];IsReparse=$false}
+    }.GetNewClosure()
+    $fixture.Fake.Adapters.DeleteWorkerFile={
+        param($Path)
+        $deleted.Add($Path);$stale[$Path]=$false
+    }.GetNewClosure()
+    $slot=Start-CcodSupervisorLifecycleWorkerSlot $hostState $fixture.Fake.Adapters 'Apply' $null
+    Assert-CcodTrue ($null-ne$slot) 'a durable request resumes after exact stale worker framing is reclaimed'
+    Assert-CcodEqual 2 $deleted.Count 'both stale lifecycle request and result leaves are removed before replacement'
+    Assert-CcodEqual ($paths.RequestPath+'|'+$paths.ResultPath) ($deleted-join '|') 'only the exact transaction framing leaves are reclaimed'
+    Assert-CcodEqual 1 $world.LifecycleOwnershipSuspends 'replacement worker begins only after the retained epoch is handed off'
+    Assert-CcodEqual 1 @($world.Calls|Where-Object{$_ -eq 'Start:Lifecycle:Apply'}).Count 'replacement launches one lifecycle worker'
+}
+
 Invoke-CcodTest 'treats error-free CancelledBeforeClose as successful already-satisfied completion without mutation' {
     foreach($case in @(
         [pscustomobject]@{Kind='CheckAndRepair';Observation='RemoteVerified';Connection='Connected';Id='40000000-0000-0000-0000-000000000001'},

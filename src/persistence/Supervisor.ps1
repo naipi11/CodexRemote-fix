@@ -619,11 +619,20 @@ function Start-CcodSupervisorLifecycleWorkerSlot {
     $workerRequest=Invoke-CcodSupervisorAdapter $Adapters.NewLifecycleWorkerRequest @($requestState.transactionId,$Action,$requestState.runtimeId,[UInt64]$requestState.runtimeGeneration,[UInt64]$requestState.leaseEpoch,$requestState.ownerIdentity,$now,$timeout) 1
     $owned=[Collections.Generic.List[string]]::new();$suspended=$false
     try{
+        Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
+        $stale=[Collections.Generic.List[string]]::new()
         foreach($path in @($paths.RequestPath,$paths.ResultPath)){
             $leaf=Invoke-CcodSupervisorAdapter $Adapters.GetWorkerLeafState @($path) 1
-            if(-not(Test-CcodSupervisorExactProperties $leaf @('Exists','IsReparse')) -or $leaf.Exists-isnot[bool] -or $leaf.IsReparse-isnot[bool] -or $leaf.Exists -or $leaf.IsReparse){throw 'lifecycle worker leaf is unsafe'}
+            if(-not(Test-CcodSupervisorExactProperties $leaf @('Exists','IsReparse')) -or $leaf.Exists-isnot[bool] -or $leaf.IsReparse-isnot[bool] -or $leaf.IsReparse){throw 'lifecycle worker leaf is unsafe'}
+            if($leaf.Exists){$stale.Add($path)}
         }
-        Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
+        foreach($path in @($stale)){
+            # A prior Supervisor owns the only kill-on-close Job and cannot coexist with this
+            # lifetime lease, so direct leaves for the active transaction are stale crash residue.
+            Invoke-CcodSupervisorAdapter $Adapters.DeleteWorkerFile @($path) 0
+            $leaf=Invoke-CcodSupervisorAdapter $Adapters.GetWorkerLeafState @($path) 1
+            if(-not(Test-CcodSupervisorExactProperties $leaf @('Exists','IsReparse')) -or $leaf.Exists-isnot[bool] -or $leaf.IsReparse-isnot[bool] -or $leaf.Exists -or $leaf.IsReparse){throw 'lifecycle worker stale framing could not be reclaimed'}
+        }
         Invoke-CcodSupervisorAdapter $Adapters.WriteWorkerRequest @($paths.RequestPath,$workerRequest) 0;$owned.Add($paths.RequestPath)
         $handoff=Invoke-CcodSupervisorAdapter $Adapters.SuspendLifecycleOwnership @($HostState.LifecycleOwnership,$HostState.Layout.InstallRoot) 1
         if($handoff-isnot[bool]-or-not$handoff){throw 'lifecycle ownership handoff is invalid'}
@@ -700,6 +709,8 @@ function Invoke-CcodSupervisorPollLifecycleSlot {
         $stdout=$poll.StdoutText|ConvertFrom-Json -ErrorAction Stop
         if(($stdout|ConvertTo-Json -Depth 16 -Compress)-cne($result|ConvertTo-Json -Depth 16 -Compress)){throw 'lifecycle worker frames differ'}
         Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleWorkerResult @($result,$slot.Request) 0
+        $expectedExitCode=if($result.ok){[int]0}else{[int]1}
+        if($poll.ExitCode-ne$expectedExitCode){throw 'lifecycle worker exit code does not match its result frame'}
         Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
         $now=Get-CcodSupervisorNowUtc $Adapters
         $reduced=Invoke-CcodSupervisorAdapter $Adapters.ReduceLifecycleWorkerResult @($HostState.LifecycleRequest,$result,$now) 1
