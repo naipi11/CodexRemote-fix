@@ -98,6 +98,12 @@ internal sealed class TrayWindow : IDisposable
         if (_menuOpen) { _native.EndMenu(); }
     }
 
+    internal void ShowAbout()
+    {
+        if (!_created || _disposed || _current == null) { throw new InvalidOperationException("tray window is not active"); }
+        _native.ShowMessageBox(_owner, _current.Strings[12], _current.Strings[11]);
+    }
+
     private TrayIconData CreateIconData(IntPtr owner)
     {
         TrayIconData icon = new TrayIconData();

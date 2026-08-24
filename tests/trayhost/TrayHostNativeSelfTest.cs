@@ -158,6 +158,15 @@ internal static class TrayHostNativeSelfTest
         window.Dispose();
     }
 
+    private static void TestVerifiedAboutUsesTheAcknowledgedSnapshotVersion()
+    {
+        FakeTrayPlatform platform = new FakeTrayPlatform(); TrayWindow window = new TrayWindow(platform); window.Create(SnapshotV2(1));
+        window.ShowAbout();
+        AssertTrue(platform.MessageBoxes.Count == 1, "verified About shows exactly one native message box");
+        AssertEqual("About|CodexRemote-fix | Version 2.5.0", platform.MessageBoxes[0], "verified About displays the version from the acknowledged snapshot");
+        window.Dispose();
+    }
+
     private static void TestNoHimcFailureIsSafe()
     {
         FakeTrayPlatform platform = new FakeTrayPlatform();
@@ -211,6 +220,7 @@ internal static class TrayHostNativeSelfTest
             TestReentryAndPendingSnapshot();
             TestSelectedCommandAndTaskbarRestore();
             TestAboutCommandDefersProofToSupervisor();
+            TestVerifiedAboutUsesTheAcknowledgedSnapshotVersion();
             TestSimplifiedMenuAndExitConfirmation();
             TestNoHimcFailureIsSafe();
             TestShellRightClickNotificationMapping();

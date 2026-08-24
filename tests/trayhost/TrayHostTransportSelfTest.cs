@@ -110,6 +110,17 @@ internal static class TrayHostTransportSelfTest
         parent.Dispose();
     }
 
+    private static void TestAcknowledgedAboutQueuesOneUiWorkItem()
+    {
+        HostTransport host = new HostTransport(); Guid actionId = Guid.NewGuid();
+        AssertTrue(host.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.ShowAbout, 14UL)), "About action registers");
+        AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(actionId, 14UL, TrayActionResultStatus.Completed, null, null)), "verified About completion is accepted");
+        TrayActionResult result;
+        AssertTrue(host.TryTakeCompletedAbout(out result) && result.ActionId == actionId && result.Status == TrayActionResultStatus.Completed, "verified About completion queues one UI work item");
+        AssertTrue(!host.TryTakeCompletedAbout(out result), "About UI work item is consumed exactly once");
+        host.Dispose();
+    }
+
     public static int Main(string[] args)
     {
         try
@@ -118,7 +129,8 @@ internal static class TrayHostTransportSelfTest
             TestBrokenPipeAndStderrCap();
             TestHostPendingAndReplayBound();
             TestActionResultCorrelationAndControlPriority();
-            Console.WriteLine("TrayHost transport self-tests passed: 4");
+            TestAcknowledgedAboutQueuesOneUiWorkItem();
+            Console.WriteLine("TrayHost transport self-tests passed: 5");
             return 0;
         }
         catch (Exception error)

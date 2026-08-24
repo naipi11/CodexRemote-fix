@@ -58,6 +58,8 @@ internal static class Program
                 window.Apply(next);
                 lock (WriteGate) { ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.PresentationAck, epoch, outboundSequence++, TrayHostWire.WriteRevision(next.Revision)), keys.HostToParent); }
             }
+            TrayActionResult about;
+            while (transport.TryTakeCompletedAbout(out about)) { window.ShowAbout(); }
             bool shouldShutdown;
             lock (stateGate) { shouldShutdown = shutdownRequested && !shutdownSent; if (shouldShutdown) { shutdownSent = true; } }
             if (shouldShutdown)
@@ -83,7 +85,7 @@ internal static class Program
                 {
                     ProtocolFrame frame = ProtocolCodec.ReadAuthenticated(input, ProtocolDirection.ParentToHost, epoch, inboundSequence++, keys.ParentToHost);
                     if (frame.MessageType == TrayHostMessageType.Presentation) { transport.TryAcceptPresentation(TrayHostWire.ReadPresentation(frame.Payload)); application.PostWork(); }
-                    else if (frame.MessageType == TrayHostMessageType.ActionResult) { if (!transport.TryAcknowledgeAction(TrayHostWire.ReadActionResult(frame.Payload))) { throw new ProtocolViolationException("action result is uncorrelated"); } }
+                    else if (frame.MessageType == TrayHostMessageType.ActionResult) { if (!transport.TryAcknowledgeAction(TrayHostWire.ReadActionResult(frame.Payload))) { throw new ProtocolViolationException("action result is uncorrelated"); } application.PostWork(); }
                     else if (frame.MessageType == TrayHostMessageType.Shutdown) { lock (stateGate) { shutdownRequested = true; } application.PostWork(); }
                     else if (frame.MessageType == TrayHostMessageType.Ping) { lock (WriteGate) { ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.Pong, epoch, outboundSequence++, frame.Payload), keys.HostToParent); } }
                 }

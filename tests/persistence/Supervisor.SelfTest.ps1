@@ -66,6 +66,7 @@ function New-CcodSupervisorFake {
         WorkerResult=$null;TickCount=0
         Preference=[pscustomobject][ordered]@{LanguageMode='System';FallbackUsed=$false;ErrorCode=$null};StoredLanguageMode='System';SystemCultureName='zh-CN'
         SetUiLanguageModes=[Collections.Generic.List[string]]::new();TrayArguments=$null;PresentationArguments=[Collections.Generic.List[object]]::new()
+        TrayActionResults=[Collections.Generic.List[object]]::new()
         PresentationInputs=[Collections.Generic.List[object]]::new()
         UiFailureRecords=[Collections.Generic.List[object]]::new();TrayErrors=[Collections.Generic.List[object]]::new()
         ActiveRuntime=[pscustomobject][ordered]@{schemaVersion=2;activeRuntime='runtime-1';generation=[UInt64]7}
@@ -177,8 +178,10 @@ function New-CcodSupervisorFake {
     $adapters.NewQueue={param($Kind)$world.Calls.Add("Queue:$Kind");if($Kind -ceq 'Command'){Write-Output -NoEnumerate $world.CommandQueue}else{Write-Output -NoEnumerate $world.EventQueue}}.GetNewClosure()
     $adapters.GetQueueCount={param($Queue)[int]$Queue.Count}.GetNewClosure()
     $adapters.TryDequeue={param($Queue)$world.TryDequeueSawRealQueue=[object]::ReferenceEquals($Queue,$world.CommandQueue);if($Queue.Count){[pscustomobject][ordered]@{Succeeded=$true;Value=$Queue.Dequeue()}}else{[pscustomobject][ordered]@{Succeeded=$false;Value=$null}}}.GetNewClosure()
-    $adapters.NewTray={param($Queue,$OnTick,$Catalog,$LanguageMode,$SystemCultureName)$world.NewTraySawRealQueue=[object]::ReferenceEquals($Queue,$world.CommandQueue);$world.Calls.Add('New:Tray');if($world.FailAt -ceq 'NewTray'){throw 'PRIVATE_TRAY_SECRET'};$world.OnTick=$OnTick;$world.TrayArguments=[pscustomobject][ordered]@{Queue=$Queue;OnTick=$OnTick;Catalog=$Catalog;LanguageMode=$LanguageMode;SystemCultureName=$SystemCultureName};[pscustomobject]@{Kind='Tray';Timer=[pscustomobject]@{Kind='Timer'};ApplicationContext=[pscustomobject]@{Kind='App'}}}.GetNewClosure()
+    $adapters.NewTray={param($Queue,$OnTick,$Catalog,$LanguageMode,$SystemCultureName)$world.NewTraySawRealQueue=[object]::ReferenceEquals($Queue,$world.CommandQueue);$world.Calls.Add('New:Tray');if($world.FailAt -ceq 'NewTray'){throw 'PRIVATE_TRAY_SECRET'};$world.OnTick=$OnTick;$world.TrayArguments=[pscustomobject][ordered]@{Queue=$Queue;OnTick=$OnTick;Catalog=$Catalog;LanguageMode=$LanguageMode;SystemCultureName=$SystemCultureName};[pscustomobject]@{Kind='Tray';CurrentRevision=[UInt64]1;Timer=[pscustomobject]@{Kind='Timer'};ApplicationContext=[pscustomobject]@{Kind='App'}}}.GetNewClosure()
     $adapters.SetTrayPresentation={param($Tray,$Presentation,$Catalog,$LanguageMode,$SystemCultureName,$WaitForAcknowledgement)$world.Calls.Add('Set:Presentation');if($world.FailAt -ceq 'SetTrayPresentation'){throw 'PRIVATE_PRESENTATION_SECRET'};$world.PresentationArguments.Add([pscustomobject][ordered]@{Tray=$Tray;Presentation=$Presentation;Catalog=$Catalog;LanguageMode=$LanguageMode;SystemCultureName=$SystemCultureName;WaitForAcknowledgement=[bool]$WaitForAcknowledgement})}.GetNewClosure()
+    $adapters.SendTrayActionResult={param($Tray,$ActionId,$Revision,$Status,$ErrorCode,$TransactionId)$world.Calls.Add("ActionResult:$Status");$world.TrayActionResults.Add([pscustomobject][ordered]@{ActionId=$ActionId;Revision=[UInt64]$Revision;Status=$Status;ErrorCode=$ErrorCode;TransactionId=$TransactionId})}.GetNewClosure()
+    $adapters.VerifyActiveRuntimeForAbout={param($InstallRoot,$RuntimeId)$world.Calls.Add('Verify:About');[pscustomobject][ordered]@{RuntimeId=$RuntimeId;Version='2.5.0'}}.GetNewClosure()
     $adapters.StopTrayTimer={param($Tray)$world.Calls.Add('Stop:Timer');if($world.FailAt -ceq 'StopTimer'){throw 'PRIVATE_TIMER_SECRET'}}.GetNewClosure()
     $adapters.RequestUiExit={param($Tray)$world.Calls.Add('Exit:UI')}.GetNewClosure()
     $adapters.CloseTray={param($Tray)$world.Calls.Add('Close:Tray');if($world.FailAt -ceq 'CloseTray'){throw 'PRIVATE_TRAY_CLOSE_SECRET'};[pscustomobject][ordered]@{SchemaVersion=1;Closed=$true;CleanupCodes=@()}}.GetNewClosure()
@@ -223,7 +226,7 @@ function New-CcodTickFixture {
     [void](& $fake.Adapters.EnterLifecycleOwnership $fake.Layout.InstallRoot $fake.Layout.RuntimeId ([UInt64]7) ([pscustomobject][ordered]@{pid=$fake.Identity.Pid;creationTimeUtc=$fake.Identity.CreationTimeUtc}) $fake.Identity.UserSid $fake.Identity.SessionId 5000)
     $wake=& $fake.Adapters.OpenLifecycleWakeEvent $fake.Identity.UserSid $fake.Identity.SessionId
     $hostState=New-CcodSupervisorHostState -Identity $fake.Identity -Layout $fake.Layout -Clock ([pscustomobject]@{Kind='Clock'}) -ShutdownEvent $shutdown -LifecycleWakeEvent $wake -CommandQueue $fake.World.CommandQueue -EventQueue $fake.World.EventQueue -State $state -Journal $null -LifecycleOwnership $fake.World.LifecycleOwnership -LifecycleRequest $fake.World.ActiveLifecycleRequest -LogonIdentity $fake.World.LogonIdentity
-    $hostState.Tray=[pscustomobject]@{Kind='Tray';RenderedLanguageMode='System';RenderedCatalog=$script:TestSystemCatalog;RenderedText='old-stable'}
+    $hostState.Tray=[pscustomobject]@{Kind='Tray';CurrentRevision=[UInt64]1;RenderedLanguageMode='System';RenderedCatalog=$script:TestSystemCatalog;RenderedText='old-stable'}
     $hostState.UiLanguageMode='System';$hostState.UiCatalog=$script:TestSystemCatalog
     [pscustomobject]@{Fake=$fake;Host=$hostState}
 }
@@ -462,48 +465,13 @@ Invoke-CcodTest 'rejects malformed or partial adapter sets before any lifecycle 
     Assert-CcodEqual 0 $fake2.World.Calls.Count 'extra adapter set invokes nothing'
 }
 
-Invoke-CcodTest 'routes one uninstall launch and contains launch receipt and dialog failures without stopping Supervisor or Codex' {
-    $success=New-CcodTickFixture;$successWorld=$success.Fake.World;$successHost=$success.Host
-    $successState=$successHost.State;$successQueue=$successHost.CommandQueue;$successTray=$successHost.Tray;$successSession=$successHost.SessionState
-    $starts=[Collections.Generic.List[object]]::new()
-    $success.Fake.Adapters.StartUninstall={
-        param($InstallRoot,$RuntimeRoot,$PowerShellPath)
-        $starts.Add([pscustomobject][ordered]@{InstallRoot=$InstallRoot;RuntimeRoot=$RuntimeRoot;PowerShellPath=$PowerShellPath})
-        [pscustomobject][ordered]@{Started=$true;Pid=[int]5050;CreationTimeUtc='2030-02-03T03:06:00.0000000Z'}
-    }.GetNewClosure()
-    $command=[pscustomobject][ordered]@{Kind='Uninstall';Value=$null;EnqueuedAtUtc='2026-08-05T00:00:00.0000000Z'}
-    Assert-CcodEqual 0 @(Invoke-CcodSupervisorCommand -Command $command -HostState $successHost -Adapters $success.Fake.Adapters).Count 'successful uninstall routing emits no output'
-    Assert-CcodEqual 1 $starts.Count 'one verified launcher call occurs'
-    Assert-CcodEqual $success.Fake.Layout.InstallRoot $starts[0].InstallRoot 'launcher receives exact install root'
-    Assert-CcodEqual $success.Fake.Layout.RuntimeRoot $starts[0].RuntimeRoot 'launcher receives exact runtime root'
-    Assert-CcodEqual $success.Fake.Layout.PowerShellPath $starts[0].PowerShellPath 'launcher receives exact PowerShell host'
-    Assert-CcodEqual $false $successHost.ShutdownRequested 'successful launch does not request direct shutdown'
-    Assert-CcodEqual 0 @($successWorld.Calls|Where-Object{$_ -ceq 'Exit:UI'}).Count 'successful launch does not request direct UI exit'
-    Assert-CcodTrue ([object]::ReferenceEquals($successState,$successHost.State) -and [object]::ReferenceEquals($successQueue,$successHost.CommandQueue) -and [object]::ReferenceEquals($successTray,$successHost.Tray) -and $successHost.SessionState -ceq $successSession) 'successful launch leaves Supervisor and current Codex state running'
-
-    foreach($mode in @('Throw','Malformed')){
-        $failure=New-CcodTickFixture;$world=$failure.Fake.World;$failureHost=$failure.Host
-        $oldState=$failureHost.State;$oldQueue=$failureHost.CommandQueue;$oldTray=$failureHost.Tray;$oldSession=$failureHost.SessionState;$oldBlock=$failureHost.BlockAutomaticActions
-        if($mode -ceq 'Throw'){$failure.Fake.Adapters.StartUninstall={param($InstallRoot,$RuntimeRoot,$PowerShellPath)throw 'PRIVATE_UNINSTALL_PATH_OR_TOKEN'}}
-        else{$failure.Fake.Adapters.StartUninstall={param($InstallRoot,$RuntimeRoot,$PowerShellPath)[pscustomobject][ordered]@{Started='true';Pid=0;CreationTimeUtc='bad';Extra='secret'}}}
-        Assert-CcodEqual 0 @(Invoke-CcodSupervisorCommand -Command $command -HostState $failureHost -Adapters $failure.Fake.Adapters).Count "$mode launcher failure emits no output"
-        Assert-CcodEqual 'UninstallStart|CCOD_UNINSTALL_START_FAILED' (($world.UiFailureRecords|ForEach-Object{"$($_.stage)|$($_.code)"})-join ',') "$mode launcher failure logs one stable record"
-        Assert-CcodTrue (($world.UiFailureRecords|ConvertTo-Json -Compress) -cnotmatch 'PRIVATE|Fake|CodexControlOtherDevices|secret|token') "$mode log contains no exception path or input"
-        Assert-CcodEqual 1 $world.TrayErrors.Count "$mode launcher failure shows one localized error"
-        Assert-CcodEqual 'Error.UninstallStart' $world.TrayErrors[0].Key "$mode error key is exact"
-        Assert-CcodTrue ([object]::ReferenceEquals($failureHost.UiCatalog,$world.TrayErrors[0].Catalog)) "$mode dialog uses the existing validated catalog"
-        Assert-CcodEqual $false $failureHost.ShutdownRequested "$mode failure does not request direct shutdown"
-        Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -ceq 'Exit:UI'}).Count "$mode failure does not request UI exit"
-        Assert-CcodTrue ([object]::ReferenceEquals($oldState,$failureHost.State) -and [object]::ReferenceEquals($oldQueue,$failureHost.CommandQueue) -and [object]::ReferenceEquals($oldTray,$failureHost.Tray) -and $failureHost.SessionState -ceq $oldSession -and $failureHost.BlockAutomaticActions -eq $oldBlock) "$mode failure leaves Supervisor and current Codex state running"
-    }
-
-    $dialog=New-CcodTickFixture;$dialogWorld=$dialog.Fake.World;$dialogHost=$dialog.Host
-    $dialog.Fake.Adapters.StartUninstall={param($InstallRoot,$RuntimeRoot,$PowerShellPath)throw 'PRIVATE_START_SECRET'}
-    $dialog.Fake.Adapters.ShowTrayError={param($Tray,$Catalog,$Key)throw 'PRIVATE_DIALOG_SECRET'}
-    Assert-CcodEqual 0 @(Invoke-CcodSupervisorCommand -Command $command -HostState $dialogHost -Adapters $dialog.Fake.Adapters).Count 'dialog failure is contained with no output'
-    Assert-CcodEqual 'CCOD_UNINSTALL_START_FAILED,CCOD_UI_ERROR_DIALOG_FAILED' (@($dialogWorld.UiFailureRecords.code)-join ',') 'dialog failure is logged separately after launch failure'
-    Assert-CcodEqual $false $dialogHost.ShutdownRequested 'dialog failure leaves Supervisor running'
-    Assert-CcodEqual 0 @($dialogWorld.Calls|Where-Object{$_ -ceq 'Exit:UI'}).Count 'dialog failure leaves tray loop running'
+Invoke-CcodTest 'rejects the removed tray uninstall command before any launcher side effect' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $legacy=[pscustomobject][ordered]@{Kind='Uninstall';Value=$null;EnqueuedAtUtc='2026-08-05T00:00:00.0000000Z'}
+    $threw=$false
+    try{Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $legacy|Out-Null}catch{$threw=$_.FullyQualifiedErrorId-like'CCOD_SUPERVISOR_COMMAND_INVALID*'}
+    Assert-CcodTrue $threw 'removed tray uninstall command is rejected at the v2 action boundary'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'ActionResult:*' -or $_ -like 'Exit:UI'}).Count 'removed tray uninstall command sends no protocol or process side effect'
 }
 
 Invoke-CcodTest 'adds the exact localization adapters and host fields at the frozen boundaries' {
@@ -640,159 +608,55 @@ Invoke-CcodTest 'treats error-free CancelledBeforeClose as successful already-sa
     }
 }
 
-Invoke-CcodTest 'commits one valid UI language command before refreshing the existing tray in place' {
+Invoke-CcodTest 'completes a v2 language action only after preference persistence and presentation acknowledgement' {
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
-    $tray=$hostState.Tray;$oldState=$hostState.State;$oldQueue=$hostState.CommandQueue
-    $command=[pscustomobject][ordered]@{Kind='SetUiLanguage';Value='en-US';EnqueuedAtUtc='2026-08-05T00:00:00.0000000Z'}
-    Assert-CcodEqual 0 @(Invoke-CcodSupervisorCommand -Command $command -HostState $hostState -Adapters $fixture.Fake.Adapters).Count 'language command emits no output'
-    Assert-CcodEqual 'en-US' $hostState.UiLanguageMode 'mode changes only after persistence'
-    Assert-CcodTrue ([object]::ReferenceEquals($script:TestEnglishCatalog,$hostState.UiCatalog)) 'catalog refreshes immediately'
-    Assert-CcodEqual 'en-US' $world.StoredLanguageMode 'atomic preference stores exact mode'
-    Assert-CcodEqual 1 $world.SetUiLanguageModes.Count 'one atomic write occurs'
-    Assert-CcodEqual 1 $world.PresentationArguments.Count 'existing tray refreshes once'
-    $render=$world.PresentationArguments[0]
-    Assert-CcodTrue ([object]::ReferenceEquals($tray,$render.Tray)) 'tray is not recreated'
-    Assert-CcodTrue ([object]::ReferenceEquals($script:TestEnglishCatalog,$render.Catalog)) 'new validated catalog is rendered'
-    Assert-CcodEqual 'en-US' $render.LanguageMode 'render receives exact new mode'
-    Assert-CcodEqual $true $render.WaitForAcknowledgement 'language render waits for the native TrayHost acknowledgement before returning'
-    Assert-CcodTrue ([object]::ReferenceEquals($oldState,$hostState.State) -and [object]::ReferenceEquals($oldQueue,$hostState.CommandQueue)) 'controller state and bounded queue remain running'
+    $action=[pscustomobject][ordered]@{ActionId=[guid]'10000000-0000-0000-0000-000000000001';Command='SetLanguageEnglish';Revision=[UInt64]1}
+    $results=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)
+    Assert-CcodEqual 1 $results.Count 'language action returns one result'
+    Assert-CcodEqual 'Completed' $results[0].Status 'language action completes only after presentation acknowledgement'
+    Assert-CcodEqual 'en-US' $hostState.UiLanguageMode 'host mode changes after the durable preference write'
+    Assert-CcodEqual 'en-US' $world.StoredLanguageMode 'preference stores the selected v2 language'
+    Assert-CcodEqual 1 $world.PresentationArguments.Count 'language action republishes one presentation'
+    Assert-CcodEqual $true $world.PresentationArguments[0].WaitForAcknowledgement 'language action waits for the native acknowledgement'
+    Assert-CcodEqual 'Completed' $world.TrayActionResults[0].Status 'completed language action is sent through the correlation channel'
     $calls=@($world.Calls)
-    Assert-CcodTrue ([Array]::IndexOf($calls,'Get:UiCatalog:en-US') -lt [Array]::IndexOf($calls,'Persist:UiLanguage:en-US')) 'catalog validation precedes persistence'
-    Assert-CcodTrue ([Array]::IndexOf($calls,'Persist:UiLanguage:en-US') -lt [Array]::IndexOf($calls,'Set:Presentation')) 'tray mutates only after persistence'
+    Assert-CcodTrue ([Array]::IndexOf($calls,'Get:UiCatalog:en-US') -lt [Array]::IndexOf($calls,'Persist:UiLanguage:en-US')) 'catalog validation precedes preference persistence'
+    Assert-CcodTrue ([Array]::IndexOf($calls,'Persist:UiLanguage:en-US') -lt [Array]::IndexOf($calls,'Set:Presentation')) 'presentation publishes only after persistence'
 }
 
-Invoke-CcodTest 'restores the existing tray with the old catalog after a new-language render failure' {
-    $recovery=New-CcodLanguageRecoveryFixture;$fixture=$recovery.Fixture;$world=$recovery.World;$hostState=$recovery.Host
-    $oldCatalog=$hostState.UiCatalog;$controllerState=$hostState.State;$queue=$hostState.CommandQueue;$session=$hostState.SessionState;$blocked=$hostState.BlockAutomaticActions
-    $command=[pscustomobject][ordered]@{Kind='SetUiLanguage';Value='en-US';EnqueuedAtUtc='2026-08-05T00:00:00.0000000Z'}
-    Assert-CcodEqual 0 @(Invoke-CcodSupervisorCommand -Command $command -HostState $hostState -Adapters $fixture.Fake.Adapters).Count 'render failure and rollback emit no output'
-    Assert-CcodEqual 'en-US,System' (@($recovery.RenderAttempts)-join ',') 'partial new render is followed by one old-mode tray redraw'
-    Assert-CcodEqual 'old-restored' $hostState.Tray.RenderedText 'old redraw reverses the observable partial new-language text'
-    Assert-CcodEqual 'System' $hostState.Tray.RenderedLanguageMode 'visible tray returns to old language'
-    Assert-CcodTrue ([object]::ReferenceEquals($oldCatalog,$hostState.Tray.RenderedCatalog)) 'visible tray returns to old catalog identity'
-    Assert-CcodEqual 'en-US,System' (@($world.SetUiLanguageModes)-join ',') 'persisted preference is restored atomically after render failure'
-    Assert-CcodEqual 'System' $world.StoredLanguageMode 'stored preference returns to old mode'
-    Assert-CcodEqual 'System' $hostState.UiLanguageMode 'host returns to old mode'
-    Assert-CcodTrue ([object]::ReferenceEquals($oldCatalog,$hostState.UiCatalog)) 'host returns to old catalog identity'
-    Assert-CcodEqual 'LanguageChange|CCOD_UI_LANGUAGE_CHANGE_FAILED' (($world.UiFailureRecords|ForEach-Object{"$($_.stage)|$($_.code)"})-join ',') 'primary failure log remains exact'
-    Assert-CcodEqual 1 $world.TrayErrors.Count 'old catalog reports the failed language change'
-    Assert-CcodTrue ([object]::ReferenceEquals($controllerState,$hostState.State) -and [object]::ReferenceEquals($queue,$hostState.CommandQueue) -and $hostState.SessionState -ceq $session -and $hostState.BlockAutomaticActions -eq $blocked) 'partial render recovery leaves controller and Codex state unchanged'
+Invoke-CcodTest 'rolls back a failed v2 language action and emits a correlated failure' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host;$world.FailAt='SetTrayPresentation'
+    $action=[pscustomobject][ordered]@{ActionId=[guid]'10000000-0000-0000-0000-000000000002';Command='SetLanguageEnglish';Revision=[UInt64]1}
+    $results=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)
+    Assert-CcodEqual 1 $results.Count 'failed language action returns one result'
+    Assert-CcodEqual 'Failed' $results[0].Status 'failed language action does not claim completion'
+    Assert-CcodEqual 'CCOD_LANGUAGE_CHANGE_ROLLED_BACK' $results[0].ErrorCode 'language rollback uses the stable error code'
+    Assert-CcodEqual 'System' $hostState.UiLanguageMode 'failed language action restores the prior host mode'
+    Assert-CcodEqual 'System' $world.StoredLanguageMode 'failed language action restores the prior persisted mode'
+    Assert-CcodEqual 'Failed' $world.TrayActionResults[0].Status 'failure is sent through the action correlation channel'
 }
 
-Invoke-CcodTest 'confirms disk mode after preference rollback failure and aligns host and tray to that known mode' {
-    $recovery=New-CcodLanguageRecoveryFixture -PreferenceRollbackFailure BeforeWrite;$fixture=$recovery.Fixture;$world=$recovery.World;$hostState=$recovery.Host
-    $controllerState=$hostState.State;$queue=$hostState.CommandQueue;$session=$hostState.SessionState;$blocked=$hostState.BlockAutomaticActions
-    $command=[pscustomobject][ordered]@{Kind='SetUiLanguage';Value='en-US';EnqueuedAtUtc='2026-08-05T00:00:00.0000000Z'}
-    Assert-CcodEqual 0 @(Invoke-CcodSupervisorCommand -Command $command -HostState $hostState -Adapters $fixture.Fake.Adapters).Count 'preference recovery failure is contained with no output'
-    Assert-CcodEqual 'en-US,en-US' (@($recovery.RenderAttempts)-join ',') 'known disk mode is used for the recovery redraw'
-    Assert-CcodEqual 'en-US' $world.StoredLanguageMode 'failed old write leaves new mode on disk'
-    Assert-CcodEqual 'en-US' $hostState.UiLanguageMode 'host follows confirmed new disk mode'
-    Assert-CcodTrue ([object]::ReferenceEquals($script:TestEnglishCatalog,$hostState.UiCatalog)) 'host uses the validated catalog matching confirmed disk mode'
-    Assert-CcodEqual 'new-restored' $hostState.Tray.RenderedText 'recovery redraw replaces partial text with a complete known-mode presentation'
-    Assert-CcodEqual 'en-US' $hostState.Tray.RenderedLanguageMode 'visible tray follows confirmed disk mode'
-    Assert-CcodTrue ([object]::ReferenceEquals($script:TestEnglishCatalog,$hostState.Tray.RenderedCatalog)) 'visible tray uses the catalog matching confirmed disk mode'
-    Assert-CcodTrue ($world.Calls.Contains('Read:UiPreference:Recovery')) 'disk preference is read after rollback write failure'
-    Assert-CcodEqual 'LanguageChange|CCOD_UI_LANGUAGE_CHANGE_FAILED,LanguagePreferenceRollback|CCOD_UI_LANGUAGE_PREFERENCE_ROLLBACK_FAILED' (($world.UiFailureRecords|ForEach-Object{"$($_.stage)|$($_.code)"})-join ',') 'primary and preference recovery logs are exact and ordered'
-    Assert-CcodTrue (($world.UiFailureRecords|ConvertTo-Json -Compress) -cnotmatch 'PRIVATE|Fake|CodexControlOtherDevices|new-partial|en-US') 'recovery logs contain no exception path catalog text or user input'
-    Assert-CcodEqual 'Error.LanguageChange' $world.TrayErrors[0].Key 'language error remains best-effort after confirmed-disk recovery'
-    Assert-CcodTrue ([object]::ReferenceEquals($script:TestSystemCatalog,$world.TrayErrors[0].Catalog)) 'language error still resolves through the old validated catalog'
-    Assert-CcodTrue ([object]::ReferenceEquals($controllerState,$hostState.State) -and [object]::ReferenceEquals($queue,$hostState.CommandQueue) -and $hostState.SessionState -ceq $session -and $hostState.BlockAutomaticActions -eq $blocked) 'preference recovery leaves controller and Codex state unchanged'
+Invoke-CcodTest 'rejects stale and removed v2 tray actions before preference or process mutation' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $stale=[pscustomobject][ordered]@{ActionId=[guid]'10000000-0000-0000-0000-000000000003';Command='SetLanguageEnglish';Revision=[UInt64]2}
+    $staleResult=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $stale)
+    Assert-CcodEqual 'Rejected' $staleResult[0].Status 'stale revision receives a correlated rejection'
+    Assert-CcodEqual 'CCOD_TRAY_ACTION_STALE' $staleResult[0].ErrorCode 'stale revision error is stable'
+    Assert-CcodEqual 0 $world.SetUiLanguageModes.Count 'stale action never persists a preference'
+    $removed=[pscustomobject][ordered]@{ActionId=[guid]'10000000-0000-0000-0000-000000000004';Command='SetAutomation';Revision=[UInt64]1}
+    $threw=$false
+    try{Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $removed|Out-Null}catch{$threw=$_.FullyQualifiedErrorId-like'CCOD_SUPERVISOR_COMMAND_INVALID*'}
+    Assert-CcodTrue $threw 'removed command is rejected before any side effect'
 }
 
-Invoke-CcodTest 'logs old-tray redraw failure independently and still shows the old-catalog error' {
-    $recovery=New-CcodLanguageRecoveryFixture -TrayRecoveryFailure $true;$fixture=$recovery.Fixture;$world=$recovery.World;$hostState=$recovery.Host
-    $oldCatalog=$hostState.UiCatalog;$controllerState=$hostState.State;$queue=$hostState.CommandQueue;$session=$hostState.SessionState;$blocked=$hostState.BlockAutomaticActions
-    $command=[pscustomobject][ordered]@{Kind='SetUiLanguage';Value='en-US';EnqueuedAtUtc='2026-08-05T00:00:00.0000000Z'}
-    Assert-CcodEqual 0 @(Invoke-CcodSupervisorCommand -Command $command -HostState $hostState -Adapters $fixture.Fake.Adapters).Count 'old tray redraw failure is contained with no output'
-    Assert-CcodEqual 'System' $world.StoredLanguageMode 'preference rollback still succeeds'
-    Assert-CcodEqual 'System' $hostState.UiLanguageMode 'host remains aligned with old disk mode'
-    Assert-CcodTrue ([object]::ReferenceEquals($oldCatalog,$hostState.UiCatalog)) 'host retains old catalog'
-    Assert-CcodEqual 'recovery-partial' $hostState.Tray.RenderedText 'failed redraw remains explicitly observable as incomplete in the fake boundary'
-    Assert-CcodEqual 'LanguageChange|CCOD_UI_LANGUAGE_CHANGE_FAILED,LanguageTrayRollback|CCOD_UI_LANGUAGE_TRAY_ROLLBACK_FAILED' (($world.UiFailureRecords|ForEach-Object{"$($_.stage)|$($_.code)"})-join ',') 'primary and tray recovery logs are exact and ordered'
-    Assert-CcodTrue (($world.UiFailureRecords|ConvertTo-Json -Compress) -cnotmatch 'PRIVATE|Fake|CodexControlOtherDevices|recovery-partial|en-US') 'tray recovery log contains no exception path catalog text or user input'
-    Assert-CcodEqual 'Error.LanguageChange' $world.TrayErrors[0].Key 'tray recovery failure still shows the language error'
-    Assert-CcodTrue ([object]::ReferenceEquals($oldCatalog,$world.TrayErrors[0].Catalog)) 'tray recovery failure still uses old validated catalog for the error'
-    Assert-CcodTrue ([object]::ReferenceEquals($controllerState,$hostState.State) -and [object]::ReferenceEquals($queue,$hostState.CommandQueue) -and $hostState.SessionState -ceq $session -and $hostState.BlockAutomaticActions -eq $blocked) 'tray recovery failure leaves controller and Codex state unchanged'
+Invoke-CcodTest 'completes v2 OpenLogs only after revision authorization and the log boundary' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $action=[pscustomobject][ordered]@{ActionId=[guid]'10000000-0000-0000-0000-000000000005';Command='OpenLogs';Revision=[UInt64]1}
+    $result=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)
+    Assert-CcodEqual 'Completed' $result[0].Status 'authorized logs action completes'
+    Assert-CcodTrue ($world.Calls.Contains('Open:Logs')) 'logs boundary runs after action authorization'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'Start:*'}).Count 'logs action starts no lifecycle or controller worker'
 }
-
-Invoke-CcodTest 'contains combined preference and old-tray rollback failures with both stable recovery records' {
-    $recovery=New-CcodLanguageRecoveryFixture -PreferenceRollbackFailure AfterWrite -TrayRecoveryFailure $true;$fixture=$recovery.Fixture;$world=$recovery.World;$hostState=$recovery.Host
-    $oldCatalog=$hostState.UiCatalog;$controllerState=$hostState.State;$queue=$hostState.CommandQueue;$session=$hostState.SessionState;$blocked=$hostState.BlockAutomaticActions
-    $command=[pscustomobject][ordered]@{Kind='SetUiLanguage';Value='en-US';EnqueuedAtUtc='2026-08-05T00:00:00.0000000Z'}
-    Assert-CcodEqual 0 @(Invoke-CcodSupervisorCommand -Command $command -HostState $hostState -Adapters $fixture.Fake.Adapters).Count 'combined recovery failures are contained with no output'
-    Assert-CcodTrue ($world.Calls.Contains('Read:UiPreference:Recovery')) 'combined case confirms disk state after the throwing preference adapter'
-    Assert-CcodEqual 'System' $world.StoredLanguageMode 'after-write failure is confirmed as old mode on disk'
-    Assert-CcodEqual 'System' $hostState.UiLanguageMode 'host follows confirmed old disk mode'
-    Assert-CcodTrue ([object]::ReferenceEquals($oldCatalog,$hostState.UiCatalog)) 'host catalog matches confirmed old disk mode'
-    Assert-CcodEqual 'LanguageChange|CCOD_UI_LANGUAGE_CHANGE_FAILED,LanguagePreferenceRollback|CCOD_UI_LANGUAGE_PREFERENCE_ROLLBACK_FAILED,LanguageTrayRollback|CCOD_UI_LANGUAGE_TRAY_ROLLBACK_FAILED' (($world.UiFailureRecords|ForEach-Object{"$($_.stage)|$($_.code)"})-join ',') 'combined recovery stages are independently and exactly logged'
-    Assert-CcodTrue (($world.UiFailureRecords|ConvertTo-Json -Compress) -cnotmatch 'PRIVATE|Fake|CodexControlOtherDevices|recovery-partial|en-US') 'combined recovery logs remain bounded and non-sensitive'
-    Assert-CcodEqual 1 $world.TrayErrors.Count 'combined recovery failure still attempts one old-catalog error dialog'
-    Assert-CcodTrue ([object]::ReferenceEquals($oldCatalog,$world.TrayErrors[0].Catalog)) 'combined recovery error uses old validated catalog'
-    Assert-CcodTrue ([object]::ReferenceEquals($controllerState,$hostState.State) -and [object]::ReferenceEquals($queue,$hostState.CommandQueue) -and $hostState.SessionState -ceq $session -and $hostState.BlockAutomaticActions -eq $blocked) 'combined recovery failures leave controller and Codex state unchanged'
-}
-
-Invoke-CcodTest 'rejects malformed language commands before catalog resolution or persistence' {
-    $timestamp='2026-08-05T00:00:00.0000000Z'
-    $cases=@(
-        [pscustomobject][ordered]@{Kind='SetUiLanguage';Value='system';EnqueuedAtUtc=$timestamp},
-        [pscustomobject][ordered]@{Kind='SetUiLanguage';Value='zh-cn';EnqueuedAtUtc=$timestamp},
-        [pscustomobject][ordered]@{Kind='SetUiLanguage';Value='fr-FR';EnqueuedAtUtc=$timestamp},
-        [pscustomobject][ordered]@{Kind='SetUiLanguage';EnqueuedAtUtc=$timestamp},
-        [pscustomobject][ordered]@{Kind='SetUiLanguage';Value='en-US';EnqueuedAtUtc=$timestamp;Extra=$true},
-        [pscustomobject][ordered]@{Kind='SetUiLanguage';Value=[int]1;EnqueuedAtUtc=$timestamp}
-    )
-    foreach($command in $cases){
-        $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host;$oldCatalog=$hostState.UiCatalog
-        Assert-CcodEqual 0 @(Invoke-CcodSupervisorCommand -Command $command -HostState $hostState -Adapters $fixture.Fake.Adapters).Count 'rejected language command emits no output'
-        Assert-CcodEqual 0 $world.SetUiLanguageModes.Count 'rejected value never persists'
-        Assert-CcodEqual 0 @($world.Calls|Where-Object {$_ -like 'Get:UiCatalog:*'}).Count 'rejected value never reaches catalog adapter'
-        Assert-CcodEqual 'System' $hostState.UiLanguageMode 'rejected value preserves old mode'
-        Assert-CcodTrue ([object]::ReferenceEquals($oldCatalog,$hostState.UiCatalog)) 'rejected value preserves old catalog'
-    }
-}
-
-Invoke-CcodTest 'rolls back catalog and persistence failures and reports only bounded stable UI records through the old catalog' {
-    foreach($stage in @('GetUiCatalog','SetUiLanguageMode')){
-        $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host;$world.FailAt=$stage
-        $oldCatalog=$hostState.UiCatalog;$oldMode=$hostState.UiLanguageMode;$oldStored=$world.StoredLanguageMode
-        $oldSession=$hostState.SessionState;$oldBlock=$hostState.BlockAutomaticActions;$oldWorker=$hostState.WorkerSlot
-        $command=[pscustomobject][ordered]@{Kind='SetUiLanguage';Value='en-US';EnqueuedAtUtc='2026-08-05T00:00:00.0000000Z'}
-        Assert-CcodEqual 0 @(Invoke-CcodSupervisorCommand -Command $command -HostState $hostState -Adapters $fixture.Fake.Adapters).Count "$stage failure is contained with no output"
-        Assert-CcodEqual $oldMode $hostState.UiLanguageMode "$stage preserves mode"
-        Assert-CcodTrue ([object]::ReferenceEquals($oldCatalog,$hostState.UiCatalog)) "$stage preserves old catalog identity"
-        Assert-CcodEqual $oldStored $world.StoredLanguageMode "$stage preserves stored preference"
-        Assert-CcodEqual 1 $world.UiFailureRecords.Count "$stage writes one bounded failure record"
-        $record=$world.UiFailureRecords[0]
-        Assert-CcodEqual 'schemaVersion,timestampUtc,component,stage,code,outcome' (@($record.PSObject.Properties.Name)-join ',') 'failure record shape is exact'
-        Assert-CcodEqual '1,2030-02-03T03:04:05.0000000Z,Supervisor,LanguageChange,CCOD_UI_LANGUAGE_CHANGE_FAILED,Failed' "$($record.schemaVersion),$($record.timestampUtc),$($record.component),$($record.stage),$($record.code),$($record.outcome)" 'failure record values are stable English'
-        Assert-CcodTrue (($record|ConvertTo-Json -Compress) -cnotmatch 'PRIVATE|Fake|en-US|Catalog') 'failure record contains no exception path catalog or input'
-        Assert-CcodEqual 1 $world.TrayErrors.Count "$stage shows one localized error"
-        Assert-CcodEqual 'Error.LanguageChange' $world.TrayErrors[0].Key 'old-catalog language error key is exact'
-        Assert-CcodTrue ([object]::ReferenceEquals($oldCatalog,$world.TrayErrors[0].Catalog)) 'dialog resolves through the old catalog'
-        Assert-CcodTrue ($hostState.SessionState -ceq $oldSession -and $hostState.BlockAutomaticActions -eq $oldBlock -and [object]::ReferenceEquals($oldWorker,$hostState.WorkerSlot)) 'controller and Codex state remain untouched'
-    }
-}
-
-Invoke-CcodTest 'contains error-dialog and UI-log failures independently without changing controller state' {
-    $dialogFixture=New-CcodTickFixture;$dialogWorld=$dialogFixture.Fake.World;$dialogHost=$dialogFixture.Host
-    $dialogSession=$dialogHost.SessionState
-    $dialogWorld.FailAt='SetUiLanguageMode';$dialogFixture.Fake.Adapters.ShowTrayError={param($Tray,$Catalog,$Key)$dialogWorld.Calls.Add('Show:TrayError:failed');throw 'PRIVATE_DIALOG_SECRET'}.GetNewClosure()
-    $command=[pscustomobject][ordered]@{Kind='SetUiLanguage';Value='zh-CN';EnqueuedAtUtc='2026-08-05T00:00:00.0000000Z'}
-    Invoke-CcodSupervisorCommand -Command $command -HostState $dialogHost -Adapters $dialogFixture.Fake.Adapters
-    Assert-CcodEqual 'CCOD_UI_LANGUAGE_CHANGE_FAILED,CCOD_UI_ERROR_DIALOG_FAILED' (@($dialogWorld.UiFailureRecords.code)-join ',') 'dialog failure is logged separately'
-    Assert-CcodEqual 'System' $dialogHost.UiLanguageMode 'dialog failure preserves UI mode'
-    Assert-CcodEqual $dialogSession $dialogHost.SessionState 'dialog failure preserves controller state'
-
-    $logFixture=New-CcodTickFixture;$logWorld=$logFixture.Fake.World;$logHost=$logFixture.Host
-    $logSession=$logHost.SessionState
-    $logWorld.FailAt='SetUiLanguageMode';$logFixture.Fake.Adapters.WriteLog={param($Record)throw 'PRIVATE_LOG_SECRET'}
-    Invoke-CcodSupervisorCommand -Command $command -HostState $logHost -Adapters $logFixture.Fake.Adapters
-    Assert-CcodTrue $logHost.RuntimeCleanupCodes.Contains('CCOD_SUPERVISOR_LOG_FAILED') 'log failure is reduced to existing bounded cleanup code'
-    Assert-CcodEqual 1 $logWorld.TrayErrors.Count 'log failure does not suppress the localized dialog'
-    Assert-CcodEqual 'System' $logHost.UiLanguageMode 'log failure preserves UI mode'
-    Assert-CcodEqual $logSession $logHost.SessionState 'log failure preserves controller state'
-}
-
 Invoke-CcodTest 'logs a tray callback failure once without suppressing the supervisor tick' {
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
     $hostState.Tray | Add-Member -NotePropertyName CallbackFailure -NotePropertyValue $true
@@ -808,7 +672,7 @@ Invoke-CcodTest 'gives Shutdown absolute priority over a slot journal command an
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
     $world.ShutdownSignaled=$true;$world.ActiveJournal=New-CcodTestTransition
     $world.Decision=[pscustomobject][ordered]@{Action='ApplyOrdinary';Reason='Ready';Target=(New-CcodSupervisorTestSnapshot);AttemptKey='71|2030-02-03T03:01:00.0000000Z';SuppressionKey=$null;EffectiveClassification='CandidateCompatible';RequiresController=$true}
-    $world.CommandQueue.Enqueue([pscustomobject][ordered]@{Kind='ApplyNow';Value=$null;EnqueuedAtUtc='2030-02-03T03:04:05.0000000Z'})
+    $world.CommandQueue.Enqueue([pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command='CheckAndRepair';Revision=[UInt64]1})
     $hostState.WorkerSlot=[pscustomobject]@{Kind='Controller';ProcessId=501}
     Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
     Assert-CcodTrue $hostState.ShutdownRequested 'shutdown latches'
@@ -818,7 +682,7 @@ Invoke-CcodTest 'gives Shutdown absolute priority over a slot journal command an
 
 Invoke-CcodTest 'menu-open tick checks shutdown but skips every heavy supervisor path' {
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
-    $world.CommandQueue.Enqueue([pscustomobject][ordered]@{Kind='OpenLogs';Value=$null;EnqueuedAtUtc='2030-02-03T03:04:05.0000000Z'})
+    $world.CommandQueue.Enqueue([pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command='OpenLogs';Revision=[UInt64]1})
     Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters $true
     Assert-CcodEqual 0 $world.StateReads 'menu-open tick performs no state read'
     Assert-CcodEqual 0 $world.JournalReads 'menu-open tick performs no journal read'
@@ -902,8 +766,9 @@ Invoke-CcodTest 'keeps queued commands and shutdown immediate inside the observa
     $commandFixture=New-CcodTickFixture;$commandWorld=$commandFixture.Fake.World;$commandHost=$commandFixture.Host
     $commandWorld.Elapsed.Enqueue([long]0);$commandWorld.Elapsed.Enqueue([long]250)
     Invoke-CcodSupervisorTick $commandHost $commandFixture.Fake.Adapters
-    $commandWorld.CommandQueue.Enqueue([pscustomobject][ordered]@{Kind='OpenLogs';Value=$null;EnqueuedAtUtc='2030-02-03T03:04:05.0000000Z'})
-    Invoke-CcodSupervisorTick $commandHost $commandFixture.Fake.Adapters
+    $commandWorld.CommandQueue.Enqueue([pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command='OpenLogs';Revision=[UInt64]1})
+    $commandOutput=@(Invoke-CcodSupervisorTick $commandHost $commandFixture.Fake.Adapters)
+    Assert-CcodEqual 0 $commandOutput.Count 'Supervisor tick consumes correlated action results without writing them to stdout'
     Assert-CcodTrue ($commandWorld.Calls.Contains('Open:Logs')) 'a queued command executes on the next 250 millisecond tick'
     Assert-CcodEqual 1 $commandWorld.StateReads 'command tick does not force an unrelated state read'
     Assert-CcodEqual 1 $commandWorld.JournalReads 'command tick does not force an unrelated journal read'
@@ -938,7 +803,7 @@ Invoke-CcodTest 'reserves the whole tick for a slot that existed at tick entry' 
 Invoke-CcodTest 'blocks a legacy transition journal without dispatching Recover before one queued command' {
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
     $world.ActiveJournal=New-CcodTestTransition
-    $world.CommandQueue.Enqueue([pscustomobject][ordered]@{Kind='OpenLogs';Value=$null;EnqueuedAtUtc='2030-02-03T03:04:05.0000000Z'})
+    $world.CommandQueue.Enqueue([pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command='OpenLogs';Revision=[UInt64]1})
     Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
     Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'Start:Controller:*'}).Count 'Supervisor never dispatches legacy Recover'
     Assert-CcodEqual 'LegacyTransitionBlocked' $hostState.Reason 'legacy journal fails closed with stable state'
@@ -948,7 +813,7 @@ Invoke-CcodTest 'blocks a legacy transition journal without dispatching Recover 
 Invoke-CcodTest 'converts persisted-special inspection into one durable lifecycle before a queued command' {
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
     $hostState.SpecialNeedsInspect=$true
-    $world.CommandQueue.Enqueue([pscustomobject][ordered]@{Kind='OpenLogs';Value=$null;EnqueuedAtUtc='2030-02-03T03:04:05.0000000Z'})
+    $world.CommandQueue.Enqueue([pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command='OpenLogs';Revision=[UInt64]1})
     Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
     Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'Start:Controller:*'}).Count 'special proof never starts a controller worker directly'
     Assert-CcodTrue ($null-ne$hostState.LifecycleRequest -and $hostState.LifecycleRequest.kind-ceq'CheckAndRepair') 'special proof creates one durable CheckAndRepair lifecycle'
@@ -1071,7 +936,7 @@ Invoke-CcodTest 'uses a constrained stale reconciliation candidate for only an e
 Invoke-CcodTest 'processes at most one command before reducer decisions' {
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
     $world.Decision=[pscustomobject][ordered]@{Action='RepairRenderer';Reason='Repair';Target=$null;AttemptKey=$null;SuppressionKey=$null;EffectiveClassification=$null;RequiresController=$true}
-    foreach($kind in @('OpenLogs','ApplyNow')){$world.CommandQueue.Enqueue([pscustomobject][ordered]@{Kind=$kind;Value=$null;EnqueuedAtUtc='2030-02-03T03:04:05.0000000Z'})}
+    foreach($command in @('OpenLogs','CheckAndRepair')){$world.CommandQueue.Enqueue([pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command=$command;Revision=[UInt64]1})}
     Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
     Assert-CcodTrue ($world.Calls.Contains('Open:Logs')) 'first command executes'
     Assert-CcodTrue $world.TryDequeueSawRealQueue 'command dequeue receives the queue object itself'
@@ -1081,7 +946,7 @@ Invoke-CcodTest 'processes at most one command before reducer decisions' {
 
 Invoke-CcodTest 'passes queue objects themselves during host creation with non-empty queues' {
     $fake=New-CcodSupervisorFake
-    $fake.World.CommandQueue.Enqueue([pscustomobject][ordered]@{Kind='OpenLogs';Value=$null;EnqueuedAtUtc='2030-02-03T03:04:05.0000000Z'})
+    $fake.World.CommandQueue.Enqueue([pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command='OpenLogs';Revision=[UInt64]1})
     $fake.World.EventQueue.Enqueue([pscustomobject][ordered]@{ProcessId=71;EventKind='Started';ObservedAtUtc='2030-02-03T03:04:05.0000000Z'})
     $receipt=Invoke-CcodSupervisorHost -ReadyToken $readyToken -Adapters $fake.Adapters
     Assert-CcodReceipt $receipt 'Stopped' 0
@@ -1092,7 +957,7 @@ Invoke-CcodTest 'passes queue objects themselves during host creation with non-e
 
 Invoke-CcodTest 'drains the command queue through the real queue object' {
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World
-    foreach($kind in @('OpenLogs','ApplyNow')){$world.CommandQueue.Enqueue([pscustomobject][ordered]@{Kind=$kind;Value=$null;EnqueuedAtUtc='2030-02-03T03:04:05.0000000Z'})}
+    foreach($command in @('OpenLogs','CheckAndRepair')){$world.CommandQueue.Enqueue([pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command=$command;Revision=[UInt64]1})}
     Invoke-CcodSupervisorDrainQueue $world.CommandQueue $fixture.Fake.Adapters
     Assert-CcodEqual 0 $world.CommandQueue.Count 'drain consumes every queued command'
     Assert-CcodTrue $world.TryDequeueSawRealQueue 'drain dequeue receives the queue object itself'
@@ -1142,6 +1007,47 @@ Invoke-CcodTest 'projects a durable lifecycle as reconnecting protection' {
     Assert-CcodEqual 'RepairNeeded' $input.ConnectionState 'presentation keeps the current connection evidence'
     Assert-CcodEqual 'Reconnecting' $input.ProtectionState 'active durable lifecycle is presented as reconnecting protection'
     Assert-CcodEqual $true $input.Busy 'active durable lifecycle is presented as busy'
+}
+
+Invoke-CcodTest 'authorizes a correlated CheckAndRepair action through the durable lifecycle inbox' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $hostState.ConnectionState='RepairNeeded'
+    $hostState.Tray.CurrentRevision=[UInt64]12
+    $action=[pscustomobject][ordered]@{ActionId=[guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';Command='CheckAndRepair';Revision=[UInt64]12}
+    $results=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)
+    Assert-CcodEqual 1 $results.Count 'authorized repair returns one action result'
+    Assert-CcodEqual 'Accepted' $results[0].Status 'repair action receives Accepted before work begins'
+    Assert-CcodEqual $action.ActionId $results[0].ActionId 'accepted repair result preserves action correlation'
+    Assert-CcodEqual $hostState.LifecycleRequest.transactionId $results[0].TransactionId 'accepted repair result carries the durable transaction id'
+    Assert-CcodEqual 'CheckAndRepair' $hostState.LifecycleRequest.kind 'repair action creates only the durable lifecycle request'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'Start:Controller:*'}).Count 'repair authorization starts no direct controller mutation'
+    $duplicateThrew=$false
+    try{Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action|Out-Null}catch{$duplicateThrew=$_.FullyQualifiedErrorId-like'CCOD_SUPERVISOR_COMMAND_INVALID*'}
+    Assert-CcodTrue $duplicateThrew 'duplicate action id is rejected before a second lifecycle request is created'
+}
+
+Invoke-CcodTest 'completes a correlated CheckAndRepair action when its lifecycle reaches a terminal phase' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $hostState.ConnectionState='RepairNeeded';$hostState.Tray.CurrentRevision=[UInt64]13
+    $action=[pscustomobject][ordered]@{ActionId=[guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeef';Command='CheckAndRepair';Revision=[UInt64]13}
+    $accepted=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)[0]
+    $hostState.LifecycleRequest.phase='Completed'
+    Complete-CcodSupervisorLifecycleTerminal $hostState $fixture.Fake.Adapters
+    Assert-CcodEqual 2 $world.TrayActionResults.Count 'repair lifecycle emits accepted and terminal correlated results'
+    $terminal=$world.TrayActionResults[1]
+    Assert-CcodEqual $action.ActionId $terminal.ActionId 'terminal result preserves action id'
+    Assert-CcodEqual $accepted.TransactionId $terminal.TransactionId 'terminal result preserves transaction id'
+    Assert-CcodEqual 'Completed' $terminal.Status 'successful lifecycle sends completed action result'
+}
+
+Invoke-CcodTest 'completes About only after validating the active runtime manifest' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $action=[pscustomobject][ordered]@{ActionId=[guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeea';Command='ShowAbout';Revision=[UInt64]1}
+    $result=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)
+    Assert-CcodEqual 'Completed' $result[0].Status 'verified About action completes'
+    Assert-CcodTrue ($world.Calls.Contains('Verify:About')) 'About verifies the active runtime before acknowledgement'
+    Assert-CcodEqual 1 $world.PresentationArguments.Count 'verified About republishes the acknowledged runtime presentation'
+    Assert-CcodEqual 'Completed' $world.TrayActionResults[0].Status 'About completion uses the correlated result channel'
 }
 
 Invoke-CcodTest 'Apply controller request carries the full process snapshot source' {

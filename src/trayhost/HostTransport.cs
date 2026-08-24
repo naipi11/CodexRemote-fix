@@ -11,6 +11,7 @@ internal sealed class HostTransport : IDisposable
 
     private readonly object _gate = new object();
     private readonly Queue<TrayHostControl> _controls = new Queue<TrayHostControl>();
+    private readonly Queue<TrayActionResult> _completedAbout = new Queue<TrayActionResult>();
     private readonly Dictionary<Guid, PendingAction> _pendingActions = new Dictionary<Guid, PendingAction>();
     private readonly Queue<Guid> _recentActionOrder = new Queue<Guid>();
     private readonly HashSet<Guid> _recentActions = new HashSet<Guid>();
@@ -78,7 +79,17 @@ internal sealed class HostTransport : IDisposable
             if (result.Status != TrayActionResultStatus.Completed && result.Status != TrayActionResultStatus.Rejected && result.Status != TrayActionResultStatus.Failed) { return false; }
             if (result.Status == TrayActionResultStatus.Completed && TrayCommandPolicy.RequiresAcceptedBeforeCompleted(pending.Action.Command) && !pending.Accepted) { return false; }
             _pendingActions.Remove(result.ActionId);
+            if (result.Status == TrayActionResultStatus.Completed && pending.Action.Command == TrayCommand.ShowAbout) { _completedAbout.Enqueue(result); }
             return true;
+        }
+    }
+
+    internal bool TryTakeCompletedAbout(out TrayActionResult result)
+    {
+        lock (_gate)
+        {
+            if (_completedAbout.Count == 0) { result = null; return false; }
+            result = _completedAbout.Dequeue(); return true;
         }
     }
 
@@ -99,6 +110,7 @@ internal sealed class HostTransport : IDisposable
             if (_disposed) { return; }
             _disposed = true;
             _controls.Clear();
+            _completedAbout.Clear();
             _pendingActions.Clear();
             _recentActions.Clear();
             _recentActionOrder.Clear();

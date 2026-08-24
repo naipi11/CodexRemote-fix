@@ -14,7 +14,7 @@ $script:CcodSupervisorAdapterNames=@(
     'ReadActiveRuntime','GetTrustedLogonIdentity','EnterLifecycleOwnership','AssertLifecycleFence','SuspendLifecycleOwnership','ResumeLifecycleOwnership','ExitLifecycleOwnership','OpenLifecycleWakeEvent','ResetLifecycleWakeEvent',
     'ReadLifecycleRequest','ReceiveLifecycleSubmissions','WriteLifecycleSubmissionReceipt','NewLifecycleRequest','WriteLifecycleRequest','MoveLifecyclePhase','CompleteLifecycleRequest','GetLifecycleStep','ReduceLifecycleWorkerResult','NewLifecycleWorkerRequest','AssertLifecycleWorkerResult',
     'ReadState','ReadJournal','ReadUiPreference','SetUiLanguageMode','GetSystemCultureName','GetUiCatalog','ShowTrayError','StartUninstall','EnumerateProcessIds','GetProcessSnapshot','ParseStaleCandidateCommandLine','GetPackageIdentity','GetSupervisorDecision','AddObservedEvent','CompleteControllerRun','HandoffRenderer','GetTrayPresentation',
-    'NewQueue','GetQueueCount','TryDequeue','NewTray','SetTrayPresentation','StopTrayTimer','RequestUiExit','CloseTray','NewWatcher','StopWatcher',
+    'NewQueue','GetQueueCount','TryDequeue','NewTray','SetTrayPresentation','SendTrayActionResult','VerifyActiveRuntimeForAbout','StopTrayTimer','RequestUiExit','CloseTray','NewWatcher','StopWatcher',
     'GetWorkerLeafState','WriteWorkerRequest','StartWorker','PollWorker','ReadWorkerResult','WaitWorker','GetWorkerIdentity','TerminateWorker','DisposeWorker','DeleteWorkerFile',
     'ClearFailedAttempt','SetAutomationEnabled','SetCandidateOptIn','OpenLogs','WriteLog','RunUiContext'
 )
@@ -323,6 +323,18 @@ function Get-CcodSupervisorDefaultAdapters {
     $defaults.TryDequeue={param($Queue)$value=$null;$ok=$Queue.TryDequeue([ref]$value);[pscustomobject][ordered]@{Succeeded=[bool]$ok;Value=$value}}
     $defaults.NewTray={param($Queue,$OnTick,$Catalog,$LanguageMode,$SystemCultureName)New-CcodTrayHostContext -CommandQueue $Queue -OnTick $OnTick -Catalog $Catalog -LanguageMode $LanguageMode -SystemCultureName $SystemCultureName}
     $defaults.SetTrayPresentation={param($Tray,$Presentation,$Catalog,$LanguageMode,$SystemCultureName,$WaitForAcknowledgement)Set-CcodTrayHostPresentation -Context $Tray -Presentation $Presentation -Catalog $Catalog -LanguageMode $LanguageMode -SystemCultureName $SystemCultureName -WaitForAcknowledgement:([bool]$WaitForAcknowledgement)}
+    $defaults.SendTrayActionResult={param($Tray,$ActionId,$Revision,$Status,$ErrorCode,$TransactionId)Send-CcodTrayHostActionResult -Context $Tray -ActionId $ActionId -Revision $Revision -Status $Status -ErrorCode $ErrorCode -TransactionId $TransactionId|Out-Null}
+    $defaults.VerifyActiveRuntimeForAbout={
+        param($InstallRoot,$RuntimeId)
+        $active=Read-CcodActiveRuntime -InstallRoot $InstallRoot
+        if($active.activeRuntime-cne$RuntimeId){throw 'active runtime mismatch'}
+        $runtimeRoot=[IO.Path]::GetFullPath((Join-Path (Join-Path $InstallRoot 'runtime') $active.activeRuntime))
+        $manifest=Test-CcodRuntimeManifest -RuntimeDirectory $runtimeRoot -ExpectedRuntimeId $active.activeRuntime
+        if(-not$manifest.Valid){throw 'runtime manifest invalid'}
+        $version='';if($RuntimeId-cmatch'^(?<version>\d+\.\d+\.\d+)-'){$version=$Matches['version']}
+        if([string]::IsNullOrWhiteSpace($version)){throw 'runtime version invalid'}
+        return [pscustomobject][ordered]@{RuntimeId=$RuntimeId;Version=$version}
+    }
     $defaults.StopTrayTimer={param($Tray)if($null -ne $Tray -and $null -ne $Tray.PSObject.Properties['Client']){return};$Tray.Timer.Stop()}
     $defaults.RequestUiExit={
         param($Tray)
@@ -482,7 +494,7 @@ function New-CcodSupervisorHostState {
         SchemaVersion=1;ShutdownRequested=$false;ShutdownEvent=$ShutdownEvent;Tray=$null;TrayCallbackFailureLogged=$false;UiLanguageMode=$null;UiCatalog=$null;State=$State;Journal=$Journal;WorkerSlot=$null
         LifecycleOwnership=$LifecycleOwnership;LifecycleRequest=$LifecycleRequest;LifecycleWorkerSlot=$null;LifecycleWakeEvent=$LifecycleWakeEvent;LogonIdentity=$LogonIdentity;LifecycleObservation='Unknown';ConnectionState='Unknown';ProtectionState='Running'
         Identity=$Identity;Layout=$Layout;CommandQueue=$CommandQueue;EventQueue=$EventQueue;Clock=$Clock
-        ObservedKeys=[ordered]@{};AttemptKeys=[ordered]@{};RecoveryIgnoreKeys=[ordered]@{};SuppressionKeys=[ordered]@{}
+        ObservedKeys=[ordered]@{};AttemptKeys=[ordered]@{};RecoveryIgnoreKeys=[ordered]@{};SuppressionKeys=[ordered]@{};TrayActionIds=[ordered]@{}
         StaticCache=[ordered]@{};TransportRetries=[ordered]@{};TerminalRecoveries=[ordered]@{}
         PackageFullName=$null;AppAsarSha256=$null;Classification=$null
         Ordinary=[object[]]@();Special=[object[]]@();SpecialNeedsInspect=$false;SpecialProof=$null;StaleReconciliationCandidate=$null;FailedStaleRepairKey=$null
@@ -689,6 +701,7 @@ function Complete-CcodSupervisorLifecycleTerminal {
     Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
     Invoke-CcodSupervisorAdapter $Adapters.CompleteLifecycleRequest @($HostState.Layout.StateRoot,$request) 0
     $successful=$request.phase-ceq'Completed' -or ($request.phase-ceq'CancelledBeforeClose' -and $null-eq$request.error)
+    Complete-CcodSupervisorLifecycleTrayAction $HostState $Adapters $request $successful
     if(-not$successful){$HostState.ConnectionState='Error'}
     $HostState.ProtectionState='Running';$HostState.LifecycleRequest=$null
 }
@@ -996,101 +1009,99 @@ function Set-CcodSupervisorCurrentTrayPresentation {
     Invoke-CcodSupervisorAdapter $Adapters.SetTrayPresentation @($HostState.Tray,$presentation,$HostState.UiCatalog,$HostState.UiLanguageMode,$culture,[bool]$WaitForAcknowledgement) 0
 }
 
+function Test-CcodSupervisorTrayAction {
+    param($Action)
+    return (Test-CcodSupervisorExactProperties $Action @('ActionId','Command','Revision')) -and $Action.ActionId-is[guid] -and $Action.ActionId-ne[guid]::Empty -and
+        $Action.Command-is[string] -and @('CheckAndRepair','SetLanguageSystem','SetLanguageChinese','SetLanguageEnglish','OpenLogs','ShowAbout','Exit')-ccontains$Action.Command -and
+        $Action.Revision-is[UInt64] -and $Action.Revision-gt0
+}
+
+function Throw-CcodSupervisorCommandError {
+    param([string]$Code,[string]$Message,$Target)
+    throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new($Message),$Code,[Management.Automation.ErrorCategory]::InvalidData,$Target)
+}
+
+function Send-CcodSupervisorTrayActionResult {
+    param($HostState,[hashtable]$Adapters,$Action,[ValidateSet('Accepted','Completed','Rejected','Failed')][string]$Status,[AllowNull()][string]$ErrorCode,[AllowNull()][string]$TransactionId)
+    $result=[pscustomobject][ordered]@{ActionId=$Action.ActionId;Revision=[UInt64]$Action.Revision;Status=$Status;ErrorCode=$ErrorCode;TransactionId=$TransactionId}
+    Invoke-CcodSupervisorAdapter $Adapters.SendTrayActionResult @($HostState.Tray,$result.ActionId,$result.Revision,$result.Status,$result.ErrorCode,$result.TransactionId) 0
+    return $result
+}
+
+function Complete-CcodSupervisorLifecycleTrayAction {
+    param($HostState,[hashtable]$Adapters,$Request,[bool]$Successful)
+    foreach($key in @($HostState.TrayActionIds.Keys)){
+        $entry=$HostState.TrayActionIds[$key]
+        if($null-eq$entry-or$null-eq$entry.PSObject.Properties['Action']-or$null-eq$entry.PSObject.Properties['TransactionId']-or$null-eq$entry.PSObject.Properties['TerminalSent']){continue}
+        if($entry.TerminalSent-or$entry.TransactionId-cne$Request.transactionId){continue}
+        try{
+            $status=if($Successful){'Completed'}else{'Failed'}
+            $code=if($Successful){$null}else{'CCOD_LIFECYCLE_ACTION_FAILED'}
+            [void](Send-CcodSupervisorTrayActionResult $HostState $Adapters $entry.Action $status $code $entry.TransactionId)
+            $entry.TerminalSent=$true
+        }catch{Write-CcodSupervisorUiFailure $HostState $Adapters 'ErrorDialog' 'CCOD_TRAY_ACTION_RESULT_FAILED'}
+    }
+}
+
+function Test-CcodSupervisorTrayActionBusy {
+    param($HostState)
+    $engine=New-CcodSupervisorEngineContext $HostState
+    return [bool]($null-ne$HostState.WorkerSlot-or$null-ne$HostState.LifecycleWorkerSlot-or$null-ne$HostState.LifecycleRequest-or$null-ne$HostState.Journal-or$engine.StateDamageBlocksActions)
+}
+
+function Invoke-CcodSupervisorLanguageAction {
+    param($HostState,[hashtable]$Adapters,$Action,[string]$Mode)
+    $oldMode=$HostState.UiLanguageMode;$oldCatalog=$HostState.UiCatalog;$persisted=$false;$culture=$null
+    try{
+        $culture=Invoke-CcodSupervisorAdapter $Adapters.GetSystemCultureName @() 1
+        if(-not(Test-CcodSupervisorCultureName $culture)){throw 'UI culture is invalid'}
+        $newCatalog=Invoke-CcodSupervisorAdapter $Adapters.GetUiCatalog @((Get-CcodSupervisorResourcesRoot),$Mode,$culture) 1
+        if(-not(Test-CcodSupervisorUiCatalog $newCatalog $Mode)){throw 'UI catalog is invalid'}
+        Invoke-CcodSupervisorAdapter $Adapters.SetUiLanguageMode @($HostState.Layout.StateRoot,$Mode) 0
+        $persisted=$true;$HostState.UiLanguageMode=$Mode;$HostState.UiCatalog=$newCatalog
+        Set-CcodSupervisorCurrentTrayPresentation $HostState $Adapters $culture -WaitForAcknowledgement
+        return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Action Completed $null $null
+    }catch{
+        if($persisted){try{Invoke-CcodSupervisorAdapter $Adapters.SetUiLanguageMode @($HostState.Layout.StateRoot,$oldMode) 0}catch{}}
+        $HostState.UiLanguageMode=$oldMode;$HostState.UiCatalog=$oldCatalog
+        if($null-ne$culture){try{Set-CcodSupervisorCurrentTrayPresentation $HostState $Adapters $culture -WaitForAcknowledgement}catch{}}
+        Write-CcodSupervisorUiFailure $HostState $Adapters 'LanguageChange' 'CCOD_LANGUAGE_CHANGE_ROLLED_BACK'
+        return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Action Failed 'CCOD_LANGUAGE_CHANGE_ROLLED_BACK' $null
+    }
+}
+
 function Invoke-CcodSupervisorCommand {
     param($HostState,[hashtable]$Adapters,$Command)
-    if(-not (Test-CcodSupervisorExactProperties $Command @('Kind','Value','EnqueuedAtUtc')) -or $Command.Kind -isnot [string] -or
-       @('ApplyNow','ManualRetry','SetAutomationEnabled','SetCandidateCompatibleOptIn','SetUiLanguage','OpenLogs','Uninstall') -cnotcontains $Command.Kind -or
-       -not (Test-CcodSupervisorCanonicalUtc $Command.EnqueuedAtUtc)){return}
-    if($Command.Kind -ceq 'SetUiLanguage'){
-        if($Command.Value -isnot [string] -or $script:CcodSupervisorUiLanguageModes -cnotcontains $Command.Value){return}
-        $oldMode=$HostState.UiLanguageMode;$oldCatalog=$HostState.UiCatalog;$persisted=$false;$trayUpdateAttempted=$false
-        try{
-            $culture=Invoke-CcodSupervisorAdapter $Adapters.GetSystemCultureName @() 1
-            if(-not (Test-CcodSupervisorCultureName $culture)){throw 'UI culture is invalid'}
-            $resourcesRoot=Get-CcodSupervisorResourcesRoot
-            $newCatalog=Invoke-CcodSupervisorAdapter $Adapters.GetUiCatalog @($resourcesRoot,$Command.Value,$culture) 1
-            if(-not (Test-CcodSupervisorUiCatalog $newCatalog $Command.Value)){throw 'UI catalog is invalid'}
-            Invoke-CcodSupervisorAdapter $Adapters.SetUiLanguageMode @($HostState.Layout.StateRoot,$Command.Value) 0
-            $persisted=$true
-            $HostState.UiLanguageMode=$Command.Value;$HostState.UiCatalog=$newCatalog
-            $trayUpdateAttempted=$true
-            Set-CcodSupervisorCurrentTrayPresentation $HostState $Adapters $culture -WaitForAcknowledgement
-        }catch{
-            $recoveryMode=$oldMode;$recoveryCatalog=$oldCatalog;$preferenceRollbackFailed=$false;$preferenceConfirmationFailed=$false;$trayRollbackFailed=$false
-            if($persisted){
-                try{Invoke-CcodSupervisorAdapter $Adapters.SetUiLanguageMode @($HostState.Layout.StateRoot,$oldMode) 0}
-                catch{
-                    $preferenceRollbackFailed=$true
-                    try{
-                        $confirmedPreference=Invoke-CcodSupervisorAdapter $Adapters.ReadUiPreference @($HostState.Layout.StateRoot) 1
-                        if(-not (Test-CcodSupervisorUiPreference $confirmedPreference) -or $confirmedPreference.FallbackUsed -or
-                           -not [string]::IsNullOrEmpty([string]$confirmedPreference.ErrorCode) -or
-                           @($oldMode,$Command.Value) -cnotcontains $confirmedPreference.LanguageMode){throw 'UI preference confirmation is invalid'}
-                        if($confirmedPreference.LanguageMode -ceq $Command.Value){$recoveryMode=$Command.Value;$recoveryCatalog=$newCatalog}
-                    }catch{$preferenceConfirmationFailed=$true}
-                }
-            }
-            $HostState.UiLanguageMode=$recoveryMode;$HostState.UiCatalog=$recoveryCatalog
-            if($trayUpdateAttempted){
-                try{Set-CcodSupervisorCurrentTrayPresentation $HostState $Adapters $culture -WaitForAcknowledgement}
-                catch{$trayRollbackFailed=$true}
-            }
-            Write-CcodSupervisorUiFailure $HostState $Adapters 'LanguageChange' 'CCOD_UI_LANGUAGE_CHANGE_FAILED'
-            if($preferenceRollbackFailed -or $preferenceConfirmationFailed){Write-CcodSupervisorUiFailure $HostState $Adapters 'LanguagePreferenceRollback' 'CCOD_UI_LANGUAGE_PREFERENCE_ROLLBACK_FAILED'}
-            if($trayRollbackFailed){Write-CcodSupervisorUiFailure $HostState $Adapters 'LanguageTrayRollback' 'CCOD_UI_LANGUAGE_TRAY_ROLLBACK_FAILED'}
-            try{Invoke-CcodSupervisorAdapter $Adapters.ShowTrayError @($HostState.Tray,$oldCatalog,'Error.LanguageChange') 0}catch{Write-CcodSupervisorUiFailure $HostState $Adapters 'ErrorDialog' 'CCOD_UI_ERROR_DIALOG_FAILED'}
+    if(-not(Test-CcodSupervisorTrayAction $Command)){Throw-CcodSupervisorCommandError 'CCOD_SUPERVISOR_COMMAND_INVALID' 'Tray action is invalid' $Command}
+    $revisionProperty=$HostState.Tray.PSObject.Properties['CurrentRevision']
+    if($null-eq$revisionProperty-or$revisionProperty.Value-isnot[UInt64]-or$revisionProperty.Value-eq0-or[UInt64]$revisionProperty.Value-ne[UInt64]$Command.Revision){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_TRAY_ACTION_STALE' $null}
+    if($HostState.TrayActionIds.Contains($Command.ActionId.ToString('D'))){Throw-CcodSupervisorCommandError 'CCOD_SUPERVISOR_COMMAND_INVALID' 'Tray action was already handled' $Command}
+    $actionEntry=[pscustomobject][ordered]@{Action=$Command;TransactionId=$null;TerminalSent=$false}
+    $HostState.TrayActionIds[$Command.ActionId.ToString('D')]=$actionEntry
+    $busy=Test-CcodSupervisorTrayActionBusy $HostState
+    switch($Command.Command){
+        'CheckAndRepair' {
+            if($busy-or$HostState.ConnectionState-cne'RepairNeeded'){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_TRAY_ACTION_UNAVAILABLE' $null}
+            if(-not(New-CcodSupervisorInternalLifecycleRequest $HostState $Adapters CheckAndRepair Tray)){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_LIFECYCLE_SUPERVISOR_BUSY' $null}
+            $actionEntry.TransactionId=$HostState.LifecycleRequest.transactionId
+            return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Accepted $null $HostState.LifecycleRequest.transactionId
         }
-        return
-    }
-    switch($Command.Kind){
-        'ApplyNow' {$HostState.ForceReconcile=$true}
-        'SetAutomationEnabled' {if($Command.Value -is [bool]){Invoke-CcodSupervisorAdapter $Adapters.SetAutomationEnabled @($HostState.Layout.StateRoot,[bool]$Command.Value) 0;$HostState.ForceReconcile=$true}}
-        'SetCandidateCompatibleOptIn' {if($Command.Value -is [bool]){Invoke-CcodSupervisorAdapter $Adapters.SetCandidateOptIn @($HostState.Layout.StateRoot,[bool]$Command.Value) 0;$HostState.ForceReconcile=$true}}
-        'OpenLogs' {Invoke-CcodSupervisorAdapter $Adapters.OpenLogs @($HostState.Layout.LogDirectory) 0}
-        'ManualRetry' {
-            if(-not [string]::IsNullOrWhiteSpace([string]$HostState.FailedStaleRepairKey)){
-                $staleKey=[string]$HostState.FailedStaleRepairKey
-                if($HostState.AttemptKeys.Contains($staleKey)){[void]$HostState.AttemptKeys.Remove($staleKey)}
-                $HostState.FailedStaleRepairKey=$null
-                $HostState.BlockAutomaticActions=$false
-                $HostState.ForceReconcile=$true
-                return
-            }
-            $retryKey=$null
-            if(-not [string]::IsNullOrWhiteSpace([string]$HostState.PackageFullName) -and
-               -not [string]::IsNullOrWhiteSpace([string]$HostState.AppAsarSha256)){
-                $retryKey=('{0}|{1}|{2}' -f $HostState.PackageFullName,$HostState.AppAsarSha256,$HostState.Layout.RuntimeId)
-                $verified=$HostState.State.VerifiedPackages
-                $record=$null
-                if($null -ne $verified -and $null -ne $verified.packages){
-                    $property=$verified.packages.PSObject.Properties[$retryKey]
-                    if($null -ne $property -and $null -ne $property.Value){$record=$property.Value}
-                }
-                if($null -ne $record -and $record.dynamicOutcome -ceq 'Failed'){
-                    try{
-                        Invoke-CcodSupervisorAdapter $Adapters.ClearFailedAttempt @(
-                            $HostState.Layout.StateRoot,$HostState.PackageFullName,$HostState.AppAsarSha256,
-                            $HostState.Layout.RuntimeId,[string]$record.confirmedAtUtc
-                        ) 1|Out-Null
-                    }catch{}
-                }
-                if($HostState.SuppressionKeys.Contains($retryKey)){[void]$HostState.SuppressionKeys.Remove($retryKey)}
-                $HostState.Classification=$null
-                $HostState.ForceReconcile=$true
-            }else{
-                $HostState.ForceReconcile=$true
-            }
+        'SetLanguageSystem' {if($busy){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_TRAY_ACTION_UNAVAILABLE' $null};return Invoke-CcodSupervisorLanguageAction $HostState $Adapters $Command System}
+        'SetLanguageChinese' {if($busy){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_TRAY_ACTION_UNAVAILABLE' $null};return Invoke-CcodSupervisorLanguageAction $HostState $Adapters $Command zh-CN}
+        'SetLanguageEnglish' {if($busy){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_TRAY_ACTION_UNAVAILABLE' $null};return Invoke-CcodSupervisorLanguageAction $HostState $Adapters $Command en-US}
+        'OpenLogs' {
+            try{Invoke-CcodSupervisorAdapter $Adapters.OpenLogs @($HostState.Layout.LogDirectory) 0;return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Completed $null $null}
+            catch{return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Failed 'CCOD_TRAY_ACTION_FAILED' $null}
         }
-        'Uninstall' {
+        'ShowAbout' {
             try{
-                $receipt=Invoke-CcodSupervisorAdapter $Adapters.StartUninstall @($HostState.Layout.InstallRoot,$HostState.Layout.RuntimeRoot,$HostState.Layout.PowerShellPath) 1
-                if(-not (Test-CcodSupervisorUninstallReceipt $receipt)){throw 'uninstall receipt is invalid'}
-            }catch{
-                Write-CcodSupervisorUiFailure $HostState $Adapters 'UninstallStart' 'CCOD_UNINSTALL_START_FAILED'
-                try{Invoke-CcodSupervisorAdapter $Adapters.ShowTrayError @($HostState.Tray,$HostState.UiCatalog,'Error.UninstallStart') 0}catch{Write-CcodSupervisorUiFailure $HostState $Adapters 'ErrorDialog' 'CCOD_UI_ERROR_DIALOG_FAILED'}
-            }
-            return
+                $about=Invoke-CcodSupervisorAdapter $Adapters.VerifyActiveRuntimeForAbout @($HostState.Layout.InstallRoot,$HostState.Layout.RuntimeId) 1
+                if(-not(Test-CcodSupervisorExactProperties $about @('RuntimeId','Version'))-or$about.RuntimeId-cne$HostState.Layout.RuntimeId-or$about.Version-isnot[string]-or$about.Version-cnotmatch'^\d+\.\d+\.\d+$'){throw 'about runtime is invalid'}
+                Set-CcodSupervisorCurrentTrayPresentation $HostState $Adapters $null -WaitForAcknowledgement
+                return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Completed $null $null
+            }catch{return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Failed 'CCOD_TRAY_ACTION_FAILED' $null}
         }
+        default {return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_TRAY_ACTION_UNAVAILABLE' $null}
     }
 }
 
@@ -1276,7 +1287,7 @@ function Invoke-CcodSupervisorTick {
         if(-not (Test-CcodSupervisorExactProperties $dequeued @('Succeeded','Value')) -or $dequeued.Succeeded -isnot [bool]){throw 'command queue receipt is invalid'}
         if($dequeued.Succeeded){
             $forceBefore=[bool]$HostState.ForceReconcile
-            Invoke-CcodSupervisorCommand $HostState $Adapters $dequeued.Value
+            [void](Invoke-CcodSupervisorCommand $HostState $Adapters $dequeued.Value)
             if(-not $forceBefore -and $HostState.ForceReconcile){$HostState.ObservationDirty=$true}
         }
         return
@@ -1318,7 +1329,7 @@ function Invoke-CcodSupervisorTick {
     if(-not (Test-CcodSupervisorExactProperties $dequeued @('Succeeded','Value')) -or $dequeued.Succeeded -isnot [bool]){throw 'command queue receipt is invalid'}
     if($dequeued.Succeeded){
         $forceBefore=[bool]$HostState.ForceReconcile
-        Invoke-CcodSupervisorCommand $HostState $Adapters $dequeued.Value
+        [void](Invoke-CcodSupervisorCommand $HostState $Adapters $dequeued.Value)
         if(-not $forceBefore -and $HostState.ForceReconcile){$HostState.ObservationDirty=$true}
         return
     }
