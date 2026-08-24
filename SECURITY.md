@@ -33,17 +33,18 @@ The persistent tray supervisor is installed per current user, not per machine:
   session and is available to same-user processes. The main-process Inspector
   is limited to the startup window and must close with an explicit
   `ECONNREFUSED` check.
-- Damaged or missing state disables automation and quarantines the evidence;
-  the user must explicitly run the installer's `-RepairState` and re-enable
-  automation and candidate-compatible updates from the tray.
-- A compatible first-seen package is tried at most once and only with both
-  consent switches enabled. Unknown, incompatible, or native-module builds
-  stay ordinary and are never stopped or reopened.
-- Default uninstall normalizes a validated special session back to an ordinary
-  session, verifies both debugger ports are closed, and only then removes the
-  task, tray, runtime, state, and logs. Explicit
-  `-KeepCurrentSpecialSession` leaves the unmonitored renderer CDP open and
-  prints that warning.
+- Lifecycle work is fenced by the active runtime generation and lease epoch.
+  The supervisor also binds safe-exit and recovery records to a trusted token
+  `AuthenticationId` (LUID), SID, and Windows session ID; PID or thread
+  identity alone is never enough to authorize a lifecycle action.
+- The tray exposes only status, one repair action, language, logs, About, and
+  safe Exit. Exit writes a protected intent for the current logon and may
+  restore Codex to ordinary mode before protection stops.
+- The tray has no uninstall command. Use Windows Settings → Apps → Installed
+  apps or the installed `unins000.exe`. Both routes invoke the same external,
+  fail-closed bootstrap. It verifies the runtime manifest, generation, epoch,
+  SID, and session, then writes a protected receipt before Inno may remove
+  app-owned files. A failed proof leaves those files in place.
 
 ## Device-key storage
 
@@ -58,10 +59,9 @@ The persistent tray supervisor is installed per current user, not per machine:
   store. Public-key reads do not normally need the private material.
 - The compatibility value sent to Codex is `os_protected_nonextractable`, but
   this JavaScript fallback is not equivalent to a hardware-backed TPM key.
-- Uninstall preserves the encrypted store by default. `-BackupDeviceKeyStore`
-  moves it to a timestamped sibling file; `-RemoveDeviceKeyStore` deletes it.
-  Both parameters are mutually exclusive, and neither revokes server-side
-  authorization: revoke the device in Codex first.
+- The external uninstall flow leaves the encrypted store in place. It has no
+  key backup, export, or removal switch, and it does not alter server-side
+  authorization. Revoke the device in Codex first when revocation is intended.
 
 ## Safer operating practice
 

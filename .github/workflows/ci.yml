@@ -34,6 +34,14 @@ jobs:
         shell: pwsh
         run: npm test
 
+      - name: Run deterministic installed lifecycle harness tests
+        shell: pwsh
+        run: npm run test:installed-lifecycle
+
+      - name: Run release contract tests
+        shell: pwsh
+        run: npm run test:release-contract
+
       - name: Run TrayHost protocol self-test
         shell: pwsh
         run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProtocolOnly

@@ -104,7 +104,6 @@ function New-CcodTrayFakeAdapters {
             $state.IconClones.Add($icon);$icon
         }.GetNewClosure()
         ShowErrorDialog={param($Title,$Message)$state.Dialogs.Add([pscustomobject][ordered]@{Title=$Title;Message=$Message})}.GetNewClosure()
-        ConfirmUninstall={param($Title,$Message)$true}
         EndMenu={$state.MenuEndCount++;$state.Calls.Add('Menu:End')}.GetNewClosure()
         DestroyIcon={param($Hicon)$state.Calls.Add("DestroyIcon:$([long]$Hicon)")}.GetNewClosure()
         DisposeIconResource={param($Resource)if($Resource.PSObject.Properties['Kind']){$state.Calls.Add("DisposeResource:$($Resource.Kind):$($Resource.Name)")}else{$state.Calls.Add("DisposeIcon:$($Resource.Color):$($Resource.Size)")};$Resource.Disposed=$true;$Resource.DisposeCount++}.GetNewClosure()
@@ -138,7 +137,7 @@ function New-CcodValidPresentation {
     [pscustomobject][ordered]@{
         Color='Green';StateKey='Active';SessionReadyVisible=$true;ApplyNowVisible=$false;ApplyNowEnabled=$false;ManualRetryVisible=$false;ManualRetryEnabled=$false
         AutomationToggleEnabled=$true;AutomationChecked=$true
-        CandidateOptInToggleEnabled=$true;CandidateOptInChecked=$false;OpenLogsEnabled=$true;UninstallEnabled=$true;Busy=$false
+        CandidateOptInToggleEnabled=$true;CandidateOptInChecked=$false;OpenLogsEnabled=$true;Busy=$false
     }
 }
 
@@ -239,6 +238,13 @@ $results.Add((Invoke-CcodTest 'exports exactly the six frozen TrayUi functions' 
     Assert-CcodEqual $expected $actual 'public export surface remains exact'
 }))
 
+$results.Add((Invoke-CcodTest 'removes the uninstall adapter and native menu command surface' {
+    $defaults=& (Get-Module TrayUi) { Get-CcodTrayDefaultAdapters }
+    Assert-CcodTrue (-not $defaults.ContainsKey('ConfirmUninstall')) 'default adapter set has no uninstall confirmation callback'
+    $source=[IO.File]::ReadAllText($modulePath)
+    Assert-CcodTrue ($source -notmatch '(?i)uninstall|1009') 'TrayUi source has no uninstall text or command id'
+}))
+
 $results.Add((Invoke-CcodTest 'cold Windows PowerShell STA binds one persistent ContextMenu and supports two Popup Collapse lifecycles without MouseUp dispatch' {
     $escapedModulePath=$modulePath.Replace("'","''")
     $escapedLocalizationPath=$localizationPath.Replace("'","''")
@@ -250,7 +256,7 @@ Import-Module '$escapedModulePath' -Force
 `$catalog=Get-CcodUiCatalog -ResourcesRoot '$escapedResourcesRoot' -LanguageMode en-US -SystemCultureName en-US
 `$presentation=[pscustomobject][ordered]@{
     Color='Green';StateKey='Active';SessionReadyVisible=`$true;ApplyNowVisible=`$false;ApplyNowEnabled=`$false;ManualRetryVisible=`$false;ManualRetryEnabled=`$false
-    AutomationToggleEnabled=`$true;AutomationChecked=`$true;CandidateOptInToggleEnabled=`$true;CandidateOptInChecked=`$false;OpenLogsEnabled=`$true;UninstallEnabled=`$true;Busy=`$false
+    AutomationToggleEnabled=`$true;AutomationChecked=`$true;CandidateOptInToggleEnabled=`$true;CandidateOptInChecked=`$false;OpenLogsEnabled=`$true;Busy=`$false
 }
 `$context=`$null
 try {
@@ -295,7 +301,7 @@ $results.Add((Invoke-CcodTest 'prebuilds one bilingual ContextMenu graph, defers
         $context=New-CcodTrayContext -CommandQueue $queue -OnTick {} -Adapters $fake.Adapters
         Assert-CcodEqual 'ContextMenu' $context.Menu.Kind 'one persistent legacy ContextMenu is constructed'
         Assert-CcodTrue ([object]::ReferenceEquals($context.Menu,$context.NotifyIcon.Properties.ContextMenu)) 'NotifyIcon is bound before it is visible'
-        Assert-CcodEqual 'Title,Status,SessionReady,ApplyNow,ManualRetry,Automation,CandidateOptIn,Language,OpenLogs,Uninstall' (@($context.Items.Keys)-join ',') 'complete top-level menu graph is prebuilt in system order'
+        Assert-CcodEqual 'Title,Status,SessionReady,ApplyNow,ManualRetry,Automation,CandidateOptIn,Language,OpenLogs' (@($context.Items.Keys)-join ',') 'complete top-level menu graph is prebuilt in system order'
         Assert-CcodEqual 'System,Chinese,English' (@($context.LanguageItems.Keys)-join ',') 'complete language submenu is prebuilt'
         Assert-CcodEqual 'Popup,Collapse' (@($context.Callbacks|Where-Object {$_.EventName -in @('Popup','Collapse')}|ForEach-Object {$_.EventName}) -join ',') 'only ContextMenu lifecycle callbacks are attached to the menu'
         Assert-CcodTrue (@($context.Callbacks|Where-Object {$_.EventName -eq 'MouseUp'}).Count -eq 0) 'automatic tray menu path never attaches MouseUp'

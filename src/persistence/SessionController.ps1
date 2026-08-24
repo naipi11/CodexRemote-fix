@@ -233,7 +233,12 @@ function Test-CcodControllerExactArguments([object[]]$Actual,[object[]]$Expected
 }
 
 function Test-CcodLegacyWrapperTail {
-    param([ValidateSet('start','reset','uninstall')][string]$Prefix,[object[]]$Arguments,[string]$InstallRoot)
+    param([ValidateSet('start','reset','uninstall')][string]$Prefix,[object[]]$Arguments,[string]$InstallRoot,[string]$InstallerRoot)
+    if($Prefix -ceq 'uninstall'){
+        return $Arguments.Count -eq 6 -and $Arguments[0] -ceq '-InstallerRoot' -and (Test-CcodControllerPathEqual $Arguments[1] $InstallerRoot) -and
+               $Arguments[2] -ceq '-InstallRoot' -and (Test-CcodControllerPathEqual $Arguments[3] $InstallRoot) -and
+               $Arguments[4] -ceq '-Mode' -and $Arguments[5] -ceq 'Prepare'
+    }
     $seen=@{}
     for($index=0;$index -lt $Arguments.Count;$index++){
         $argument=$Arguments[$index]
@@ -250,12 +255,6 @@ function Test-CcodLegacyWrapperTail {
             }
             'reset' {
                 if(@('-BackupDeviceKeyStore','-DoNotRestart') -cnotcontains $argument){return $false}
-            }
-            'uninstall' {
-                if(@('-KeepCurrentSpecialSession','-BackupDeviceKeyStore','-RemoveDeviceKeyStore','-Confirm:$false') -ccontains $argument){continue}
-                if($argument -cne '-InstallRoot' -or $index+1 -ge $Arguments.Count){return $false}
-                $value=$Arguments[++$index]
-                if(-not (Test-CcodControllerPathEqual $value $InstallRoot)){return $false}
             }
         }
     }
@@ -301,10 +300,10 @@ function Test-CcodLegacyRecoverProvenance {
 
         if($null -eq $RuntimeContext -or $RuntimeContext.RuntimeRoot -isnot [string] -or $RuntimeContext.InstallRoot -isnot [string] -or $RuntimeContext.ControllerPath -isnot [string] -or
             $null -eq $RuntimeContext.Manifest -or $null -eq $RuntimeContext.Manifest.PSObject.Properties['files']){return $false}
-        $wrapperLeaf=switch($prefix){'start'{'Start-CodexControlOtherDevices.ps1'}'reset'{'Reset-CodexControlOtherDevices.ps1'}'uninstall'{'Uninstall-CodexControlOtherDevices.ps1'}}
+        $wrapperLeaf=switch($prefix){'start'{'Start-CodexControlOtherDevices.ps1'}'reset'{'Reset-CodexControlOtherDevices.ps1'}'uninstall'{'src/persistence/UninstallBootstrap.ps1'}}
         $manifestMatches=@($RuntimeContext.Manifest.files|Where-Object{$null -ne $_ -and $null -ne $_.PSObject.Properties['path'] -and $_.path -is [string] -and $_.path -ceq $wrapperLeaf})
         if($manifestMatches.Count -ne 1){return $false}
-        $wrapperPath=[IO.Path]::GetFullPath((Join-Path $RuntimeContext.RuntimeRoot $wrapperLeaf))
+        $wrapperPath=if($prefix -ceq 'uninstall'){$null}else{[IO.Path]::GetFullPath((Join-Path $RuntimeContext.RuntimeRoot $wrapperLeaf))}
         $expectedController=[IO.Path]::GetFullPath((Join-Path $RuntimeContext.RuntimeRoot 'src\persistence\SessionController.ps1'))
         if(-not (Test-CcodControllerPathEqual $RuntimeContext.ControllerPath $expectedController)){return $false}
 
@@ -325,16 +324,17 @@ function Test-CcodLegacyRecoverProvenance {
         if(-not (Test-CcodControllerExactArguments $childArguments $expectedChild @(0,5,7,9))){return $false}
         $parentArguments=@(& $Adapter.ParseProcessCommandLine $parent.CommandLine)
         if($parentArguments.Count -lt 6){return $false}
-        if(-not (Test-CcodControllerPathEqual $parentArguments[5] $wrapperPath)){
-            $stableUninstaller=[IO.Path]::GetFullPath((Join-Path $RuntimeContext.InstallRoot 'Uninstall-CodexControlOtherDevices.ps1'))
-            if($prefix -cne 'uninstall' -or -not (Test-CcodControllerPathEqual $parentArguments[5] $stableUninstaller) -or
-                $null -eq $manifestMatches[0].PSObject.Properties['sha256'] -or $manifestMatches[0].sha256 -isnot [string] -or
-                -not (& $Adapter.TestLegacyFileSafe $stableUninstaller) -or (& $Adapter.GetFileSha256 $stableUninstaller) -cne $manifestMatches[0].sha256){return $false}
-            $wrapperPath=$stableUninstaller
-        }
+        $installerRoot=$null
+        if($prefix -ceq 'uninstall'){
+            try{$wrapperPath=[IO.Path]::GetFullPath([string]$parentArguments[5]);$installerRoot=[IO.Path]::GetFullPath((Split-Path (Split-Path (Split-Path $wrapperPath -Parent) -Parent) -Parent))}catch{return $false}
+            $expectedBootstrap=[IO.Path]::GetFullPath((Join-Path $installerRoot 'src\persistence\UninstallBootstrap.ps1'))
+            if(-not (Test-CcodControllerPathEqual $wrapperPath $expectedBootstrap) -or
+               $null -eq $manifestMatches[0].PSObject.Properties['sha256'] -or $manifestMatches[0].sha256 -isnot [string] -or $manifestMatches[0].sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+               -not (& $Adapter.TestLegacyFileSafe $wrapperPath) -or (& $Adapter.GetFileSha256 $wrapperPath) -cne $manifestMatches[0].sha256){return $false}
+        }elseif(-not (Test-CcodControllerPathEqual $parentArguments[5] $wrapperPath)){return $false}
         $expectedParent=@($approvedPowerShell,'-NoProfile','-ExecutionPolicy','Bypass','-File',$wrapperPath)
         if(-not (Test-CcodControllerExactArguments @($parentArguments|Select-Object -First 6) $expectedParent @(0,5)) -or
-            -not (Test-CcodLegacyWrapperTail -Prefix $prefix -Arguments @($parentArguments|Select-Object -Skip 6) -InstallRoot $RuntimeContext.InstallRoot) -or
+            -not (Test-CcodLegacyWrapperTail -Prefix $prefix -Arguments @($parentArguments|Select-Object -Skip 6) -InstallRoot $RuntimeContext.InstallRoot -InstallerRoot $installerRoot) -or
             -not (Test-CcodLegacyRequestSemantics -Request $Request -Prefix $prefix -Arguments @($parentArguments|Select-Object -Skip 6))){return $false}
         return $true
     }catch{return $false}

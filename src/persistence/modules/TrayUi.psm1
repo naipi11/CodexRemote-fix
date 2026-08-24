@@ -7,7 +7,7 @@ $script:TrayWinFormsLoaded=$false
 $script:TrayAdapterNames=@(
     'GetUtcNow','GetQueueCount','TryEnqueue','TryDequeue','GetManagedThreadId','GetApartmentState',
     'CreateUiObject','SetUiProperty','GetUiProperty','SetUiVisible','StartUiTimer','StopUiTimer',
-    'AttachUiCallback','DetachUiCallback','AddUiChild','DisposeUiObject','ExitUiContext','ShowErrorDialog','ConfirmUninstall','EndMenu',
+    'AttachUiCallback','DetachUiCallback','AddUiChild','DisposeUiObject','ExitUiContext','ShowErrorDialog','EndMenu',
     'CreateBitmap','DrawBridgeIcon','GetHicon','CloneIcon','DestroyIcon','DisposeIconResource',
     'NewSourceIdentifier','RegisterTrace','RegisterIntrinsic','CleanupWatcherAttempt','DetachWatcherCallback','UnregisterWatcher',
     'RemoveWatcherJob','DisposeWatcherResource'
@@ -16,8 +16,8 @@ $script:TrayUiLanguageModes=@('System','zh-CN','en-US')
 $script:TrayUiCatalogKeys=@(
     'Tray.Title','Status.Waiting','Status.Inspecting','Status.Transitioning','Status.Active','Status.ActivePaused','Status.Suppressed','Status.Recovered','Status.Error','Status.RendererHandoff',
     'Tooltip.Waiting','Tooltip.Inspecting','Tooltip.Transitioning','Tooltip.Active','Tooltip.ActivePaused','Tooltip.Suppressed','Tooltip.Recovered','Tooltip.Error',
-    'Menu.SessionReady','Menu.ApplyNow','Menu.ManualRetry','Menu.Automation','Menu.CandidateOptIn','Menu.Language','Menu.FollowSystem','Menu.Chinese','Menu.English','Menu.OpenLogs','Menu.About','Menu.AboutVersion','Menu.Uninstall',
-    'Dialog.UninstallTitle','Dialog.UninstallMessage','Error.UninstallStart','Error.LanguageChange'
+    'Menu.SessionReady','Menu.ApplyNow','Menu.ManualRetry','Menu.Automation','Menu.CandidateOptIn','Menu.Language','Menu.FollowSystem','Menu.Chinese','Menu.English','Menu.OpenLogs','Menu.About','Menu.AboutVersion',
+    'Error.LanguageChange'
 )
 $script:TrayCleanupCodeAllowlist=@(
     'CCOD_TRAY_CLEANUP_ICON_HIDE_FAILED','CCOD_TRAY_CLEANUP_TIMER_STOP_FAILED','CCOD_TRAY_CLEANUP_TIMER_DISPOSE_FAILED',
@@ -101,8 +101,8 @@ function ConvertTo-CcodTrayLegacyCatalog {
             'Tray.Title'=$source.'Tray.Title'
             'Status.Waiting'=$source.'Connection.WaitingForCodex';'Status.Inspecting'=$source.'Connection.Checking';'Status.Transitioning'=$source.'Connection.Checking';'Status.Active'=$source.'Connection.Connected';'Status.ActivePaused'=$source.'Connection.Connected';'Status.Suppressed'=$source.'Connection.RepairNeeded';'Status.Recovered'=$source.'Connection.RepairNeeded';'Status.Error'=$source.'Connection.Error';'Status.RendererHandoff'=$source.'Connection.Error'
             'Tooltip.Waiting'=$source.'Connection.WaitingForCodex';'Tooltip.Inspecting'=$source.'Connection.Checking';'Tooltip.Transitioning'=$source.'Connection.Checking';'Tooltip.Active'=$source.'Connection.Connected';'Tooltip.ActivePaused'=$source.'Connection.Connected';'Tooltip.Suppressed'=$source.'Connection.RepairNeeded';'Tooltip.Recovered'=$source.'Connection.RepairNeeded';'Tooltip.Error'=$source.'Connection.Error'
-            'Menu.SessionReady'=$source.'Connection.Connected';'Menu.ApplyNow'=$source.'Menu.CheckAndRepair';'Menu.ManualRetry'=$source.'Menu.CheckAndRepair';'Menu.Automation'='Retired';'Menu.CandidateOptIn'='Retired';'Menu.Language'=$source.'Menu.Language';'Menu.FollowSystem'=$source.'Menu.FollowSystem';'Menu.Chinese'=$source.'Menu.Chinese';'Menu.English'=$source.'Menu.English';'Menu.OpenLogs'=$source.'Menu.OpenLogs';'Menu.About'=$source.'Menu.About';'Menu.AboutVersion'=$source.'Menu.AboutVersion';'Menu.Uninstall'=$source.'Menu.Exit'
-            'Dialog.UninstallTitle'=$source.'Dialog.ExitTitle';'Dialog.UninstallMessage'=$source.'Dialog.ExitMessage';'Error.UninstallStart'=$source.'Error.ActionFailed';'Error.LanguageChange'=$source.'Error.LanguageChange'
+            'Menu.SessionReady'=$source.'Connection.Connected';'Menu.ApplyNow'=$source.'Menu.CheckAndRepair';'Menu.ManualRetry'=$source.'Menu.CheckAndRepair';'Menu.Automation'='Retired';'Menu.CandidateOptIn'='Retired';'Menu.Language'=$source.'Menu.Language';'Menu.FollowSystem'=$source.'Menu.FollowSystem';'Menu.Chinese'=$source.'Menu.Chinese';'Menu.English'=$source.'Menu.English';'Menu.OpenLogs'=$source.'Menu.OpenLogs';'Menu.About'=$source.'Menu.About';'Menu.AboutVersion'=$source.'Menu.AboutVersion'
+            'Error.LanguageChange'=$source.'Error.LanguageChange'
         }
         return [pscustomobject][ordered]@{LanguageMode=$Catalog.LanguageMode;EffectiveLocale=$Catalog.EffectiveLocale;Strings=[pscustomobject]$legacy;UsedEmergencyCatalog=$Catalog.UsedEmergencyCatalog;ErrorCode=$Catalog.ErrorCode}
     }catch{return $Catalog}
@@ -168,24 +168,6 @@ function Invoke-CcodTraySideEffectAdapter {
     $succeeded=-not $capture.Threw -and $capture.Items.Count -eq 0
     foreach($item in $capture.Items){if(Test-CcodDiagnosticRecord $item){$succeeded=$false}}
     return [pscustomobject][ordered]@{Completed=[bool](-not $capture.Threw);Succeeded=[bool]$succeeded}
-}
-
-function Invoke-CcodTrayUninstallConfirmation {
-    param(
-        [Parameter(Mandatory)][string]$Title,[Parameter(Mandatory)][string]$Message,
-        [AllowNull()][scriptblock]$ShowDialog=$null
-    )
-    if($null -eq $ShowDialog){
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-        return [bool]([Windows.Forms.MessageBox]::Show(
-            $Message,$Title,
-            [Windows.Forms.MessageBoxButtons]::YesNo,
-            [Windows.Forms.MessageBoxIcon]::Warning,
-            [Windows.Forms.MessageBoxDefaultButton]::Button2
-        ) -eq [Windows.Forms.DialogResult]::Yes)
-    }
-    $result=& $ShowDialog $Message $Title ([Windows.Forms.MessageBoxButtons]::YesNo) ([Windows.Forms.MessageBoxIcon]::Warning) ([Windows.Forms.MessageBoxDefaultButton]::Button2)
-    return [bool]($result -eq [Windows.Forms.DialogResult]::Yes)
 }
 
 function Invoke-CcodOwnedTrayAdapter {
@@ -310,7 +292,6 @@ function Get-CcodTrayDefaultAdapters {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
         [Windows.Forms.MessageBox]::Show($Message,$Title,[Windows.Forms.MessageBoxButtons]::OK,[Windows.Forms.MessageBoxIcon]::Error)|Out-Null
     }
-    $defaults.ConfirmUninstall={param($Title,$Message)Invoke-CcodTrayUninstallConfirmation -Title $Title -Message $Message}
     $defaults.EndMenu={
         Initialize-CcodTrayNativeMethodsV3
         if(-not [CcodTrayNativeMethodsV3]::EndMenu()){throw 'EndMenu failed'}
@@ -547,12 +528,9 @@ function Test-CcodContextObject {
             -not (Test-CcodTrayRenderState $Context.CurrentRender) -or
             -not (Test-CcodAdapterSet $Context.Adapters) -or $Context.Items -isnot [Collections.Specialized.OrderedDictionary] -or $Context.LanguageItems -isnot [Collections.Specialized.OrderedDictionary] -or $Context.Separators -isnot [Collections.Specialized.OrderedDictionary] -or $Context.Icons -isnot [Collections.Specialized.OrderedDictionary] -or $Context.Callbacks -isnot [Collections.Generic.List[object]] -or
            $Context.CleanupCodes -isnot [Collections.Generic.List[string]] -or
-            -not (Test-CcodOrderedKeys $Context.CommandValues @('AutomationChecked','CandidateOptInChecked','LanguageMode','UninstallTitle','UninstallMessage')) -or
+            -not (Test-CcodOrderedKeys $Context.CommandValues @('AutomationChecked','CandidateOptInChecked','LanguageMode')) -or
             $Context.CommandValues.AutomationChecked -isnot [bool] -or $Context.CommandValues.CandidateOptInChecked -isnot [bool] -or
             $Context.CommandValues.LanguageMode -isnot [string] -or $script:TrayUiLanguageModes -cnotcontains $Context.CommandValues.LanguageMode -or
-           $Context.CommandValues.UninstallTitle -isnot [string] -or $Context.CommandValues.UninstallTitle.Length -lt 1 -or $Context.CommandValues.UninstallTitle.Length -gt 300 -or
-           $Context.CommandValues.UninstallMessage -isnot [string] -or $Context.CommandValues.UninstallMessage.Length -lt 1 -or $Context.CommandValues.UninstallMessage.Length -gt 300 -or
-           (Test-CcodControlCharacter $Context.CommandValues.UninstallTitle) -or (Test-CcodControlCharacter $Context.CommandValues.UninstallMessage) -or
            -not (Test-CcodCleanupReceipt $Context.CloseReceipt 'Closed' $script:TrayCleanupCodeAllowlist)){return $false}
         if($Context.State -ceq 'Closed'){
             if($null -ne $Context.OnTick -or $null -eq $Context.CloseReceipt -or $Context.MenuOpen -or $null -ne $Context.PendingRender){return $false}
@@ -667,11 +645,6 @@ function Invoke-CcodTrayNativeCommandId {
             1006 {$kind='SetUiLanguage';$value='zh-CN'}
             1007 {$kind='SetUiLanguage';$value='en-US'}
             1008 {$kind='OpenLogs'}
-            1009 {
-                $kind='Uninstall'
-                $confirmed=Invoke-CcodTrayAdapter $Context.Adapters.ConfirmUninstall @($Context.CommandValues.UninstallTitle,$Context.CommandValues.UninstallMessage) 1 'CCOD_TRAY_CREATE_FAILED' 'Tray'
-                if($confirmed -isnot [bool] -or -not $confirmed){return}
-            }
             default {return}
         }
         $timestamp=Get-CcodCanonicalUtc $Context.Adapters 'CCOD_TRAY_CREATE_FAILED' 'Tray'
@@ -767,8 +740,6 @@ function New-CcodTrayNativeMenuSpec {
     )
     $items.Add((New-CcodTrayNativeMenuItem -CommandId 0 -Text $strings['Menu.Language'] -Enabled $true -Children $languageItems))
     $items.Add((New-CcodTrayNativeMenuItem -CommandId 1008 -Text $strings['Menu.OpenLogs'] -Enabled $presentation.OpenLogsEnabled))
-    $items.Add((New-CcodTrayNativeMenuItem -CommandId 0 -Text '' -Separator $true))
-    $items.Add((New-CcodTrayNativeMenuItem -CommandId 1009 -Text $strings['Menu.Uninstall'] -Enabled $presentation.UninstallEnabled))
     Write-Output -NoEnumerate ([object[]]$items.ToArray())
 }
 
@@ -806,7 +777,6 @@ function Update-CcodTrayContextMenu {
     Set-CcodTrayMenuItem $Context $language.Chinese $strings['Menu.Chinese'] $true $true ($Render.LanguageMode -ceq 'zh-CN') $true
     Set-CcodTrayMenuItem $Context $language.English $strings['Menu.English'] $true $true ($Render.LanguageMode -ceq 'en-US') $true
     Set-CcodTrayMenuItem $Context $items.OpenLogs $strings['Menu.OpenLogs'] $presentation.OpenLogsEnabled $true
-    Set-CcodTrayMenuItem $Context $items.Uninstall $strings['Menu.Uninstall'] $presentation.UninstallEnabled $true
     foreach($separator in @($Context.Separators.Values)){
         Set-CcodTrayMenuItem $Context $separator '-' $false $true
     }
@@ -823,8 +793,6 @@ function Invoke-CcodTrayRenderWrite {
     $Context.CommandValues.AutomationChecked=[bool]$presentation.AutomationChecked
     $Context.CommandValues.CandidateOptInChecked=[bool]$presentation.CandidateOptInChecked
     $Context.CommandValues.LanguageMode=$Render.LanguageMode
-    $Context.CommandValues.UninstallTitle=$Render.Localized['Dialog.UninstallTitle']
-    $Context.CommandValues.UninstallMessage=$Render.Localized['Dialog.UninstallMessage']
     $Context.CurrentRender=$Render
     $Context.LastAppliedFingerprint=$Render.Fingerprint
 }
@@ -855,7 +823,6 @@ function New-CcodTrayContext {
         Callbacks=[Collections.Generic.List[object]]::new();CommandValues=[ordered]@{
             AutomationChecked=$false;CandidateOptInChecked=$false
             LanguageMode=$LanguageMode
-            UninstallTitle=$localized['Dialog.UninstallTitle'];UninstallMessage=$localized['Dialog.UninstallMessage']
         }
         CleanupCodes=[Collections.Generic.List[string]]::new();CloseReceipt=$null
     }
@@ -880,8 +847,6 @@ function New-CcodTrayContext {
         $context.LanguageItems['Chinese']=New-CcodTrayMenuItem $context 'LanguageChinese' $context.Items['Language']
         $context.LanguageItems['English']=New-CcodTrayMenuItem $context 'LanguageEnglish' $context.Items['Language']
         $context.Items['OpenLogs']=New-CcodTrayMenuItem $context 'OpenLogs' $context.Menu
-        $context.Separators['BeforeUninstall']=New-CcodTrayMenuItem $context 'BeforeUninstall' $context.Menu '-'
-        $context.Items['Uninstall']=New-CcodTrayMenuItem $context 'Uninstall' $context.Menu
         foreach($color in @('Gray','Green','Yellow','Red')){
             foreach($size in @(16,32)){
                 $bitmap=$null;$hicon=[IntPtr]::Zero
@@ -903,7 +868,7 @@ function New-CcodTrayContext {
         }
         $initialPresentation=[pscustomobject][ordered]@{
             Color='Gray';StateKey='Waiting';SessionReadyVisible=$false;ApplyNowVisible=$false;ApplyNowEnabled=$false;ManualRetryVisible=$false;ManualRetryEnabled=$false
-            AutomationToggleEnabled=$false;AutomationChecked=$false;CandidateOptInToggleEnabled=$false;CandidateOptInChecked=$false;OpenLogsEnabled=$false;UninstallEnabled=$false;Busy=$false
+            AutomationToggleEnabled=$false;AutomationChecked=$false;CandidateOptInToggleEnabled=$false;CandidateOptInChecked=$false;OpenLogsEnabled=$false;Busy=$false
         }
         $initialRender=New-CcodTrayRenderState $initialPresentation $localized $LanguageMode $SystemCultureName
         Invoke-CcodTrayRenderWrite $context $initialRender 'CCOD_TRAY_CREATE_FAILED'
@@ -940,7 +905,7 @@ function New-CcodTrayContext {
             $attachment=Invoke-CcodOwnedTrayAdapter $adapter.AttachUiCallback @($context.Menu,$binding[0],$binding[1]) $adapter.DetachUiCallback $validMenuAttachment 'CCOD_TRAY_CREATE_FAILED' 'Tray'
             $context.Callbacks.Add($attachment)
         }
-        $commandMap=[ordered]@{ApplyNow=1001;ManualRetry=1002;Automation=1003;CandidateOptIn=1004;System=1005;Chinese=1006;English=1007;OpenLogs=1008;Uninstall=1009}
+        $commandMap=[ordered]@{ApplyNow=1001;ManualRetry=1002;Automation=1003;CandidateOptIn=1004;System=1005;Chinese=1006;English=1007;OpenLogs=1008}
         foreach($key in @($commandMap.Keys)){
             $commandId=[int]$commandMap[$key]
             $click={
@@ -1056,11 +1021,11 @@ function Test-CcodControlCharacter {
 
 function Assert-CcodTrayPresentation {
     param($Presentation)
-    $names=@('Color','StateKey','SessionReadyVisible','ApplyNowVisible','ApplyNowEnabled','ManualRetryVisible','ManualRetryEnabled','AutomationToggleEnabled','AutomationChecked','CandidateOptInToggleEnabled','CandidateOptInChecked','OpenLogsEnabled','UninstallEnabled','Busy')
+    $names=@('Color','StateKey','SessionReadyVisible','ApplyNowVisible','ApplyNowEnabled','ManualRetryVisible','ManualRetryEnabled','AutomationToggleEnabled','AutomationChecked','CandidateOptInToggleEnabled','CandidateOptInChecked','OpenLogsEnabled','Busy')
     if(-not (Test-CcodExactProperties $Presentation $names)){Throw-CcodTrayError 'CCOD_TRAY_INPUT_INVALID' 'Tray'}
     if($Presentation.Color -isnot [string] -or @('Gray','Green','Yellow','Red') -cnotcontains $Presentation.Color){Throw-CcodTrayError 'CCOD_TRAY_INPUT_INVALID' 'Tray'}
     if($Presentation.StateKey -isnot [string] -or @('Waiting','Inspecting','Transitioning','Active','ActivePaused','RendererHandoff','Suppressed','Recovered','Error') -cnotcontains $Presentation.StateKey){Throw-CcodTrayError 'CCOD_TRAY_INPUT_INVALID' 'Tray'}
-    foreach($name in $names[2..13]){if($Presentation.$name -isnot [bool]){Throw-CcodTrayError 'CCOD_TRAY_INPUT_INVALID' 'Tray'}}
+    foreach($name in $names[2..12]){if($Presentation.$name -isnot [bool]){Throw-CcodTrayError 'CCOD_TRAY_INPUT_INVALID' 'Tray'}}
 }
 
 function ConvertTo-CcodTrayLegacyPresentation {
@@ -1073,7 +1038,7 @@ function ConvertTo-CcodTrayLegacyPresentation {
         $state=switch($Presentation.ConnectionState){'WaitingForCodex'{'Waiting'}'Checking'{'Inspecting'}'Connected'{'Active'}'RepairNeeded'{'Suppressed'}default{'Error'}}
         return [pscustomobject][ordered]@{
             Color=$Presentation.Color;StateKey=$state;SessionReadyVisible=[bool]($Presentation.ConnectionState-ceq'Connected');ApplyNowVisible=[bool]($Presentation.ConnectionState-ceq'RepairNeeded');ApplyNowEnabled=[bool]$Presentation.RepairEnabled;ManualRetryVisible=[bool]($Presentation.ConnectionState-in@('RepairNeeded','Error'));ManualRetryEnabled=[bool]$Presentation.RepairEnabled
-            AutomationToggleEnabled=$false;AutomationChecked=$false;CandidateOptInToggleEnabled=$false;CandidateOptInChecked=$false;OpenLogsEnabled=[bool]$Presentation.OpenLogsEnabled;UninstallEnabled=[bool]$Presentation.ExitEnabled;Busy=[bool]$Presentation.Busy
+            AutomationToggleEnabled=$false;AutomationChecked=$false;CandidateOptInToggleEnabled=$false;CandidateOptInChecked=$false;OpenLogsEnabled=[bool]$Presentation.OpenLogsEnabled;Busy=[bool]$Presentation.Busy
         }
     }catch{return $Presentation}
 }
@@ -1114,7 +1079,7 @@ function Show-CcodTrayError {
         [Parameter(Mandatory)][AllowNull()]$Context,[Parameter(Mandatory)][AllowNull()]$Catalog,
         [Parameter(Mandatory)][AllowNull()]$Key
     )
-    if(-not (Test-CcodContextObject $Context) -or $Key -isnot [string] -or @('Error.LanguageChange','Error.UninstallStart') -cnotcontains $Key -or
+    if(-not (Test-CcodContextObject $Context) -or $Key -isnot [string] -or @('Error.LanguageChange') -cnotcontains $Key -or
        -not (Test-CcodTrayCatalog $Catalog)){Throw-CcodTrayError 'CCOD_TRAY_INPUT_INVALID' 'Tray'}
     $queueGate=$Context.QueueGate
     try{[Threading.Monitor]::Enter($queueGate)}catch{Throw-CcodTrayError 'CCOD_TRAY_INPUT_INVALID' 'Tray'}

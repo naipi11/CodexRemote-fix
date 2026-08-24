@@ -13,7 +13,7 @@ $script:CcodSupervisorAdapterNames=@(
     'EnterLease','ExitLease','OpenReadyEvent','OpenShutdownEvent','IsEventSignaled','SignalEvent','CloseEvent',
     'ReadActiveRuntime','GetTrustedLogonIdentity','WriteSafeExitIntent','ClearSafeExitIntent','EnterLifecycleOwnership','AssertLifecycleFence','SuspendLifecycleOwnership','ResumeLifecycleOwnership','ExitLifecycleOwnership','OpenLifecycleWakeEvent','ResetLifecycleWakeEvent',
     'ReadLifecycleRequest','ReceiveLifecycleSubmissions','WriteLifecycleSubmissionReceipt','NewLifecycleRequest','WriteLifecycleRequest','MoveLifecyclePhase','CompleteLifecycleRequest','GetLifecycleStep','ReduceLifecycleWorkerResult','NewLifecycleWorkerRequest','AssertLifecycleWorkerResult',
-    'ReadState','ReadJournal','ReadUiPreference','SetUiLanguageMode','GetSystemCultureName','GetUiCatalog','ShowTrayError','StartUninstall','EnumerateProcessIds','GetProcessSnapshot','ParseStaleCandidateCommandLine','GetPackageIdentity','GetSupervisorDecision','AddObservedEvent','CompleteControllerRun','HandoffRenderer','GetTrayPresentation',
+    'ReadState','ReadJournal','ReadUiPreference','SetUiLanguageMode','GetSystemCultureName','GetUiCatalog','ShowTrayError','EnumerateProcessIds','GetProcessSnapshot','ParseStaleCandidateCommandLine','GetPackageIdentity','GetSupervisorDecision','AddObservedEvent','CompleteControllerRun','HandoffRenderer','GetTrayPresentation',
     'NewQueue','GetQueueCount','TryDequeue','NewTray','SetTrayPresentation','SendTrayActionResult','VerifyActiveRuntimeForAbout','StopTrayTimer','RequestUiExit','CloseTray','NewWatcher','StopWatcher',
     'GetWorkerLeafState','WriteWorkerRequest','StartWorker','PollWorker','ReadWorkerResult','WaitWorker','GetWorkerIdentity','TerminateWorker','DisposeWorker','DeleteWorkerFile',
     'ClearFailedAttempt','SetAutomationEnabled','SetCandidateOptIn','OpenLogs','WriteLog','RunUiContext'
@@ -100,13 +100,6 @@ function Test-CcodSupervisorDiagnosticRecord {
         $Value -is [Management.Automation.InformationRecord]
 }
 
-function Test-CcodSupervisorUninstallReceipt {
-    param($Receipt)
-    return (Test-CcodSupervisorExactProperties $Receipt @('Started','Pid','CreationTimeUtc')) -and
-        $Receipt.Started -is [bool] -and $Receipt.Started -and $Receipt.Pid -is [int] -and $Receipt.Pid -gt 0 -and
-        (Test-CcodSupervisorCanonicalUtc $Receipt.CreationTimeUtc)
-}
-
 function Test-CcodSupervisorUiText {
     param($Value)
     if($Value -isnot [string] -or $Value.Length -lt 1 -or $Value.Length -gt 300){return $false}
@@ -187,7 +180,7 @@ function Invoke-CcodSupervisorNullableAdapter {
 function Import-CcodSupervisorModules {
     if($null -eq $script:CcodSupervisorScriptPath){throw 'supervisor script path is unavailable'}
     $moduleRoot=Join-Path (Split-Path $script:CcodSupervisorScriptPath -Parent) 'modules'
-    foreach($leaf in @('KernelObjects.psm1','PersistenceIO.psm1','RuntimeManifest.psm1','LifecycleEpoch.psm1','LifecycleTransaction.psm1','LifecycleCoordinator.psm1','LifecycleRequest.psm1','TrustedLogonIdentity.psm1','StateStore.psm1','TransitionJournal.psm1','ProcessControl.psm1','RendererIntegration.psm1','SupervisorEngine.psm1','UiLocalization.psm1','UiPreferences.psm1','TrayUi.psm1','TrayHostClient.psm1','UiActions.psm1','WorkerRuntime.psm1')){
+    foreach($leaf in @('KernelObjects.psm1','PersistenceIO.psm1','RuntimeManifest.psm1','LifecycleEpoch.psm1','LifecycleTransaction.psm1','LifecycleCoordinator.psm1','LifecycleRequest.psm1','TrustedLogonIdentity.psm1','StateStore.psm1','TransitionJournal.psm1','ProcessControl.psm1','RendererIntegration.psm1','SupervisorEngine.psm1','UiLocalization.psm1','UiPreferences.psm1','TrayUi.psm1','TrayHostClient.psm1','WorkerRuntime.psm1')){
         Import-Module -Name (Join-Path $moduleRoot $leaf) -Force -ErrorAction Stop
     }
     foreach($leaf in @('KernelObjects.psm1','LifecycleTransaction.psm1')){
@@ -283,7 +276,6 @@ function Get-CcodSupervisorDefaultAdapters {
     $defaults.GetSystemCultureName={[Globalization.CultureInfo]::CurrentUICulture.Name}
     $defaults.GetUiCatalog={param($ResourcesRoot,$LanguageMode,$SystemCultureName)Get-CcodUiCatalog -ResourcesRoot $ResourcesRoot -LanguageMode $LanguageMode -SystemCultureName $SystemCultureName}
     $defaults.ShowTrayError={param($Tray,$Catalog,$Key)if($null -ne $Tray -and $null -ne $Tray.PSObject.Properties['Client']){Show-CcodTrayHostError -Context $Tray -Catalog $Catalog -Key $Key}else{Show-CcodTrayError -Context $Tray -Catalog $Catalog -Key $Key}}
-    $defaults.StartUninstall={param($InstallRoot,$RuntimeRoot,$PowerShellPath)Start-CcodTrayUninstall -InstallRoot $InstallRoot -RuntimeRoot $RuntimeRoot -PowerShellPath $PowerShellPath}
     $defaults.EnumerateProcessIds={Get-CcodChatGptProcessIds}
     $defaults.GetProcessSnapshot={param($ProcessId,$StatusEvidence)Get-CcodProcessSnapshot -ProcessId $ProcessId -StatusEvidence $StatusEvidence}
     $defaults.ParseStaleCandidateCommandLine={
@@ -1004,7 +996,7 @@ function Get-CcodSupervisorResourcesRoot {
 }
 
 function Write-CcodSupervisorUiFailure {
-    param($HostState,[hashtable]$Adapters,[ValidateSet('LanguageChange','LanguagePreferenceRollback','LanguageTrayRollback','UninstallStart','ErrorDialog','TrayCallback')][string]$Stage,[string]$Code)
+    param($HostState,[hashtable]$Adapters,[ValidateSet('LanguageChange','LanguagePreferenceRollback','LanguageTrayRollback','ErrorDialog','TrayCallback')][string]$Stage,[string]$Code)
     try{
         $now=Invoke-CcodSupervisorAdapter $Adapters.GetUtcNow @() 1
         if($now -is [DateTimeOffset]){$timestamp=$now.UtcDateTime.ToString('o',[Globalization.CultureInfo]::InvariantCulture)}

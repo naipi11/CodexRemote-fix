@@ -256,10 +256,16 @@ try{
             param([string]$Prefix,[string]$WrapperLeaf,[string[]]$Tail,[bool]$RestartOrdinary,[int]$TimeoutMilliseconds)
             $variantRequest=New-CcodControllerRequest -Action Recover;$variantRequest.restartOrdinary=$RestartOrdinary;$variantRequest.timeoutMilliseconds=$TimeoutMilliseconds
             $variantRequestPath=[IO.Path]::GetFullPath((Join-Path $legacyRoot "$Prefix-$nonce-request.json"));$variantResultPath=[IO.Path]::GetFullPath((Join-Path $legacyRoot "$Prefix-$nonce-result.json"))
-            $variantWrapper=[IO.Path]::GetFullPath((Join-Path $runtimeRoot $WrapperLeaf))
-            $variantRuntime=[pscustomobject][ordered]@{InstallRoot=$runtimeContext.InstallRoot;RuntimeRoot=$runtimeRoot;RuntimeId='runtime-1';ControllerPath=$controller;Manifest=[pscustomobject][ordered]@{files=@([pscustomobject][ordered]@{path=$WrapperLeaf})}}
+            $installerRoot=$null;$manifestPath=$WrapperLeaf;$manifestRecord=[pscustomobject][ordered]@{path=$manifestPath}
+            if($Prefix -ceq 'uninstall'){
+                $installerRoot=[IO.Path]::GetFullPath((Join-Path $root 'installer'))
+                $variantWrapper=[IO.Path]::GetFullPath((Join-Path $installerRoot 'src\persistence\UninstallBootstrap.ps1'))
+                $manifestPath='src/persistence/UninstallBootstrap.ps1';$manifestRecord=[pscustomobject][ordered]@{path=$manifestPath;sha256=('a'*64)}
+            }else{$variantWrapper=[IO.Path]::GetFullPath((Join-Path $runtimeRoot $WrapperLeaf))}
+            $variantRuntime=[pscustomobject][ordered]@{InstallRoot=$runtimeContext.InstallRoot;RuntimeRoot=$runtimeRoot;RuntimeId='runtime-1';ControllerPath=$controller;Manifest=[pscustomobject][ordered]@{files=@($manifestRecord)}}
             $variantAdapters=$validAdapters.Clone();$tailValue=@($Tail);$powerShellValue=$powershell;$controllerValue=$controller
             $variantAdapters.ParseProcessCommandLine={param($CommandLine)if($CommandLine -ceq 'child'){@($powerShellValue,'-NoProfile','-ExecutionPolicy','Bypass','-File',$controllerValue,'-RequestPath',$variantRequestPath,'-ResultPath',$variantResultPath)}else{@($powerShellValue,'-NoProfile','-ExecutionPolicy','Bypass','-File',$variantWrapper)+$tailValue}}.GetNewClosure()
+            if($Prefix -ceq 'uninstall'){$variantAdapters.GetFileSha256={param($Path)('a'*64)}.GetNewClosure()}
             Test-CcodLegacyRecoverProvenance -Request $variantRequest -RequestPath $variantRequestPath -ResultPath $variantResultPath -RuntimeContext $variantRuntime -Adapter $variantAdapters
         }.GetNewClosure()
         Assert-CcodEqual $true (& $testVariant 'reset' 'Reset-CodexControlOtherDevices.ps1' @() $true 30000) 'default Reset maps exactly to restartOrdinary true'
@@ -268,8 +274,9 @@ try{
         Assert-CcodEqual $false (& $testVariant 'reset' 'Reset-CodexControlOtherDevices.ps1' @() $false 30000) 'default Reset cannot claim DoNotRestart semantics'
         Assert-CcodEqual $true (& $testVariant 'start' 'Start-CodexControlOtherDevices.ps1' @('-RestartCodex','-TimeoutSeconds','60') $true 60000) 'Start timeout and restart semantics correlate exactly'
         Assert-CcodEqual $false (& $testVariant 'start' 'Start-CodexControlOtherDevices.ps1' @('-RestartCodex','-TimeoutSeconds','60') $true 30000) 'Start timeout mismatch is rejected'
-        Assert-CcodEqual $true (& $testVariant 'uninstall' 'Uninstall-CodexControlOtherDevices.ps1' @('-InstallRoot',$runtimeContext.InstallRoot,'-Confirm:$false') $true 30000) 'Uninstall default normalization semantics correlate exactly'
-        Assert-CcodEqual $false (& $testVariant 'uninstall' 'Uninstall-CodexControlOtherDevices.ps1' @('-KeepCurrentSpecialSession') $true 30000) 'Uninstall KeepCurrentSpecialSession cannot dispatch Recover'
+        $installerRoot=[IO.Path]::GetFullPath((Join-Path $root 'installer'))
+        Assert-CcodEqual $true (& $testVariant 'uninstall' 'src/persistence/UninstallBootstrap.ps1' @('-InstallerRoot',$installerRoot,'-InstallRoot',$runtimeContext.InstallRoot,'-Mode','Prepare') $true 30000) 'manifest-bound uninstall bootstrap normalization semantics correlate exactly'
+        Assert-CcodEqual $false (& $testVariant 'uninstall' 'src/persistence/UninstallBootstrap.ps1' @('-KeepCurrentSpecialSession') $true 30000) 'removed uninstall options cannot dispatch Recover'
 
         $selfRequest=New-CcodControllerRequest -Action Recover;$selfRequest.supervisorIdentity.pid=700;$selfRequest.supervisorIdentity.creationTimeUtc=$current.CreationTimeUtc
         $forgeries=@(

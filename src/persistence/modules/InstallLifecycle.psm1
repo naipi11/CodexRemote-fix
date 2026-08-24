@@ -259,6 +259,7 @@ function Get-CcodLifecycleSourceFiles {
         'src\persistence\SessionController.ps1',
         'src\persistence\StaticProbeWorker.ps1',
         'src\persistence\LifecycleWorker.ps1',
+        'src\persistence\UninstallBootstrap.ps1',
         'Test-CodexControlOtherDevices.ps1',
         'Start-CodexControlOtherDevices.ps1',
         'Reset-CodexControlOtherDevices.ps1'
@@ -486,6 +487,28 @@ function Write-CcodLifecycleLog {
     }
 }
 
+function Test-CcodLifecycleCanonicalUtc {
+    param($Value)
+
+    $parsed = [DateTime]::MinValue
+    return $Value -is [string] -and
+        [DateTime]::TryParseExact($Value,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$parsed) -and
+        $parsed.Kind -eq [DateTimeKind]::Utc -and
+        $parsed.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture) -ceq $Value
+}
+
+function Test-CcodLifecycleSupervisorIdentityShape {
+    param($SupervisorIdentity,$CurrentIdentity)
+
+    return $null -ne $SupervisorIdentity -and $null -ne $CurrentIdentity -and
+        $SupervisorIdentity.Pid -is [int] -and $SupervisorIdentity.Pid -ge 1 -and
+        (Test-CcodLifecycleCanonicalUtc $SupervisorIdentity.CreationTimeUtc) -and
+        $SupervisorIdentity.SessionId -is [int] -and $CurrentIdentity.SessionId -is [int] -and
+        $SupervisorIdentity.SessionId -eq $CurrentIdentity.SessionId -and
+        $SupervisorIdentity.UserSid -is [string] -and $CurrentIdentity.UserSid -is [string] -and
+        $SupervisorIdentity.UserSid -ceq $CurrentIdentity.UserSid
+}
+
 function Get-CcodLifecycleSupervisorIdentity {
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
@@ -494,6 +517,7 @@ function Get-CcodLifecycleSupervisorIdentity {
     )
 
     $stateRoot = Join-Path $InstallRoot 'state'
+    $statusIdentity = $null
     if (Test-Path -LiteralPath (Join-Path $stateRoot 'status.json') -PathType Leaf) {
         try {
             $status = Read-CcodStatus -StateRoot $stateRoot
@@ -502,11 +526,11 @@ function Get-CcodLifecycleSupervisorIdentity {
         }
         if ($null -ne $status -and $null -ne $status.session -and
             $status.session.supervisorPid -is [int] -and $status.session.supervisorPid -ge 1 -and
-            $status.session.supervisorCreationTimeUtc -is [string] -and -not [string]::IsNullOrWhiteSpace($status.session.supervisorCreationTimeUtc) -and
+            (Test-CcodLifecycleCanonicalUtc $status.session.supervisorCreationTimeUtc) -and
             $status.session.sessionId -is [string]) {
             $sessionId = 0
-            if ([int]::TryParse($status.session.sessionId, [ref]$sessionId)) {
-                return [pscustomobject][ordered]@{
+            if ([int]::TryParse($status.session.sessionId, [ref]$sessionId) -and $sessionId -eq [int]$Identity.SessionId) {
+                $statusIdentity = [pscustomobject][ordered]@{
                     Pid = [int]$status.session.supervisorPid
                     CreationTimeUtc = [string]$status.session.supervisorCreationTimeUtc
                     SessionId = [int]$sessionId
@@ -515,7 +539,13 @@ function Get-CcodLifecycleSupervisorIdentity {
             }
         }
     }
-    return (& $Adapters.FindSupervisorFallback $InstallRoot $Identity)
+    if ($null -ne $statusIdentity) {
+        $statusVerified = & $Adapters.TestSupervisorIdentity $InstallRoot $statusIdentity $Identity
+        if ($statusVerified -is [bool] -and $statusVerified) { return $statusIdentity }
+    }
+    $fallback = & $Adapters.FindSupervisorFallback $InstallRoot $Identity
+    if (Test-CcodLifecycleSupervisorIdentityShape $fallback $Identity) { return $fallback }
+    return $null
 }
 
 function Get-CcodLifecycleVerifiedSupervisorFallback {
@@ -533,10 +563,10 @@ function Get-CcodLifecycleVerifiedSupervisorFallback {
         $bootstrapPath = [IO.Path]::GetFullPath((Join-Path $root 'bootstrap.ps1'))
         if (-not [IO.File]::Exists($bootstrapPath) -or (Test-CcodLifecycleReparse -Path $bootstrapPath)) { return $null }
         $runtimeRoot = Get-CcodLifecycleCanonicalRoot -Path (Join-Path $root 'runtime') -Kind 'Runtime root'
-        $runtimePrefix = $runtimeRoot.TrimEnd('\') + '\'
+        $runtimePrefix = $runtimeRoot.TrimEnd([char[]]@([char]92,[char]47)) + [IO.Path]::DirectorySeparatorChar
         $bootstrapFilePattern = '(?i)(?:^|\s)-File\s+"' + [regex]::Escape($bootstrapPath) + '"(?=\s|$)'
         $bootstrapRootPattern = '(?i)(?:^|\s)-InstallRoot\s+"' + [regex]::Escape($root) + '"(?=\s|$)'
-        $supervisorFilePattern = '(?i)(?:^|\s)-File\s+"(?<path>' + [regex]::Escape($runtimeRoot) + '\\[^"\\]+\\src\\persistence\\Supervisor\.ps1)"(?=\s|$)'
+        $supervisorFilePattern = '(?i)(?:^|\s)-File\s+"(?<path>' + [regex]::Escape($runtimePrefix) + '[^\\/\s"]+' + [regex]::Escape('\src\persistence\Supervisor.ps1') + ')"(?=\s|$)'
         $tokenPattern = '(?i)(?:^|\s)-ReadyToken\s+[0-9a-f]{64}(?=\s|$)'
         $processes = @(& $ProcessEnumerator)
         $byPid = @{}
@@ -585,6 +615,43 @@ function Get-CcodLifecycleVerifiedSupervisorFallback {
     }
 }
 
+function Test-CcodLifecycleVerifiedSupervisorAbsent {
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)]$Identity,
+        [Parameter(Mandatory)][scriptblock]$ProcessEnumerator
+    )
+
+    try {
+        if ($Identity.UserSid -isnot [string] -or [string]::IsNullOrWhiteSpace($Identity.UserSid) -or $Identity.SessionId -isnot [int] -or $Identity.SessionId -lt 0) {
+            return $false
+        }
+        $root = Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
+        $runtimeRoot = Get-CcodLifecycleCanonicalRoot -Path (Join-Path $root 'runtime') -Kind 'Runtime root'
+        $runtimePrefix = $runtimeRoot.TrimEnd([char[]]@([char]92,[char]47)) + [IO.Path]::DirectorySeparatorChar
+        $supervisorPathPattern = '(?i)' + [regex]::Escape($runtimePrefix) + '.+?' + [regex]::Escape('\src\persistence\Supervisor.ps1')
+        foreach ($process in @(& $ProcessEnumerator)) {
+            if ($null -eq $process -or $null -eq $process.PSObject.Properties['ProcessId'] -or
+                $null -eq $process.PSObject.Properties['SessionId'] -or $null -eq $process.PSObject.Properties['CommandLine']) {
+                return $false
+            }
+            $sessionId = 0
+            $processId = 0
+            if (-not [int]::TryParse([string]$process.SessionId,[ref]$sessionId) -or
+                -not [int]::TryParse([string]$process.ProcessId,[ref]$processId) -or $processId -lt 1) {
+                return $false
+            }
+            if ($sessionId -ne [int]$Identity.SessionId) { continue }
+            $commandLine = [string]$process.CommandLine
+            if ([string]::IsNullOrWhiteSpace($commandLine)) { return $false }
+            if ([regex]::IsMatch($commandLine,$supervisorPathPattern)) { return $false }
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Stop-CcodLifecycleSupervisor {
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
@@ -602,6 +669,64 @@ function Stop-CcodLifecycleSupervisor {
     $terminated = & $Adapters.TerminateSupervisor $Identity
     if ($terminated -isnot [bool] -or -not $terminated) { return $false }
     $forcedExit = & $Adapters.WaitSupervisorExit $Identity 5000
+    return ($forcedExit -is [bool] -and $forcedExit)
+}
+
+function Get-CcodLifecycleTrayHostIdentities {
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$RuntimeId,
+        [Parameter(Mandatory)]$Identity,
+        [Parameter(Mandatory)][hashtable]$Adapters
+    )
+
+    $candidates = @(& $Adapters.FindTrayHostIdentities $InstallRoot $RuntimeId $Identity)
+    $identities = [Collections.Generic.List[object]]::new()
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($candidate in $candidates) {
+        if ($null -eq $candidate -or $candidate.Pid -isnot [int] -or $candidate.Pid -lt 1 -or
+            $candidate.CreationTimeUtc -isnot [string] -or [string]::IsNullOrWhiteSpace($candidate.CreationTimeUtc) -or
+            $candidate.SessionId -isnot [int] -or $candidate.SessionId -ne [int]$Identity.SessionId -or
+            $candidate.UserSid -isnot [string] -or $candidate.UserSid -cne [string]$Identity.UserSid) {
+            Throw-CcodLifecycleError 'CCOD_UNINSTALL_PROTECTION_STOP_FAILED' 'A TrayHost process identity could not be proven' $candidate
+        }
+        $created = [DateTime]::MinValue
+        if (-not [DateTime]::TryParseExact($candidate.CreationTimeUtc,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$created) -or
+            $created.Kind -ne [DateTimeKind]::Utc -or $created.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture) -cne $candidate.CreationTimeUtc) {
+            Throw-CcodLifecycleError 'CCOD_UNINSTALL_PROTECTION_STOP_FAILED' 'A TrayHost process creation time could not be proven' $candidate
+        }
+        $key = ('{0}|{1}' -f $candidate.Pid,$candidate.CreationTimeUtc)
+        if (-not $seen.Add($key)) {
+            Throw-CcodLifecycleError 'CCOD_UNINSTALL_PROTECTION_STOP_FAILED' 'Duplicate TrayHost process identities are unsafe' $candidate
+        }
+        $identities.Add([pscustomobject][ordered]@{
+            Pid = [int]$candidate.Pid
+            CreationTimeUtc = [string]$candidate.CreationTimeUtc
+            SessionId = [int]$candidate.SessionId
+            UserSid = [string]$candidate.UserSid
+        })
+    }
+    if ($identities.Count -gt 1) {
+        Throw-CcodLifecycleError 'CCOD_UNINSTALL_PROTECTION_STOP_FAILED' 'More than one verified TrayHost is present' $identities
+    }
+    return $identities.ToArray()
+}
+
+function Stop-CcodLifecycleExactProcess {
+    param(
+        [Parameter(Mandatory)]$Identity,
+        [Parameter(Mandatory)][hashtable]$Adapters
+    )
+
+    $exited = & $Adapters.WaitExactProcessExit $Identity 10000
+    if ($exited -is [bool] -and $exited) { return $true }
+    if ($exited -isnot [bool]) { return $false }
+    $current = & $Adapters.IsExactProcessIdentityCurrent $Identity
+    if ($current -isnot [bool]) { return $false }
+    if (-not $current) { return $true }
+    $terminated = & $Adapters.TerminateExactProcess $Identity
+    if ($terminated -isnot [bool] -or -not $terminated) { return $false }
+    $forcedExit = & $Adapters.WaitExactProcessExit $Identity 5000
     return ($forcedExit -is [bool] -and $forcedExit)
 }
 
@@ -740,6 +865,60 @@ function Get-CcodLifecycleAdapters {
                 Invoke-CimMethod -InputObject $Process -MethodName GetOwnerSid -ErrorAction Stop
             }
         }
+        TestSupervisorIdentity = {
+            param($InstallRoot, $SupervisorIdentity, $Identity)
+            try {
+                if (-not (Test-CcodLifecycleSupervisorIdentityShape $SupervisorIdentity $Identity)) { return $false }
+                $verified = Get-CcodLifecycleVerifiedSupervisorFallback -InstallRoot $InstallRoot -Identity $Identity -ProcessEnumerator {
+                    Get-CimInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction Stop
+                } -OwnerSidResolver {
+                    param($Process)
+                    Invoke-CimMethod -InputObject $Process -MethodName GetOwnerSid -ErrorAction Stop
+                }
+                $matches = (Test-CcodLifecycleSupervisorIdentityShape $verified $Identity) -and
+                    $verified.Pid -eq $SupervisorIdentity.Pid -and
+                    $verified.CreationTimeUtc -ceq $SupervisorIdentity.CreationTimeUtc
+                return [bool]$matches
+            } catch {
+                return $false
+            }
+        }
+        TestSupervisorAbsent = {
+            param($InstallRoot, $Identity)
+            Test-CcodLifecycleVerifiedSupervisorAbsent -InstallRoot $InstallRoot -Identity $Identity -ProcessEnumerator {
+                Get-CimInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction Stop
+            }
+        }
+        FindTrayHostIdentities = {
+            param($InstallRoot, $RuntimeId, $Identity)
+            $root = Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
+            $runtime = Get-CcodLifecycleCanonicalRoot -Path (Join-Path (Join-Path $root 'runtime') $RuntimeId) -Kind 'Runtime root'
+            $expectedPath = [IO.Path]::GetFullPath((Join-Path $runtime 'bin\CodexRemote.TrayHost.exe'))
+            $matches = [Collections.Generic.List[object]]::new()
+            foreach ($process in @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'CodexRemote.TrayHost.exe'" -ErrorAction Stop)) {
+                if ($null -eq $process -or $null -eq $process.PSObject.Properties['ProcessId'] -or
+                    $null -eq $process.PSObject.Properties['ExecutablePath'] -or $null -eq $process.PSObject.Properties['SessionId'] -or
+                    $null -eq $process.PSObject.Properties['CreationDate']) {
+                    Throw-CcodLifecycleError 'CCOD_UNINSTALL_PROTECTION_STOP_FAILED' 'A TrayHost process could not be inspected completely' $process
+                }
+                $pid = 0
+                if (-not [int]::TryParse([string]$process.ProcessId,[ref]$pid) -or $pid -lt 1) {
+                    Throw-CcodLifecycleError 'CCOD_UNINSTALL_PROTECTION_STOP_FAILED' 'A TrayHost process ID is invalid' $process
+                }
+                $path = [IO.Path]::GetFullPath([string]$process.ExecutablePath)
+                if ($path -cne $expectedPath) { continue }
+                if ([int]$process.SessionId -ne [int]$Identity.SessionId) {
+                    Throw-CcodLifecycleError 'CCOD_UNINSTALL_PROTECTION_STOP_FAILED' 'A matching TrayHost belongs to another session' $process
+                }
+                $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop
+                if ($null -eq $owner -or [int]$owner.ReturnValue -ne 0 -or [string]$owner.Sid -cne [string]$Identity.UserSid) {
+                    Throw-CcodLifecycleError 'CCOD_UNINSTALL_PROTECTION_STOP_FAILED' 'A matching TrayHost owner could not be proven' $process
+                }
+                $created = ([DateTime]$process.CreationDate).ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)
+                $matches.Add([pscustomobject][ordered]@{ Pid=$pid; CreationTimeUtc=$created; SessionId=[int]$process.SessionId; UserSid=[string]$owner.Sid })
+            }
+            return $matches.ToArray()
+        }
         IsSupervisorIdentityCurrent = {
             param($SupervisorIdentity)
             try {
@@ -747,6 +926,16 @@ function Get-CcodLifecycleAdapters {
                 if ($null -eq $process) { return $false }
                 try {
                     return $process.StartTime.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture) -ceq $SupervisorIdentity.CreationTimeUtc
+                } finally { $process.Dispose() }
+            } catch { return $false }
+        }
+        IsExactProcessIdentityCurrent = {
+            param($ProcessIdentity)
+            try {
+                $process = Get-Process -Id $ProcessIdentity.Pid -ErrorAction SilentlyContinue
+                if ($null -eq $process) { return $false }
+                try {
+                    return $process.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture) -ceq $ProcessIdentity.CreationTimeUtc
                 } finally { $process.Dispose() }
             } catch { return $false }
         }
@@ -772,6 +961,14 @@ function Get-CcodLifecycleAdapters {
         }
         RemoveSupervisorTask = {
             Remove-CcodSupervisorTask -TaskName $script:CcodLifecycleTaskName
+        }
+        TestSupervisorTaskAbsent = {
+            try {
+                $matches = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -ceq $script:CcodLifecycleTaskName })
+                return ($matches.Count -eq 0)
+            } catch {
+                return $false
+            }
         }
         StartSupervisorTask = {
             Start-ScheduledTask -TaskName $script:CcodLifecycleTaskName -ErrorAction Stop | Out-Null
@@ -808,6 +1005,19 @@ function Get-CcodLifecycleAdapters {
             }
             return $false
         }
+        WaitExactProcessExit = {
+            param($ProcessIdentity, $TimeoutMilliseconds)
+            $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+            while ($stopwatch.ElapsedMilliseconds -lt [long]$TimeoutMilliseconds) {
+                $process = Get-Process -Id $ProcessIdentity.Pid -ErrorAction SilentlyContinue
+                if ($null -eq $process) { return $true }
+                try {
+                    if ($process.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture) -cne $ProcessIdentity.CreationTimeUtc) { return $true }
+                } finally { $process.Dispose() }
+                Start-Sleep -Milliseconds 250
+            }
+            return $false
+        }
         TerminateSupervisor = {
             param($SupervisorIdentity)
             $process = $null
@@ -815,6 +1025,17 @@ function Get-CcodLifecycleAdapters {
                 $process = Get-Process -Id $SupervisorIdentity.Pid -ErrorAction SilentlyContinue
                 if ($null -eq $process) { return $true }
                 if ($process.StartTime.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture) -cne $SupervisorIdentity.CreationTimeUtc) { return $true }
+                $process.Kill()
+                return $true
+            } catch { return $false } finally { if ($null -ne $process) { $process.Dispose() } }
+        }
+        TerminateExactProcess = {
+            param($ProcessIdentity)
+            $process = $null
+            try {
+                $process = Get-Process -Id $ProcessIdentity.Pid -ErrorAction SilentlyContinue
+                if ($null -eq $process) { return $true }
+                if ($process.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture) -cne $ProcessIdentity.CreationTimeUtc) { return $true }
                 $process.Kill()
                 return $true
             } catch { return $false } finally { if ($null -ne $process) { $process.Dispose() } }
@@ -863,19 +1084,6 @@ function Get-CcodLifecycleAdapters {
         ExitTransitionLease = {
             param($Lease)
             Exit-CcodMutex -Lease $Lease
-        }
-        ResolveDeviceKeyStore = {
-            Resolve-CcodDeviceKeyStorePath
-        }
-        BackupDeviceKeyStore = {
-            param($Path, $BackupPath)
-            [IO.Directory]::CreateDirectory((Split-Path $BackupPath -Parent)) | Out-Null
-            [IO.File]::Move($Path, $BackupPath)
-            $BackupPath
-        }
-        RemoveDeviceKeyStore = {
-            param($Path)
-            if ([IO.File]::Exists($Path)) { [IO.File]::Delete($Path) }
         }
         CopyFile = {
             param($Source, $Destination)
@@ -1431,84 +1639,164 @@ function Invoke-CcodInstall {
     }
 }
 
-function Invoke-CcodUninstall {
-    [CmdletBinding(SupportsShouldProcess = $true)]
+function Set-CcodUninstallTransactionPhase {
     param(
-        [string]$InstallRoot,
-        [switch]$KeepCurrentSpecialSession,
-        [switch]$BackupDeviceKeyStore,
-        [switch]$RemoveDeviceKeyStore,
+        [Parameter(Mandatory)]$Transaction,
+        [Parameter(Mandatory)][ValidateSet('Requested','Recovering','RecoveryProven','StoppingProtection','ProtectionStopped','TaskRemoved','ApplicationStateRemoved','ReadyForInno')][string]$Phase,
+        [Parameter(Mandatory)][scriptblock]$WriteTransaction,
+        [Parameter(Mandatory)][hashtable]$Adapters
+    )
+
+    $now = & $Adapters.UtcNow
+    if ($now -isnot [DateTime]) { Throw-CcodLifecycleError 'CCOD_UNINSTALL_CLOCK_INVALID' 'Uninstall transaction clock must return DateTime' $null }
+    [void]($Transaction.phase = $Phase)
+    [void]($Transaction.resumePhase = $Phase)
+    [void]($Transaction.updatedAtUtc = $now.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture))
+    [void]($Transaction.errorCode = $null)
+    & $WriteTransaction $Transaction
+}
+
+function Assert-CcodUninstallTransactionContext {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)]$Identity)
+    if ($null -eq $Transaction -or $Transaction.runtimeId -isnot [string] -or $Transaction.runtimeId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$' -or
+        $Transaction.userSid -isnot [string] -or $Transaction.userSid -cnotmatch '^S-\d-\d+(?:-\d+)+$' -or
+        $Transaction.sessionId -isnot [int] -or $Transaction.sessionId -lt 0 -or
+        $null -eq $Identity -or $Identity.UserSid -isnot [string] -or $Identity.SessionId -isnot [int] -or
+        $Transaction.userSid -cne $Identity.UserSid -or $Transaction.sessionId -ne $Identity.SessionId) {
+        Throw-CcodLifecycleError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'The uninstall transaction does not match the current user and session' $Transaction
+    }
+    try { [void]([uint64]$Transaction.runtimeGeneration); [void]([uint64]$Transaction.leaseEpoch) }
+    catch { Throw-CcodLifecycleError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'The uninstall transaction generation or epoch is invalid' $Transaction }
+    $pointer = Read-CcodActiveRuntime -InstallRoot $InstallRoot
+    if ($pointer.activeRuntime -cne $Transaction.runtimeId -or [uint64]$pointer.generation -ne [uint64]$Transaction.runtimeGeneration) {
+        Throw-CcodLifecycleError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'The uninstall transaction does not match the active runtime generation' $pointer
+    }
+    $epoch = Read-CcodLifecycleEpoch -InstallRoot $InstallRoot
+    if ([uint64]$epoch -ne [uint64]$Transaction.leaseEpoch) {
+        Throw-CcodLifecycleError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'The uninstall transaction does not match the current lifecycle epoch' $epoch
+    }
+    return $pointer
+}
+
+function Assert-CcodUninstallTransitionLease {
+    param($Lease)
+    if ($null -eq $Lease -or $Lease.Outcome -isnot [string] -or $Lease.Outcome -cne 'Acquired' -or
+        $Lease.Released -isnot [bool] -or $Lease.Released -or $null -eq $Lease.Handle) {
+        Throw-CcodLifecycleError 'CCOD_UNINSTALL_BUSY' 'The uninstall transition lease could not be acquired' $Lease
+    }
+}
+
+function Invoke-CcodUninstallCleanup {
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)]$Transaction,
+        [Parameter(Mandatory)][scriptblock]$WriteTransaction,
         [hashtable]$Adapters
     )
 
     $adapters = Get-CcodLifecycleAdapters -Adapters $Adapters
-    if ([string]::IsNullOrWhiteSpace($InstallRoot)) { $InstallRoot = $script:CcodLifecycleDefaultInstallRoot }
     $root = Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
-    if ([bool]$BackupDeviceKeyStore -and [bool]$RemoveDeviceKeyStore) {
-        Throw-CcodLifecycleError 'CCOD_UNINSTALL_KEY_CONFLICT' 'Backup and removal of the device key store are mutually exclusive' $null
+    if ($Transaction.phase -isnot [string] -or $Transaction.resumePhase -isnot [string]) {
+        Throw-CcodLifecycleError 'CCOD_UNINSTALL_TRANSACTION_INVALID' 'The uninstall transaction phase is invalid' $Transaction
     }
-    if (-not $PSCmdlet.ShouldProcess($root, 'Uninstall the Codex Control Other Devices supervisor')) {
-        return [pscustomobject][ordered]@{
-            Outcome = 'WhatIf'
-            KeptDeviceKeyStore = $true
-            BackupPath = $null
+    $phase = if ($Transaction.phase -ceq 'Failed') { $Transaction.resumePhase } else { $Transaction.phase }
+    if (@('Requested','Recovering','RecoveryProven','StoppingProtection','ProtectionStopped','TaskRemoved','ApplicationStateRemoved','ReadyForInno') -cnotcontains $phase) {
+        Throw-CcodLifecycleError 'CCOD_UNINSTALL_TRANSACTION_INVALID' 'The uninstall transaction cannot be resumed' $Transaction
+    }
+    if ($phase -ceq 'ReadyForInno') {
+        if ([IO.Directory]::Exists($root) -or [IO.File]::Exists($root)) {
+            Throw-CcodLifecycleError 'CCOD_UNINSTALL_APPLICATION_STATE_REMOVAL_FAILED' 'The application state remains present and cannot be handed to Inno' $root
         }
+        if ($Transaction.phase -ne 'ReadyForInno') { Set-CcodUninstallTransactionPhase -Transaction $Transaction -Phase 'ReadyForInno' -WriteTransaction $WriteTransaction -Adapters $adapters }
+        return $Transaction
     }
-    if (-not [IO.Directory]::Exists($root)) {
-        Throw-CcodLifecycleError 'CCOD_INSTALL_REQUIRED' 'Install root does not exist' $root
+    if ($phase -ceq 'ApplicationStateRemoved') {
+        if ([IO.Directory]::Exists($root) -or [IO.File]::Exists($root)) {
+            Throw-CcodLifecycleError 'CCOD_UNINSTALL_APPLICATION_STATE_REMOVAL_FAILED' 'The application state removal phase is not proven by an absent install root' $root
+        }
+        Set-CcodUninstallTransactionPhase -Transaction $Transaction -Phase 'ReadyForInno' -WriteTransaction $WriteTransaction -Adapters $adapters
+        return $Transaction
     }
-    $activePath = Join-Path $root 'active.json'
-    if (-not [IO.File]::Exists($activePath)) {
-        Throw-CcodLifecycleError 'CCOD_INSTALL_REQUIRED' 'Install root has no active runtime pointer' $root
-    }
-    $pointer = Read-CcodActiveRuntime -InstallRoot $root
+
     $identity = & $adapters.GetCurrentIdentity
-    $supervisor = Get-CcodLifecycleSupervisorIdentity -InstallRoot $root -Identity $identity -Adapters $adapters
+    $pointer = $null
+    if ($phase -eq 'TaskRemoved') {
+        if ($Transaction.userSid -isnot [string] -or $Transaction.sessionId -isnot [int] -or
+            $identity.UserSid -isnot [string] -or $identity.SessionId -isnot [int] -or
+            $Transaction.userSid -cne $identity.UserSid -or $Transaction.sessionId -ne $identity.SessionId) {
+            Throw-CcodLifecycleError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'The resumable uninstall transaction does not match the current user and session' $Transaction
+        }
+    } else {
+        $pointer = Assert-CcodUninstallTransactionContext -InstallRoot $root -Transaction $Transaction -Identity $identity
+    }
     $lease = $null
-    $keptKeyStore = $false
-    $backupPath = $null
     try {
         $lease = & $adapters.EnterTransitionLease $identity.UserSid $identity.SessionId
-        & $adapters.SetAutomationEnabled (Join-Path $root 'state') $false
-        if ($KeepCurrentSpecialSession) {
-            Write-CcodLifecycleLog -InstallRoot $root -Adapters $adapters -Stage 'Uninstall' -Code 'CCOD_UNINSTALL_UNMONITORED_CDP' -Outcome 'Warning'
-        } else {
-            $receipt = & $adapters.NormalizeSpecialSession $root $pointer.activeRuntime $identity
-            if ($null -ne $receipt -and $null -ne $receipt.PSObject.Properties['SpecialPresent'] -and [bool]$receipt.SpecialPresent -and
-                ($null -eq $receipt.PSObject.Properties['Normalized'] -or -not [bool]$receipt.Normalized)) {
-                Throw-CcodLifecycleError 'CCOD_UNINSTALL_NORMALIZATION_FAILED' 'A validated special session could not be normalized to an ordinary session' $receipt
+        Assert-CcodUninstallTransitionLease $lease
+
+        if ($phase -in @('Requested','Recovering')) {
+            & $adapters.SetAutomationEnabled (Join-Path $root 'state') $false
+            Set-CcodUninstallTransactionPhase -Transaction $Transaction -Phase 'Recovering' -WriteTransaction $WriteTransaction -Adapters $adapters
+            try {
+                $recovery = & $adapters.NormalizeSpecialSession $root $pointer.activeRuntime $identity
+                if ($null -eq $recovery -or $null -eq $recovery.PSObject.Properties['SpecialPresent'] -or $recovery.SpecialPresent -isnot [bool] -or
+                    $null -eq $recovery.PSObject.Properties['Normalized'] -or $recovery.Normalized -isnot [bool] -or
+                    ([bool]$recovery.SpecialPresent -and -not [bool]$recovery.Normalized)) {
+                    throw 'recovery proof is invalid'
+                }
+            } catch {
+                Throw-CcodLifecycleError 'CCOD_UNINSTALL_RECOVERY_FAILED' 'A special Codex session could not be recovered before uninstall' $Transaction
             }
+            Set-CcodUninstallTransactionPhase -Transaction $Transaction -Phase 'RecoveryProven' -WriteTransaction $WriteTransaction -Adapters $adapters
+            $phase = 'RecoveryProven'
         }
-        & $adapters.RemoveSupervisorTask
-        if ($null -ne $supervisor) {
-            Stop-CcodLifecycleSupervisor -InstallRoot $root -Adapters $adapters -Identity $supervisor
+
+        if ($phase -in @('RecoveryProven','StoppingProtection')) {
+            Set-CcodUninstallTransactionPhase -Transaction $Transaction -Phase 'StoppingProtection' -WriteTransaction $WriteTransaction -Adapters $adapters
+            try {
+                $trayHosts = @(Get-CcodLifecycleTrayHostIdentities -InstallRoot $root -RuntimeId $pointer.activeRuntime -Identity $identity -Adapters $adapters)
+                $supervisor = Get-CcodLifecycleSupervisorIdentity -InstallRoot $root -Identity $identity -Adapters $adapters
+                if (-not (Stop-CcodLifecycleSupervisor -InstallRoot $root -Adapters $adapters -Identity $supervisor)) { throw 'exact Supervisor exit was not proven' }
+                $supervisorAbsent = & $adapters.TestSupervisorAbsent $root $identity
+                if ($supervisorAbsent -isnot [bool] -or -not $supervisorAbsent) { throw 'Supervisor absence was not proven after shutdown' }
+                foreach ($trayHost in $trayHosts) {
+                    if (-not (Stop-CcodLifecycleExactProcess -Identity $trayHost -Adapters $adapters)) { throw 'exact TrayHost exit was not proven' }
+                }
+                $idle = & $adapters.WaitSupervisorTaskIdle 10000
+                if ($idle -isnot [bool] -or -not $idle) { throw 'scheduled task is not idle' }
+            } catch {
+                Throw-CcodLifecycleError 'CCOD_UNINSTALL_PROTECTION_STOP_FAILED' 'Supervisor and TrayHost shutdown could not be proven before uninstall' $Transaction
+            }
+            Set-CcodUninstallTransactionPhase -Transaction $Transaction -Phase 'ProtectionStopped' -WriteTransaction $WriteTransaction -Adapters $adapters
+            $phase = 'ProtectionStopped'
         }
-        $keyPath = & $adapters.ResolveDeviceKeyStore
-        if ($BackupDeviceKeyStore -and -not [string]::IsNullOrWhiteSpace($keyPath) -and [IO.File]::Exists($keyPath)) {
-            $now = & $adapters.UtcNow
-            $base = $keyPath + '.backup.' + $now.ToUniversalTime().ToString('yyyyMMdd-HHmmss')
-            $destination = $base
-            $suffix = 0
-            while ([IO.File]::Exists($destination)) { $suffix++; $destination = "$base.$suffix" }
-            $backupPath = & $adapters.BackupDeviceKeyStore $keyPath $destination
-        } elseif ($RemoveDeviceKeyStore -and -not [string]::IsNullOrWhiteSpace($keyPath) -and [IO.File]::Exists($keyPath)) {
-            & $adapters.RemoveDeviceKeyStore $keyPath
-            Write-CcodLifecycleLog -InstallRoot $root -Adapters $adapters -Stage 'Uninstall' -Code 'CCOD_UNINSTALL_REVOKE_REMINDER' -Outcome 'Warning'
-        } else {
-            $keptKeyStore = $true
+
+        if ($phase -eq 'ProtectionStopped') {
+            try {
+                & $adapters.RemoveSupervisorTask
+                $absent = & $adapters.TestSupervisorTaskAbsent
+                if ($absent -isnot [bool] -or -not $absent) { throw 'scheduled task deletion was not proven' }
+                $supervisorAbsent = & $adapters.TestSupervisorAbsent $root $identity
+                if ($supervisorAbsent -isnot [bool] -or -not $supervisorAbsent) { throw 'a Supervisor remains or its absence could not be proven after task removal' }
+                if (@(Get-CcodLifecycleTrayHostIdentities -InstallRoot $root -RuntimeId $pointer.activeRuntime -Identity $identity -Adapters $adapters).Count -ne 0) { throw 'a TrayHost remains after task removal' }
+            }
+            catch { Throw-CcodLifecycleError 'CCOD_UNINSTALL_TASK_REMOVAL_FAILED' 'The supervisor scheduled task could not be removed' $Transaction }
+            Set-CcodUninstallTransactionPhase -Transaction $Transaction -Phase 'TaskRemoved' -WriteTransaction $WriteTransaction -Adapters $adapters
+            $phase = 'TaskRemoved'
         }
-        Write-CcodLifecycleLog -InstallRoot $root -Adapters $adapters -Stage 'Uninstall' -Code 'CCOD_UNINSTALL_COMPLETED' -Outcome 'Uninstalled'
-        Remove-CcodLifecycleInstallTree -InstallRoot $root -Adapters $adapters
+
+        if ($phase -eq 'TaskRemoved') {
+            try { Remove-CcodLifecycleInstallTree -InstallRoot $root -Adapters $adapters }
+            catch { Throw-CcodLifecycleError 'CCOD_UNINSTALL_APPLICATION_STATE_REMOVAL_FAILED' 'The application runtime and state could not be removed safely' $Transaction }
+            Set-CcodUninstallTransactionPhase -Transaction $Transaction -Phase 'ApplicationStateRemoved' -WriteTransaction $WriteTransaction -Adapters $adapters
+            Set-CcodUninstallTransactionPhase -Transaction $Transaction -Phase 'ReadyForInno' -WriteTransaction $WriteTransaction -Adapters $adapters
+        }
+        return $Transaction
     } finally {
-        if ($null -ne $lease) {
+        if ($null -ne $lease -and $lease.Outcome -is [string] -and $lease.Outcome -ceq 'Acquired' -and -not $lease.Released) {
             try { [void](& $adapters.ExitTransitionLease $lease) } catch { }
         }
     }
-    return [pscustomobject][ordered]@{
-        Outcome = 'Uninstalled'
-        KeptDeviceKeyStore = [bool]$keptKeyStore
-        BackupPath = $backupPath
-    }
 }
 
-Export-ModuleMember -Function Invoke-CcodInstall, Invoke-CcodRepairState, Invoke-CcodUninstall, Test-CcodLifecycleRemovePath
+Export-ModuleMember -Function Invoke-CcodInstall, Invoke-CcodRepairState, Test-CcodLifecycleRemovePath

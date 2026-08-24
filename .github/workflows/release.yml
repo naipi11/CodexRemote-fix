@@ -5,16 +5,44 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to rebuild and publish
+        required: true
+        type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  prepare:
+    runs-on: windows-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Validate release tag
+        id: release
+        shell: pwsh
+        env:
+          CCOD_RELEASE_TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          $tag = if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') { [string]$env:CCOD_RELEASE_TAG_INPUT } else { [string]$env:GITHUB_REF_NAME }
+          $tag = $tag.Trim()
+          if ($tag -cnotmatch '^v\d+\.\d+\.\d+$') {
+            throw "Release tag must be canonical vX.Y.Z; received '$tag'."
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+  build:
+    needs: prepare
+    outputs:
+      tag: ${{ needs.prepare.outputs.tag }}
     runs-on: windows-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -29,28 +57,81 @@ jobs:
         shell: pwsh
         run: npm test
 
+      - name: Run deterministic installed lifecycle harness tests
+        shell: pwsh
+        run: npm run test:installed-lifecycle
+
+      - name: Run release contract tests
+        shell: pwsh
+        run: npm run test:release-contract
+
       - name: Run source-identical TrayHost smoke
         shell: pwsh
         run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionOnly
 
       - name: Build CodexRemote-fix installer
         shell: pwsh
-        run: ./build/build.ps1
+        env:
+          CCOD_RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          $version = $env:CCOD_RELEASE_TAG.Substring(1)
+          ./build/build.ps1 -Version $version
 
-      - name: Upload CodexRemote-fix installer artifact
+      - name: Upload immutable CodexRemote-fix installer
         uses: actions/upload-artifact@v4
         with:
           name: CodexRemote-fix installer
           path: build/dist/*
           if-no-files-found: error
 
+  publish:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.tag }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download immutable CodexRemote-fix installer
+        uses: actions/download-artifact@v4
+        with:
+          name: CodexRemote-fix installer
+          path: build/dist
+
+      - name: Verify downloaded release candidate contract
+        shell: pwsh
+        env:
+          CCOD_RELEASE_TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          npm run test:release-contract
+          $tag = $env:CCOD_RELEASE_TAG
+          if ($tag -cnotmatch '^v\d+\.\d+\.\d+$') {
+            throw "Release tag output is invalid: '$tag'."
+          }
+          $version = $tag.Substring(1)
+          . ./tools/Test-ReleaseDefender.ps1 -Library
+          $manifestPath = Join-Path $PWD ("build\dist\CodexRemote-fix-$version-release-manifest.json")
+          Test-CcodReleaseAssetManifest -ManifestPath $manifestPath -AssetDirectory (Join-Path $PWD 'build\dist') -ExpectedVersion $version | Out-Null
+
       - name: Publish GitHub release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          CCOD_RELEASE_TAG: ${{ needs.build.outputs.tag }}
         run: |
-          $tag = $env:GITHUB_REF_NAME
-          $version = $tag.TrimStart('v')
+          $tag = $env:CCOD_RELEASE_TAG
+          if ($tag -cnotmatch '^v\d+\.\d+\.\d+$') {
+            throw "Release tag output is invalid: '$tag'."
+          }
+          $version = $tag.Substring(1)
           $changelog = Get-Content -LiteralPath (Join-Path $PWD 'CHANGELOG.md') -Raw -Encoding UTF8
           $releaseSection = [regex]::Match($changelog, '(?ms)^## ' + [regex]::Escape($tag) + '\r?\n(.*?)(?=^## |\z)')
           if (-not $releaseSection.Success) {
@@ -62,11 +143,84 @@ jobs:
           }
           $notesPath = Join-Path $env:RUNNER_TEMP ("CodexRemote-fix-$tag-release-notes.md")
           Set-Content -LiteralPath $notesPath -Value ("# CodexRemote-fix $version`n`n" + $englishSection.Groups[1].Value.Trim() + "`n") -Encoding UTF8
-          $exists = $null -ne (gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null)
+          & gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets 2>$null | Out-Null
+          $exists = $LASTEXITCODE -eq 0
+          $existingAssets = @()
+          if ($exists) {
+            $existingAssets = @(& gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name')
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not inspect existing release assets for $tag."
+            }
+          }
+          $assets = @(Get-ChildItem -LiteralPath (Join-Path $PWD 'build\dist') -File | Where-Object { $_.Extension -in @('.exe', '.txt', '.json') })
+          $assetNames = @($assets | ForEach-Object { $_.Name })
+          $unexpected = @($existingAssets | Where-Object { $assetNames -cnotcontains $_ })
+          if ($unexpected.Count -ne 0) {
+            throw "Existing release $tag contains unexpected assets and cannot be safely updated: $($unexpected -join ', ')"
+          }
+          foreach ($asset in $assets) {
+            if ($existingAssets -ccontains $asset.Name) {
+              $downloadRoot = Join-Path $env:RUNNER_TEMP ('ccod-existing-asset-' + [guid]::NewGuid().ToString('N'))
+              New-Item -ItemType Directory -Path $downloadRoot -Force | Out-Null
+              try {
+                & gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern $asset.Name --dir $downloadRoot
+                if ($LASTEXITCODE -ne 0) {
+                  throw "Could not download existing release asset $($asset.Name)."
+                }
+                $existingAsset = Join-Path $downloadRoot $asset.Name
+                if (-not (Test-Path -LiteralPath $existingAsset -PathType Leaf) -or
+                    (Get-FileHash -LiteralPath $existingAsset -Algorithm SHA256).Hash.ToLowerInvariant() -cne (Get-FileHash -LiteralPath $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()) {
+                  throw "Existing release asset $($asset.Name) differs from the immutable candidate."
+                }
+              } finally {
+                if (Test-Path -LiteralPath $downloadRoot) { Remove-Item -LiteralPath $downloadRoot -Recurse -Force -ErrorAction SilentlyContinue }
+              }
+            }
+          }
           if (-not $exists) {
             gh release create $tag --repo $env:GITHUB_REPOSITORY --title "CodexRemote-fix $version" --notes-file $notesPath
           } else {
             gh release edit $tag --repo $env:GITHUB_REPOSITORY --title "CodexRemote-fix $version" --notes-file $notesPath
           }
+          foreach ($asset in $assets) {
+            if ($existingAssets -cnotcontains $asset.Name) {
+              & gh release upload $tag --repo $env:GITHUB_REPOSITORY $asset.FullName
+              if ($LASTEXITCODE -ne 0) {
+                throw "Could not upload release asset $($asset.Name)."
+              }
+            }
+          }
+
+      - name: Read back published GitHub release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CCOD_RELEASE_TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          $tag = $env:CCOD_RELEASE_TAG
+          if ($tag -cnotmatch '^v\d+\.\d+\.\d+$') {
+            throw "Release tag output is invalid: '$tag'."
+          }
           $assets = @(Get-ChildItem -LiteralPath (Join-Path $PWD 'build\dist') -File | Where-Object { $_.Extension -in @('.exe', '.txt', '.json') })
-          gh release upload $tag --repo $env:GITHUB_REPOSITORY $assets.FullName --clobber
+          $assetNames = @($assets | ForEach-Object { $_.Name })
+          $publishedNames = @(& gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name')
+          if ($LASTEXITCODE -ne 0 -or ((@($publishedNames | Sort-Object) -join '|') -cne (@($assetNames | Sort-Object) -join '|'))) {
+            throw "Published release $tag does not expose the exact expected asset set for read-back."
+          }
+          $readBackRoot = Join-Path $env:RUNNER_TEMP ('ccod-release-readback-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $readBackRoot -Force | Out-Null
+          try {
+            foreach ($asset in $assets) {
+              & gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern $asset.Name --dir $readBackRoot
+              if ($LASTEXITCODE -ne 0) {
+                throw "Could not read back published release asset $($asset.Name)."
+              }
+              $readBackAsset = Join-Path $readBackRoot $asset.Name
+              if (-not (Test-Path -LiteralPath $readBackAsset -PathType Leaf) -or
+                  (Get-FileHash -LiteralPath $readBackAsset -Algorithm SHA256).Hash.ToLowerInvariant() -cne (Get-FileHash -LiteralPath $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()) {
+                throw "Published release asset $($asset.Name) does not match the immutable candidate bytes."
+              }
+            }
+          } finally {
+            if (Test-Path -LiteralPath $readBackRoot) { Remove-Item -LiteralPath $readBackRoot -Recurse -Force -ErrorAction SilentlyContinue }
+          }

@@ -1,6 +1,6 @@
 {
   "name": "codexremote-fix",
-  "version": "2.4.24",
+  "version": "2.5.0",
   "private": true,
   "description": "CodexRemote-fix persistent current-user tray supervisor for Windows",
   "license": "MIT",
@@ -17,6 +17,8 @@
     "test:installed": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/Validate.ps1",
     "test:runtime": "node tests/CleanroomSelfTest.js",
     "test:persistence": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/PersistenceSelfTest.ps1",
-    "test:package": "node tests/PackageCheckerSelfTest.mjs"
+    "test:package": "node tests/PackageCheckerSelfTest.mjs",
+    "test:installed-lifecycle": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/InstalledLifecycleHarness.SelfTest.ps1",
+    "test:release-contract": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/ReleaseWorkflow.SelfTest.ps1"
   }
 }

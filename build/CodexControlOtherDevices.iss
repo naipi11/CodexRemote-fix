@@ -74,9 +74,6 @@ Type: files; Name: "{userprograms}\Codex Control other devices\Uninstall CodexRe
 Type: dirifempty; Name: "{userprograms}\Codex Control other devices"
 Type: files; Name: "{userdesktop}\Codex 设备连接 (Device Connection).lnk"
 
-[UninstallRun]
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Uninstall-CodexControlOtherDevices.ps1"" -BackupDeviceKeyStore"; Flags: runhidden waituntilterminated; RunOnceId: "UninstallCodexControlOtherDevices"
-
 [Icons]
 Name: "{group}\CodexRemote-fix"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{localappdata}\CodexControlOtherDevices\bootstrap.ps1"" -InstallRoot ""{localappdata}\CodexControlOtherDevices"" -EntryMode Explicit"; WorkingDir: "{localappdata}\CodexControlOtherDevices"; IconFilename: "{app}\assets\CodexRemote-fix.ico"
 Name: "{group}\CodexRemote-fix compatibility check"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Test-CodexControlOtherDevices.ps1"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\CodexRemote-fix.ico"
@@ -311,5 +308,104 @@ begin
     end;
     WizardForm.Update;
     Sleep(ACTIVATION_POLL_MILLISECONDS);
+  end;
+end;
+
+function IsCanonicalUninstallTransactionId(const Value: String): Boolean;
+var
+  Index: Integer;
+  Character: Char;
+begin
+  Result := Length(Value) = 36;
+  if not Result then Exit;
+  for Index := 1 to Length(Value) do
+  begin
+    Character := Value[Index];
+    if (Index = 9) or (Index = 14) or (Index = 19) or (Index = 24) then
+    begin
+      if Character <> '-' then begin Result := False; Exit; end;
+    end
+    else if not (((Character >= '0') and (Character <= '9')) or ((Character >= 'a') and (Character <= 'f'))) then
+    begin
+      Result := False;
+      Exit;
+    end;
+  end;
+end;
+
+function TryReadUninstallTransactionId(var TransactionId: String): Boolean;
+var
+  CurrentPath, Text, Marker: String;
+  Content: AnsiString;
+  Position: Integer;
+begin
+  Result := False;
+  TransactionId := '';
+  CurrentPath := ExpandConstant('{localappdata}\CodexRemote-fix-uninstall\current.json');
+  if not IsSafeActivationFile(CurrentPath) then Exit;
+  if not LoadBoundedActivationReceipt(CurrentPath, Content) then Exit;
+  Text := String(Content);
+  Marker := '"transactionId":"';
+  Position := Pos(Marker, Text);
+  if Position = 0 then Exit;
+  Position := Position + Length(Marker);
+  if Position + 36 > Length(Text) + 1 then Exit;
+  TransactionId := Copy(Text, Position, 36);
+  if (Position + 36 > Length(Text)) or (Text[Position + 36] <> '"') or not IsCanonicalUninstallTransactionId(TransactionId) then
+  begin
+    TransactionId := '';
+    Exit;
+  end;
+  Result := True;
+end;
+
+function GetExternalUninstallBootstrapPath: String;
+var
+  TransactionId: String;
+begin
+  Result := '';
+  if not TryReadUninstallTransactionId(TransactionId) then Exit;
+  Result := ExpandConstant('{localappdata}\CodexRemote-fix-uninstall\') + TransactionId + '\payload\src\persistence\UninstallBootstrap.ps1';
+  if not FileExists(Result) then Result := '';
+end;
+
+function InitializeUninstall(): Boolean;
+var
+  ResultCode: Integer;
+  Parameters: String;
+begin
+  Parameters := '-NoProfile -ExecutionPolicy Bypass -File "' +
+    ExpandConstant('{app}\src\persistence\UninstallBootstrap.ps1') + '" -InstallerRoot "' +
+    ExpandConstant('{app}') + '" -InstallRoot "' +
+    ExpandConstant('{localappdata}\CodexControlOtherDevices') + '" -Mode Prepare';
+  Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters,
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+  if not Result then
+  begin
+    Log('CodexRemote-fix uninstall bootstrap refused pre-deletion cleanup, result code ' + IntToStr(ResultCode) + '.');
+    SuppressibleMsgBox('CodexRemote-fix could not verify safe cleanup. No installer files were removed; retry uninstall after resolving the reported support code.', mbError, MB_OK, IDOK);
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ResultCode: Integer;
+  Parameters, BootstrapPath: String;
+begin
+  if CurUninstallStep <> usPostUninstall then Exit;
+  BootstrapPath := GetExternalUninstallBootstrapPath;
+  if BootstrapPath = '' then
+  begin
+    Log('CodexRemote-fix uninstall completion receipt could not locate the staged bootstrap.');
+    RaiseException('CCOD_UNINSTALL_FINALIZATION_MISSING');
+  end;
+  Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + BootstrapPath +
+    '" -InstallerRoot "' + ExpandConstant('{app}') + '" -InstallRoot "' +
+    ExpandConstant('{localappdata}\CodexControlOtherDevices') + '" -Mode FinalizeReceipt';
+  if (not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters,
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode)) or (ResultCode <> 0) then
+  begin
+    Log('CodexRemote-fix uninstall completion receipt was not finalized, result code ' + IntToStr(ResultCode) + '.');
+    RaiseException('CCOD_UNINSTALL_FINALIZATION_FAILED');
   end;
 end;

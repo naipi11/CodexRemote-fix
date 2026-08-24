@@ -4,6 +4,7 @@ $repositoryRoot=Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $resetPath=Join-Path $repositoryRoot 'Reset-CodexControlOtherDevices.ps1'
 $startPath=Join-Path $repositoryRoot 'Start-CodexControlOtherDevices.ps1'
 $promptPath=Join-Path $repositoryRoot 'Prompt-CcodRestart.ps1'
+$uninstallPath=Join-Path $repositoryRoot 'Uninstall-CodexControlOtherDevices.ps1'
 . $resetPath
 . $startPath
 
@@ -246,6 +247,30 @@ Export-ModuleMember -Function Submit-CcodLifecycleRequest
         Assert-CcodEqual 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff' $record.submissionId 'rejected submission remains correlated'
         Assert-CcodEqual $null $record.transactionId 'rejected receipt has no fabricated transaction id'
     }finally{if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}}
+}
+
+Invoke-CcodTest 'public uninstall wrapper rejects retired direct options and delegates only to the installed Inno executable' {
+    $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($uninstallPath,[ref]$tokens,[ref]$errors)
+    Assert-CcodTrue (@($errors).Count -eq 0) 'Uninstall wrapper parses'
+    $commands=@($ast.FindAll({param($node)$node -is [Management.Automation.Language.CommandAst]},$true)|ForEach-Object{$_.GetCommandName()}|Where-Object{$_})
+    Assert-CcodTrue ($commands -ccontains 'Start-Process') 'Uninstall wrapper delegates the real operation to Inno'
+    foreach($forbidden in @('Import-Module','Remove-Item','Move-Item','Copy-Item','Invoke-CcodUninstall')){Assert-CcodTrue ($commands -cnotcontains $forbidden) "Uninstall wrapper has no direct $forbidden path"}
+    foreach($argument in @(@{Name='KeepCurrentSpecialSession';Value=$true},@{Name='BackupDeviceKeyStore';Value=$true},@{Name='RemoveDeviceKeyStore';Value=$true})){
+        $failure=$null
+        $parameters=@{};$parameters[[string]$argument.Name]=$argument.Value
+        try { & $uninstallPath @parameters } catch { $failure=$_ }
+        Assert-CcodTrue ($null-ne$failure -and $failure.FullyQualifiedErrorId-like'CCOD_UNINSTALL_OPTION_REMOVED*') "retired uninstall option $($argument.Name) fails closed"
+    }
+    $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-uninstall-wrapper-'+[guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($root)|Out-Null
+        $fixtureScript=Join-Path $root 'Uninstall-CodexControlOtherDevices.ps1'
+        [IO.File]::Copy($uninstallPath,$fixtureScript,$true)
+        [IO.File]::WriteAllText((Join-Path $root 'unins000.exe'),'placeholder',[Text.UTF8Encoding]::new($false))
+        $receipt=& $fixtureScript -WhatIf
+        Assert-CcodEqual 'WhatIf' $receipt.Outcome 'WhatIf does not launch the placeholder uninstaller'
+        Assert-CcodEqual $true $receipt.KeptDeviceKeyStore 'WhatIf confirms the device-key store remains in place'
+    } finally { if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force} }
 }
 
 Write-Host 'Manual wrapper self-tests passed.'

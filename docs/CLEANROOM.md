@@ -56,6 +56,13 @@ atomic, the bootstrap keeps one verified previous runtime for rollback, and
 state files are schema-1 with strict readers that quarantine damaged
 evidence instead of normalizing it.
 
+The Supervisor-to-TrayHost boundary is protocol v2: a private authenticated
+pipe binds the parent process identity and runtime ID, then accepts only
+revision-bound snapshots and allow-listed action/result frames. Lifecycle and
+safe-exit work independently carries a generation/epoch fence and a trusted
+token logon identity, so a stale runtime or another Windows logon cannot reuse
+an old intent.
+
 Automated tests are hermetic: they never install a real scheduled task, never
 start or stop the real Codex application, never write the real device-key
 store, and never resolve the real `CODEX_HOME`. Real-machine acceptance

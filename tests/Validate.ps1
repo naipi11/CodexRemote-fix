@@ -102,13 +102,19 @@ foreach ($required in @(
     'Install-CodexControlOtherDevices.ps1',
     'Uninstall-CodexControlOtherDevices.ps1',
     'src\persistence\bootstrap.ps1',
+    'src\persistence\UninstallBootstrap.ps1',
     'src\persistence\modules\InstallLifecycle.psm1',
     'src\persistence\modules\ScheduledTask.psm1',
     'src\persistence\modules\WorkerRuntime.psm1',
     'tests\PersistenceSelfTest.ps1',
+    'tests\installed\Invoke-InstalledLifecycleIntegration.ps1',
     'tests\persistence\Bootstrap.SelfTest.ps1',
     'tests\persistence\ScheduledTask.SelfTest.ps1',
     'tests\persistence\InstallLifecycle.SelfTest.ps1',
+    'tests\persistence\UninstallBootstrap.SelfTest.ps1',
+    'tests\persistence\InstalledLifecycleHarness.SelfTest.ps1',
+    'tests\persistence\ReleaseWorkflow.SelfTest.ps1',
+    'tools\Test-ReleaseDefender.ps1',
     'tests\persistence\WorkerRuntime.SelfTest.ps1'
 )) {
     if (-not (Test-Path -LiteralPath (Join-Path $projectRoot $required) -PathType Leaf)) {

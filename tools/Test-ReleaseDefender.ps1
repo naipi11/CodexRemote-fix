@@ -1,0 +1,302 @@
+[CmdletBinding(DefaultParameterSetName = 'Run')]
+param(
+    [Parameter(Mandatory, ParameterSetName = 'Run')][string]$InstallerPath,
+    [Parameter(Mandatory, ParameterSetName = 'Run')][string]$ChecksumPath,
+    [Parameter(Mandatory, ParameterSetName = 'Run')][string]$EvidencePath,
+    [Parameter(Mandatory, ParameterSetName = 'Library')][switch]$Library
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Throw-CcodReleaseDefenderError {
+    param([Parameter(Mandatory)][string]$Id, [Parameter(Mandatory)][string]$Message, $Target)
+    throw [Management.Automation.ErrorRecord]::new(
+        [InvalidOperationException]::new($Message),
+        $Id,
+        [Management.Automation.ErrorCategory]::InvalidOperation,
+        $Target
+    )
+}
+
+function Get-CcodReleaseDefenderErrorId {
+    param([Parameter(Mandatory)]$ErrorRecord)
+    $id = [string]$ErrorRecord.FullyQualifiedErrorId
+    if ([string]::IsNullOrWhiteSpace($id)) { return $null }
+    return ($id -split ',')[0]
+}
+
+function Get-CcodReleaseDefenderHash {
+    param([Parameter(Mandatory)][string]$Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [IO.File]::OpenRead($Path)
+        try { return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+        finally { $stream.Dispose() }
+    } finally { $sha.Dispose() }
+}
+
+function Test-CcodReleaseDefenderCanonicalUtc {
+    param([AllowNull()][string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $parsed = [datetime]::MinValue
+    if (-not [datetime]::TryParse($Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) { return $false }
+    return $parsed.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture) -ceq $Value
+}
+
+function Assert-CcodReleaseDefenderRegularFile {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Kind)
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathRooted($Path)) {
+        Throw-CcodReleaseDefenderError 'CCOD_RELEASE_ASSET_INVALID' "$Kind must be an absolute path" $Path
+    }
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not [IO.File]::Exists($full)) { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_ASSET_INVALID' "$Kind is missing" $full }
+    $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        Throw-CcodReleaseDefenderError 'CCOD_RELEASE_ASSET_INVALID' "$Kind must be a regular non-reparse file" $full
+    }
+    return $full
+}
+
+function Assert-CcodReleaseDefenderDirectory {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Kind)
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathRooted($Path)) {
+        Throw-CcodReleaseDefenderError 'CCOD_RELEASE_ASSET_INVALID' "$Kind must be an absolute path" $Path
+    }
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not [IO.Directory]::Exists($full)) { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_ASSET_INVALID' "$Kind is missing" $full }
+    $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        Throw-CcodReleaseDefenderError 'CCOD_RELEASE_ASSET_INVALID' "$Kind must be a non-reparse directory" $full
+    }
+    return $full
+}
+
+function Get-CcodReleaseDefenderDefaultAdapters {
+    $defaults = @{}
+    $defaults.GetFileSha256 = { param($Path) Get-CcodReleaseDefenderHash -Path $Path }.GetNewClosure()
+    $defaults.ReadText = { param($Path) [IO.File]::ReadAllText($Path) }.GetNewClosure()
+    $defaults.GetZoneId = {
+        param($Path)
+        try {
+            $stream = Get-Item -LiteralPath $Path -Stream Zone.Identifier -ErrorAction Stop
+            if ($null -eq $stream) { return $null }
+            $text = Get-Content -LiteralPath $Path -Stream Zone.Identifier -Raw -ErrorAction Stop
+            $match = [regex]::Match([string]$text, '(?m)^ZoneId=(\d+)\s*$')
+            if (-not $match.Success) { return $null }
+            return [int]$match.Groups[1].Value
+        } catch { return $null }
+    }.GetNewClosure()
+    $defaults.GetDefenderStatus = { Get-MpComputerStatus -ErrorAction Stop }.GetNewClosure()
+    $defaults.StartCustomScan = { param($Path) Start-MpScan -ScanType CustomScan -ScanPath $Path -ErrorAction Stop }.GetNewClosure()
+    $defaults.GetThreatDetections = { @(Get-MpThreatDetection -ErrorAction Stop) }.GetNewClosure()
+    $defaults.GetUtcNow = { [datetime]::UtcNow }.GetNewClosure()
+    $defaults.WriteReceipt = {
+        param($Path, $Receipt)
+        if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathRooted($Path)) {
+            Throw-CcodReleaseDefenderError 'CCOD_DEFENDER_EVIDENCE_INVALID' 'Defender evidence path must be absolute' $Path
+        }
+        $target = [IO.Path]::GetFullPath($Path)
+        $parent = Split-Path $target -Parent
+        if (-not [IO.Directory]::Exists($parent)) { [IO.Directory]::CreateDirectory($parent) | Out-Null }
+        $parentItem = Get-Item -LiteralPath $parent -Force -ErrorAction Stop
+        if (($parentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or [IO.File]::Exists($target)) {
+            Throw-CcodReleaseDefenderError 'CCOD_DEFENDER_EVIDENCE_INVALID' 'Defender evidence target is unsafe or already exists' $target
+        }
+        $temporary = "$target.$([guid]::NewGuid().ToString('N')).tmp"
+        try {
+            [IO.File]::WriteAllText($temporary, ($Receipt | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+            [IO.File]::Move($temporary, $target)
+            return $target
+        } finally {
+            if ([IO.File]::Exists($temporary)) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+        }
+    }.GetNewClosure()
+    return $defaults
+}
+
+function Resolve-CcodReleaseDefenderAdapters {
+    param([hashtable]$Adapters)
+    $resolved = Get-CcodReleaseDefenderDefaultAdapters
+    if ($null -eq $Adapters) { return $resolved }
+    foreach ($name in $Adapters.Keys) {
+        if (-not $resolved.ContainsKey([string]$name) -or $Adapters[$name] -isnot [scriptblock]) {
+            Throw-CcodReleaseDefenderError 'CCOD_DEFENDER_ADAPTER_INVALID' 'Defender test adapters must replace known scriptblock adapters only' $name
+        }
+        $resolved[[string]$name] = $Adapters[$name]
+    }
+    return $resolved
+}
+
+function Get-CcodReleaseDefenderChecksum {
+    param([Parameter(Mandatory)][string]$InstallerPath, [Parameter(Mandatory)][string]$ChecksumPath, [Parameter(Mandatory)][hashtable]$Adapters)
+    $installer = Assert-CcodReleaseDefenderRegularFile -Path $InstallerPath -Kind 'Installer asset'
+    $checksum = Assert-CcodReleaseDefenderRegularFile -Path $ChecksumPath -Kind 'Installer checksum'
+    $text = & $Adapters.ReadText $checksum
+    if ($text -isnot [string]) { Throw-CcodReleaseDefenderError 'CCOD_DEFENDER_CHECKSUM_INVALID' 'Installer checksum could not be read as text' $checksum }
+    $match = [regex]::Match($text.TrimEnd("`r", "`n"), '^([0-9a-f]{64}) \*([^\r\n]+)$')
+    if (-not $match.Success -or $match.Groups[2].Value -cne [IO.Path]::GetFileName($installer)) {
+        Throw-CcodReleaseDefenderError 'CCOD_DEFENDER_CHECKSUM_INVALID' 'Installer checksum is malformed or names a different asset' $checksum
+    }
+    $actual = [string](& $Adapters.GetFileSha256 $installer)
+    if ($actual -cnotmatch '^[0-9a-f]{64}$' -or $actual -cne $match.Groups[1].Value) {
+        Throw-CcodReleaseDefenderError 'CCOD_DEFENDER_CHECKSUM_INVALID' 'Installer checksum does not match the exact bytes submitted for scanning' $installer
+    }
+    return [pscustomobject][ordered]@{ InstallerPath = $installer; ChecksumPath = $checksum; Sha256 = $actual }
+}
+
+function Test-CcodReleaseAssetManifest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ManifestPath,
+        [Parameter(Mandatory)][string]$AssetDirectory,
+        [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$ExpectedVersion
+    )
+    $manifestFile = Assert-CcodReleaseDefenderRegularFile -Path $ManifestPath -Kind 'Release manifest'
+    $directory = Assert-CcodReleaseDefenderDirectory -Path $AssetDirectory -Kind 'Release asset directory'
+    try { $manifest = [IO.File]::ReadAllText($manifestFile) | ConvertFrom-Json -ErrorAction Stop }
+    catch { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Release manifest is not valid JSON' $manifestFile }
+    $expectedFields = @('schemaVersion','product','version','gitCommit','buildTimestampUtc','assets')
+    if ($null -eq $manifest -or (($manifest.PSObject.Properties.Name | Sort-Object) -join '|') -cne (($expectedFields | Sort-Object) -join '|') -or
+        ($manifest.schemaVersion -isnot [int] -and $manifest.schemaVersion -isnot [long]) -or [int]$manifest.schemaVersion -ne 1 -or
+        $manifest.product -isnot [string] -or $manifest.product -cne 'CodexRemote-fix' -or
+        $manifest.version -isnot [string] -or $manifest.version -cne $ExpectedVersion -or
+        $manifest.gitCommit -isnot [string] -or $manifest.gitCommit -cnotmatch '^[0-9a-f]{40}$' -or
+        $manifest.buildTimestampUtc -isnot [string] -or -not (Test-CcodReleaseDefenderCanonicalUtc $manifest.buildTimestampUtc)) {
+        Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Release manifest metadata does not have the required canonical shape' $manifestFile
+    }
+    $assets = @($manifest.assets)
+    $expectedNames = @(
+        "CodexRemote-fix-$ExpectedVersion-setup.exe",
+        "CodexRemote-fix-$ExpectedVersion-setup.exe.sha256.txt",
+        "CodexRemote-fix-$ExpectedVersion-trayhost-provenance.json"
+    )
+    if ($assets.Count -ne $expectedNames.Count) { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Release manifest does not bind the exact required asset set' $manifestFile }
+    $assetHashes = @{}
+    foreach ($asset in $assets) {
+        if ($null -eq $asset -or (($asset.PSObject.Properties.Name | Sort-Object) -join '|') -cne 'name|sha256' -or
+            $asset.name -isnot [string] -or $asset.sha256 -isnot [string] -or $asset.name -cnotmatch '^[A-Za-z0-9._-]+$' -or $asset.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            $assetHashes.ContainsKey([string]$asset.name)) {
+            Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Release manifest asset records are malformed or duplicate' $manifestFile
+        }
+        $assetHashes[[string]$asset.name] = [string]$asset.sha256
+    }
+    if ((@($assetHashes.Keys | Sort-Object) -join '|') -cne (@($expectedNames | Sort-Object) -join '|')) {
+        Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Release manifest asset names are not the exact final candidate set' $manifestFile
+    }
+    foreach ($name in $expectedNames) {
+        $assetPath = Assert-CcodReleaseDefenderRegularFile -Path (Join-Path $directory $name) -Kind 'Release asset'
+        $actual = Get-CcodReleaseDefenderHash -Path $assetPath
+        if ($actual -cne $assetHashes[$name]) {
+            Throw-CcodReleaseDefenderError 'CCOD_RELEASE_ASSET_HASH_MISMATCH' 'Release asset bytes do not match the signed manifest hash' $name
+        }
+    }
+    $installer = Join-Path $directory $expectedNames[0]
+    $checksum = Join-Path $directory $expectedNames[1]
+    $checksumText = [IO.File]::ReadAllText($checksum).TrimEnd("`r", "`n")
+    if ($checksumText -cne ("{0} *{1}" -f $assetHashes[$expectedNames[0]], $expectedNames[0])) {
+        Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Release checksum file is not bound to the manifest installer hash' $checksum
+    }
+    try { $trayHost = [IO.File]::ReadAllText((Join-Path $directory $expectedNames[2])) | ConvertFrom-Json -ErrorAction Stop }
+    catch { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'TrayHost provenance is not valid JSON' $expectedNames[2] }
+    $trayHostVersion = $trayHost.PSObject.Properties['version']
+    $trayHostCommit = $trayHost.PSObject.Properties['gitCommit']
+    $trayHostTimestamp = $trayHost.PSObject.Properties['buildTimestampUtc']
+    if ($null -eq $trayHostVersion -or $null -eq $trayHostCommit -or $null -eq $trayHostTimestamp -or
+        $trayHostVersion.Value -isnot [string] -or $trayHostVersion.Value -cne $ExpectedVersion -or
+        $trayHostCommit.Value -isnot [string] -or $trayHostCommit.Value -cne $manifest.gitCommit -or
+        $trayHostTimestamp.Value -isnot [string] -or -not (Test-CcodReleaseDefenderCanonicalUtc $trayHostTimestamp.Value)) {
+        Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'TrayHost provenance is not bound to the release version, source commit, and timestamp' $expectedNames[2]
+    }
+    return [pscustomobject][ordered]@{
+        Valid = $true
+        Version = $ExpectedVersion
+        GitCommit = [string]$manifest.gitCommit
+        BuildTimestampUtc = [string]$manifest.buildTimestampUtc
+        InstallerSha256 = [string]$assetHashes[$expectedNames[0]]
+        InstallerName = $expectedNames[0]
+    }
+}
+
+function Get-CcodReleaseDefenderDetectionKeys {
+    param($Records)
+    $keys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($record in @($Records)) {
+        if ($null -eq $record) { continue }
+        $threat = if ($null -ne $record.PSObject.Properties['ThreatID']) { [string]$record.ThreatID } else { '' }
+        $time = if ($null -ne $record.PSObject.Properties['InitialDetectionTime']) { [string]$record.InitialDetectionTime } else { '' }
+        $resources = if ($null -ne $record.PSObject.Properties['Resources']) { [string]$record.Resources } else { '' }
+        if (-not [string]::IsNullOrWhiteSpace($threat) -or -not [string]::IsNullOrWhiteSpace($time) -or -not [string]::IsNullOrWhiteSpace($resources)) {
+            $null = $keys.Add("$threat|$time|$resources")
+        }
+    }
+    Write-Output -NoEnumerate $keys
+}
+
+function Invoke-CcodReleaseDefenderCheck {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InstallerPath,
+        [Parameter(Mandatory)][string]$ChecksumPath,
+        [Parameter(Mandatory)][string]$EvidencePath,
+        [hashtable]$Adapters
+    )
+    $adapters = Resolve-CcodReleaseDefenderAdapters -Adapters $Adapters
+    $candidate = Get-CcodReleaseDefenderChecksum -InstallerPath $InstallerPath -ChecksumPath $ChecksumPath -Adapters $adapters
+    $installerLeaf = [IO.Path]::GetFileName($candidate.InstallerPath)
+    $versionMatch = [regex]::Match($installerLeaf, '^CodexRemote-fix-(\d+\.\d+\.\d+)-setup\.exe$')
+    if (-not $versionMatch.Success) { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Installer name cannot bind a release manifest version' $installerLeaf }
+    $version = $versionMatch.Groups[1].Value
+    $manifestPath = Join-Path (Split-Path $candidate.InstallerPath -Parent) "CodexRemote-fix-$version-release-manifest.json"
+    $manifest = Test-CcodReleaseAssetManifest -ManifestPath $manifestPath -AssetDirectory (Split-Path $candidate.InstallerPath -Parent) -ExpectedVersion $version
+    if ($manifest.InstallerSha256 -cne $candidate.Sha256) { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_ASSET_HASH_MISMATCH' 'Release manifest and checksum bind different installer bytes' $installerLeaf }
+    $zone = & $adapters.GetZoneId $candidate.InstallerPath
+    if ($zone -isnot [int] -or [int]$zone -ne 3) {
+        Throw-CcodReleaseDefenderError 'CCOD_DEFENDER_ZONE_REQUIRED' 'The final downloaded installer must retain Internet ZoneId 3 before scanning.' $zone
+    }
+    $status = & $adapters.GetDefenderStatus
+    if ($null -eq $status -or $null -eq $status.PSObject.Properties['AMProductVersion'] -or $null -eq $status.PSObject.Properties['AntivirusSignatureVersion'] -or
+        $status.AMProductVersion -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$status.AMProductVersion) -or
+        $status.AntivirusSignatureVersion -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$status.AntivirusSignatureVersion)) {
+        Throw-CcodReleaseDefenderError 'CCOD_DEFENDER_STATUS_INVALID' 'Defender platform or signature version is unavailable.' $status
+    }
+    $before = Get-CcodReleaseDefenderDetectionKeys -Records (& $adapters.GetThreatDetections)
+    $started = & $adapters.GetUtcNow
+    if ($started -isnot [datetime]) { Throw-CcodReleaseDefenderError 'CCOD_DEFENDER_CLOCK_INVALID' 'Defender clock did not return a DateTime value' $started }
+    $scanError = $null
+    try { & $adapters.StartCustomScan $candidate.InstallerPath }
+    catch { $scanError = $_ }
+    $completed = & $adapters.GetUtcNow
+    if ($completed -isnot [datetime]) { $completed = [datetime]::UtcNow }
+    $after = Get-CcodReleaseDefenderDetectionKeys -Records (& $adapters.GetThreatDetections)
+    $newDetections = @($after | Where-Object { -not $before.Contains($_) })
+    $errorCode = $null
+    if ($null -ne $scanError) { $errorCode = 'CCOD_DEFENDER_SCAN_FAILED' }
+    elseif ($newDetections.Count -gt 0) { $errorCode = 'CCOD_DEFENDER_DETECTIONS_FOUND' }
+    $receipt = [pscustomobject][ordered]@{
+        schemaVersion = 1
+        installerSha256 = $candidate.Sha256
+        zoneId = [int]$zone
+        defenderPlatformVersion = [string]$status.AMProductVersion
+        signatureVersion = [string]$status.AntivirusSignatureVersion
+        scanStartedAtUtc = $started.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+        scanCompletedAtUtc = $completed.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+        detectionCount = [int]$newDetections.Count
+        outcome = if ($null -eq $errorCode) { 'Completed' } else { 'Failed' }
+        errorCode = $errorCode
+    }
+    try { & $adapters.WriteReceipt $EvidencePath $receipt | Out-Null }
+    catch { Throw-CcodReleaseDefenderError 'CCOD_DEFENDER_EVIDENCE_WRITE_FAILED' 'Defender scan receipt could not be written.' $EvidencePath }
+    if ($null -ne $errorCode) { Throw-CcodReleaseDefenderError $errorCode 'The Defender final-asset gate did not complete cleanly.' $candidate.Sha256 }
+    return $receipt
+}
+
+if (-not $Library) {
+    try {
+        $receipt = Invoke-CcodReleaseDefenderCheck -InstallerPath $InstallerPath -ChecksumPath $ChecksumPath -EvidencePath $EvidencePath
+        $receipt | ConvertTo-Json -Depth 8
+    } catch {
+        Write-Error $_
+        exit 1
+    }
+}

@@ -6,6 +6,14 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.0
+
+### English
+
+- Rebuilt restart and repair as a durable Supervisor-owned lifecycle that resumes safely after delayed or manual Codex launches.
+- Simplified the tray to truthful connection/protection status, one repair action, language, logs, About, and safe Exit.
+- Made upgrades wait for the new runtime and tray, preserved authorized devices, and unified Windows Settings and direct uninstall behind a fail-closed cleanup flow.
+
 ## v2.4.24
 
 ### English

@@ -624,7 +624,10 @@ Invoke-CcodTest 'adds the exact localization adapters and host fields at the fro
     $names=Get-CcodSupervisorAdapterNames
     $first=[Array]::IndexOf($names,'ReadUiPreference')
     Assert-CcodTrue ($first -ge 0) 'ReadUiPreference adapter exists'
-    Assert-CcodEqual 'ReadUiPreference,SetUiLanguageMode,GetSystemCultureName,GetUiCatalog,ShowTrayError,StartUninstall' (@($names[$first..($first+5)])-join ',') 'localization and uninstall adapter order is exact'
+    Assert-CcodEqual 'ReadUiPreference,SetUiLanguageMode,GetSystemCultureName,GetUiCatalog,ShowTrayError,EnumerateProcessIds' (@($names[$first..($first+5)])-join ',') 'localization adapter order is exact'
+    Assert-CcodTrue ($names -cnotcontains 'StartUninstall') 'tray uninstall adapter is removed'
+    $defaults=Get-CcodSupervisorDefaultAdapters
+    Assert-CcodTrue (-not $defaults.ContainsKey('StartUninstall')) 'default adapters omit the tray uninstall launcher'
     foreach($name in @('ReadActiveRuntime','GetTrustedLogonIdentity','EnterLifecycleOwnership','AssertLifecycleFence','ExitLifecycleOwnership','OpenLifecycleWakeEvent','ResetLifecycleWakeEvent','ReadLifecycleRequest','ReceiveLifecycleSubmissions','WriteLifecycleSubmissionReceipt','NewLifecycleRequest','WriteLifecycleRequest','MoveLifecyclePhase','CompleteLifecycleRequest','GetLifecycleStep','ReduceLifecycleWorkerResult','NewLifecycleWorkerRequest','AssertLifecycleWorkerResult')){
         Assert-CcodTrue ($names -ccontains $name) "$name lifecycle adapter exists"
     }

@@ -57,8 +57,6 @@ $commandQueue = [Collections.Concurrent.ConcurrentQueue[object]]::new()
 $galleryAdapters = @{
     # Accept commands in memory only so menu clicks cannot mutate preference/safety state.
     TryEnqueue = { param($Queue,$Value) $true }
-    # Never open a destructive confirmation from a visual gallery.
-    ConfirmUninstall = { param($Title,$Message) $false }
 }
 
 foreach ($selectedLocale in $locales) {
