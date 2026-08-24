@@ -32,7 +32,7 @@ jobs:
 
       - name: Run uninstall bootstrap self-test
         shell: pwsh
-        run: ./tests/persistence/UninstallBootstrap.SelfTest.ps1
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./tests/persistence/UninstallBootstrap.SelfTest.ps1
 
       - name: Run repository validation
         shell: pwsh
