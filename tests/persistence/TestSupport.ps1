@@ -12,8 +12,17 @@ function Assert-CcodThrows([scriptblock]$Action, [string]$ErrorId) {
 }
 
 function Invoke-CcodTest([string]$Name, [scriptblock]$Action) {
-    & $Action
-    [pscustomobject]@{ Name = $Name; Ok = $true }
+    try {
+        & $Action
+        return [pscustomobject]@{ Name = $Name; Ok = $true }
+    } catch {
+        $safeName = ($Name -replace '[^A-Za-z0-9_.-]', '-') -replace '-+', '-'
+        if ($safeName.Length -gt 120) { $safeName = $safeName.Substring(0,120) }
+        $errorId = ([string]$_.FullyQualifiedErrorId -split '[,:]')[0]
+        if ($errorId -cnotmatch '^(?:ASSERT|CCOD)_[A-Z0-9_]+$') { $errorId = 'UNCLASSIFIED' }
+        [Console]::Error.WriteLine(('CCOD_SELFTEST_FAILED case={0} error={1}' -f $safeName,$errorId))
+        throw
+    }
 }
 
 function Get-CcodTestFileSha256 {
