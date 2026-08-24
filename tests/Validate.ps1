@@ -85,6 +85,14 @@ if ($failures.Count -eq 0) {
     $powershellExecutable = (Get-Command powershell.exe -ErrorAction Stop).Source
     $persistenceOutput = & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $persistenceSelfTest 2>&1
     if ($LASTEXITCODE -ne 0) {
+        $persistenceText = $persistenceOutput -join ' '
+        if ($persistenceText -match 'ASSERT_EQUAL: submission error code expected=\[\] actual=\[CCOD_LIFECYCLE_PATH_INVALID\]') {
+            $lifecycleProbe = Join-Path $PSScriptRoot 'persistence\Invoke-LifecycleRequestCiProbe.ps1'
+            if (Test-Path -LiteralPath $lifecycleProbe -PathType Leaf) {
+                Write-Host 'Lifecycle request CI probe follows:'
+                & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $lifecycleProbe
+            }
+        }
         foreach ($line in @($persistenceOutput)) {
             $text = [string]$line
             if ($text -match 'CCOD_LIFECYCLE_TEST_DIAG_') { Write-Host $text }
