@@ -24,6 +24,7 @@ $script:CcodUninstallPayloadEntries = @(
     'src/persistence/modules/RuntimeManifest.psm1',
     'src/persistence/modules/LifecycleEpoch.psm1',
     'src/persistence/modules/StateStore.psm1',
+    'src/persistence/modules/TrustedLogonIdentity.psm1',
     'src/persistence/modules/ScheduledTask.psm1',
     'src/persistence/modules/KernelObjects.psm1',
     'src/persistence/modules/CompatibilityProbe.psm1',
