@@ -394,9 +394,19 @@ function Invoke-CcodBootstrapSafeExitMarkerPolicy {
 }
 
 function Test-CcodBootstrapSafeExitSuppression {
-    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$Pointer,[Parameter(Mandatory)][string]$UserSid,[Parameter(Mandatory)][int]$SessionId,[Parameter(Mandatory)][ValidateSet('Task','Explicit')][string]$EntryMode)
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)]$Pointer,
+        [Parameter(Mandatory)][string]$UserSid,
+        [Parameter(Mandatory)][int]$SessionId,
+        [Parameter(Mandatory)][ValidateSet('Task','Explicit')][string]$EntryMode,
+        [scriptblock]$GetMarkerItem
+    )
     $marker=Join-Path $InstallRoot 'state\lifecycle\safe-exit-intent.json'
-    $preflight=Get-CcodBootstrapSafeExitMarkerPreflight @{GetMarkerItem={try{Get-Item -LiteralPath $marker -Force -ErrorAction Stop}catch [Management.Automation.ItemNotFoundException]{return $null}}}
+    if($null-eq$GetMarkerItem){
+        $GetMarkerItem={try{Get-Item -LiteralPath $marker -Force -ErrorAction Stop}catch [Management.Automation.ItemNotFoundException]{return $null}}.GetNewClosure()
+    }
+    $preflight=Get-CcodBootstrapSafeExitMarkerPreflight @{GetMarkerItem=$GetMarkerItem}
     if($preflight-ceq'Absent'){return $false}
     if($preflight-ceq'Invalid'){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Safe-exit marker path is not a regular file' $marker}
     $validation=Test-CcodBootstrapRuntime -InstallRoot $InstallRoot -RuntimeId $Pointer.ActiveRuntime
@@ -767,6 +777,26 @@ function Write-CcodBootstrapLog {
     }
 }
 
+function Invoke-CcodBootstrapPrelaunch {
+    param([Parameter(Mandatory)][hashtable]$Adapters)
+
+    $suppressed = [bool](& $Adapters.TestSafeExitSuppression)
+    if ($suppressed) {
+        return [pscustomobject]@{
+            Suppressed = $true
+            KernelModule = $null
+            LaunchLease = $null
+        }
+    }
+
+    $acquired = & $Adapters.AcquireLaunchLease
+    return [pscustomobject]@{
+        Suppressed = $false
+        KernelModule = $acquired.KernelModule
+        LaunchLease = $acquired.LaunchLease
+    }
+}
+
 if($MyInvocation.InvocationName -ne '.'){
 $exitCode = 1
 $root = $null
@@ -791,11 +821,21 @@ try {
     }
 
     $initialPointer = Read-CcodBootstrapActivePointer -InstallRoot $root
-    $safeExitSuppressed=Test-CcodBootstrapSafeExitSuppression -InstallRoot $root -Pointer $initialPointer -UserSid $userSid -SessionId $sessionId -EntryMode $EntryMode
+    $prelaunch = Invoke-CcodBootstrapPrelaunch -Adapters @{
+        TestSafeExitSuppression = {
+            Test-CcodBootstrapSafeExitSuppression -InstallRoot $root -Pointer $initialPointer -UserSid $userSid -SessionId $sessionId -EntryMode $EntryMode
+        }
+        AcquireLaunchLease = {
+            $module = Import-CcodBootstrapKernelObjects -InstallRoot $root -Pointer $initialPointer
+            $lease = & $module { param($Sid,$Timeout) Enter-CcodMutex -Kind 'AccountTransition' -UserSid $Sid -TimeoutMilliseconds $Timeout } $userSid ([int]($ReadyTimeoutSeconds * 1000))
+            [pscustomobject]@{ KernelModule = $module; LaunchLease = $lease }
+        }
+    }
+    $safeExitSuppressed = $prelaunch.Suppressed
     if($safeExitSuppressed){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_SUPPRESSED' 'Task startup was intentionally suppressed by the same-logon safe-exit marker' $root}
 
-    $kernelModule = Import-CcodBootstrapKernelObjects -InstallRoot $root -Pointer $initialPointer
-    $launchLease = & $kernelModule { param($Sid,$Timeout) Enter-CcodMutex -Kind 'AccountTransition' -UserSid $Sid -TimeoutMilliseconds $Timeout } $userSid ([int]($ReadyTimeoutSeconds * 1000))
+    $kernelModule = $prelaunch.KernelModule
+    $launchLease = $prelaunch.LaunchLease
     if ($launchLease.Outcome -cne 'Acquired') {
         Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_LAUNCH_BUSY' 'An installation transition is in progress; bootstrap will retry through the scheduled task' $root
     }

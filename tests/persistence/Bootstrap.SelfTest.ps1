@@ -298,12 +298,33 @@ $results += Invoke-CcodTest 'identity and comparison failures use the same Expli
     }
 }
 
-$results += Invoke-CcodTest 'strict marker preflight distinguishes absence from unsafe path inspection' {
-    # Production mutation caught: treating access errors, directories, or reparse paths as absent markers.
-    Assert-CcodExactEqual 'Absent' (Get-CcodBootstrapSafeExitMarkerPreflight @{GetMarkerItem={$null}}) 'only a true missing leaf is absent'
-    Assert-CcodThrows {Get-CcodBootstrapSafeExitMarkerPreflight @{GetMarkerItem={throw 'access'}}} 'CCOD_SAFE_EXIT_INTENT_INVALID'
-    $directory=Get-Item -LiteralPath ([IO.Path]::GetTempPath()) -Force
-    Assert-CcodExactEqual 'Invalid' (Get-CcodBootstrapSafeExitMarkerPreflight @{GetMarkerItem={$directory}}) 'directory marker path is invalid'
+$results += Invoke-CcodTest 'production suppression caller fails closed for unsafe marker inspection and proceeds only on absence' {
+    # Production mutation caught: bypassing the injected marker-item boundary or treating access, directory, or reparse results as absent.
+    $arguments = @{
+        InstallRoot = 'C:\ccod-bootstrap-marker-boundary'
+        Pointer = [pscustomobject]@{ ActiveRuntime = 'unused-for-preflight' }
+        UserSid = 'S-1-5-21-1-2-3-1001'
+        SessionId = 1
+        EntryMode = 'Task'
+    }
+
+    Assert-CcodExactEqual $false (Test-CcodBootstrapSafeExitSuppression @arguments -GetMarkerItem { $null }) 'true absence proceeds without marker suppression'
+    Assert-CcodThrows { Test-CcodBootstrapSafeExitSuppression @arguments -GetMarkerItem { throw 'access denied' } } 'CCOD_SAFE_EXIT_INTENT_INVALID'
+
+    $directory = Get-Item -LiteralPath ([IO.Path]::GetTempPath()) -Force
+    Assert-CcodThrows { Test-CcodBootstrapSafeExitSuppression @arguments -GetMarkerItem { $directory } } 'CCOD_SAFE_EXIT_INTENT_INVALID'
+
+    $reparse = [IO.FileInfo]::new('C:\synthetic-safe-exit-reparse')
+    $instanceNonPublic = [Reflection.BindingFlags]'Instance,NonPublic'
+    $dataField = [IO.FileInfo].BaseType.GetField('_data', $instanceNonPublic)
+    $initializedField = [IO.FileInfo].BaseType.GetField('_dataInitialised', $instanceNonPublic)
+    $boxedData = [object]$dataField.GetValue($reparse)
+    $attributeField = $dataField.FieldType.GetField('fileAttributes', [Reflection.BindingFlags]'Instance,Public,NonPublic')
+    $attributeField.SetValue($boxedData, [int][IO.FileAttributes]::ReparsePoint)
+    $dataField.SetValue($reparse, $boxedData)
+    $initializedField.SetValue($reparse, 0)
+    Assert-CcodTrue (($reparse.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) 'fixture is a FileInfo marked ReparsePoint'
+    Assert-CcodThrows { Test-CcodBootstrapSafeExitSuppression @arguments -GetMarkerItem { $reparse } } 'CCOD_SAFE_EXIT_INTENT_INVALID'
 }
 
 
@@ -601,12 +622,26 @@ $results += Invoke-CcodTest 'defaults InstallRoot to the bootstrap script direct
     Assert-CcodTrue (@($entryMode.Attributes | Where-Object { $_.TypeName.Name -ceq 'ValidateSet' }).Count -eq 1) 'bootstrap constrains entry mode to the declared safe modes'
 }
 
-$results += Invoke-CcodTest 'evaluates safe-exit marker policy before taking the AccountTransition launch lease' {
-    # Production mutation caught: recursively entering lifecycle ownership while AccountTransition is already held.
-    $source=Get-Content -LiteralPath $bootstrapScript -Raw -Encoding UTF8
-    $policy=$source.IndexOf('$safeExitSuppressed=Test-CcodBootstrapSafeExitSuppression',[StringComparison]::Ordinal)
-    $lease=$source.IndexOf('$launchLease = & $kernelModule',[StringComparison]::Ordinal)
-    Assert-CcodTrue ($policy -ge 0 -and $lease -ge 0 -and $policy -lt $lease) 'marker policy runs before launch lease acquisition'
+$results += Invoke-CcodTest 'prelaunch evaluates safe-exit policy before lease acquisition and suppression skips the lease' {
+    # Production mutation caught: acquiring AccountTransition before marker policy, or acquiring it after same-logon suppression.
+    $calls = [Collections.Generic.List[string]]::new()
+    $lease = [pscustomobject]@{ Outcome = 'Acquired'; Released = $false }
+    $adapters = @{
+        TestSafeExitSuppression = { $calls.Add('MarkerPolicy'); $false }
+        AcquireLaunchLease = { $calls.Add('AccountTransition'); [pscustomobject]@{ KernelModule = 'kernel'; LaunchLease = $lease } }
+    }
+
+    $proceed = Invoke-CcodBootstrapPrelaunch -Adapters $adapters
+    Assert-CcodExactEqual 'MarkerPolicy|AccountTransition' ($calls -join '|') 'marker policy runs before AccountTransition acquisition'
+    Assert-CcodExactEqual $false $proceed.Suppressed 'ordinary startup proceeds'
+    Assert-CcodExactEqual $lease $proceed.LaunchLease 'ordinary startup returns the acquired launch lease'
+
+    $calls.Clear()
+    $adapters.TestSafeExitSuppression = { $calls.Add('MarkerPolicy'); $true }.GetNewClosure()
+    $suppressed = Invoke-CcodBootstrapPrelaunch -Adapters $adapters
+    Assert-CcodExactEqual 'MarkerPolicy' ($calls -join '|') 'same-logon suppression never acquires AccountTransition'
+    Assert-CcodExactEqual $true $suppressed.Suppressed 'same-logon marker suppresses startup'
+    Assert-CcodExactEqual $null $suppressed.LaunchLease 'suppressed startup owns no launch lease'
 }
 
 $results | Format-Table -AutoSize
