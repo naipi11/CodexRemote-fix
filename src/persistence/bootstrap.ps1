@@ -9,7 +9,11 @@ param(
 
     [Parameter(Mandatory = $false)]
     [ValidateRange(1, 120)]
-    [int]$ReadyTimeoutSeconds = 15
+    [int]$ReadyTimeoutSeconds = 15,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('Task','Explicit')]
+    [string]$EntryMode = 'Explicit'
 )
 
 Set-StrictMode -Version 2.0

@@ -534,6 +534,9 @@ $results += Invoke-CcodTest 'defaults InstallRoot to the bootstrap script direct
     Assert-CcodTrue ($null -ne $param) 'InstallRoot parameter exists'
     Assert-CcodTrue (-not $param.Attributes.Where({ $_.TypeName.Name -ceq 'Parameter' -and $_.NamedArguments.Where({ $_.ArgumentName -ceq 'Mandatory' -and $_.Argument.Extent.Text -match 'true' }) }).Count) 'InstallRoot is not mandatory'
     Assert-CcodTrue ($param.DefaultValue.Extent.Text -match 'PSScriptRoot') 'InstallRoot defaults to PSScriptRoot for scheduled-task launches'
+    $entryMode = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -ceq 'EntryMode' } | Select-Object -First 1
+    Assert-CcodTrue ($null -ne $entryMode -and $entryMode.DefaultValue.Extent.Text -match "'Explicit'") 'bootstrap defaults manual launches to Explicit entry mode'
+    Assert-CcodTrue (@($entryMode.Attributes | Where-Object { $_.TypeName.Name -ceq 'ValidateSet' }).Count -eq 1) 'bootstrap constrains entry mode to the declared safe modes'
 }
 
 $results | Format-Table -AutoSize

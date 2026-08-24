@@ -60,7 +60,7 @@ function New-CcodFakeTaskAdapters {
   </Settings>
   <Actions Context="Author"><Exec>
     <Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
-    <Arguments>-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "C:\Users\name\AppData\Local\CodexControlOtherDevices\bootstrap.ps1" -InstallRoot "C:\Users\name\AppData\Local\CodexControlOtherDevices"</Arguments>
+    <Arguments>-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "C:\Users\name\AppData\Local\CodexControlOtherDevices\bootstrap.ps1" -InstallRoot "C:\Users\name\AppData\Local\CodexControlOtherDevices" -EntryMode Task</Arguments>
     <WorkingDirectory>C:\Users\name\AppData\Local\CodexControlOtherDevices</WorkingDirectory>
   </Exec></Actions>
 </Task>
@@ -90,6 +90,7 @@ $results += Invoke-CcodTest 'supervisor task spec uses the fixed limited interac
     Assert-CcodTrue ([IO.Path]::IsPathRooted($spec.Execute)) 'absolute PowerShell path'
     Assert-CcodTrue ($spec.Argument -match ([Regex]::Escape('bootstrap.ps1'))) 'bootstrap is the task target'
     Assert-CcodTrue ($spec.Argument -match ([Regex]::Escape('-InstallRoot "C:\Users\name\AppData\Local\CodexControlOtherDevices"'))) 'task passes absolute InstallRoot'
+    Assert-CcodTrue ($spec.Argument -match ([Regex]::Escape('-EntryMode Task'))) 'scheduled task explicitly enters bootstrap Task mode'
     Assert-CcodTrue ([IO.Path]::IsPathRooted($spec.WorkingDirectory)) 'working directory is absolute'
 }
 
@@ -145,6 +146,7 @@ $results += Invoke-CcodTest 'snapshot verifies exported XML safety values and re
     Assert-CcodExactEqual $false $snapshot.StopIfGoingOnBatteries 'XML does not stop on battery'
     Assert-CcodTrue ([IO.Path]::IsPathRooted($snapshot.Execute)) 'XML action is absolute'
     Assert-CcodTrue ($snapshot.Argument -match '-WindowStyle Hidden') 'XML action is hidden'
+    Assert-CcodTrue ($snapshot.Argument -match ([Regex]::Escape('-EntryMode Task'))) 'XML action preserves bootstrap Task mode'
 }
 
 $results | Format-Table -AutoSize
