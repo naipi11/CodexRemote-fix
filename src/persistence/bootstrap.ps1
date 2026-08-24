@@ -367,24 +367,20 @@ function Import-CcodBootstrapKernelObjects {
     Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_KERNEL_MISSING' 'No verified runtime contains the kernel-object module required for launch serialization' $InstallRoot
 }
 
+function Invoke-CcodBootstrapExplicitMarkerReplacement {param([hashtable]$Adapters)if(-not(&$Adapters.ConfirmReplacement)){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_CONFIRMATION_REQUIRED' 'Explicit startup requires local confirmation before marker replacement' $null};$ownership=&$Adapters.EnterOwnership;try{&$Adapters.ClearCorruptIntent}finally{&$Adapters.ExitOwnership $ownership|Out-Null};return [pscustomobject]@{Suppressed=$false;Cleared=$true}}
+function Get-CcodBootstrapSafeExitMarkerPreflight {param([hashtable]$Adapters)try{$item=&$Adapters.GetMarkerItem}catch{Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Safe-exit marker inspection failed' $null};if($null-eq$item){return 'Absent'};if($item-isnot[IO.FileInfo]-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){return 'Invalid'};return 'File'}
 function Invoke-CcodBootstrapSafeExitMarkerPolicy {
     param([Parameter(Mandatory)][ValidateSet('Task','Explicit')][string]$EntryMode,[Parameter(Mandatory)][hashtable]$Adapters)
     try{$intent=&$Adapters.ReadIntent}catch{
         if($EntryMode-ceq'Task'){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Task startup refuses an unreadable safe-exit marker' $null}
-        if(-not(&$Adapters.ConfirmReplacement)){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_CONFIRMATION_REQUIRED' 'Explicit startup requires local confirmation before replacing an unreadable safe-exit marker' $null}
-        $ownership=&$Adapters.EnterOwnership
-        try{&$Adapters.ClearCorruptIntent}finally{&$Adapters.ExitOwnership $ownership|Out-Null}
-        return [pscustomobject]@{Suppressed=$false;Cleared=$true}
+        return Invoke-CcodBootstrapExplicitMarkerReplacement $Adapters
     }
     if($null-eq$intent){return [pscustomobject]@{Suppressed=$false;Cleared=$false}}
     $identity=$null;try{$identity=&$Adapters.GetIdentity}catch{
         if($EntryMode-ceq'Task'){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Task startup requires a trusted logon identity' $null}
-        if(-not(&$Adapters.ConfirmReplacement)){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_CONFIRMATION_REQUIRED' 'Explicit startup requires local confirmation before marker replacement' $null}
-        $ownership=&$Adapters.EnterOwnership
-        try{&$Adapters.ClearCorruptIntent}finally{&$Adapters.ExitOwnership $ownership|Out-Null}
-        return [pscustomobject]@{Suppressed=$false;Cleared=$true}
+        return Invoke-CcodBootstrapExplicitMarkerReplacement $Adapters
     }
-    $same=&$Adapters.TestSameLogon $intent $identity
+    try{$same=&$Adapters.TestSameLogon $intent $identity}catch{if($EntryMode-ceq'Task'){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Task startup requires trusted marker comparison' $null};return Invoke-CcodBootstrapExplicitMarkerReplacement $Adapters}
     if($same-and$EntryMode-ceq'Task'){
         $active=&$Adapters.ReadActiveRequest
         if($null-ne$active-and$active.kind-ceq'SafeExit'-and$active.transactionId-ceq$intent.recoveryTransactionId){return [pscustomobject]@{Suppressed=$false;Cleared=$false}}
@@ -400,9 +396,9 @@ function Invoke-CcodBootstrapSafeExitMarkerPolicy {
 function Test-CcodBootstrapSafeExitSuppression {
     param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$Pointer,[Parameter(Mandatory)][string]$UserSid,[Parameter(Mandatory)][int]$SessionId,[Parameter(Mandatory)][ValidateSet('Task','Explicit')][string]$EntryMode)
     $marker=Join-Path $InstallRoot 'state\lifecycle\safe-exit-intent.json'
-    $markerItem=Get-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
-    if($null-eq$markerItem){return $false}
-    if($markerItem-isnot[IO.FileInfo]-or($markerItem.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Safe-exit marker path is not a regular file' $marker}
+    $preflight=Get-CcodBootstrapSafeExitMarkerPreflight @{GetMarkerItem={try{Get-Item -LiteralPath $marker -Force -ErrorAction Stop}catch [Management.Automation.ItemNotFoundException]{return $null}}}
+    if($preflight-ceq'Absent'){return $false}
+    if($preflight-ceq'Invalid'){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Safe-exit marker path is not a regular file' $marker}
     $validation=Test-CcodBootstrapRuntime -InstallRoot $InstallRoot -RuntimeId $Pointer.ActiveRuntime
     if(-not$validation.Valid){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Safe-exit marker cannot be verified against the active runtime' $marker}
     $modulePath=Join-Path $validation.RuntimeDirectory 'src\persistence\modules\TrustedLogonIdentity.psm1'

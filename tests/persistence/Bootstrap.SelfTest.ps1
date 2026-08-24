@@ -284,6 +284,28 @@ $results += Invoke-CcodTest 'marker policy requires positive Explicit confirmati
     Assert-CcodThrows {Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Task -Adapters $task} 'CCOD_SAFE_EXIT_INTENT_INVALID'
 }
 
+$results += Invoke-CcodTest 'identity and comparison failures use the same Explicit confirmation replacement boundary' {
+    # Production mutation caught: treating token/comparison failures as a bare confirmation-required error without showing confirmation.
+    foreach($failure in @('Identity','Compare')){
+        $calls=[Collections.Generic.List[string]]::new();$intent=[pscustomobject]@{recoveryTransactionId='33333333-2222-3333-4444-555555555555'}
+        $adapters=@{ReadIntent={$intent};GetIdentity={if($failure-ceq'Identity'){throw 'token'};[pscustomobject]@{}};TestSameLogon={param($a,$b)if($failure-ceq'Compare'){throw 'compare'};$false};ReadActiveRequest={$null};ReadCompletionReceipt={param($x)$null};Log={param($x){}};ConfirmReplacement={$calls.Add('Confirm');$false};EnterOwnership={$calls.Add('Enter');[pscustomobject]@{}};ExitOwnership={param($x)$calls.Add('Exit')};ClearIntent={$calls.Add('Clear')};ClearCorruptIntent={$calls.Add('ClearCorrupt')}}
+        Assert-CcodThrows {Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Task -Adapters $adapters} 'CCOD_SAFE_EXIT_INTENT_INVALID'
+        Assert-CcodThrows {Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Explicit -Adapters $adapters} 'CCOD_SAFE_EXIT_INTENT_CONFIRMATION_REQUIRED'
+        $calls.Clear();$adapters.ConfirmReplacement={$calls.Add('Confirm');$true}.GetNewClosure()
+        $result=Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Explicit -Adapters $adapters
+        Assert-CcodTrue $result.Cleared "$failure Explicit Yes replaces marker"
+        Assert-CcodExactEqual 'Confirm|Enter|ClearCorrupt|Exit' ($calls-join '|') "$failure replacement acquires ownership after confirmation"
+    }
+}
+
+$results += Invoke-CcodTest 'strict marker preflight distinguishes absence from unsafe path inspection' {
+    # Production mutation caught: treating access errors, directories, or reparse paths as absent markers.
+    Assert-CcodExactEqual 'Absent' (Get-CcodBootstrapSafeExitMarkerPreflight @{GetMarkerItem={$null}}) 'only a true missing leaf is absent'
+    Assert-CcodThrows {Get-CcodBootstrapSafeExitMarkerPreflight @{GetMarkerItem={throw 'access'}}} 'CCOD_SAFE_EXIT_INTENT_INVALID'
+    $directory=Get-Item -LiteralPath ([IO.Path]::GetTempPath()) -Force
+    Assert-CcodExactEqual 'Invalid' (Get-CcodBootstrapSafeExitMarkerPreflight @{GetMarkerItem={$directory}}) 'directory marker path is invalid'
+}
+
 
 $results += Invoke-CcodTest 'selects previous runtime after active exits before ready and swaps pointer' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-" + [guid]::NewGuid().ToString('N'))
