@@ -26,6 +26,10 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
       - name: Run repository validation
         shell: pwsh
         run: npm test

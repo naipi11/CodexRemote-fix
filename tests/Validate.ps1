@@ -4,6 +4,21 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# npm normally launches this Windows PowerShell entry point from a PowerShell 7
+# shell. Preserve the Desktop module discovery paths so child Windows PowerShell
+# tests can resolve inbox cmdlets such as Get-FileHash instead of inheriting only
+# the PowerShell 7 module layout.
+if ($PSVersionTable.PSEdition -eq 'Desktop') {
+    $desktopModulePaths = @(
+        [Environment]::GetEnvironmentVariable('PSModulePath', 'User'),
+        [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    if ($desktopModulePaths.Count -gt 0) {
+        $env:PSModulePath = $desktopModulePaths -join ';'
+    }
+}
+
 $projectRoot = Split-Path $PSScriptRoot -Parent
 $failures = [System.Collections.Generic.List[string]]::new()
 $cleanRoomSelfTest = Join-Path $PSScriptRoot 'CleanroomSelfTest.js'

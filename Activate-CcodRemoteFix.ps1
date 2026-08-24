@@ -4,6 +4,8 @@ param(
     [Parameter(Mandatory)][string]$InstallRoot,
     [string]$ActivationId,
     [switch]$ValidateReceiptOnly,
+    [switch]$ValidateReceiptWithTimeout,
+    [ValidateRange(1,300000)][int]$ValidationTimeoutMilliseconds = 2000,
     [switch]$Prompt,
     [switch]$NoUi
 )
@@ -84,6 +86,81 @@ function Read-CcodTerminalActivationReceipt {
     return $receipt
 }
 
+function ConvertTo-CcodNativeProcessArgument {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Argument)
+    $quoted = [Text.StringBuilder]::new()
+    [void]$quoted.Append('"')
+    $slashes = 0
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq [char]'\') { $slashes++; continue }
+        if ($character -eq [char]'"') {
+            [void]$quoted.Append(('\' * (($slashes * 2) + 1)))
+            [void]$quoted.Append('"')
+            $slashes = 0
+            continue
+        }
+        if ($slashes -gt 0) {
+            [void]$quoted.Append(('\' * $slashes))
+            $slashes = 0
+        }
+        [void]$quoted.Append($character)
+    }
+    if ($slashes -gt 0) { [void]$quoted.Append(('\' * ($slashes * 2))) }
+    [void]$quoted.Append('"')
+    return $quoted.ToString()
+}
+
+function Invoke-CcodBoundedReceiptValidator {
+    param([Parameter(Mandatory)][int]$TimeoutMilliseconds)
+    $process = $null
+    try {
+        $hostExecutable = Join-Path $PSHOME 'powershell.exe'
+        if (-not [IO.File]::Exists($hostExecutable) -or -not [IO.File]::Exists($PSCommandPath)) {
+            throw 'CCOD_ACTIVATION_VALIDATOR_START_FAILED'
+        }
+        $arguments = @(
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            $PSCommandPath,
+            '-AppRoot',
+            $AppRoot,
+            '-InstallRoot',
+            $InstallRoot,
+            '-ValidateReceiptOnly',
+            '-ActivationId',
+            $ActivationId
+        )
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $hostExecutable
+        $startInfo.Arguments = (($arguments | ForEach-Object { ConvertTo-CcodNativeProcessArgument ([string]$_) }) -join ' ')
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) { throw 'CCOD_ACTIVATION_VALIDATOR_START_FAILED' }
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            try {
+                if (-not $process.HasExited) { $process.Kill() }
+            } catch { }
+            Write-Error 'CCOD_ACTIVATION_VALIDATOR_TIMEOUT' -ErrorAction Continue
+            return 3
+        }
+        $exitCode = [int]$process.ExitCode
+        if ($exitCode -eq 0 -or $exitCode -eq 2) { return $exitCode }
+        Write-Error 'CCOD_ACTIVATION_RECEIPT_INVALID' -ErrorAction Continue
+        return 3
+    } catch {
+        Write-Error 'CCOD_ACTIVATION_VALIDATOR_START_FAILED' -ErrorAction Continue
+        return 3
+    } finally {
+        if ($null -ne $process) { $process.Dispose() }
+    }
+}
+
 function Read-CcodFinalActivationReceipt {
     param([Parameter(Mandatory)][string]$Root,[Parameter(Mandatory)][string]$ExpectedActivationId)
     $receipt = Read-CcodTerminalActivationReceipt -Root $Root -ExpectedActivationId $ExpectedActivationId
@@ -100,11 +177,16 @@ function Show-CcodActivationFailure {
     } catch { }
 }
 
+if ($ValidateReceiptOnly -and $ValidateReceiptWithTimeout) { Write-Error 'CCOD_ACTIVATION_VALIDATOR_MODE_INVALID' -ErrorAction Continue; exit 3 }
 if ([string]::IsNullOrWhiteSpace($ActivationId)) {
-    if ($ValidateReceiptOnly) { Write-Error 'CCOD_ACTIVATION_ID_INVALID' -ErrorAction Continue; exit 3 }
+    if ($ValidateReceiptOnly -or $ValidateReceiptWithTimeout) { Write-Error 'CCOD_ACTIVATION_ID_INVALID' -ErrorAction Continue; exit 3 }
     $ActivationId = [guid]::NewGuid().ToString('D')
 }
 if (-not (Test-CcodCanonicalGuid $ActivationId)) { Write-Error 'CCOD_ACTIVATION_ID_INVALID' -ErrorAction Continue; exit 3 }
+if ($ValidateReceiptWithTimeout) {
+    $validationResult = Invoke-CcodBoundedReceiptValidator -TimeoutMilliseconds $ValidationTimeoutMilliseconds
+    exit $validationResult
+}
 if ($ValidateReceiptOnly) {
     try {
         $terminalReceipt = Read-CcodTerminalActivationReceipt -Root ([IO.Path]::GetFullPath($InstallRoot)) -ExpectedActivationId $ActivationId
