@@ -367,6 +367,62 @@ function Import-CcodBootstrapKernelObjects {
     Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_KERNEL_MISSING' 'No verified runtime contains the kernel-object module required for launch serialization' $InstallRoot
 }
 
+function Invoke-CcodBootstrapSafeExitMarkerPolicy {
+    param([Parameter(Mandatory)][ValidateSet('Task','Explicit')][string]$EntryMode,[Parameter(Mandatory)][hashtable]$Adapters)
+    try{$intent=&$Adapters.ReadIntent}catch{
+        if($EntryMode-ceq'Task'){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Task startup refuses an unreadable safe-exit marker' $null}
+        if(-not(&$Adapters.ConfirmReplacement)){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_CONFIRMATION_REQUIRED' 'Explicit startup requires local confirmation before replacing an unreadable safe-exit marker' $null}
+        $ownership=&$Adapters.EnterOwnership
+        try{&$Adapters.ClearCorruptIntent}finally{&$Adapters.ExitOwnership $ownership|Out-Null}
+        return [pscustomobject]@{Suppressed=$false;Cleared=$true}
+    }
+    $identity=$null;try{$identity=&$Adapters.GetIdentity}catch{if($EntryMode-ceq'Task'){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Task startup requires a trusted logon identity' $null};Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_CONFIRMATION_REQUIRED' 'Explicit startup requires local confirmation before marker replacement' $null}
+    $same=&$Adapters.TestSameLogon $intent $identity
+    if($same-and$EntryMode-ceq'Task'){&$Adapters.Log 'SAFE_EXIT_SUPPRESSED';return [pscustomobject]@{Suppressed=$true;Cleared=$false}}
+    $ownership=&$Adapters.EnterOwnership
+    try{&$Adapters.ClearIntent;$cleared=$true}finally{&$Adapters.ExitOwnership $ownership|Out-Null}
+    return [pscustomobject]@{Suppressed=$false;Cleared=$cleared}
+}
+
+function Test-CcodBootstrapSafeExitSuppression {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$Pointer,[Parameter(Mandatory)][string]$UserSid,[Parameter(Mandatory)][int]$SessionId,[Parameter(Mandatory)][ValidateSet('Task','Explicit')][string]$EntryMode)
+    $marker=Join-Path $InstallRoot 'state\lifecycle\safe-exit-intent.json'
+    if(-not[IO.File]::Exists($marker)){return $false}
+    $validation=Test-CcodBootstrapRuntime -InstallRoot $InstallRoot -RuntimeId $Pointer.ActiveRuntime
+    if(-not$validation.Valid){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Safe-exit marker cannot be verified against the active runtime' $marker}
+    $modulePath=Join-Path $validation.RuntimeDirectory 'src\persistence\modules\TrustedLogonIdentity.psm1'
+    if(-not[IO.File]::Exists($modulePath)){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Safe-exit marker support is missing from the verified active runtime' $marker}
+    try{
+        $trusted=Import-Module -Name $modulePath -Force -PassThru -ErrorAction Stop
+    }catch{
+        if($EntryMode-ceq'Task'){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Task startup refuses an unreadable safe-exit marker' $marker}
+        Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_CONFIRMATION_REQUIRED' 'Explicit startup requires local confirmation before replacing an unreadable safe-exit marker' $marker
+    }
+    $stateRoot=Join-Path $InstallRoot 'state'
+    $ownership=$null
+    $policyAdapters=@{
+        ReadIntent={& $trusted {param($Root)Read-CcodSafeExitIntent -StateRoot $Root} $stateRoot}
+        GetIdentity={& $trusted {Get-CcodTrustedLogonIdentity}}
+        TestSameLogon={param($Intent,$Identity)& $trusted {param($Value,$Current)Test-CcodSafeExitIntentForCurrentLogon -Intent $Value -LogonIdentity $Current} $Intent $Identity}
+        Log={param($Message)Write-CcodBootstrapLog -InstallRoot $InstallRoot -Message $Message}
+        ConfirmReplacement={Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop;[Windows.Forms.MessageBox]::Show('Replace the unreadable safe-exit marker and start CodexRemote-fix?','CodexRemote-fix',[Windows.Forms.MessageBoxButtons]::YesNo,[Windows.Forms.MessageBoxIcon]::Warning)-eq[Windows.Forms.DialogResult]::Yes}
+        EnterOwnership={
+        $epochPath=Join-Path $validation.RuntimeDirectory 'src\persistence\modules\LifecycleEpoch.psm1'
+        if(-not[IO.File]::Exists($epochPath)){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Safe-exit marker cannot be cleared without the verified lifecycle fence module' $marker}
+        $epoch=Import-Module -Name $epochPath -Force -PassThru -ErrorAction Stop;$process=[Diagnostics.Process]::GetCurrentProcess()
+        try{
+            $owner=[pscustomobject][ordered]@{pid=[int]$process.Id;creationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)}
+            $ownership=& $epoch {param($Root,$RuntimeId,$Generation,$Owner,$Sid,$Session)Enter-CcodLifecycleOwnership -InstallRoot $Root -RuntimeId $RuntimeId -RuntimeGeneration $Generation -OwnerIdentity $Owner -UserSid $Sid -SessionId $Session} $InstallRoot $Pointer.ActiveRuntime ([UInt64]$Pointer.Generation) $owner $UserSid $SessionId
+            if($null-eq$ownership){throw 'lifecycle ownership was not acquired'};return $ownership
+        }finally{$process.Dispose()}}
+        ExitOwnership={param($Lease)& $epoch {param($Value)Exit-CcodLifecycleOwnership -Ownership $Value} $Lease}
+        ClearIntent={& $trusted {param($Root)Clear-CcodSafeExitIntent -StateRoot $Root|Out-Null} $stateRoot;Write-CcodBootstrapLog -InstallRoot $InstallRoot -Message 'SAFE_EXIT_MARKER_CLEARED'}
+        ClearCorruptIntent={& $trusted {param($Root)$path=Get-CcodSafeExitIntentPath -StateRoot $Root;Assert-CcodSafeExitIntentFileAcl -Path $path;[IO.File]::Delete($path)} $stateRoot;Write-CcodBootstrapLog -InstallRoot $InstallRoot -Message 'SAFE_EXIT_MARKER_CLEARED'}
+    }
+    $result=Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode $EntryMode -Adapters $policyAdapters
+    return [bool]$result.Suppressed
+}
+
 function Invoke-CcodBootstrapFencedPointerPromotion {
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
@@ -698,6 +754,7 @@ function Write-CcodBootstrapLog {
     }
 }
 
+if($MyInvocation.InvocationName -ne '.'){
 $exitCode = 1
 $root = $null
 $readyEvent = $null
@@ -706,6 +763,7 @@ $launchLease = $null
 $kernelModule = $null
 $identity = $null
 $currentProcess = $null
+$safeExitSuppressed = $false
 try {
     $root = Get-CcodBootstrapCanonicalRoot -InstallRoot $InstallRoot
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -720,6 +778,9 @@ try {
     }
 
     $initialPointer = Read-CcodBootstrapActivePointer -InstallRoot $root
+    $safeExitSuppressed=Test-CcodBootstrapSafeExitSuppression -InstallRoot $root -Pointer $initialPointer -UserSid $userSid -SessionId $sessionId -EntryMode $EntryMode
+    if($safeExitSuppressed){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_SUPPRESSED' 'Task startup was intentionally suppressed by the same-logon safe-exit marker' $root}
+
     $kernelModule = Import-CcodBootstrapKernelObjects -InstallRoot $root -Pointer $initialPointer
     $launchLease = & $kernelModule { param($Sid,$Timeout) Enter-CcodMutex -Kind 'AccountTransition' -UserSid $Sid -TimeoutMilliseconds $Timeout } $userSid ([int]($ReadyTimeoutSeconds * 1000))
     if ($launchLease.Outcome -cne 'Acquired') {
@@ -785,10 +846,13 @@ try {
     }
 } catch {
     $errorId = Get-CcodBootstrapErrorId -ErrorRecord $_
+    if($errorId-ceq'CCOD_SAFE_EXIT_SUPPRESSED'){$exitCode=0}
+    else{
     if ($null -ne $root) {
         Write-CcodBootstrapLog -InstallRoot $root -Message ("Bootstrap failed: {0} {1}" -f $errorId, $_.Exception.Message)
     }
     $exitCode = 1
+    }
 } finally {
     if ($null -ne $child) {
         try { Stop-CcodBootstrapChild -Process $child } catch { }
@@ -805,3 +869,4 @@ try {
 }
 
 exit $exitCode
+}

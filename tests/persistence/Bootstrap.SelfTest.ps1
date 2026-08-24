@@ -5,6 +5,7 @@ $repositoryRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $bootstrapScript = Join-Path $repositoryRoot 'src\persistence\bootstrap.ps1'
 $runtimeManifestModule = Join-Path $repositoryRoot 'src\persistence\modules\RuntimeManifest.psm1'
 $kernelObjectsModule = Join-Path $repositoryRoot 'src\persistence\modules\KernelObjects.psm1'
+$trustedLogonModule = Join-Path $repositoryRoot 'src\persistence\modules\TrustedLogonIdentity.psm1'
 $powershellExecutable = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
 if (-not (Test-Path -LiteralPath $bootstrapScript -PathType Leaf)) {
@@ -18,6 +19,8 @@ if (-not (Test-Path -LiteralPath $kernelObjectsModule -PathType Leaf)) {
 }
 Import-Module $runtimeManifestModule -Force
 Import-Module $kernelObjectsModule -Force
+Import-Module $trustedLogonModule -Force
+. $bootstrapScript
 
 function Assert-CcodExactEqual($Expected, $Actual, [string]$Message) {
     if (-not [object]::Equals($Expected, $Actual)) {
@@ -129,7 +132,7 @@ function Add-CcodTestRuntime {
     $kernelPath = Join-Path $kernelDirectory 'KernelObjects.psm1'
     [IO.File]::Copy($kernelObjectsModule, $kernelPath, $true)
     if ($IncludeFenceModules) {
-        foreach ($moduleName in @('PersistenceIO.psm1','LifecycleEpoch.psm1','RuntimeManifest.psm1')) {
+        foreach ($moduleName in @('PersistenceIO.psm1','LifecycleEpoch.psm1','RuntimeManifest.psm1','TrustedLogonIdentity.psm1')) {
             [IO.File]::Copy((Join-Path $repositoryRoot ('src\persistence\modules\' + $moduleName)), (Join-Path $kernelDirectory $moduleName), $true)
         }
         if ($FailLifecycleRelease) {
@@ -201,11 +204,12 @@ function Invoke-CcodBootstrapUnderTest {
     param(
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$ReadyToken,
-        [int]$ReadyTimeoutSeconds = 3
+        [int]$ReadyTimeoutSeconds = 3,
+        [ValidateSet('Task','Explicit')][string]$EntryMode = 'Explicit'
     )
 
     $output = & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $bootstrapScript `
-        -InstallRoot $Root -ReadyToken $ReadyToken -ReadyTimeoutSeconds $ReadyTimeoutSeconds 2>&1
+        -InstallRoot $Root -ReadyToken $ReadyToken -ReadyTimeoutSeconds $ReadyTimeoutSeconds -EntryMode $EntryMode 2>&1
     $exitCode = [int]$LASTEXITCODE
     return $exitCode
 }
@@ -244,6 +248,34 @@ function Invoke-CcodBootstrapTimed {
 }
 
 $results = @()
+
+$results += Invoke-CcodTest 'marker policy deterministically suppresses only the same trusted Task logon' {
+    # Production mutation caught: starting a supervisor on same-logon retry or suppressing a new logon.
+    $calls=[Collections.Generic.List[string]]::new();$intent=[pscustomobject]@{marker='valid'};$identity=[pscustomobject]@{logon='current'}
+    $adapters=@{ReadIntent={$calls.Add('Read');$intent};GetIdentity={$calls.Add('Identity');$identity};TestSameLogon={param($Value,$Current)$calls.Add('Compare');$true};Log={param($Message)$calls.Add("Log:$Message")};ConfirmReplacement={$true};EnterOwnership={$calls.Add('Enter');[pscustomobject]@{}};ExitOwnership={param($Lease)$calls.Add('Exit')};ClearIntent={$calls.Add('Clear')};ClearCorruptIntent={$calls.Add('ClearCorrupt')}}
+    $same=Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Task -Adapters $adapters
+    Assert-CcodExactEqual $true $same.Suppressed 'exact trusted Task marker suppresses startup'
+    Assert-CcodExactEqual 'Read|Identity|Compare|Log:SAFE_EXIT_SUPPRESSED' ($calls-join '|') 'suppression only reads compares and logs; it never launches or clears'
+    $calls.Clear();$adapters.TestSameLogon={param($Value,$Current)$calls.Add('Compare');$false}.GetNewClosure()
+    $new=Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Task -Adapters $adapters
+    Assert-CcodExactEqual $false $new.Suppressed 'new trusted identity is not suppressed'
+    Assert-CcodExactEqual 'Read|Identity|Compare|Enter|Clear|Exit' ($calls-join '|') 'new trusted identity clears only under lifecycle ownership'
+}
+
+$results += Invoke-CcodTest 'marker policy requires positive Explicit confirmation before corrupt marker replacement' {
+    # Production mutation caught: clearing an unreadable marker in Explicit mode without a local confirmation boundary.
+    $calls=[Collections.Generic.List[string]]::new()
+    $adapters=@{ReadIntent={throw 'corrupt'};GetIdentity={$null};TestSameLogon={param($Value,$Current)$false};Log={param($Message)$calls.Add("Log:$Message")};ConfirmReplacement={$calls.Add('Confirm');$false};EnterOwnership={$calls.Add('Enter');[pscustomobject]@{}};ExitOwnership={param($Lease)$calls.Add('Exit')};ClearIntent={$calls.Add('Clear')};ClearCorruptIntent={$calls.Add('ClearCorrupt')}}
+    Assert-CcodThrows {Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Explicit -Adapters $adapters} 'CCOD_SAFE_EXIT_INTENT_CONFIRMATION_REQUIRED'
+    Assert-CcodExactEqual 'Confirm' ($calls-join '|') 'negative confirmation does not acquire ownership or clear'
+    $calls.Clear();$adapters.ConfirmReplacement={$calls.Add('Confirm');$true}.GetNewClosure()
+    $result=Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Explicit -Adapters $adapters
+    Assert-CcodTrue $result.Cleared 'positive confirmation replaces corrupt marker'
+    Assert-CcodExactEqual 'Confirm|Enter|ClearCorrupt|Exit' ($calls-join '|') 'corrupt replacement clears only after ownership'
+    $task=@{ReadIntent={throw 'corrupt'};GetIdentity={$null};TestSameLogon={param($Value,$Current)$false};Log={param($Message){}};ConfirmReplacement={$true};EnterOwnership={[pscustomobject]@{}};ExitOwnership={param($Lease){}};ClearIntent={};ClearCorruptIntent={}}
+    Assert-CcodThrows {Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Task -Adapters $task} 'CCOD_SAFE_EXIT_INTENT_INVALID'
+}
+
 
 $results += Invoke-CcodTest 'selects previous runtime after active exits before ready and swaps pointer' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-" + [guid]::NewGuid().ToString('N'))
@@ -537,6 +569,14 @@ $results += Invoke-CcodTest 'defaults InstallRoot to the bootstrap script direct
     $entryMode = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -ceq 'EntryMode' } | Select-Object -First 1
     Assert-CcodTrue ($null -ne $entryMode -and $entryMode.DefaultValue.Extent.Text -match "'Explicit'") 'bootstrap defaults manual launches to Explicit entry mode'
     Assert-CcodTrue (@($entryMode.Attributes | Where-Object { $_.TypeName.Name -ceq 'ValidateSet' }).Count -eq 1) 'bootstrap constrains entry mode to the declared safe modes'
+}
+
+$results += Invoke-CcodTest 'evaluates safe-exit marker policy before taking the AccountTransition launch lease' {
+    # Production mutation caught: recursively entering lifecycle ownership while AccountTransition is already held.
+    $source=Get-Content -LiteralPath $bootstrapScript -Raw -Encoding UTF8
+    $policy=$source.IndexOf('$safeExitSuppressed=Test-CcodBootstrapSafeExitSuppression',[StringComparison]::Ordinal)
+    $lease=$source.IndexOf('$launchLease = & $kernelModule',[StringComparison]::Ordinal)
+    Assert-CcodTrue ($policy -ge 0 -and $lease -ge 0 -and $policy -lt $lease) 'marker policy runs before launch lease acquisition'
 }
 
 $results | Format-Table -AutoSize

@@ -641,6 +641,9 @@ $results += Invoke-CcodTest 'projects the truthful v2 connection and protection 
     $ready=Get-CcodTrayPresentation -ConnectionState Connected -ProtectionState Running -Busy:$false -StateDamageBlocksActions:$false
     # Production mutation caught: disabling Exit after the Supervisor has established a non-busy, undamaged presentation.
     Assert-CcodExactEqual $true $ready.ExitEnabled 'SafeExit is available only after the Supervisor reaches a ready presentation'
+    # Production mutation caught: treating a non-busy reconnecting lifecycle as ready for Exit.
+    $reconnecting=Get-CcodTrayPresentation -ConnectionState Connected -ProtectionState Reconnecting -Busy:$false -StateDamageBlocksActions:$false
+    Assert-CcodExactEqual $false $reconnecting.ExitEnabled 'non-busy Reconnecting does not enable Exit'
     $busy=Get-CcodTrayPresentation -ConnectionState RepairNeeded -ProtectionState Reconnecting -Busy:$true -StateDamageBlocksActions:$false
     Assert-CcodExactEqual $false $busy.RepairEnabled 'busy lifecycle disables repair'
     Assert-CcodExactEqual $false $busy.LanguageEnabled 'busy lifecycle disables language changes'

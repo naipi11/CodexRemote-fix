@@ -122,6 +122,7 @@ function New-CcodSupervisorFake {
     $adapters.ReadActiveRuntime={param($InstallRoot)$world.Calls.Add('Read:ActiveRuntime');if($world.FailAt -ceq 'ReadActiveRuntime'){throw 'PRIVATE_RUNTIME_POINTER_SECRET'};$world.ActiveRuntime}.GetNewClosure()
     $adapters.GetTrustedLogonIdentity={param($ExpectedUserSid,$ExpectedSessionId)$world.Calls.Add('Read:LogonIdentity');if($world.FailAt -ceq 'GetTrustedLogonIdentity'){throw 'PRIVATE_LOGON_SECRET'};$world.LogonIdentity}.GetNewClosure()
     $adapters.WriteSafeExitIntent={param($StateRoot,$LogonIdentity,$RuntimeId,$TransactionId,$NowUtc)$world.Calls.Add('Write:SafeExitIntent');if($world.FailAt -ceq 'WriteSafeExitIntent'){throw 'PRIVATE_SAFE_EXIT_INTENT_SECRET'};$world.SafeExitIntentWritten=$true}.GetNewClosure()
+    $adapters.ClearSafeExitIntent={param($StateRoot)$world.Calls.Add('Clear:SafeExitIntent');$world.SafeExitIntentWritten=$false;return $true}.GetNewClosure()
     $adapters.EnterLifecycleOwnership={
         param($InstallRoot,$RuntimeId,$RuntimeGeneration,$OwnerIdentity,$UserSid,$SessionId,$TimeoutMilliseconds)
         $world.Calls.Add("Enter:LifecycleOwnership:$RuntimeGeneration");if($world.FailAt -ceq 'EnterLifecycleOwnership'){throw 'PRIVATE_OWNERSHIP_SECRET'};$world.LifecycleOwnershipEntries++
@@ -181,7 +182,7 @@ function New-CcodSupervisorFake {
     $adapters.TryDequeue={param($Queue)$world.TryDequeueSawRealQueue=[object]::ReferenceEquals($Queue,$world.CommandQueue);if($Queue.Count){[pscustomobject][ordered]@{Succeeded=$true;Value=$Queue.Dequeue()}}else{[pscustomobject][ordered]@{Succeeded=$false;Value=$null}}}.GetNewClosure()
     $adapters.NewTray={param($Queue,$OnTick,$Catalog,$LanguageMode,$SystemCultureName)$world.NewTraySawRealQueue=[object]::ReferenceEquals($Queue,$world.CommandQueue);$world.Calls.Add('New:Tray');if($world.FailAt -ceq 'NewTray'){throw 'PRIVATE_TRAY_SECRET'};$world.OnTick=$OnTick;$world.TrayArguments=[pscustomobject][ordered]@{Queue=$Queue;OnTick=$OnTick;Catalog=$Catalog;LanguageMode=$LanguageMode;SystemCultureName=$SystemCultureName};[pscustomobject]@{Kind='Tray';CurrentRevision=[UInt64]1;Timer=[pscustomobject]@{Kind='Timer'};ApplicationContext=[pscustomobject]@{Kind='App'}}}.GetNewClosure()
     $adapters.SetTrayPresentation={param($Tray,$Presentation,$Catalog,$LanguageMode,$SystemCultureName,$WaitForAcknowledgement)$world.Calls.Add('Set:Presentation');if($world.FailAt -ceq 'SetTrayPresentation'){throw 'PRIVATE_PRESENTATION_SECRET'};$world.PresentationArguments.Add([pscustomobject][ordered]@{Tray=$Tray;Presentation=$Presentation;Catalog=$Catalog;LanguageMode=$LanguageMode;SystemCultureName=$SystemCultureName;WaitForAcknowledgement=[bool]$WaitForAcknowledgement})}.GetNewClosure()
-    $adapters.SendTrayActionResult={param($Tray,$ActionId,$Revision,$Status,$ErrorCode,$TransactionId)$world.Calls.Add("ActionResult:$Status");$world.TrayActionResults.Add([pscustomobject][ordered]@{ActionId=$ActionId;Revision=[UInt64]$Revision;Status=$Status;ErrorCode=$ErrorCode;TransactionId=$TransactionId})}.GetNewClosure()
+    $adapters.SendTrayActionResult={param($Tray,$ActionId,$Revision,$Status,$ErrorCode,$TransactionId)$world.Calls.Add("ActionResult:$Status");$world.TrayActionResults.Add([pscustomobject][ordered]@{ActionId=$ActionId;Revision=[UInt64]$Revision;Status=$Status;ErrorCode=$ErrorCode;TransactionId=$TransactionId});return $true}.GetNewClosure()
     $adapters.VerifyActiveRuntimeForAbout={param($InstallRoot,$RuntimeId)$world.Calls.Add('Verify:About');[pscustomobject][ordered]@{RuntimeId=$RuntimeId;Version='2.5.0'}}.GetNewClosure()
     $adapters.StopTrayTimer={param($Tray)$world.Calls.Add('Stop:Timer');if($world.FailAt -ceq 'StopTimer'){throw 'PRIVATE_TIMER_SECRET'}}.GetNewClosure()
     $adapters.RequestUiExit={param($Tray)$world.Calls.Add('Exit:UI')}.GetNewClosure()
@@ -478,6 +479,7 @@ Invoke-CcodTest 'rejects the removed tray uninstall command before any launcher 
 Invoke-CcodTest 'Exit submits a durable SafeExit request instead of shutting down the tray directly' {
     # Production mutation caught: replacing Exit with a direct RequestUiExit call, or submitting any kind other than SafeExit.
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $hostState.LastAcknowledgedPresentation=[pscustomobject]@{ExitEnabled=$true}
     $action=[pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command='Exit';Revision=[UInt64]1}
     $result=Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action
     Assert-CcodEqual 'Accepted' $result.Status 'Exit is accepted as a lifecycle action'
@@ -504,6 +506,98 @@ Invoke-CcodTest 'SafeExit commits its same-logon intent before it stops the tray
     Assert-CcodEqual 'Stopping' $hostState.ProtectionState 'SafeExit publishes stopping protection after intent commit'
 }
 
+Invoke-CcodTest 'SafeExit refuses UI shutdown when its correlated terminal result cannot be delivered' {
+    # Production mutation caught: swallowing a terminal action-result failure and still requesting UI exit.
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $request=& (Get-Module LifecycleTransaction | Select-Object -First 1) {
+        param($RuntimeId,$Generation,$Epoch,$Owner,$Logon)
+        $value=New-CcodLifecycleRequest -Kind SafeExit -Origin Tray -RuntimeId $RuntimeId -RuntimeGeneration $Generation -LeaseEpoch $Epoch -OwnerIdentity $Owner -LogonIdentity $Logon -NowUtc '2030-02-03T03:04:05.0000000Z'
+        Move-CcodLifecyclePhase -Request $value -NextPhase CancelledBeforeClose -NowUtc '2030-02-03T03:04:06.0000000Z'
+    } $hostState.Layout.RuntimeId ([UInt64]$hostState.LifecycleOwnership.runtimeGeneration) ([UInt64]$hostState.LifecycleOwnership.epoch) $hostState.LifecycleOwnership.ownerIdentity $hostState.LogonIdentity
+    $hostState.LifecycleRequest=$request
+    $action=[pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command='Exit';Revision=[UInt64]1}
+    $hostState.TrayActionIds[$action.ActionId.ToString('D')]=[pscustomobject][ordered]@{Action=$action;TransactionId=$request.transactionId;TerminalSent=$false}
+    $fixture.Fake.Adapters.SendTrayActionResult={param($Tray,$ActionId,$Revision,$Status,$ErrorCode,$TransactionId)$world.Calls.Add("ActionResult:$Status");throw 'PRIVATE_ACTION_DELIVERY_FAILURE'}.GetNewClosure()
+    Complete-CcodSupervisorLifecycleTerminal $hostState $fixture.Fake.Adapters
+    Assert-CcodEqual 0 @($world.Calls|Where-Object { $_ -ceq 'Exit:UI' }).Count 'undelivered terminal result never permits UI shutdown'
+    Assert-CcodEqual 'Running' $hostState.ProtectionState 'undelivered terminal result restores running protection'
+    Assert-CcodEqual 'SAFE_EXIT_RECOVERY_FAILED' $hostState.LifecycleRequest.error 'undelivered terminal result is durably disarmed'
+}
+
+Invoke-CcodTest 'SafeExit acknowledges Stopping before terminal completion and UI exit' {
+    # Production mutation caught: completing the action or exiting before an acknowledged Stopping presentation.
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $request=& (Get-Module LifecycleTransaction | Select-Object -First 1) {
+        param($RuntimeId,$Generation,$Epoch,$Owner,$Logon)
+        $value=New-CcodLifecycleRequest -Kind SafeExit -Origin Tray -RuntimeId $RuntimeId -RuntimeGeneration $Generation -LeaseEpoch $Epoch -OwnerIdentity $Owner -LogonIdentity $Logon -NowUtc '2030-02-03T03:04:05.0000000Z'
+        Move-CcodLifecyclePhase -Request $value -NextPhase CancelledBeforeClose -NowUtc '2030-02-03T03:04:06.0000000Z'
+    } $hostState.Layout.RuntimeId ([UInt64]$hostState.LifecycleOwnership.runtimeGeneration) ([UInt64]$hostState.LifecycleOwnership.epoch) $hostState.LifecycleOwnership.ownerIdentity $hostState.LogonIdentity
+    $hostState.LifecycleRequest=$request
+    $action=[pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command='Exit';Revision=[UInt64]1}
+    $hostState.TrayActionIds[$action.ActionId.ToString('D')]=[pscustomobject][ordered]@{Action=$action;TransactionId=$request.transactionId;TerminalSent=$false}
+    Complete-CcodSupervisorLifecycleTerminal $hostState $fixture.Fake.Adapters
+    $calls=@($world.Calls);$presentation=[Array]::IndexOf($calls,'Set:Presentation');$actionResult=[Array]::IndexOf($calls,'ActionResult:Completed');$uiExit=[Array]::IndexOf($calls,'Exit:UI')
+    Assert-CcodTrue ($presentation -ge 0 -and $actionResult -gt $presentation -and $uiExit -gt $actionResult) 'acknowledged Stopping presentation precedes terminal action completion and UI exit'
+    Assert-CcodEqual $true $world.PresentationArguments[$world.PresentationArguments.Count-1].WaitForAcknowledgement 'Stopping waits for native acknowledgement'
+}
+
+Invoke-CcodTest 'SafeExit fence loss stays running and records the stable recovery failure' {
+    # Production mutation caught: allowing a first or final lifecycle-fence failure to escape as an unclassified retryable exit.
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $request=& (Get-Module LifecycleTransaction | Select-Object -First 1) {
+        param($RuntimeId,$Generation,$Epoch,$Owner,$Logon)
+        $value=New-CcodLifecycleRequest -Kind SafeExit -Origin Tray -RuntimeId $RuntimeId -RuntimeGeneration $Generation -LeaseEpoch $Epoch -OwnerIdentity $Owner -LogonIdentity $Logon -NowUtc '2030-02-03T03:04:05.0000000Z'
+        Move-CcodLifecyclePhase -Request $value -NextPhase CancelledBeforeClose -NowUtc '2030-02-03T03:04:06.0000000Z'
+    } $hostState.Layout.RuntimeId ([UInt64]$hostState.LifecycleOwnership.runtimeGeneration) ([UInt64]$hostState.LifecycleOwnership.epoch) $hostState.LifecycleOwnership.ownerIdentity $hostState.LogonIdentity
+    $hostState.LifecycleRequest=$request
+    $fixture.Fake.Adapters.AssertLifecycleFence={param($InstallRoot,$Ownership)throw 'PRIVATE_FENCE_LOSS'}.GetNewClosure()
+    Complete-CcodSupervisorLifecycleTerminal $hostState $fixture.Fake.Adapters
+    Assert-CcodEqual 'Running' $hostState.ProtectionState 'fence loss keeps protection running'
+    Assert-CcodEqual 'SAFE_EXIT_RECOVERY_FAILED' $hostState.LifecycleRequest.error 'fence loss writes the stable SafeExit failure'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object { $_ -ceq 'Exit:UI' }).Count 'fence loss never requests UI exit'
+}
+
+Invoke-CcodTest 'SafeExit marker presentation and completion failures are durably disarmed' {
+    # Production mutations caught: allowing any pre-terminal boundary failure to retain an armed successful SafeExit request.
+    foreach($failure in @('WriteSafeExitIntent','SetTrayPresentation','CompleteLifecycleRequest')){
+        $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+        $request=& (Get-Module LifecycleTransaction | Select-Object -First 1) {
+            param($RuntimeId,$Generation,$Epoch,$Owner,$Logon)
+            $value=New-CcodLifecycleRequest -Kind SafeExit -Origin Tray -RuntimeId $RuntimeId -RuntimeGeneration $Generation -LeaseEpoch $Epoch -OwnerIdentity $Owner -LogonIdentity $Logon -NowUtc '2030-02-03T03:04:05.0000000Z'
+            Move-CcodLifecyclePhase -Request $value -NextPhase CancelledBeforeClose -NowUtc '2030-02-03T03:04:06.0000000Z'
+        } $hostState.Layout.RuntimeId ([UInt64]$hostState.LifecycleOwnership.runtimeGeneration) ([UInt64]$hostState.LifecycleOwnership.epoch) $hostState.LifecycleOwnership.ownerIdentity $hostState.LogonIdentity
+        $hostState.LifecycleRequest=$request
+        if($failure-ceq'WriteSafeExitIntent'){$fixture.Fake.Adapters.WriteSafeExitIntent={param($a,$b,$c,$d,$e)throw 'fail'}.GetNewClosure()}
+        if($failure-ceq'SetTrayPresentation'){$fixture.Fake.Adapters.SetTrayPresentation={param($a,$b,$c,$d,$e,$f)throw 'fail'}.GetNewClosure()}
+        if($failure-ceq'CompleteLifecycleRequest'){$fixture.Fake.Adapters.CompleteLifecycleRequest={param($a,$b)throw 'fail'}.GetNewClosure()}
+        Complete-CcodSupervisorLifecycleTerminal $hostState $fixture.Fake.Adapters
+        Assert-CcodEqual 'Running' $hostState.ProtectionState "$failure keeps protection running"
+        Assert-CcodEqual 'SAFE_EXIT_RECOVERY_FAILED' $hostState.LifecycleRequest.error "$failure stores a stable disarmed SafeExit error"
+        Assert-CcodEqual 0 @($world.Calls|Where-Object{$_-ceq'Exit:UI'}).Count "$failure never exits the UI"
+    }
+}
+
+Invoke-CcodTest 'unsuccessful SafeExit terminal phase never writes a marker or exits later' {
+    # Production mutation caught: treating any terminal SafeExit phase as success and retrying it into an exit.
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $request=New-CcodPersistedLifecycleRequest -Kind SafeExit
+    $request=& (Get-Module LifecycleTransaction|Select-Object -First 1){param($Value)$next=Move-CcodLifecyclePhase -Request $Value -NextPhase CloseRequested -NowUtc '2030-02-03T03:04:06.0000000Z';Move-CcodLifecyclePhase -Request $next -NextPhase CloseFailed -NowUtc '2030-02-03T03:04:07.0000000Z'} $request
+    $request.error='SAFE_EXIT_RECOVERY_FAILED';$hostState.LifecycleRequest=$request
+    Complete-CcodSupervisorLifecycleTerminal $hostState $fixture.Fake.Adapters
+    Assert-CcodEqual $false $world.SafeExitIntentWritten 'failed terminal SafeExit writes no marker'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_-ceq'Exit:UI'}).Count 'failed terminal SafeExit does not exit'
+}
+
+Invoke-CcodTest 'Exit is rejected unless the acknowledged presentation enabled it' {
+    # Production mutation caught: authorizing Exit solely from lifecycle idleness while the displayed native action is disabled.
+    $fixture=New-CcodTickFixture;$hostState=$fixture.Host;$world=$fixture.Fake.World
+    $hostState.LastAcknowledgedPresentation=[pscustomobject]@{ExitEnabled=$false}
+    $action=[pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command='Exit';Revision=[UInt64]1}
+    $result=Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action
+    Assert-CcodEqual 'Rejected' $result.Status 'Exit is rejected when no enabled presentation was acknowledged'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object { $_ -like 'New:Lifecycle:SafeExit' }).Count 'disabled presentation creates no SafeExit request'
+}
+
 Invoke-CcodTest 'adds the exact localization adapters and host fields at the frozen boundaries' {
     $names=Get-CcodSupervisorAdapterNames
     $first=[Array]::IndexOf($names,'ReadUiPreference')
@@ -515,8 +609,8 @@ Invoke-CcodTest 'adds the exact localization adapters and host fields at the fro
     $fixture=New-CcodTickFixture
     $hostNames=@($fixture.Host.PSObject.Properties.Name)
     $trayIndex=[Array]::IndexOf($hostNames,'Tray')
-    Assert-CcodEqual 'Tray,TrayCallbackFailureLogged,UiLanguageMode,UiCatalog,State' (@($hostNames[$trayIndex..($trayIndex+4)])-join ',') 'UI host fields occur immediately after Tray'
-    foreach($name in @('LifecycleOwnership','LifecycleRequest','LifecycleWorkerSlot','ConnectionState','ProtectionState')){Assert-CcodTrue ($hostNames -ccontains $name) "$name host field exists"}
+    Assert-CcodEqual 'Tray,TrayCallbackFailureLogged,UiLanguageMode,UiCatalog,LastAcknowledgedPresentation,State' (@($hostNames[$trayIndex..($trayIndex+5)])-join ',') 'UI host fields occur immediately after Tray'
+    foreach($name in @('LifecycleOwnership','LifecycleRequest','LifecycleWorkerSlot','ConnectionState','ProtectionState','LastAcknowledgedPresentation')){Assert-CcodTrue ($hostNames -ccontains $name) "$name host field exists"}
 }
 
 Invoke-CcodTest 'accepts at most one of two simultaneous durable submissions and rejects the other while busy' {

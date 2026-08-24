@@ -11,7 +11,7 @@ $script:CcodSupervisorLogPath=$null
 $script:CcodSupervisorAdapterNames=@(
     'GetIdentity','ResolveLayout','StartClock','GetElapsedMilliseconds','GetUtcNow',
     'EnterLease','ExitLease','OpenReadyEvent','OpenShutdownEvent','IsEventSignaled','SignalEvent','CloseEvent',
-    'ReadActiveRuntime','GetTrustedLogonIdentity','WriteSafeExitIntent','EnterLifecycleOwnership','AssertLifecycleFence','SuspendLifecycleOwnership','ResumeLifecycleOwnership','ExitLifecycleOwnership','OpenLifecycleWakeEvent','ResetLifecycleWakeEvent',
+    'ReadActiveRuntime','GetTrustedLogonIdentity','WriteSafeExitIntent','ClearSafeExitIntent','EnterLifecycleOwnership','AssertLifecycleFence','SuspendLifecycleOwnership','ResumeLifecycleOwnership','ExitLifecycleOwnership','OpenLifecycleWakeEvent','ResetLifecycleWakeEvent',
     'ReadLifecycleRequest','ReceiveLifecycleSubmissions','WriteLifecycleSubmissionReceipt','NewLifecycleRequest','WriteLifecycleRequest','MoveLifecyclePhase','CompleteLifecycleRequest','GetLifecycleStep','ReduceLifecycleWorkerResult','NewLifecycleWorkerRequest','AssertLifecycleWorkerResult',
     'ReadState','ReadJournal','ReadUiPreference','SetUiLanguageMode','GetSystemCultureName','GetUiCatalog','ShowTrayError','StartUninstall','EnumerateProcessIds','GetProcessSnapshot','ParseStaleCandidateCommandLine','GetPackageIdentity','GetSupervisorDecision','AddObservedEvent','CompleteControllerRun','HandoffRenderer','GetTrayPresentation',
     'NewQueue','GetQueueCount','TryDequeue','NewTray','SetTrayPresentation','SendTrayActionResult','VerifyActiveRuntimeForAbout','StopTrayTimer','RequestUiExit','CloseTray','NewWatcher','StopWatcher',
@@ -259,6 +259,7 @@ function Get-CcodSupervisorDefaultAdapters {
     $defaults.ReadActiveRuntime={param($InstallRoot)Read-CcodActiveRuntime -InstallRoot $InstallRoot}
     $defaults.GetTrustedLogonIdentity={param($ExpectedUserSid,$ExpectedSessionId)Get-CcodTrustedLogonIdentity -ExpectedUserSid $ExpectedUserSid -ExpectedSessionId $ExpectedSessionId}
     $defaults.WriteSafeExitIntent={param($StateRoot,$LogonIdentity,$RuntimeId,$RecoveryTransactionId,$NowUtc)Write-CcodSafeExitIntent -StateRoot $StateRoot -LogonIdentity $LogonIdentity -RuntimeId $RuntimeId -RecoveryTransactionId $RecoveryTransactionId -NowUtc $NowUtc}
+    $defaults.ClearSafeExitIntent={param($StateRoot)Clear-CcodSafeExitIntent -StateRoot $StateRoot}
     $defaults.EnterLifecycleOwnership={param($InstallRoot,$RuntimeId,$RuntimeGeneration,$OwnerIdentity,$UserSid,$SessionId,$TimeoutMilliseconds)Enter-CcodLifecycleOwnership -InstallRoot $InstallRoot -RuntimeId $RuntimeId -RuntimeGeneration $RuntimeGeneration -OwnerIdentity $OwnerIdentity -UserSid $UserSid -SessionId $SessionId -TimeoutMilliseconds $TimeoutMilliseconds}
     $defaults.AssertLifecycleFence={param($InstallRoot,$Ownership)Assert-CcodLifecycleFence -InstallRoot $InstallRoot -Ownership $Ownership}
     $defaults.SuspendLifecycleOwnership={param($Ownership,$InstallRoot)Suspend-CcodLifecycleOwnership -Ownership $Ownership -InstallRoot $InstallRoot}
@@ -324,7 +325,7 @@ function Get-CcodSupervisorDefaultAdapters {
     $defaults.TryDequeue={param($Queue)$value=$null;$ok=$Queue.TryDequeue([ref]$value);[pscustomobject][ordered]@{Succeeded=[bool]$ok;Value=$value}}
     $defaults.NewTray={param($Queue,$OnTick,$Catalog,$LanguageMode,$SystemCultureName)New-CcodTrayHostContext -CommandQueue $Queue -OnTick $OnTick -Catalog $Catalog -LanguageMode $LanguageMode -SystemCultureName $SystemCultureName}
     $defaults.SetTrayPresentation={param($Tray,$Presentation,$Catalog,$LanguageMode,$SystemCultureName,$WaitForAcknowledgement)Set-CcodTrayHostPresentation -Context $Tray -Presentation $Presentation -Catalog $Catalog -LanguageMode $LanguageMode -SystemCultureName $SystemCultureName -WaitForAcknowledgement:([bool]$WaitForAcknowledgement)}
-    $defaults.SendTrayActionResult={param($Tray,$ActionId,$Revision,$Status,$ErrorCode,$TransactionId)Send-CcodTrayHostActionResult -Context $Tray -ActionId $ActionId -Revision $Revision -Status $Status -ErrorCode $ErrorCode -TransactionId $TransactionId|Out-Null}
+    $defaults.SendTrayActionResult={param($Tray,$ActionId,$Revision,$Status,$ErrorCode,$TransactionId)Send-CcodTrayHostActionResult -Context $Tray -ActionId $ActionId -Revision $Revision -Status $Status -ErrorCode $ErrorCode -TransactionId $TransactionId}
     $defaults.VerifyActiveRuntimeForAbout={
         param($InstallRoot,$RuntimeId)
         $active=Read-CcodActiveRuntime -InstallRoot $InstallRoot
@@ -492,7 +493,7 @@ function New-CcodSupervisorHostState {
     if(-not (Test-CcodSupervisorIdentity $Identity) -or -not (Test-CcodSupervisorLayout $Layout) -or $null -eq $Clock -or
        -not (Test-CcodSupervisorEvent $ShutdownEvent 'Shutdown') -or -not (Test-CcodSupervisorEvent $LifecycleWakeEvent 'LifecycleWake') -or $null -eq $CommandQueue -or $null -eq $EventQueue -or $null -eq $State -or $null -eq $LifecycleOwnership -or $null -eq $LogonIdentity){throw 'host state inputs are invalid'}
     [pscustomobject][ordered]@{
-        SchemaVersion=1;ShutdownRequested=$false;ShutdownEvent=$ShutdownEvent;Tray=$null;TrayCallbackFailureLogged=$false;UiLanguageMode=$null;UiCatalog=$null;State=$State;Journal=$Journal;WorkerSlot=$null
+        SchemaVersion=1;ShutdownRequested=$false;ShutdownEvent=$ShutdownEvent;Tray=$null;TrayCallbackFailureLogged=$false;UiLanguageMode=$null;UiCatalog=$null;LastAcknowledgedPresentation=$null;State=$State;Journal=$Journal;WorkerSlot=$null
         LifecycleOwnership=$LifecycleOwnership;LifecycleRequest=$LifecycleRequest;LifecycleWorkerSlot=$null;LifecycleWakeEvent=$LifecycleWakeEvent;LogonIdentity=$LogonIdentity;LifecycleObservation='Unknown';ConnectionState='Unknown';ProtectionState='Running'
         Identity=$Identity;Layout=$Layout;CommandQueue=$CommandQueue;EventQueue=$EventQueue;Clock=$Clock
         ObservedKeys=[ordered]@{};AttemptKeys=[ordered]@{};RecoveryIgnoreKeys=[ordered]@{};SuppressionKeys=[ordered]@{};TrayActionIds=[ordered]@{}
@@ -700,23 +701,33 @@ function Complete-CcodSupervisorLifecycleTerminal {
     $request=$HostState.LifecycleRequest
     if($null-eq$request -or -not(Test-CcodSupervisorLifecycleTerminal $request.phase)){throw 'lifecycle completion is not terminal'}
     $successful=$request.phase-ceq'Completed' -or ($request.phase-ceq'CancelledBeforeClose' -and $null-eq$request.error)
-    Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
     if($request.kind-ceq'SafeExit' -and $successful){
+        $markerWritten=$false
         try{
+            Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
             Invoke-CcodSupervisorAdapter $Adapters.WriteSafeExitIntent @($HostState.Layout.StateRoot,$HostState.LogonIdentity,$HostState.Layout.RuntimeId,$request.transactionId,(Get-CcodSupervisorNowUtc $Adapters)) 0|Out-Null
+            $markerWritten=$true
+            $HostState.ProtectionState='Stopping'
+            Set-CcodSupervisorCurrentTrayPresentation $HostState $Adapters -WaitForAcknowledgement
             Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
             Invoke-CcodSupervisorAdapter $Adapters.CompleteLifecycleRequest @($HostState.Layout.StateRoot,$request) 0
-            $HostState.ProtectionState='Stopping'
-            Complete-CcodSupervisorLifecycleTrayAction $HostState $Adapters $request $true
+            if(-not(Complete-CcodSupervisorLifecycleTrayAction $HostState $Adapters $request $true)){
+                Invoke-CcodSupervisorAdapter $Adapters.ClearSafeExitIntent @($HostState.Layout.StateRoot) 0|Out-Null
+                $HostState.ProtectionState='Running';$HostState.LifecycleRequest=$null
+                return
+            }
             Invoke-CcodSupervisorAdapter $Adapters.RequestUiExit @($HostState.Tray) 0
             $HostState.ShutdownRequested=$true;$HostState.LifecycleRequest=$null
             return
         }catch{
-            $HostState.ProtectionState='Running'
-            Complete-CcodSupervisorLifecycleTrayAction $HostState $Adapters $request $false 'SAFE_EXIT_RECOVERY_FAILED'
+            if($markerWritten){try{Invoke-CcodSupervisorAdapter $Adapters.ClearSafeExitIntent @($HostState.Layout.StateRoot) 0|Out-Null}catch{}}
+            $HostState.ProtectionState='Running';$request.error='SAFE_EXIT_RECOVERY_FAILED'
+            try{Invoke-CcodSupervisorAdapter $Adapters.WriteLifecycleRequest @($HostState.Layout.StateRoot,$request) 0}catch{}
+            [void](Complete-CcodSupervisorLifecycleTrayAction $HostState $Adapters $request $false 'SAFE_EXIT_RECOVERY_FAILED')
             return
         }
     }
+    Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
     Invoke-CcodSupervisorAdapter $Adapters.CompleteLifecycleRequest @($HostState.Layout.StateRoot,$request) 0
     Complete-CcodSupervisorLifecycleTrayAction $HostState $Adapters $request $successful
     if(-not$successful){$HostState.ConnectionState='Error'}
@@ -1024,6 +1035,7 @@ function Set-CcodSupervisorCurrentTrayPresentation {
     $presentation=Invoke-CcodSupervisorAdapter $Adapters.GetTrayPresentation @($arguments) 1
     if($null -eq $presentation){throw 'tray presentation is invalid'}
     Invoke-CcodSupervisorAdapter $Adapters.SetTrayPresentation @($HostState.Tray,$presentation,$HostState.UiCatalog,$HostState.UiLanguageMode,$culture,[bool]$WaitForAcknowledgement) 0
+    $HostState.LastAcknowledgedPresentation=$presentation
 }
 
 function Test-CcodSupervisorTrayAction {
@@ -1041,7 +1053,11 @@ function Throw-CcodSupervisorCommandError {
 function Send-CcodSupervisorTrayActionResult {
     param($HostState,[hashtable]$Adapters,$Action,[ValidateSet('Accepted','Completed','Rejected','Failed')][string]$Status,[AllowNull()][string]$ErrorCode,[AllowNull()][string]$TransactionId)
     $result=[pscustomobject][ordered]@{ActionId=$Action.ActionId;Revision=[UInt64]$Action.Revision;Status=$Status;ErrorCode=$ErrorCode;TransactionId=$TransactionId}
-    Invoke-CcodSupervisorAdapter $Adapters.SendTrayActionResult @($HostState.Tray,$result.ActionId,$result.Revision,$result.Status,$result.ErrorCode,$result.TransactionId) 0
+    try{
+        $delivered=Invoke-CcodSupervisorAdapter $Adapters.SendTrayActionResult @($HostState.Tray,$result.ActionId,$result.Revision,$result.Status,$result.ErrorCode,$result.TransactionId) 1
+        if($delivered-isnot[bool]-or-not$delivered){throw 'tray action result was not acknowledged'}
+        $result|Add-Member -NotePropertyName Delivered -NotePropertyValue $true
+    }catch{$result|Add-Member -NotePropertyName Delivered -NotePropertyValue $false}
     return $result
 }
 
@@ -1054,10 +1070,12 @@ function Complete-CcodSupervisorLifecycleTrayAction {
         try{
             $status=if($Successful){'Completed'}else{'Failed'}
             $code=if($Successful){$null}else{$FailureCode}
-            [void](Send-CcodSupervisorTrayActionResult $HostState $Adapters $entry.Action $status $code $entry.TransactionId)
+            $delivery=Send-CcodSupervisorTrayActionResult $HostState $Adapters $entry.Action $status $code $entry.TransactionId
+            if(-not$delivery.Delivered){return $false}
             $entry.TerminalSent=$true
         }catch{Write-CcodSupervisorUiFailure $HostState $Adapters 'ErrorDialog' 'CCOD_TRAY_ACTION_RESULT_FAILED'}
     }
+    return $true
 }
 
 function Test-CcodSupervisorTrayActionBusy {
@@ -1104,7 +1122,8 @@ function Invoke-CcodSupervisorCommand {
             return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Accepted $null $HostState.LifecycleRequest.transactionId
         }
         'Exit' {
-            if($busy){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_TRAY_ACTION_UNAVAILABLE' $null}
+            $presentation=$HostState.PSObject.Properties['LastAcknowledgedPresentation']
+            if($busy-or$null-eq$presentation-or$null-eq$presentation.Value-or$presentation.Value.ExitEnabled-isnot[bool]-or-not$presentation.Value.ExitEnabled){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_TRAY_ACTION_UNAVAILABLE' $null}
             if(-not(New-CcodSupervisorInternalLifecycleRequest $HostState $Adapters SafeExit Tray)){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_LIFECYCLE_SUPERVISOR_BUSY' $null}
             $actionEntry.TransactionId=$HostState.LifecycleRequest.transactionId
             return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Accepted $null $HostState.LifecycleRequest.transactionId

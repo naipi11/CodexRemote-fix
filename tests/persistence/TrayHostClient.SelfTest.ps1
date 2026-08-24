@@ -44,8 +44,9 @@ Invoke-CcodTest 'TrayHost client emits the fixed v2 connection protection snapsh
 
 Invoke-CcodTest 'TrayHost starts fail-closed until the Supervisor publishes an eligible Exit presentation' {
     # Production mutation caught: enabling the native Exit action in the initial pre-Supervisor snapshot.
-    $source = Get-Content -LiteralPath $modulePath -Raw -Encoding UTF8
-    Assert-CcodTrue ($source -cmatch 'ExitEnabled=\$false;Busy=\$false') 'initial native presentation keeps Exit disabled before lifecycle ownership and recovery checks'
+    $presentation=New-CcodTrayHostInitialPresentation
+    Assert-CcodEqual $false $presentation.ExitEnabled 'initial native presentation keeps Exit disabled before lifecycle ownership and recovery checks'
+    Assert-CcodEqual $false $presentation.Busy 'initial presentation is an idle disabled action surface, not a synthetic busy state'
 }
 
 Write-Host 'TrayHost client self-tests passed.'
