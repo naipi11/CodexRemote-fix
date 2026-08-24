@@ -37,6 +37,8 @@ function New-CcodLifecycleWorkerHarness {
         GetBootstrapContext={[pscustomobject][ordered]@{InstallRoot=$install;WorkersRoot=$workers}}.GetNewClosure()
         ResolveRuntime={param($Path,$Runtime,$Generation)$context}.GetNewClosure()
         ReadRequest={param($Path)Get-Content -LiteralPath $Path -Raw|ConvertFrom-Json}
+        EnterDelegation={param($Context,$Request)[pscustomobject][ordered]@{schemaVersion=1;lease=[pscustomobject]@{Released=$false};epoch=[UInt64]$Request.leaseEpoch;runtimeId=$Request.runtimeId;runtimeGeneration=[UInt64]$Request.runtimeGeneration;ownerIdentity=$Request.ownerIdentity;released=$false}}
+        ExitDelegation={param($Delegation)$Delegation.released=$true;$Delegation.lease.Released=$true;$true}
         AssertFence={param($Context,$Request)$world.FenceCalls++;$true}.GetNewClosure()
         GetCurrentIdentity={ [pscustomobject][ordered]@{UserSid='S-1-5-21-1-2-3-1001';SessionId=2} }
         InvokeController={param($ActionName,$RequestValue,$ContextValue)$world.ControllerCalls++;$controller}.GetNewClosure()

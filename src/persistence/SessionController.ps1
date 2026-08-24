@@ -181,6 +181,7 @@ function Get-CcodControllerAdapters($Adapters){
             }
             Assert-CcodLifecycleFence -InstallRoot $InstallRoot -Ownership $ownership
         }
+        GetDelegatedOwnership={$null}
         WriteResult={param($Path,$Value)Write-CcodAtomicJson -Path $Path -Value $Value}
         WriteStdout={param($Line)[Console]::Out.WriteLine($Line)}
         WriteStderr={param($Line)[Console]::Error.WriteLine($Line)}
@@ -478,6 +479,16 @@ function Assert-CcodControllerMutationFence($Request,$Paths,[hashtable]$Adapter)
     }
 }
 
+function Test-CcodControllerDelegatedOwnership($Request,$Identity,$Delegation){
+    try{
+        if(-not(Test-CcodControllerExactProperties $Delegation @('schemaVersion','lease','epoch','runtimeId','runtimeGeneration','ownerIdentity','released'))-or$Delegation.schemaVersion-ne1-or$Delegation.released-isnot[bool]-or$Delegation.released-or
+            $Delegation.epoch-ne$Request.leaseEpoch-or$Delegation.runtimeId-cne$Request.runtimeId-or$Delegation.runtimeGeneration-ne$Request.runtimeGeneration-or
+            -not(Test-CcodControllerExactProperties $Delegation.ownerIdentity @('pid','creationTimeUtc'))-or$Delegation.ownerIdentity.pid-ne$Request.ownerIdentity.pid-or$Delegation.ownerIdentity.creationTimeUtc-cne$Request.ownerIdentity.creationTimeUtc){return $false}
+        Assert-CcodControllerLeaseResult $Delegation.lease 'AccountTransition' $Identity
+        return $Delegation.lease.Outcome-ceq'Acquired'-and-not$Delegation.lease.Released
+    }catch{return $false}
+}
+
 function Write-CcodControllerFencedResult($Request,$Paths,[string]$ResultPath,$Value,[hashtable]$Adapter){
     Assert-CcodControllerMutationFence $Request $Paths $Adapter
     & $Adapter.WriteResult $ResultPath $Value|Out-Null
@@ -494,18 +505,19 @@ function Invoke-CcodSessionController {
         if(-not $leaseInputValid){
             $result=New-CcodControllerErrorResult $Request 'CCOD_REQUEST_INVALID' 'InputValidation' 'The request does not match this controller session.'
         }else{
+            $delegatedOwnership=$null
+            if($Request.schemaVersion-eq2){try{$delegatedOwnership=&$adapter.GetDelegatedOwnership}catch{};if(-not(Test-CcodControllerDelegatedOwnership $Request $identity $delegatedOwnership)){$result=New-CcodControllerErrorResult $Request 'CCOD_REQUEST_INVALID' 'InputValidation' 'The request has no verified LifecycleWorker delegation.'}}
+        }
+        if($null-eq$result){
             $total=[Math]::Min([int]$Request.timeoutMilliseconds,5000)
             try{
                 $clock=& $adapter.StartStopwatch
-                $delegatedLifecycle=$Request.schemaVersion -eq 2
-                if($delegatedLifecycle){Assert-CcodControllerMutationFence $Request $Paths $adapter}
-                else{
-                    $remaining=Get-CcodControllerRemainingBudget $total $clock $adapter
-                    $accountLease=& $adapter.EnterMutex 'AccountTransition' $identity.UserSid $null $remaining
-                    Assert-CcodControllerLeaseResult $accountLease 'AccountTransition' $identity
-                    if($accountLease.Outcome -ceq 'TimedOut'){$result=New-CcodControllerErrorResult $Request 'CCOD_TRANSITION_BUSY' 'LeaseAcquire' 'The transition lease is busy.'}
-                    else{$accountLeaseAcquired=$true}
-                }
+                if($Request.schemaVersion-eq2){Assert-CcodControllerMutationFence $Request $Paths $adapter}
+                $remaining=Get-CcodControllerRemainingBudget $total $clock $adapter
+                $accountLease=& $adapter.EnterMutex 'AccountTransition' $identity.UserSid $null $remaining
+                Assert-CcodControllerLeaseResult $accountLease 'AccountTransition' $identity
+                if($accountLease.Outcome -ceq 'TimedOut'){$result=New-CcodControllerErrorResult $Request 'CCOD_TRANSITION_BUSY' 'LeaseAcquire' 'The transition lease is busy.'}
+                else{$accountLeaseAcquired=$true}
                 if($null-eq$result){
                     $remaining=Get-CcodControllerRemainingBudget $total $clock $adapter
                     $sessionLease=& $adapter.EnterMutex 'Transition' $identity.UserSid $identity.SessionId $remaining

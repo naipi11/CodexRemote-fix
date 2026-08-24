@@ -1,16 +1,11 @@
 [CmdletBinding()]
-param([string]$RequestPath,[string]$ResultPath,[string]$StartupGateName,[string]$StartupGateToken,[int]$ExpectedParentPid,[string]$ExpectedParentCreationTimeUtc)
+param([string]$RequestPath,[string]$ResultPath)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
 $VerbosePreference='SilentlyContinue'
 $InformationPreference='SilentlyContinue'
-
-if($MyInvocation.InvocationName-ne'.'){
-    Import-Module (Join-Path $PSScriptRoot 'modules\WorkerRuntime.psm1') -Force
-    [void](Wait-CcodWorkerStartupGate -GateName $StartupGateName -GateToken $StartupGateToken -ExpectedParentPid $ExpectedParentPid -ExpectedParentCreationTimeUtc $ExpectedParentCreationTimeUtc -TimeoutMilliseconds 15000)
-}
 
 $script:CcodLifecycleWorkerScriptPath=if([string]::IsNullOrWhiteSpace($PSCommandPath)){$null}else{[IO.Path]::GetFullPath($PSCommandPath)}
 $script:CcodLifecycleWorkerRequestFields=@('schemaVersion','transactionId','action','runtimeId','runtimeGeneration','leaseEpoch','ownerIdentity','notBeforeUtc','timeoutMilliseconds')
@@ -175,13 +170,13 @@ function Assert-CcodLifecycleWorkerRuntimeClosure {
 }
 
 function Assert-CcodLifecycleWorkerFence {
-    param($Context,$Request)
-    $ownership=[pscustomobject][ordered]@{schemaVersion=1;lease=[pscustomobject][ordered]@{Released=$false};epoch=[UInt64]$Request.leaseEpoch;runtimeId=$Request.runtimeId;runtimeGeneration=[UInt64]$Request.runtimeGeneration;ownerIdentity=$Request.ownerIdentity;released=$false}
+    param($Context,$Request,$Delegation)
+    $ownership=if($null-ne$Delegation){$Delegation}else{[pscustomobject][ordered]@{schemaVersion=1;lease=[pscustomobject][ordered]@{Released=$false};epoch=[UInt64]$Request.leaseEpoch;runtimeId=$Request.runtimeId;runtimeGeneration=[UInt64]$Request.runtimeGeneration;ownerIdentity=$Request.ownerIdentity;released=$false}}
     Assert-CcodLifecycleFence -InstallRoot $Context.InstallRoot -Ownership $ownership
 }
 
 function Invoke-CcodLifecycleControllerFacade {
-    param([string]$Action,$Request,$Context)
+    param([string]$Action,$Request,$Context,$Delegation)
     $controllerPath=[IO.Path]::GetFullPath((Join-Path $Context.RuntimeRoot 'src\persistence\SessionController.ps1'))
     $identity=Get-CcodLifecycleWorkerCurrentIdentity
     $controllerAction=if($Action -ceq 'VerifyRemote'){'Inspect'}else{$Action}
@@ -191,7 +186,7 @@ function Invoke-CcodLifecycleControllerFacade {
         source=$null;existingOnly=[bool]($controllerAction -cne 'Apply');rendererPort=$null;mainPort=$null;timeoutMilliseconds=[Math]::Max(500,[Math]::Min(120000,$Request.timeoutMilliseconds));restartOrdinary=$false
     }
     $paths=[pscustomobject][ordered]@{StateRoot=[IO.Path]::GetFullPath((Join-Path $Context.InstallRoot 'state'));TransitionPath=[IO.Path]::GetFullPath((Join-Path $Context.InstallRoot 'state\transition.json'));TransitionLogPath=[IO.Path]::GetFullPath((Join-Path $Context.InstallRoot 'logs\transactions.log'));SessionLogPath=[IO.Path]::GetFullPath((Join-Path $Context.InstallRoot 'logs\session.log'));CheckerPath=[IO.Path]::GetFullPath((Join-Path $Context.RuntimeRoot 'src\check-package.mjs'));OrchestratorPath=[IO.Path]::GetFullPath((Join-Path $Context.RuntimeRoot 'src\runtime\orchestrator.js'));MainPayloadPath=[IO.Path]::GetFullPath((Join-Path $Context.RuntimeRoot 'src\runtime\main-payload.js'))}
-    $run=& {param($Path,$Value,$ControllerPaths). $Path;$noWrite={param($P,$V)};$noLine={param($Line)};Invoke-CcodSessionController -Request $Value -Paths $ControllerPaths -ResultPath ([IO.Path]::GetFullPath((Join-Path $ControllerPaths.StateRoot 'workers\controller-unused.result.json'))) -Adapters @{WriteResult=$noWrite;WriteStdout=$noLine;WriteStderr=$noLine}} $controllerPath $controllerRequest $paths
+    $run=& {param($Path,$Value,$ControllerPaths,$Delegated). $Path;$noWrite={param($P,$V)};$noLine={param($Line)};$bound=$Delegated;Invoke-CcodSessionController -Request $Value -Paths $ControllerPaths -ResultPath ([IO.Path]::GetFullPath((Join-Path $ControllerPaths.StateRoot 'workers\controller-unused.result.json'))) -Adapters @{WriteResult=$noWrite;WriteStdout=$noLine;WriteStderr=$noLine;GetDelegatedOwnership={$bound}.GetNewClosure()}} $controllerPath $controllerRequest $paths $Delegation
     return $run.Result
 }
 
@@ -213,10 +208,12 @@ function Get-CcodLifecycleWorkerAdapters {
         GetBootstrapContext={param($Path)Get-CcodLifecycleWorkerBootstrapContext $Path}
         ReadRequest={param($Path)Read-CcodStrictJson -Path $Path -ExpectedSchema 1 -Kind 'lifecycle worker request'}
         ResolveRuntime={param($Path,$Runtime,$Generation)$bootstrap=Get-CcodLifecycleWorkerBootstrapContext $Path;Resolve-CcodActiveRuntimeContext -InstallRoot $bootstrap.InstallRoot -ExpectedRuntimeId $Runtime -ExpectedGeneration $Generation -ExpectedScriptPath $Path -ScriptRelativePath 'src/persistence/LifecycleWorker.ps1'}
-        AssertFence={param($Context,$Request)Assert-CcodLifecycleWorkerFence $Context $Request}
+        EnterDelegation={param($Context,$Request)$identity=Get-CcodLifecycleWorkerCurrentIdentity;Enter-CcodLifecycleDelegation -InstallRoot $Context.InstallRoot -RuntimeId $Request.runtimeId -RuntimeGeneration $Request.runtimeGeneration -LeaseEpoch $Request.leaseEpoch -OwnerIdentity $Request.ownerIdentity -UserSid $identity.UserSid -SessionId $identity.SessionId -TimeoutMilliseconds ([Math]::Min(15000,$Request.timeoutMilliseconds))}
+        ExitDelegation={param($Delegation)Exit-CcodLifecycleDelegation -Delegation $Delegation}
+        AssertFence={param($Context,$Request,$Delegation)Assert-CcodLifecycleWorkerFence $Context $Request $Delegation}
         GetCurrentIdentity={Get-CcodLifecycleWorkerCurrentIdentity}
-        InvokeController={param($Action,$Request,$Context)Invoke-CcodLifecycleControllerFacade $Action $Request $Context}
-        RequestOrdinaryLaunch={param($Request,$Context)$ownership=[pscustomobject][ordered]@{runtimeGeneration=[UInt64]$Request.runtimeGeneration;leaseEpoch=[UInt64]$Request.leaseEpoch;ownerIdentity=$Request.ownerIdentity};$boundContext=$Context;$boundRequest=$Request;Request-CcodOrdinaryPackagedLaunch -RequestedAtUtc $Request.notBeforeUtc -Ownership $ownership -AssertLifecycleFence {param($Generation,$Epoch,$Owner)Assert-CcodLifecycleWorkerFence $boundContext $boundRequest}.GetNewClosure()}
+        InvokeController={param($Action,$Request,$Context,$Delegation)Invoke-CcodLifecycleControllerFacade $Action $Request $Context $Delegation}
+        RequestOrdinaryLaunch={param($Request,$Context,$Delegation)$ownership=[pscustomobject][ordered]@{runtimeGeneration=[UInt64]$Request.runtimeGeneration;leaseEpoch=[UInt64]$Request.leaseEpoch;ownerIdentity=$Request.ownerIdentity};$boundContext=$Context;$boundRequest=$Request;$boundDelegation=$Delegation;Request-CcodOrdinaryPackagedLaunch -RequestedAtUtc $Request.notBeforeUtc -Ownership $ownership -AssertLifecycleFence {param($Generation,$Epoch,$Owner)Assert-CcodLifecycleWorkerFence $boundContext $boundRequest $boundDelegation}.GetNewClosure()}
         ObserveOrdinary={param($Request,$Context)$identity=Get-CcodLifecycleWorkerCurrentIdentity;Wait-CcodVerifiedOrdinaryRoot -NotBeforeUtc $Request.notBeforeUtc -ExpectedUserSid $identity.UserSid -ExpectedSessionId $identity.SessionId -StatusEvidence $null -TimeoutMilliseconds ([Math]::Min(45000,$Request.timeoutMilliseconds))}
         WriteResult={param($Path,$Value)Write-CcodAtomicJson -Path $Path -Value $Value}
         WriteStdout={param($Line)[Console]::Out.WriteLine($Line)};WriteStderr={param($Line)[Console]::Error.WriteLine($Line)}
@@ -236,7 +233,7 @@ function Get-CcodLifecycleWorkerFailureCode {
 function Invoke-CcodLifecycleWorker {
     [CmdletBinding()]
     param([string]$RequestPath,[string]$ResultPath,[hashtable]$Adapters)
-    $adapter=Get-CcodLifecycleWorkerAdapters $Adapters;$request=$null;$requestValid=$false;$bootstrap=$null;$context=$null;$canPublish=$false;$result=$null;$stage='RuntimeAuthorization';$stale=$false
+    $adapter=Get-CcodLifecycleWorkerAdapters $Adapters;$request=$null;$requestValid=$false;$bootstrap=$null;$context=$null;$delegation=$null;$canPublish=$false;$result=$null;$stage='RuntimeAuthorization';$stale=$false
     try{
         $scriptPath=& $adapter.GetScriptPath;$bootstrap=& $adapter.GetBootstrapContext $scriptPath
         $stage='PathValidation';Assert-CcodLifecycleWorkerPaths $bootstrap $RequestPath $ResultPath $null $Adapters
@@ -245,12 +242,12 @@ function Invoke-CcodLifecycleWorker {
         $stage='RuntimeAuthorization';$context=& $adapter.ResolveRuntime $scriptPath $request.runtimeId $request.runtimeGeneration
         if($null-eq$context -or $context.RuntimeId -cne $request.runtimeId -or [UInt64]$context.RuntimeGeneration -ne [UInt64]$request.runtimeGeneration){Throw-CcodLifecycleWorkerError 'CCOD_LIFECYCLE_WORKER_RUNTIME_UNAUTHORIZED' 'Lifecycle request does not match active runtime generation' $request}
         Assert-CcodLifecycleWorkerRuntimeClosure $context|Out-Null
-        $stage='Fence';[void](& $adapter.AssertFence $context $request);$canPublish=$true
+        $stage='Fence';$delegation=&$adapter.EnterDelegation $context $request;[void](& $adapter.AssertFence $context $request $delegation);$canPublish=$true
         $stage='Operation'
         switch($request.action){
-            'RequestOrdinaryLaunch'{$receipt=& $adapter.RequestOrdinaryLaunch $request $context;if(-not(Test-CcodLifecycleWorkerExactObject $receipt @('outcome','requestedAtUtc','launcherPid'))-or$receipt.outcome-cne'LaunchRequested'-or$receipt.requestedAtUtc-cne$request.notBeforeUtc){Throw-CcodLifecycleWorkerError 'CCOD_LIFECYCLE_WORKER_RESULT_INVALID' 'Launch receipt is invalid' $receipt};$result=[pscustomobject][ordered]@{schemaVersion=1;transactionId=$request.transactionId;action=$request.action;ok=$true;outcome='LaunchRequested';observation='NoCodex';error=$null}}
+            'RequestOrdinaryLaunch'{$receipt=& $adapter.RequestOrdinaryLaunch $request $context $delegation;if(-not(Test-CcodLifecycleWorkerExactObject $receipt @('outcome','requestedAtUtc','launcherPid'))-or$receipt.outcome-cne'LaunchRequested'-or$receipt.requestedAtUtc-cne$request.notBeforeUtc){Throw-CcodLifecycleWorkerError 'CCOD_LIFECYCLE_WORKER_RESULT_INVALID' 'Launch receipt is invalid' $receipt};$result=[pscustomobject][ordered]@{schemaVersion=1;transactionId=$request.transactionId;action=$request.action;ok=$true;outcome='LaunchRequested';observation='NoCodex';error=$null}}
             'ObserveOrdinary'{$ordinary=& $adapter.ObserveOrdinary $request $context;$found=$null-ne$ordinary;$result=[pscustomobject][ordered]@{schemaVersion=1;transactionId=$request.transactionId;action=$request.action;ok=$true;outcome=$(if($found){'OrdinaryObserved'}else{'ObservationTimedOut'});observation=$(if($found){'Ordinary'}else{'ObservationTimedOut'});error=$null}}
-            default{$controller=& $adapter.InvokeController $request.action $request $context;$result=ConvertFrom-CcodLifecycleControllerResult $request.action $controller $request}
+            default{$controller=& $adapter.InvokeController $request.action $request $context $delegation;$result=ConvertFrom-CcodLifecycleControllerResult $request.action $controller $request}
         }
         $stage='ResultValidation';Assert-CcodLifecycleWorkerPublicResult $result $request|Out-Null
     }catch{
@@ -258,17 +255,20 @@ function Invoke-CcodLifecycleWorker {
         $result=New-CcodLifecycleWorkerErrorResult $(if($requestValid){$request}else{$null}) $code $stage
     }
     if(-not$canPublish -or $stale){
+        if($null-ne$delegation){try{[void](&$adapter.ExitDelegation $delegation)}catch{}}
         try{& $adapter.WriteStderr $(if($null-ne$result.error-and$result.error.code-is[string]){$result.error.code}else{'CCOD_LIFECYCLE_OPERATION_FAILED'})}catch{}
         return [pscustomobject][ordered]@{Result=$result;ExitCode=1}
     }
     try{
-        if($requestValid){Assert-CcodLifecycleWorkerPublicResult $result $request|Out-Null;$stage='Fence';[void](& $adapter.AssertFence $context $request)}
+        if($requestValid){Assert-CcodLifecycleWorkerPublicResult $result $request|Out-Null;$stage='Fence';[void](& $adapter.AssertFence $context $request $delegation)}
         $stage='ResultValidation';& $adapter.WriteResult $ResultPath $result
     }catch{
+        if($null-ne$delegation){try{[void](&$adapter.ExitDelegation $delegation)}catch{}}
         $code=Get-CcodLifecycleWorkerFailureCode $_ $stage
         return [pscustomobject][ordered]@{Result=(New-CcodLifecycleWorkerErrorResult $(if($requestValid){$request}else{$null}) $code $stage);ExitCode=1}
     }
-    try{& $adapter.WriteStdout ($result|ConvertTo-Json -Depth 12 -Compress)}catch{return [pscustomobject][ordered]@{Result=$result;ExitCode=1}}
+    try{& $adapter.WriteStdout ($result|ConvertTo-Json -Depth 12 -Compress)}catch{if($null-ne$delegation){try{[void](&$adapter.ExitDelegation $delegation)}catch{}};return [pscustomobject][ordered]@{Result=$result;ExitCode=1}}
+    if($null-ne$delegation){try{if(-not[bool](&$adapter.ExitDelegation $delegation)){throw 'release'}}catch{return [pscustomobject][ordered]@{Result=(New-CcodLifecycleWorkerErrorResult $request 'CCOD_LIFECYCLE_OPERATION_FAILED' 'LeaseRelease');ExitCode=1}}}
     return [pscustomobject][ordered]@{Result=$result;ExitCode=$(if($result.ok){0}else{1})}
 }
 

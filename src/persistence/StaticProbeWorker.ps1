@@ -1,11 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$RequestPath,
-    [string]$ResultPath,
-    [string]$StartupGateName,
-    [string]$StartupGateToken,
-    [int]$ExpectedParentPid,
-    [string]$ExpectedParentCreationTimeUtc
+    [string]$ResultPath
 )
 
 Set-StrictMode -Version Latest
@@ -13,11 +9,6 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $VerbosePreference = 'SilentlyContinue'
 $InformationPreference = 'SilentlyContinue'
-
-if($MyInvocation.InvocationName -ne '.'){
-    Import-Module (Join-Path $PSScriptRoot 'modules\WorkerRuntime.psm1') -Force
-    [void](Wait-CcodWorkerStartupGate -GateName $StartupGateName -GateToken $StartupGateToken -ExpectedParentPid $ExpectedParentPid -ExpectedParentCreationTimeUtc $ExpectedParentCreationTimeUtc -TimeoutMilliseconds 15000)
-}
 
 $script:CcodStaticProbeWorkerScriptPath = if ([string]::IsNullOrWhiteSpace($PSCommandPath)) { $null } else { [IO.Path]::GetFullPath($PSCommandPath) }
 $script:CcodStaticProbeRequestFields = @('schemaVersion','action','requestId','runtimeId','supervisorIdentity','targetIdentity','timeoutMilliseconds')
@@ -29,7 +20,6 @@ $script:CcodStaticProbeRequiredFiles = @(
     'src/persistence/StaticProbeWorker.ps1',
     'src/persistence/modules/RuntimeManifest.psm1',
     'src/persistence/modules/PersistenceIO.psm1',
-    'src/persistence/modules/WorkerRuntime.psm1',
     'src/persistence/modules/TrustedLogonIdentity.psm1',
     'src/persistence/modules/StateStore.psm1',
     'src/persistence/modules/CompatibilityProbe.psm1',

@@ -11,7 +11,7 @@ $script:CcodSupervisorLogPath=$null
 $script:CcodSupervisorAdapterNames=@(
     'GetIdentity','ResolveLayout','StartClock','GetElapsedMilliseconds','GetUtcNow',
     'EnterLease','ExitLease','OpenReadyEvent','OpenShutdownEvent','IsEventSignaled','SignalEvent','CloseEvent',
-    'ReadActiveRuntime','GetTrustedLogonIdentity','EnterLifecycleOwnership','AssertLifecycleFence','ExitLifecycleOwnership','OpenLifecycleWakeEvent','ResetLifecycleWakeEvent',
+    'ReadActiveRuntime','GetTrustedLogonIdentity','EnterLifecycleOwnership','AssertLifecycleFence','SuspendLifecycleOwnership','ResumeLifecycleOwnership','ExitLifecycleOwnership','OpenLifecycleWakeEvent','ResetLifecycleWakeEvent',
     'ReadLifecycleRequest','ReceiveLifecycleSubmissions','WriteLifecycleSubmissionReceipt','NewLifecycleRequest','WriteLifecycleRequest','MoveLifecyclePhase','CompleteLifecycleRequest','GetLifecycleStep','ReduceLifecycleWorkerResult','NewLifecycleWorkerRequest','AssertLifecycleWorkerResult',
     'ReadState','ReadJournal','ReadUiPreference','SetUiLanguageMode','GetSystemCultureName','GetUiCatalog','ShowTrayError','StartUninstall','EnumerateProcessIds','GetProcessSnapshot','ParseStaleCandidateCommandLine','GetPackageIdentity','GetSupervisorDecision','AddObservedEvent','CompleteControllerRun','HandoffRenderer','GetTrayPresentation',
     'NewQueue','GetQueueCount','TryDequeue','NewTray','SetTrayPresentation','StopTrayTimer','RequestUiExit','CloseTray','NewWatcher','StopWatcher',
@@ -259,6 +259,8 @@ function Get-CcodSupervisorDefaultAdapters {
     $defaults.GetTrustedLogonIdentity={param($ExpectedUserSid,$ExpectedSessionId)Get-CcodTrustedLogonIdentity -ExpectedUserSid $ExpectedUserSid -ExpectedSessionId $ExpectedSessionId}
     $defaults.EnterLifecycleOwnership={param($InstallRoot,$RuntimeId,$RuntimeGeneration,$OwnerIdentity,$UserSid,$SessionId,$TimeoutMilliseconds)Enter-CcodLifecycleOwnership -InstallRoot $InstallRoot -RuntimeId $RuntimeId -RuntimeGeneration $RuntimeGeneration -OwnerIdentity $OwnerIdentity -UserSid $UserSid -SessionId $SessionId -TimeoutMilliseconds $TimeoutMilliseconds}
     $defaults.AssertLifecycleFence={param($InstallRoot,$Ownership)Assert-CcodLifecycleFence -InstallRoot $InstallRoot -Ownership $Ownership}
+    $defaults.SuspendLifecycleOwnership={param($Ownership,$InstallRoot)Suspend-CcodLifecycleOwnership -Ownership $Ownership -InstallRoot $InstallRoot}
+    $defaults.ResumeLifecycleOwnership={param($Ownership,$InstallRoot,$UserSid,$SessionId)Resume-CcodLifecycleOwnership -Ownership $Ownership -InstallRoot $InstallRoot -UserSid $UserSid -SessionId $SessionId}
     $defaults.ExitLifecycleOwnership={param($Ownership)Exit-CcodLifecycleOwnership -Ownership $Ownership}
     $defaults.ReadLifecycleRequest={param($StateRoot)Read-CcodLifecycleRequest -StateRoot $StateRoot}
     $defaults.ReceiveLifecycleSubmissions={param($StateRoot,$MaximumCount)Receive-CcodLifecycleSubmissions -StateRoot $StateRoot -MaximumCount $MaximumCount}
@@ -615,7 +617,7 @@ function Start-CcodSupervisorLifecycleWorkerSlot {
     }
     $paths=New-CcodSupervisorLifecycleWorkerPaths $HostState $requestState.transactionId
     $workerRequest=Invoke-CcodSupervisorAdapter $Adapters.NewLifecycleWorkerRequest @($requestState.transactionId,$Action,$requestState.runtimeId,[UInt64]$requestState.runtimeGeneration,[UInt64]$requestState.leaseEpoch,$requestState.ownerIdentity,$now,$timeout) 1
-    $owned=[Collections.Generic.List[string]]::new()
+    $owned=[Collections.Generic.List[string]]::new();$suspended=$false
     try{
         foreach($path in @($paths.RequestPath,$paths.ResultPath)){
             $leaf=Invoke-CcodSupervisorAdapter $Adapters.GetWorkerLeafState @($path) 1
@@ -623,11 +625,24 @@ function Start-CcodSupervisorLifecycleWorkerSlot {
         }
         Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
         Invoke-CcodSupervisorAdapter $Adapters.WriteWorkerRequest @($paths.RequestPath,$workerRequest) 0;$owned.Add($paths.RequestPath)
+        $handoff=Invoke-CcodSupervisorAdapter $Adapters.SuspendLifecycleOwnership @($HostState.LifecycleOwnership,$HostState.Layout.InstallRoot) 1
+        if($handoff-isnot[bool]-or-not$handoff){throw 'lifecycle ownership handoff is invalid'}
+        $suspended=$true
         $started=Invoke-CcodSupervisorAdapter $Adapters.StartWorker @('Lifecycle',$HostState.Layout.LifecycleWorkerPath,$paths.RequestPath,$paths.ResultPath,$null,$workerRequest,$HostState.Layout.PowerShellPath) 1
-        if(-not(Test-CcodSupervisorExactProperties $started @('ProcessId','CreationTimeUtc','Handle','JobHandle','StartupGate')) -or $started.ProcessId-isnot[int] -or $started.ProcessId-lt1 -or -not(Test-CcodSupervisorCanonicalUtc $started.CreationTimeUtc) -or $null-eq$started.Handle -or $null-eq$started.JobHandle -or $null-eq$started.StartupGate){throw 'lifecycle worker start receipt is invalid'}
-        $HostState.LifecycleWorkerSlot=[pscustomobject][ordered]@{Kind='Lifecycle';Action=$Action;RequestId=$requestState.transactionId;RuntimeId=$requestState.runtimeId;Request=$workerRequest;RequestPath=$paths.RequestPath;ResultPath=$paths.ResultPath;StderrPath=$null;ProcessId=[int]$started.ProcessId;CreationTimeUtc=$started.CreationTimeUtc;Handle=$started.Handle;JobHandle=$started.JobHandle;StartupGate=$started.StartupGate}
+        if(-not(Test-CcodSupervisorExactProperties $started @('ProcessId','CreationTimeUtc','Handle','JobHandle')) -or $started.ProcessId-isnot[int] -or $started.ProcessId-lt1 -or -not(Test-CcodSupervisorCanonicalUtc $started.CreationTimeUtc) -or $null-eq$started.Handle -or $null-eq$started.JobHandle){throw 'lifecycle worker start receipt is invalid'}
+        $HostState.LifecycleWorkerSlot=[pscustomobject][ordered]@{Kind='Lifecycle';Action=$Action;RequestId=$requestState.transactionId;RuntimeId=$requestState.runtimeId;Request=$workerRequest;RequestPath=$paths.RequestPath;ResultPath=$paths.ResultPath;StderrPath=$null;ProcessId=[int]$started.ProcessId;CreationTimeUtc=$started.CreationTimeUtc;Handle=$started.Handle;JobHandle=$started.JobHandle}
         return $HostState.LifecycleWorkerSlot
-    }catch{foreach($path in @($owned)){try{Invoke-CcodSupervisorAdapter $Adapters.DeleteWorkerFile @($path) 0}catch{}};throw}
+    }catch{
+        if($suspended){
+            try{
+                $resumed=Invoke-CcodSupervisorAdapter $Adapters.ResumeLifecycleOwnership @($HostState.LifecycleOwnership,$HostState.Layout.InstallRoot,$HostState.Identity.UserSid,[int]$HostState.Identity.SessionId) 1
+                if($resumed-isnot[bool]-or-not$resumed){throw 'lifecycle ownership reacquire receipt is invalid'}
+                Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
+            }catch{throw 'lifecycle ownership could not be reacquired after worker-start failure'}
+        }
+        foreach($path in @($owned)){try{Invoke-CcodSupervisorAdapter $Adapters.DeleteWorkerFile @($path) 0}catch{}}
+        throw
+    }
 }
 
 function Clear-CcodSupervisorLifecycleWorkerSlot {
@@ -676,6 +691,11 @@ function Invoke-CcodSupervisorPollLifecycleSlot {
     if(-not$poll.Completed){return}
     try{
         if($poll.ExitCode-isnot[int] -or @([int]0,[int]1)-cnotcontains$poll.ExitCode -or [string]::IsNullOrEmpty($poll.StdoutText) -or $poll.StdoutOverflow -or $poll.StderrOverflow -or $poll.StdoutByteCount-gt1048576 -or $poll.StderrByteCount-gt65536){throw 'lifecycle worker frame is invalid'}
+        $exited=Invoke-CcodSupervisorAdapter $Adapters.WaitWorker @($slot,[int]2000) 1
+        if($exited-isnot[bool]-or-not$exited){throw 'lifecycle worker exit is not proven'}
+        $resumed=Invoke-CcodSupervisorAdapter $Adapters.ResumeLifecycleOwnership @($HostState.LifecycleOwnership,$HostState.Layout.InstallRoot,$HostState.Identity.UserSid,[int]$HostState.Identity.SessionId) 1
+        if($resumed-isnot[bool]-or-not$resumed){throw 'lifecycle ownership reacquire receipt is invalid'}
+        Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
         $result=Invoke-CcodSupervisorAdapter $Adapters.ReadWorkerResult @($slot.ResultPath) 1
         $stdout=$poll.StdoutText|ConvertFrom-Json -ErrorAction Stop
         if(($stdout|ConvertTo-Json -Depth 16 -Compress)-cne($result|ConvertTo-Json -Depth 16 -Compress)){throw 'lifecycle worker frames differ'}
@@ -807,12 +827,12 @@ function Start-CcodSupervisorWorkerSlot {
         Invoke-CcodSupervisorAdapter $Adapters.WriteWorkerRequest @($paths.RequestPath,$request) 0;$ownedFiles.Add($paths.RequestPath)
         $scriptPath=if($Kind -ceq 'StaticProbe'){$HostState.Layout.StaticWorkerPath}else{$HostState.Layout.ControllerPath}
         $started=Invoke-CcodSupervisorAdapter $Adapters.StartWorker @($Kind,$scriptPath,$paths.RequestPath,$paths.ResultPath,$paths.StderrPath,$request,$HostState.Layout.PowerShellPath) 1
-        if(-not (Test-CcodSupervisorExactProperties $started @('ProcessId','CreationTimeUtc','Handle','JobHandle','StartupGate')) -or $started.ProcessId -isnot [int] -or $started.ProcessId -lt 1 -or
-           -not (Test-CcodSupervisorCanonicalUtc $started.CreationTimeUtc) -or $null -eq $started.Handle -or $null-eq$started.JobHandle -or $null-eq$started.StartupGate){throw 'worker start receipt is invalid'}
+        if(-not (Test-CcodSupervisorExactProperties $started @('ProcessId','CreationTimeUtc','Handle','JobHandle')) -or $started.ProcessId -isnot [int] -or $started.ProcessId -lt 1 -or
+           -not (Test-CcodSupervisorCanonicalUtc $started.CreationTimeUtc) -or $null -eq $started.Handle -or $null-eq$started.JobHandle){throw 'worker start receipt is invalid'}
         $HostState.WorkerSlot=[pscustomobject][ordered]@{
             Kind=$Kind;Action=$request.action;RequestId=$requestId;RuntimeId=$HostState.Layout.RuntimeId;Request=$request
             RequestPath=$paths.RequestPath;ResultPath=$paths.ResultPath;StderrPath=$paths.StderrPath
-            ProcessId=[int]$started.ProcessId;CreationTimeUtc=$started.CreationTimeUtc;Handle=$started.Handle;JobHandle=$started.JobHandle;StartupGate=$started.StartupGate
+            ProcessId=[int]$started.ProcessId;CreationTimeUtc=$started.CreationTimeUtc;Handle=$started.Handle;JobHandle=$started.JobHandle
         }
         return $HostState.WorkerSlot
     }catch{
@@ -1416,6 +1436,7 @@ function Invoke-CcodSupervisorHost {
         if($null-ne$lifecycleWakeEvent){Invoke-CcodSupervisorCleanupStage {Invoke-CcodSupervisorAdapter $adapter.CloseEvent @($lifecycleWakeEvent) 0} $codes 'CCOD_SUPERVISOR_LIFECYCLE_WAKE_CLOSE_FAILED'}
         if($null-ne$hostState){foreach($runtimeCode in @($hostState.RuntimeCleanupCodes)){Add-CcodSupervisorCleanupCode $codes $runtimeCode}}
         if($workerCleanupSafe){
+            if($lifecycleOwned-and$null-ne$lifecycleOwnership-and-not$lifecycleOwnership.released-and$null-ne$lifecycleOwnership.lease.PSObject.Properties['Released']-and$lifecycleOwnership.lease.Released){$lifecycleOwnership.released=$true;$lifecycleOwned=$false}
             if($lifecycleOwned){Invoke-CcodSupervisorCleanupStage {$released=Invoke-CcodSupervisorAdapter $adapter.ExitLifecycleOwnership @($lifecycleOwnership) 1;if($released-isnot[bool] -or -not$released -or -not$lifecycleOwnership.released){throw 'lifecycle ownership release failed'}} $codes 'CCOD_SUPERVISOR_LIFECYCLE_RELEASE_FAILED'}
             if($localOwned){Invoke-CcodSupervisorCleanupStage {$released=Invoke-CcodSupervisorAdapter $adapter.ExitLease @($localLease) 1;if($released -isnot [bool] -or -not $released){throw 'local lease release failed'}} $codes 'CCOD_SUPERVISOR_LOCAL_RELEASE_FAILED'}
             if($accountOwned){Invoke-CcodSupervisorCleanupStage {$released=Invoke-CcodSupervisorAdapter $adapter.ExitLease @($accountLease) 1;if($released -isnot [bool] -or -not $released){throw 'account lease release failed'}} $codes 'CCOD_SUPERVISOR_ACCOUNT_RELEASE_FAILED'}

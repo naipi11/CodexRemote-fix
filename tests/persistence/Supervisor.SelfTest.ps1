@@ -70,7 +70,7 @@ function New-CcodSupervisorFake {
         UiFailureRecords=[Collections.Generic.List[object]]::new();TrayErrors=[Collections.Generic.List[object]]::new()
         ActiveRuntime=[pscustomobject][ordered]@{schemaVersion=2;activeRuntime='runtime-1';generation=[UInt64]7}
         LogonIdentity=[pscustomobject][ordered]@{authenticationId='00000000:00001234';userSid='S-1-5-21-111-222-333-1001';sessionId=[int]1}
-        LifecycleOwnership=$null;LifecycleOwnershipEntries=0;LifecycleFenceAssertions=0;LifecycleOwnershipExits=0
+        LifecycleOwnership=$null;LifecycleOwnershipEntries=0;LifecycleFenceAssertions=0;LifecycleOwnershipExits=0;LifecycleOwnershipSuspends=0;LifecycleOwnershipResumes=0
         ActiveLifecycleRequest=$null;LifecycleSubmissions=[Collections.Generic.Queue[object]]::new();LifecycleSubmissionReceipts=[Collections.Generic.List[object]]::new();CompletedLifecycleRequests=[Collections.Generic.List[object]]::new()
         LifecycleWrites=[Collections.Generic.List[object]]::new();LifecycleMoves=[Collections.Generic.List[string]]::new();StartedLifecycleRequests=[Collections.Generic.List[object]]::new();AutoCompleteLifecycleWorkers=$false
         WorkerWaitResults=[Collections.Generic.Queue[bool]]::new();WorkerTerminateResults=[Collections.Generic.Queue[bool]]::new()
@@ -127,6 +127,8 @@ function New-CcodSupervisorFake {
         $world.LifecycleOwnership
     }.GetNewClosure()
     $adapters.AssertLifecycleFence={param($InstallRoot,$Ownership)$world.Calls.Add("Fence:$($Ownership.epoch)");$world.LifecycleFenceAssertions++;$true}.GetNewClosure()
+    $adapters.SuspendLifecycleOwnership={param($Ownership,$InstallRoot)$world.Calls.Add("Suspend:LifecycleOwnership:$($Ownership.epoch)");$world.LifecycleOwnershipSuspends++;$Ownership.lease.Released=$true;$true}.GetNewClosure()
+    $adapters.ResumeLifecycleOwnership={param($Ownership,$InstallRoot,$UserSid,$SessionId)$world.Calls.Add("Resume:LifecycleOwnership:$($Ownership.epoch)");$world.LifecycleOwnershipResumes++;$Ownership.lease.Released=$false;$true}.GetNewClosure()
     $adapters.ExitLifecycleOwnership={param($Ownership)$world.Calls.Add("Exit:LifecycleOwnership:$($Ownership.epoch)");$world.LifecycleOwnershipExits++;if($world.FailAt -ceq 'ExitLifecycleOwnership'){throw 'PRIVATE_OWNERSHIP_RELEASE_SECRET'};$Ownership.released=$true;$true}.GetNewClosure()
     $adapters.ReadLifecycleRequest={param($StateRoot)$world.Calls.Add('Read:LifecycleRequest');if($world.FailAt -ceq 'ReadLifecycleRequest'){throw 'PRIVATE_LIFECYCLE_REQUEST_SECRET'};$world.ActiveLifecycleRequest}.GetNewClosure()
     $adapters.ReceiveLifecycleSubmissions={
@@ -148,7 +150,7 @@ function New-CcodSupervisorFake {
     $adapters.MoveLifecyclePhase={param($Request,$NextPhase,$NowUtc)$world.Calls.Add("Move:Lifecycle:$NextPhase");$world.LifecycleMoves.Add($NextPhase);& $transactionModule {param($Value,$Phase,$Now)Move-CcodLifecyclePhase -Request $Value -NextPhase $Phase -NowUtc $Now} $Request $NextPhase $NowUtc}.GetNewClosure()
     $adapters.CompleteLifecycleRequest={param($StateRoot,$Request)$world.Calls.Add("Complete:Lifecycle:$($Request.phase)");$world.CompletedLifecycleRequests.Add($Request);$world.ActiveLifecycleRequest=$null}.GetNewClosure()
     $adapters.GetLifecycleStep={param($Request,$Observation,$NowUtc)& $coordinatorModule {param($Value,$Observed,$Now)Get-CcodLifecycleStep -Request $Value -Observation $Observed -NowUtc $Now} $Request $Observation $NowUtc}.GetNewClosure()
-    $adapters.ReduceLifecycleWorkerResult={param($Request,$Result,$NowUtc)& $coordinatorModule {param($Value,$WorkerResult,$Now)Reduce-CcodLifecycleWorkerResult -Request $Value -Result $WorkerResult -NowUtc $Now} $Request $Result $NowUtc}.GetNewClosure()
+    $adapters.ReduceLifecycleWorkerResult={param($Request,$Result,$NowUtc)$world.Calls.Add("Reduce:Lifecycle:$($Result.action)");& $coordinatorModule {param($Value,$WorkerResult,$Now)Reduce-CcodLifecycleWorkerResult -Request $Value -Result $WorkerResult -NowUtc $Now} $Request $Result $NowUtc}.GetNewClosure()
     $adapters.NewLifecycleWorkerRequest={
         param($TransactionId,$Action,$RuntimeId,$RuntimeGeneration,$LeaseEpoch,$OwnerIdentity,$NotBeforeUtc,$TimeoutMilliseconds)
         $world.Calls.Add("New:LifecycleWorker:$Action")
@@ -184,7 +186,7 @@ function New-CcodSupervisorFake {
     $adapters.StopWatcher={param($Watcher)$world.Calls.Add('Stop:Watcher');if($world.FailAt -ceq 'StopWatcher'){throw 'PRIVATE_WATCHER_STOP_SECRET'};[pscustomobject][ordered]@{SchemaVersion=1;Stopped=$true;CleanupCodes=@()}}.GetNewClosure()
     $adapters.GetWorkerLeafState={param($Path)$world.Calls.Add("Leaf:$([IO.Path]::GetFileName($Path))");[pscustomobject][ordered]@{Exists=$false;IsReparse=$false}}.GetNewClosure()
     $adapters.WriteWorkerRequest={param($Path,$Request)$world.Calls.Add("Write:$($Request.action)");if($null -ne $Request.PSObject.Properties['leaseEpoch']){$world.StartedLifecycleRequests.Add($Request)}}.GetNewClosure()
-    $adapters.StartWorker={param($Kind,$ScriptPath,$RequestPath,$ResultPath,$StderrPath,$Request,$PowerShellPath)$world.Calls.Add("Start:$Kind`:$($Request.action)");[pscustomobject][ordered]@{ProcessId=501;CreationTimeUtc='2030-02-03T03:05:00.0000000Z';Handle=[pscustomobject]@{Kind='Worker'};JobHandle=[pscustomobject]@{Kind='Job';IsClosed=$false};StartupGate=[pscustomobject]@{Name='Fake-Gate';Token=('a'*64);Handle=[pscustomobject]@{Kind='Gate'};Released=$true;Disposed=$false}}}.GetNewClosure()
+    $adapters.StartWorker={param($Kind,$ScriptPath,$RequestPath,$ResultPath,$StderrPath,$Request,$PowerShellPath)$world.Calls.Add("Start:$Kind`:$($Request.action)");[pscustomobject][ordered]@{ProcessId=501;CreationTimeUtc='2030-02-03T03:05:00.0000000Z';Handle=[pscustomobject]@{Kind='Worker'};JobHandle=[pscustomobject]@{Kind='Job';IsClosed=$false}}}.GetNewClosure()
     $adapters.PollWorker={
         param($Slot)
         $world.Calls.Add("Poll:$($Slot.Kind)")
@@ -424,6 +426,18 @@ Invoke-CcodTest 'surviving lifecycle worker keeps framing and lifecycle ownershi
     Assert-CcodEqual 0 @($fake.World.Calls|Where-Object{$_ -like 'Exit:LifecycleOwnership:*' -or $_ -eq 'Exit:Supervisor' -or $_ -eq 'Exit:AccountSupervisor'}).Count 'survivor prevents every explicit ownership release'
 }
 
+Invoke-CcodTest 'shutdown records a proven suspended handoff as released without a second account-mutex exit' {
+    $fake=New-CcodSupervisorFake
+    $fake.World.LifecycleSubmissions.Enqueue([pscustomobject][ordered]@{schemaVersion=1;submissionId='eeeeeeee-ffff-0000-1111-222222222222';kind='RestartAndRepair';origin='Installer';runtimeId='runtime-1';runtimeGeneration=[UInt64]7;createdAtUtc='2030-02-03T03:04:05.0000000Z'})
+    $fake.World.TickCount=1
+    $receipt=Invoke-CcodSupervisorHost -ReadyToken $readyToken -Adapters $fake.Adapters
+    Assert-CcodReceipt $receipt 'Stopped' 0
+    Assert-CcodEqual 1 $fake.World.LifecycleOwnershipSuspends 'active worker starts only after the Supervisor has released its raw account lease'
+    Assert-CcodEqual 0 $fake.World.LifecycleOwnershipResumes 'shutdown does not reacquire a handoff that it will not reduce or persist'
+    Assert-CcodTrue $fake.World.LifecycleOwnership.released 'shutdown marks the already-released ownership receipt terminal after exact worker exit'
+    Assert-CcodEqual 0 @($fake.World.Calls|Where-Object{$_ -like 'Exit:LifecycleOwnership:*'}).Count 'shutdown never attempts a second ExitMutex against the suspended lease'
+}
+
 Invoke-CcodTest 'shutdown waits and cleans a reachable StaticProbe before lifecycle ownership release' {
     $fake=New-CcodSupervisorFake;$target=New-CcodSupervisorTestSnapshot
     $fake.World.ProcessIds=@([int]$target.Pid);$fake.World.Snapshots[[int]$target.Pid]=$target
@@ -555,6 +569,10 @@ Invoke-CcodTest 'resumes WaitingForManualLaunch after Supervisor restart and com
         Assert-CcodEqual 7 $request.runtimeGeneration 'every worker request keeps the active generation'
     }
     Assert-CcodEqual 1 $fake.World.LifecycleOwnershipEntries 'Supervisor restart enters one ownership epoch'
+    Assert-CcodEqual 2 $fake.World.LifecycleOwnershipSuspends 'each durable worker intent hands the exact epoch to its verified worker'
+    Assert-CcodEqual 2 $fake.World.LifecycleOwnershipResumes 'Supervisor reacquires the same epoch before each worker result is reduced'
+    $calls=@($fake.World.Calls);$firstSuspend=[Array]::IndexOf($calls,'Suspend:LifecycleOwnership:11');$firstStart=[Array]::IndexOf($calls,'Start:Lifecycle:Apply');$firstResume=[Array]::IndexOf($calls,'Resume:LifecycleOwnership:11');$firstReduction=[Array]::IndexOf($calls,'Reduce:Lifecycle:Apply')
+    Assert-CcodTrue ($firstSuspend-ge0-and$firstStart-gt$firstSuspend-and$firstResume-gt$firstStart-and$firstReduction-gt$firstResume) 'handoff is durable-intent then worker then reacquire before reduction and persistence'
     Assert-CcodEqual 0 @($fake.World.Calls|Where-Object{$_ -like 'Start:Controller:*'}).Count 'resume performs no mutation outside LifecycleWorker slot'
 }
 

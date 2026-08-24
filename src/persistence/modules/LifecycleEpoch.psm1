@@ -339,6 +339,44 @@ function Assert-CcodLifecycleFence {
     return $true
 }
 
+function Suspend-CcodLifecycleOwnership {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Ownership,[Parameter(Mandatory)][string]$InstallRoot,[hashtable]$Adapters)
+    [void](Assert-CcodLifecycleFence -InstallRoot $InstallRoot -Ownership $Ownership -Adapters $Adapters)
+    $resolved=Get-CcodLifecycleEpochAdapters -Adapters $Adapters
+    try{$released=&$resolved.ExitMutex $Ownership.lease}catch{Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_RELEASE_FAILED' 'Lifecycle ownership could not enter delegation' $Ownership}
+    if($released-isnot[bool]-or-not$released-or-not$Ownership.lease.Released){Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_RELEASE_FAILED' 'Lifecycle ownership handoff was not proven' $Ownership}
+    return $true
+}
+
+function Enter-CcodLifecycleDelegation {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][string]$RuntimeId,[Parameter(Mandatory)][UInt64]$RuntimeGeneration,[Parameter(Mandatory)][UInt64]$LeaseEpoch,[Parameter(Mandatory)]$OwnerIdentity,[Parameter(Mandatory)][string]$UserSid,[Parameter(Mandatory)][int]$SessionId,[int]$TimeoutMilliseconds=15000,[hashtable]$Adapters)
+    $resolved=Get-CcodLifecycleEpochAdapters -Adapters $Adapters;$lease=$null
+    try{$lease=&$resolved.EnterMutex $UserSid $SessionId $TimeoutMilliseconds}catch{Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_LEASE_FAILED' 'Delegated lifecycle mutex could not be acquired' $InstallRoot}
+    if($null-eq$lease-or$lease.Outcome-cne'Acquired'){Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_LEASE_TIMEOUT' 'Delegated lifecycle mutex timed out' $InstallRoot}
+    $delegation=[pscustomobject][ordered]@{schemaVersion=1;lease=$lease;epoch=$LeaseEpoch;runtimeId=$RuntimeId;runtimeGeneration=$RuntimeGeneration;ownerIdentity=$OwnerIdentity;released=$false}
+    try{[void](Assert-CcodLifecycleFence -InstallRoot $InstallRoot -Ownership $delegation -Adapters $resolved);return $delegation}catch{try{[void](&$resolved.ExitMutex $lease)}catch{};throw}
+}
+
+function Exit-CcodLifecycleDelegation {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Delegation,[hashtable]$Adapters)
+    return Exit-CcodLifecycleOwnership -Ownership $Delegation -Adapters $Adapters
+}
+
+function Resume-CcodLifecycleOwnership {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Ownership,[Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][string]$UserSid,[Parameter(Mandatory)][int]$SessionId,[int]$TimeoutMilliseconds=15000,[hashtable]$Adapters)
+    Assert-CcodLifecycleOwnershipReceipt -Ownership $Ownership
+    if($Ownership.released-or$null-eq$Ownership.lease.PSObject.Properties['Released']-or-not$Ownership.lease.Released){Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_FENCE_STALE' 'Lifecycle ownership is not suspended for delegation' $Ownership}
+    $resolved=Get-CcodLifecycleEpochAdapters -Adapters $Adapters;$lease=$null
+    try{$lease=&$resolved.EnterMutex $UserSid $SessionId $TimeoutMilliseconds}catch{Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_LEASE_FAILED' 'Lifecycle ownership could not be reacquired' $InstallRoot}
+    if($null-eq$lease-or$lease.Outcome-cne'Acquired'){Throw-CcodLifecycleEpochError 'CCOD_LIFECYCLE_LEASE_TIMEOUT' 'Lifecycle ownership reacquire timed out' $InstallRoot}
+    $candidate=[pscustomobject][ordered]@{schemaVersion=1;lease=$lease;epoch=$Ownership.epoch;runtimeId=$Ownership.runtimeId;runtimeGeneration=$Ownership.runtimeGeneration;ownerIdentity=$Ownership.ownerIdentity;released=$false}
+    try{[void](Assert-CcodLifecycleFence -InstallRoot $InstallRoot -Ownership $candidate -Adapters $resolved);$Ownership.lease=$lease;$Ownership.released=$false;return $true}catch{try{[void](&$resolved.ExitMutex $lease)}catch{};throw}
+}
+
 function Exit-CcodLifecycleOwnership {
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Ownership, [hashtable]$Adapters)
@@ -353,4 +391,4 @@ function Exit-CcodLifecycleOwnership {
     return $true
 }
 
-Export-ModuleMember -Function Enter-CcodLifecycleOwnership, Assert-CcodLifecycleFence, Exit-CcodLifecycleOwnership, Read-CcodLifecycleEpoch
+Export-ModuleMember -Function Enter-CcodLifecycleOwnership, Assert-CcodLifecycleFence, Suspend-CcodLifecycleOwnership, Enter-CcodLifecycleDelegation, Exit-CcodLifecycleDelegation, Resume-CcodLifecycleOwnership, Exit-CcodLifecycleOwnership, Read-CcodLifecycleEpoch

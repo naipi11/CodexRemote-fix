@@ -21,7 +21,6 @@ function New-CcodWorkerSlot {
         CreationTimeUtc = [string]$Receipt.CreationTimeUtc
         Handle = $Receipt.Handle
         JobHandle = $Receipt.JobHandle
-        StartupGate = $Receipt.StartupGate
         RequestPath = $RequestPath
         ResultPath = $ResultPath
         StderrPath = $StderrPath
@@ -113,7 +112,7 @@ $results += Invoke-CcodTest 'lifecycle worker request constructor and result val
     Assert-CcodThrows { Assert-CcodLifecycleWorkerResult -Result $result -ExpectedRequest $request } 'CCOD_WORKER_RESULT_INVALID'
 }
 
-$results += Invoke-CcodTest 'real worker remains behind its one-use gate until Job assignment and parent release' {
+$results += Invoke-CcodTest 'real worker remains suspended until exact Job assignment and thread resume' {
     $root = New-CcodWorkerTempRoot
     $workerScript = Join-Path $root 'worker.ps1'
     $requestPath = Join-Path $root 'request.json'
@@ -125,13 +124,11 @@ $results += Invoke-CcodTest 'real worker remains behind its one-use gate until J
         Write-CcodAtomicJson -Path $requestPath -Value $request
         $payload = [pscustomobject][ordered]@{ schemaVersion = 1; action = 'Probe'; ok = $true; requestId = ('b' * 32); runtimeId = 'runtime-1'; targetIdentity = $null; probe = $null; error = $null }
         $json = $payload | ConvertTo-Json -Depth 8 -Compress
-        $markerPath=Join-Path $root 'after-gate.marker';$parentFile=Join-Path $root 'worker-parent.txt'
+        $markerPath=Join-Path $root 'after-resume.marker';$parentFile=Join-Path $root 'worker-parent.txt'
         $escapedModule=$modulePath.Replace("'","''");$escapedMarker=$markerPath.Replace("'","''");$escapedParent=$parentFile.Replace("'","''")
         $scriptText = @(
             '[CmdletBinding()]',
-            'param([string]$RequestPath,[string]$ResultPath,[string]$StartupGateName,[string]$StartupGateToken,[int]$ExpectedParentPid,[string]$ExpectedParentCreationTimeUtc)',
-            ("Import-Module '"+$escapedModule+"' -Force"),
-            'Wait-CcodWorkerStartupGate -GateName $StartupGateName -GateToken $StartupGateToken -ExpectedParentPid $ExpectedParentPid -ExpectedParentCreationTimeUtc $ExpectedParentCreationTimeUtc -TimeoutMilliseconds 10000',
+            'param([string]$RequestPath,[string]$ResultPath)',
             '$value = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json',
             ("[IO.File]::WriteAllText('"+$escapedMarker+"','released',[Text.UTF8Encoding]::new(`$false))"),
             '$cim = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $PID) -ErrorAction Stop',
@@ -144,18 +141,18 @@ $results += Invoke-CcodTest 'real worker remains behind its one-use gate until J
         [IO.File]::WriteAllText($workerScript, $scriptText, [Text.UTF8Encoding]::new($false))
 
         $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        $workerModule=Get-Module WorkerRuntime|Select-Object -First 1
-        $defaults=& $workerModule {Get-CcodWorkerRuntimeAdapters $null}
-        $observed=[pscustomobject]@{MarkerBeforeRelease=$null}
+        $workerModule=Get-Module WorkerRuntime|Select-Object -First 1;$defaults=& $workerModule {Get-CcodWorkerRuntimeAdapters $null}
+        $global:CcodSuspendedMarkerPath=$markerPath;$global:CcodSuspendedNative=$null;$global:CcodWorkerDefaults=$defaults
         $receipt = Start-CcodWorkerProcess -Kind 'Lifecycle' -ScriptPath $workerScript -RequestPath $requestPath -ResultPath $resultPath -StderrPath $stderrPath -PowerShellPath $powershell -Adapters @{
-            SignalGate={param($Gate)$observed.MarkerBeforeRelease=[IO.File]::Exists($markerPath);& $defaults.SignalGate $Gate}.GetNewClosure()
+            CreateSuspendedProcess={param($File,$Arguments)$native=&$global:CcodWorkerDefaults.CreateSuspendedProcess $File $Arguments;$global:CcodSuspendedNative=$native;$native}
+            AssignProcessToJob={param($Job,$Native)if([IO.File]::Exists($global:CcodSuspendedMarkerPath)){throw 'child ran before assignment'};&$global:CcodWorkerDefaults.AssignProcessToJob $Job $Native}
         }
-        Assert-CcodEqual $false $observed.MarkerBeforeRelease 'child cannot read request or create operation marker before gate release'
+        Assert-CcodEqual $false ([IO.File]::Exists($markerPath)) 'assignment occurs before child can read request or create operation marker'
         Assert-CcodTrue ($receipt.ProcessId -is [int] -and $receipt.ProcessId -ge 1) 'worker start returns a real pid'
         Assert-CcodTrue ($receipt.CreationTimeUtc -cmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$') 'worker start returns canonical creation time'
         Assert-CcodTrue ($null -ne $receipt.Handle) 'worker start returns a process handle'
         Assert-CcodTrue ($null-ne$receipt.JobHandle -and -not$receipt.JobHandle.IsClosed) 'worker start retains the kill-on-close Job handle'
-        Assert-CcodTrue ($null-ne$receipt.StartupGate -and $receipt.StartupGate.Released) 'worker start retains one released one-use gate'
+        Assert-CcodTrue ($global:CcodSuspendedNative.ProcessHandle.IsClosed-and$global:CcodSuspendedNative.ThreadHandle.IsClosed) 'primary native process and thread handles close after resume'
         $slot = New-CcodWorkerSlot -Receipt $receipt -RequestPath $requestPath -ResultPath $resultPath -StderrPath $stderrPath
         $completed = Wait-CcodWorkerExit -Slot $slot -TimeoutMilliseconds 20000
         Assert-CcodEqual $true $completed 'worker exits within the wait window'
@@ -181,6 +178,7 @@ $results += Invoke-CcodTest 'real worker remains behind its one-use gate until J
         Remove-CcodWorkerFile -Path $stderrPath
         Assert-CcodTrue (-not (Test-Path -LiteralPath $resultPath)) 'result file cleaned'
     } finally {
+        Remove-Variable CcodSuspendedMarkerPath,CcodSuspendedNative,CcodWorkerDefaults -Scope Global -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
     }
 }
@@ -191,34 +189,47 @@ $results += Invoke-CcodTest 'Job assignment failure kills the exact gated child 
         $global:CcodWorkerAssignmentCapturePath=$capturePath
         [IO.Directory]::CreateDirectory($root)|Out-Null;[IO.File]::WriteAllText($requestPath,'{"schemaVersion":1}',[Text.UTF8Encoding]::new($false))
         $escapedModule=$modulePath.Replace("'","''");$escapedMarker=$markerPath.Replace("'","''")
-        $scriptText=@('[CmdletBinding()]','param([string]$RequestPath,[string]$ResultPath,[string]$StartupGateName,[string]$StartupGateToken,[int]$ExpectedParentPid,[string]$ExpectedParentCreationTimeUtc)',("Import-Module '"+$escapedModule+"' -Force"),'Wait-CcodWorkerStartupGate -GateName $StartupGateName -GateToken $StartupGateToken -ExpectedParentPid $ExpectedParentPid -ExpectedParentCreationTimeUtc $ExpectedParentCreationTimeUtc -TimeoutMilliseconds 10000',("[IO.File]::WriteAllText('"+$escapedMarker+"','ran',[Text.UTF8Encoding]::new(`$false))"),'Start-Sleep -Seconds 30')-join"`r`n"
+        $scriptText=@('[CmdletBinding()]','param([string]$RequestPath,[string]$ResultPath)',("[IO.File]::WriteAllText('"+$escapedMarker+"','ran',[Text.UTF8Encoding]::new(`$false))"),'Start-Sleep -Seconds 30')-join"`r`n"
         [IO.File]::WriteAllText($workerScript,$scriptText,[Text.UTF8Encoding]::new($false));$powershell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         Assert-CcodThrows {Start-CcodWorkerProcess -Kind Lifecycle -ScriptPath $workerScript -RequestPath $requestPath -ResultPath $resultPath -StderrPath $null -PowerShellPath $powershell -Adapters @{
-            AssignProcessToJob={param($Job,$Process)[IO.File]::WriteAllText($global:CcodWorkerAssignmentCapturePath,(([ordered]@{pid=[int]$Process.Id;created=$Process.StartTime.ToUniversalTime().ToString('o')}|ConvertTo-Json -Compress)),[Text.UTF8Encoding]::new($false));$false}
+            AssignProcessToJob={param($Job,$Native)[IO.File]::WriteAllText($global:CcodWorkerAssignmentCapturePath,(([ordered]@{pid=[int]$Native.ProcessId}|ConvertTo-Json -Compress)),[Text.UTF8Encoding]::new($false));$false}
         }|Out-Null} 'CCOD_WORKER_START_FAILED'
         Assert-CcodTrue ([IO.File]::Exists($capturePath)) 'assignment failure starts one gated child'
         $captured=Get-Content -LiteralPath $capturePath -Raw|ConvertFrom-Json
-        $clock=[Diagnostics.Stopwatch]::StartNew();do{$identity=Get-CcodWorkerIdentity -Pid ([int]$captured.pid);if($null-eq$identity-or$identity.CreationTimeUtc-cne$captured.created){$stopped=$true;break};if($clock.ElapsedMilliseconds-ge5000){$stopped=$false;break};Start-Sleep -Milliseconds 50}while($true)
+        $clock=[Diagnostics.Stopwatch]::StartNew();do{$identity=Get-CcodWorkerIdentity -Pid ([int]$captured.pid);if($null-eq$identity){$stopped=$true;break};if($clock.ElapsedMilliseconds-ge5000){$stopped=$false;break};Start-Sleep -Milliseconds 50}while($true)
         Assert-CcodTrue ([int]$captured.pid-gt0) 'assignment failure started one exact gated child'
         Assert-CcodTrue $stopped 'assignment failure terminates the exact child'
         Assert-CcodEqual $false ([IO.File]::Exists($markerPath)) 'unassigned child never crosses the startup gate'
     }finally{Remove-Variable -Name CcodWorkerAssignmentCapturePath -Scope Global -ErrorAction SilentlyContinue;if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}}
 }
 
-$results += Invoke-CcodTest 'Job creation failure closes the already-created gate and starts no child' {
+$results += Invoke-CcodTest 'suspended process creation failure closes the already-created Job and starts no child' {
     $root=New-CcodWorkerTempRoot;$workerScript=Join-Path $root 'never-start.ps1';$requestPath=Join-Path $root 'request.json';$resultPath=Join-Path $root 'result.json'
-    $global:CcodWorkerContainmentFailure=[pscustomobject]@{Gate=$null;Disposed=$false;Started=$false}
+    $global:CcodWorkerContainmentFailure=[pscustomobject]@{Job=$null;Disposed=$false;Started=$false}
     try{
         [IO.Directory]::CreateDirectory($root)|Out-Null;[IO.File]::WriteAllText($workerScript,'param()',[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllText($requestPath,'{}',[Text.UTF8Encoding]::new($false))
         Assert-CcodThrows {Start-CcodWorkerProcess -Kind Lifecycle -ScriptPath $workerScript -RequestPath $requestPath -ResultPath $resultPath -StderrPath $null -PowerShellPath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -Adapters @{
-            CreateGate={param($Token,$Parent)$handle=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset);$gate=[pscustomobject]@{Name='Fake';Token=$Token;Handle=$handle;Released=$false;Disposed=$false};$global:CcodWorkerContainmentFailure.Gate=$gate;$gate}
-            CreateJob={throw 'job creation failed'}
-            StartProcess={param($StartInfo)$global:CcodWorkerContainmentFailure.Started=$true;throw 'must not start'}
-            DisposeGate={param($Gate)$Gate.Handle.Dispose();$Gate.Disposed=$true;$global:CcodWorkerContainmentFailure.Disposed=$true}
+            CreateJob={$job=[pscustomobject]@{IsClosed=$false};$global:CcodWorkerContainmentFailure.Job=$job;$job}
+            CreateSuspendedProcess={param($File,$Arguments)$global:CcodWorkerContainmentFailure.Started=$true;throw 'create suspended failed'}
+            DisposeJob={param($Job)$Job.IsClosed=$true;$global:CcodWorkerContainmentFailure.Disposed=$true}
         }|Out-Null} 'CCOD_WORKER_START_FAILED'
-        Assert-CcodEqual $false $global:CcodWorkerContainmentFailure.Started 'Job creation failure starts no process'
-        Assert-CcodTrue $global:CcodWorkerContainmentFailure.Disposed 'Job creation failure closes the already-created gate'
-    }finally{if($null-ne$global:CcodWorkerContainmentFailure.Gate-and-not$global:CcodWorkerContainmentFailure.Gate.Disposed){$global:CcodWorkerContainmentFailure.Gate.Handle.Dispose()};Remove-Variable CcodWorkerContainmentFailure -Scope Global -ErrorAction SilentlyContinue;if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}}
+        Assert-CcodTrue $global:CcodWorkerContainmentFailure.Started 'suspended create boundary is attempted once'
+        Assert-CcodTrue $global:CcodWorkerContainmentFailure.Disposed 'suspended create failure closes the already-created Job'
+    }finally{Remove-Variable CcodWorkerContainmentFailure -Scope Global -ErrorAction SilentlyContinue;if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}}
+}
+
+$results += Invoke-CcodTest 'resume failure kills the exact assigned suspended child and closes native handles' {
+    $root=New-CcodWorkerTempRoot;$workerScript=Join-Path $root 'resume-failure.ps1';$requestPath=Join-Path $root 'request.json';$resultPath=Join-Path $root 'result.json';$markerPath=Join-Path $root 'operation.marker';$global:CcodResumeFailure=[pscustomobject]@{Native=$null}
+    try{
+        [IO.Directory]::CreateDirectory($root)|Out-Null;[IO.File]::WriteAllText($workerScript,("param([string]`$RequestPath,[string]`$ResultPath)`r`n[IO.File]::WriteAllText('"+$markerPath.Replace("'","''")+"','ran')"),[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllText($requestPath,'{}',[Text.UTF8Encoding]::new($false))
+        $module=Get-Module WorkerRuntime|Select-Object -First 1;$global:CcodResumeDefaults=&$module{Get-CcodWorkerRuntimeAdapters $null}
+        Assert-CcodThrows {Start-CcodWorkerProcess -Kind Lifecycle -ScriptPath $workerScript -RequestPath $requestPath -ResultPath $resultPath -StderrPath $null -PowerShellPath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -Adapters @{
+            CreateSuspendedProcess={param($File,$Arguments)$native=&$global:CcodResumeDefaults.CreateSuspendedProcess $File $Arguments;$global:CcodResumeFailure.Native=$native;$native};ResumeProcess={param($Native)$false}
+        }|Out-Null} 'CCOD_WORKER_START_FAILED'
+        Assert-CcodEqual $false ([IO.File]::Exists($markerPath)) 'resume failure permits zero child operation'
+        Assert-CcodTrue ($global:CcodResumeFailure.Native.ProcessHandle.IsClosed-and$global:CcodResumeFailure.Native.ThreadHandle.IsClosed) 'resume failure closes both native handles'
+        $clock=[Diagnostics.Stopwatch]::StartNew();do{$identity=Get-CcodWorkerIdentity -Pid $global:CcodResumeFailure.Native.ProcessId;if($null-eq$identity){$gone=$true;break};if($clock.ElapsedMilliseconds-ge5000){$gone=$false;break};Start-Sleep -Milliseconds 50}while($true);Assert-CcodTrue $gone 'resume failure terminates exact suspended child'
+    }finally{Remove-Variable CcodResumeFailure,CcodResumeDefaults -Scope Global -ErrorAction SilentlyContinue;if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}}
 }
 
 $results += Invoke-CcodTest 'closing the kill-on-close Job stops a surviving gated worker and proves exit' {
@@ -232,9 +243,7 @@ $results += Invoke-CcodTest 'closing the kill-on-close Job stops a surviving gat
         $escapedModule=$modulePath.Replace("'","''")
         $scriptText = @(
             '[CmdletBinding()]',
-            'param([string]$RequestPath,[string]$ResultPath,[string]$StartupGateName,[string]$StartupGateToken,[int]$ExpectedParentPid,[string]$ExpectedParentCreationTimeUtc)',
-            ("Import-Module '"+$escapedModule+"' -Force"),
-            'Wait-CcodWorkerStartupGate -GateName $StartupGateName -GateToken $StartupGateToken -ExpectedParentPid $ExpectedParentPid -ExpectedParentCreationTimeUtc $ExpectedParentCreationTimeUtc -TimeoutMilliseconds 10000',
+            'param([string]$RequestPath,[string]$ResultPath)',
             'Start-Sleep -Seconds 120'
         ) -join "`r`n"
         [IO.File]::WriteAllText($workerScript, $scriptText, [Text.UTF8Encoding]::new($false))

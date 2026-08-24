@@ -47,7 +47,7 @@ function Close-CcodControllerTestLease($Lease){
     return $true
 }
 
-function New-CcodMalformedControllerTestLease([string]$Case,[string]$Kind='Transition'){
+function New-CcodMalformedControllerTestLease([string]$Case,[string]$Kind='AccountTransition'){
     if($Case -ceq 'Minimal'){return [pscustomobject][ordered]@{Kind=$Kind}}
     if($Case -ceq 'Dictionary'){
         $name=if($Kind-ceq'AccountTransition'){Get-CcodKernelObjectName -Kind $Kind -UserSid $script:CcodControllerTestUserSid}else{Get-CcodKernelObjectName -Kind $Kind -UserSid $script:CcodControllerTestUserSid -SessionId $script:CcodControllerTestSessionId}
@@ -100,6 +100,10 @@ function Merge-CcodControllerTestAdapters([hashtable]$Overrides){
         ReadJournal={param($Path)$null}
         UtcNow={ [DateTime]::Parse('2030-02-03T03:00:00Z').ToUniversalTime() }
         AssertLifecycleFence={param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity,$RuntimeId,$InstallRoot)$true}
+        GetDelegatedOwnership={
+            $owner=[pscustomobject][ordered]@{pid=401;creationTimeUtc='2030-02-03T04:05:06.0000000Z'}
+            [pscustomobject][ordered]@{schemaVersion=1;lease=(New-CcodControllerTestLease AccountTransition);epoch=[UInt64]9;runtimeId='runtime-1';runtimeGeneration=[UInt64]4;ownerIdentity=$owner;released=$false}
+        }
     }
     if($null -ne $Overrides){foreach($name in $Overrides.Keys){$resolved[$name]=$Overrides[$name]}}
     return $resolved
@@ -132,7 +136,7 @@ try{
         }
     }
 
-    Invoke-CcodTest 'schema-v2 is delegated by the exact live lifecycle owner and acquires only the session transition lease' {
+    Invoke-CcodTest 'schema-v2 proves delegated ownership by reentering account then acquiring session transition' {
         foreach($action in @('Inspect','Close','Apply')){
             $events=[Collections.Generic.List[string]]::new();$request=New-CcodControllerV2Request -Action $action
             $run=Invoke-CcodLeasedTestController -Request $request -Paths $paths -ResultPath $resultPath -Adapters @{
@@ -143,8 +147,8 @@ try{
                 ExitMutex={param($Lease)$events.Add("exit:$($Lease.Kind)");Close-CcodControllerTestLease $Lease}.GetNewClosure()
                 WriteResult={param($Path,$Value)$events.Add('write')}.GetNewClosure();WriteStdout={param($Line)$events.Add('stdout')}.GetNewClosure();WriteStderr={param($Line)}
             }
-            Assert-CcodEqual (('fence,enter:Transition,journal,engine:{0},fence,write,exit:Transition,fence,write,stdout' -f $action)) ($events-join ',') "$action validates delegated ownership before the sole session lease and each durable publication"
-            Assert-CcodEqual 0 @($events|Where-Object{$_-ceq'enter:AccountTransition'}).Count "$action never reacquires the Supervisor-owned account lease"
+            Assert-CcodEqual (('fence,enter:AccountTransition,enter:Transition,journal,engine:{0},fence,write,exit:Transition,exit:AccountTransition,fence,write,stdout' -f $action)) ($events-join ',') "$action validates delegation then proves real reentrant account ownership before session work"
+            Assert-CcodEqual 1 @($events|Where-Object{$_-ceq'enter:AccountTransition'}).Count "$action reenters the worker-held account lease exactly once"
             Assert-CcodEqual 0 $run.ExitCode "$action delegated operation succeeds"
         }
     }
@@ -152,12 +156,26 @@ try{
     Invoke-CcodTest 'stale delegated lifecycle ownership is rejected before the session lease' {
         $events=[Collections.Generic.List[string]]::new();$request=New-CcodControllerV2Request -Action Close
         $adapters=Merge-CcodControllerTestAdapters @{
+            GetDelegatedOwnership={
+                $owner=[pscustomobject][ordered]@{pid=401;creationTimeUtc='2030-02-03T04:05:06.0000000Z'}
+                [pscustomobject][ordered]@{schemaVersion=1;lease=(New-CcodControllerTestLease AccountTransition);epoch=[UInt64]9;runtimeId='runtime-1';runtimeGeneration=[UInt64]4;ownerIdentity=$owner;released=$false}
+            }
             AssertLifecycleFence={param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity,$RuntimeId,$InstallRoot)$events.Add('fence');$exception=[InvalidOperationException]::new('stale');throw [Management.Automation.ErrorRecord]::new($exception,'CCOD_LIFECYCLE_FENCE_STALE',[Management.Automation.ErrorCategory]::SecurityError,$OwnerIdentity)}.GetNewClosure()
             EnterMutex={param($Kind,$UserSid,$SessionId,$TimeoutMilliseconds)$events.Add("enter:$Kind");throw 'must not enter'}.GetNewClosure()
             WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}
         }
         Assert-CcodThrows {Invoke-CcodSessionController -Request $request -Paths $paths -ResultPath $resultPath -Adapters $adapters|Out-Null} 'CCOD_LIFECYCLE_FENCE_STALE'
         Assert-CcodEqual 'fence' ($events-join ',') 'stale owner reaches no transition mutex or engine operation'
+    }
+
+    Invoke-CcodTest 'unrelated live process with valid epoch facts cannot operate without worker-held delegation' {
+        $events=[Collections.Generic.List[string]]::new();$request=New-CcodControllerV2Request -Action Apply
+        $run=Invoke-CcodLeasedTestController -Request $request -Paths $paths -ResultPath $resultPath -Adapters @{
+            GetDelegatedOwnership={$null};EnterMutex={param($Kind,$UserSid,$SessionId,$TimeoutMilliseconds)$events.Add($Kind);throw 'must not acquire'};EngineInvoker={throw 'must not operate'}
+            WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}
+        }
+        Assert-CcodEqual 'CCOD_REQUEST_INVALID' $run.Result.error.code 'direct schema-v2 call has no delegated mutation authority'
+        Assert-CcodEqual 0 $events.Count 'unrelated process reaches no mutex or engine operation'
     }
 
     Invoke-CcodTest 'a stale schema-v2 fence propagates before process mutation and before final result publication' {
@@ -296,8 +314,8 @@ try{
         Assert-CcodEqual 0 $run.ExitCode 'Inspected is exit zero'
     }
 
-    Invoke-CcodTest 'acquires the delegated session lease and releases it after atomic persistence' {
-        $events=[Collections.Generic.List[string]]::new();$timeouts=[Collections.Generic.List[int]]::new();$elapsed=[Collections.Generic.Queue[long]]::new();$elapsed.Enqueue(0)
+    Invoke-CcodTest 'reenters the worker-held account lease then releases both leases after atomic persistence' {
+        $events=[Collections.Generic.List[string]]::new();$timeouts=[Collections.Generic.List[int]]::new();$elapsed=[Collections.Generic.Queue[long]]::new();$elapsed.Enqueue(0);$elapsed.Enqueue(1250)
         $request=New-CcodControllerRequest;$run=Invoke-CcodLeasedTestController -Request $request -Paths $paths -ResultPath $resultPath -Adapters @{
             GetElapsedMilliseconds={param($Clock)$elapsed.Dequeue()}.GetNewClosure()
             EnterMutex={param($Kind,$UserSid,$SessionId,$TimeoutMilliseconds)$events.Add("enter:${Kind}:$SessionId");$timeouts.Add($TimeoutMilliseconds);New-CcodControllerTestLease $Kind}.GetNewClosure()
@@ -308,8 +326,8 @@ try{
             WriteStdout={param($Line)$events.Add('stdout')}.GetNewClosure()
             WriteStderr={param($Line)}
         }
-        Assert-CcodEqual 'enter:Transition:1,journal,engine,write,exit:Transition,write,stdout' ($events -join ',') 'delegated wrapper persists unsafe provisional, releases the session lease, then publishes final result'
-        Assert-CcodEqual '5000' ($timeouts -join ',') 'one five-second budget supplies the sole session wait'
+        Assert-CcodEqual 'enter:AccountTransition:,enter:Transition:1,journal,engine,write,exit:Transition,exit:AccountTransition,write,stdout' ($events -join ',') 'delegated wrapper proves the handoff account lease, releases both leases, then publishes final result'
+        Assert-CcodEqual '5000,3750' ($timeouts -join ',') 'one five-second budget supplies exact remaining milliseconds to the session wait'
         Assert-CcodEqual 0 $run.ExitCode 'normal leased inspect remains safe'
     }
 
@@ -321,7 +339,7 @@ try{
             ExitMutex={param($Lease)$events.Add("exit:$($Lease.Kind)");Close-CcodControllerTestLease $Lease}.GetNewClosure()
             WriteStdout={param($Line)$events.Add('stdout');$stdout.Add($Line)}.GetNewClosure();WriteStderr={param($Line)}
         }
-        Assert-CcodEqual 'write,exit:Transition,write,stdout' ($events -join ',') 'no final success is durable until the delegated session release validates'
+        Assert-CcodEqual 'write,exit:Transition,exit:AccountTransition,write,stdout' ($events -join ',') 'no final success is durable until both delegated releases validate'
         Assert-CcodEqual 2 $writes.Count 'leased completion uses one provisional and one final atomic write'
         $provisional=$writes[0]|ConvertFrom-Json
         Assert-CcodEqual 'schemaVersion,action,ok,outcome,safeState,stage,transactionId,package,source,special,probes,recovery,error,logFile' (($provisional.PSObject.Properties.Name)-join ',') 'provisional has the exact 14-field result contract'
@@ -335,7 +353,7 @@ try{
         Assert-CcodEqual 0 $run.ExitCode 'validated two-phase publication remains successful'
     }
 
-    Invoke-CcodTest 'session timeout prevents journal and engine and returns correlated busy' {
+    Invoke-CcodTest 'account timeout prevents journal and engine and returns correlated busy' {
         $events=[Collections.Generic.List[string]]::new();$request=New-CcodControllerRequest -Action Apply
         $run=Invoke-CcodLeasedTestController -Request $request -Paths $paths -ResultPath $resultPath -Adapters @{
             EnterMutex={param($Kind,$UserSid,$SessionId,$TimeoutMilliseconds)$events.Add("enter:$Kind");New-CcodControllerTestLease $Kind TimedOut}.GetNewClosure()
@@ -343,22 +361,22 @@ try{
             EngineInvoker={param($Action,$Request,$Paths)$events.Add('engine');throw 'must not invoke engine'}.GetNewClosure()
             WriteResult={param($Path,$Value)$events.Add('write')}.GetNewClosure();WriteStdout={param($Line)$events.Add('stdout')}.GetNewClosure();WriteStderr={param($Line)}
         }
-        Assert-CcodEqual 'enter:Transition,write,stdout' ($events -join ',') 'session timeout has no state action'
-        Assert-CcodEqual 'CCOD_TRANSITION_BUSY' $run.Result.error.code 'session timeout is stable busy'
+        Assert-CcodEqual 'enter:AccountTransition,write,stdout' ($events -join ',') 'account timeout has no state action'
+        Assert-CcodEqual 'CCOD_TRANSITION_BUSY' $run.Result.error.code 'account timeout is stable busy'
         Assert-CcodEqual 'LeaseAcquire' $run.Result.stage 'busy stage is exact'
         Assert-CcodEqual $request.transactionId $run.Result.transactionId 'busy preserves canonical correlation'
     }
 
-    Invoke-CcodTest 'delegated timeout never acquires or releases the account lease' {
+    Invoke-CcodTest 'delegated session timeout releases the reentered account lease' {
         $events=[Collections.Generic.List[string]]::new();$request=New-CcodControllerRequest
         $run=Invoke-CcodLeasedTestController -Request $request -Paths $paths -ResultPath $resultPath -Adapters @{
-            EnterMutex={param($Kind,$UserSid,$SessionId,$TimeoutMilliseconds)$events.Add("enter:$Kind");New-CcodControllerTestLease $Kind TimedOut}.GetNewClosure()
+            EnterMutex={param($Kind,$UserSid,$SessionId,$TimeoutMilliseconds)$events.Add("enter:$Kind");if($Kind-ceq'AccountTransition'){New-CcodControllerTestLease $Kind}else{New-CcodControllerTestLease $Kind TimedOut}}.GetNewClosure()
             ExitMutex={param($Lease)$events.Add("exit:$($Lease.Kind)");Close-CcodControllerTestLease $Lease}.GetNewClosure()
             ReadJournal={param($Path)$events.Add('journal');throw 'must not read'}.GetNewClosure();EngineInvoker={param($Action,$Request,$Paths)$events.Add('engine');throw 'must not invoke'}.GetNewClosure()
             WriteResult={param($Path,$Value)$events.Add('write')}.GetNewClosure();WriteStdout={param($Line)$events.Add('stdout')}.GetNewClosure();WriteStderr={param($Line)}
         }
-        Assert-CcodEqual 'enter:Transition,write,stdout' ($events -join ',') 'delegated timeout touches only the session lease path'
-        Assert-CcodEqual 'CCOD_TRANSITION_BUSY' $run.Result.error.code 'delegated timeout is stable busy'
+        Assert-CcodEqual 'enter:AccountTransition,enter:Transition,write,exit:AccountTransition,write,stdout' ($events -join ',') 'delegated session timeout closes the reentered account lease'
+        Assert-CcodEqual 'CCOD_TRANSITION_BUSY' $run.Result.error.code 'delegated session timeout is stable busy'
     }
 
     Invoke-CcodTest 'acquisition exception and actual-session mismatch fail before engine actions' {
@@ -367,7 +385,7 @@ try{
             EnterMutex={param($Kind,$UserSid,$SessionId,$TimeoutMilliseconds)$exceptionEvents.Add("enter:$Kind");throw "C:\private\acl.sddl`n--token hunter2"}.GetNewClosure()
             ReadJournal={param($Path)$exceptionEvents.Add('journal')}.GetNewClosure();EngineInvoker={param($Action,$Request,$Paths)$exceptionEvents.Add('engine')}.GetNewClosure();WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)};WriteLog={param($Path,$Line)$exceptionLogs.Add($Line)}.GetNewClosure()
         }
-        Assert-CcodEqual 'enter:Transition' ($exceptionEvents -join ',') 'acquisition exception cannot reach journal or engine'
+        Assert-CcodEqual 'enter:AccountTransition' ($exceptionEvents -join ',') 'acquisition exception cannot reach journal or engine'
         Assert-CcodEqual 'CCOD_KERNEL_OPEN_FAILED' $failure.Result.error.code 'unrecognized acquisition exception maps to one stable kernel code'
         Assert-CcodEqual 'LeaseAcquire' $failure.Result.stage 'acquisition exception remains in lease stage'
         Assert-CcodEqual 1 $exceptionLogs.Count 'acquisition exception writes one bounded diagnostic'
@@ -434,7 +452,7 @@ try{
                     }
                 }catch{$escaped=$_}
                 Assert-CcodEqual $null $escaped "$case malformed lease never escapes cleanup framing"
-                Assert-CcodEqual 'enter:Transition' ($events -join ',') "$case stops before journal engine or release"
+                Assert-CcodEqual 'enter:AccountTransition' ($events -join ',') "$case stops before journal engine or release"
                 Assert-CcodEqual 'CCOD_KERNEL_LEASE_INVALID' $run.Result.error.code "$case maps to the stable invalid-lease code"
                 Assert-CcodEqual 'LeaseAcquire' $run.Result.stage "$case remains a lease-acquire failure"
                 Assert-CcodEqual 1 $writes.Count "$case persists one unsafe result"
@@ -445,12 +463,12 @@ try{
         }
     }
 
-    Invoke-CcodTest 'a malformed delegated session lease reaches no release path' {
-        $session=[pscustomobject][ordered]@{Kind='Transition'};$events=[Collections.Generic.List[string]]::new();$escaped=$null;$run=$null
+    Invoke-CcodTest 'a malformed delegated session lease releases only the reentered account lease' {
+        $account=New-CcodControllerTestLease AccountTransition;$session=[pscustomobject][ordered]@{Kind='Transition'};$events=[Collections.Generic.List[string]]::new();$escaped=$null;$run=$null
         try{
             try{
                 $run=Invoke-CcodLeasedTestController -Request (New-CcodControllerRequest) -Paths $paths -ResultPath $resultPath -Adapters @{
-                    EnterMutex={param($Kind,$UserSid,$SessionId,$TimeoutMilliseconds)$events.Add("enter:$Kind");$session}.GetNewClosure()
+                    EnterMutex={param($Kind,$UserSid,$SessionId,$TimeoutMilliseconds)$events.Add("enter:$Kind");if($Kind-ceq'AccountTransition'){$account}else{$session}}.GetNewClosure()
                     ExitMutex={param($Lease)$events.Add("exit:$($Lease.Kind)");Close-CcodControllerTestLease $Lease}.GetNewClosure()
                     ReadJournal={param($Path)$events.Add('journal');throw 'invalid session lease must never reach journal'}.GetNewClosure()
                     EngineInvoker={param($Action,$Request,$Paths)$events.Add('engine');throw 'invalid session lease must never reach engine'}.GetNewClosure()
@@ -458,10 +476,10 @@ try{
                 }
             }catch{$escaped=$_}
             Assert-CcodEqual $null $escaped 'malformed session lease cannot break cleanup framing'
-            Assert-CcodEqual 'enter:Transition' ($events -join ',') 'invalid delegated lease is never released'
+            Assert-CcodEqual 'enter:AccountTransition,enter:Transition,exit:AccountTransition' ($events -join ',') 'invalid delegated session lease releases the validated account lease once'
             Assert-CcodEqual 'CCOD_KERNEL_LEASE_INVALID' $run.Result.error.code 'malformed session lease maps to the stable invalid-lease code'
             Assert-CcodEqual 1 $run.ExitCode 'malformed session lease exits unsafe'
-        }finally{}
+        }finally{[void](Close-CcodControllerTestLease $account)}
     }
 
     Invoke-CcodTest 'journal callback IDs use only the six exact transition errors with no callback data' {
@@ -517,7 +535,7 @@ try{
                 EngineInvoker={param($Action,$Request,$Paths)$events.Add("engine:$Action");New-CcodControllerResult $Action $Request.transactionId $(if($Action -ceq 'Recover'){'Recovered'}else{'Activated'})}.GetNewClosure()
                 WriteLog={param($Path,$Line)$logs.Add($Line)}.GetNewClosure();WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}
             }
-            Assert-CcodEqual 1 @($events|Where-Object{$_ -like 'enter:*'}).Count 'delegated abandoned session ownership is not reacquired'
+            Assert-CcodEqual 2 @($events|Where-Object{$_ -like 'enter:*'}).Count 'delegated operation proves the account handoff before the session lease'
             Assert-CcodEqual 1 @($events|Where-Object{$_ -like 'engine:*'}).Count 'abandoned path invokes exactly once'
             Assert-CcodEqual 1 $logs.Count 'one warning is emitted even if one of two leases is abandoned'
             $record=$logs[0]|ConvertFrom-Json
@@ -527,7 +545,7 @@ try{
         }
     }
 
-    Invoke-CcodTest 'engine and result-write exceptions release the delegated session lease exactly once' {
+    Invoke-CcodTest 'engine and result-write exceptions release both delegated leases exactly once' {
         foreach($failurePoint in @('Engine','Write')){
             $releases=[Collections.Generic.List[string]]::new();$request=New-CcodControllerRequest
             $adapters=@{
@@ -537,13 +555,13 @@ try{
                 WriteStdout={param($Line)};WriteStderr={param($Line)};WriteLog={param($Path,$Line)}
             }
             $run=Invoke-CcodLeasedTestController -Request $request -Paths $paths -ResultPath $resultPath -Adapters $adapters
-            Assert-CcodEqual 'Transition' ($releases -join ',') "$failurePoint releases the session lease exactly once"
+            Assert-CcodEqual 'Transition,AccountTransition' ($releases -join ',') "$failurePoint releases session then account exactly once"
             Assert-CcodEqual 1 $run.ExitCode "$failurePoint exits unsafe"
             Assert-CcodTrue (($run.Result|ConvertTo-Json -Depth 16 -Compress) -cnotmatch 'private|hunter2|secret') "$failurePoint public framing is sanitized"
         }
     }
 
-    Invoke-CcodTest 'delegated session release failure corrects the durable result' {
+    Invoke-CcodTest 'delegated lease release failure corrects the durable result' {
         $request=New-CcodControllerRequest;$leases=[Collections.Generic.List[object]]::new();$events=[Collections.Generic.List[string]]::new();$writes=[Collections.Generic.List[string]]::new();$stdout=[Collections.Generic.List[string]]::new();$logs=[Collections.Generic.List[string]]::new()
         try{
             $run=Invoke-CcodLeasedTestController -Request $request -Paths $paths -ResultPath $resultPath -Adapters @{
@@ -554,7 +572,7 @@ try{
                 WriteStdout={param($Line)$events.Add('stdout');$stdout.Add($Line)}.GetNewClosure();WriteStderr={param($Line)}
                 WriteLog={param($Path,$Line)$logs.Add($Line)}.GetNewClosure()
             }
-            Assert-CcodEqual 'write,exit:Transition,write,stdout' ($events -join ',') 'success is corrected after the delegated session release fails'
+            Assert-CcodEqual 'write,exit:Transition,exit:AccountTransition,write,stdout' ($events -join ',') 'success is corrected after each delegated release is attempted'
             Assert-CcodEqual 2 $writes.Count 'release failure overwrites the earlier durable success with one corrected result'
             Assert-CcodEqual $false (($writes[0]|ConvertFrom-Json).ok) 'the initial under-lease write is the unsafe provisional'
             Assert-CcodEqual 1 $stdout.Count 'release failure still emits exactly one stdout frame'
@@ -589,7 +607,7 @@ try{
                     WriteStdout={param($Line)$stdout.Add($Line)}.GetNewClosure();WriteStderr={param($Line)};WriteLog={param($Path,$Line)}
                 }
                 Assert-CcodEqual 2 $state.WriteCount "$mode attempts one provisional and one post-release final write"
-                Assert-CcodEqual 'Transition' ($releases -join ',') "$mode attempts the delegated session release exactly once"
+                Assert-CcodEqual 'Transition,AccountTransition' ($releases -join ',') "$mode attempts both delegated releases exactly once"
                 Assert-CcodTrue ($null -ne $state.Durable) "$mode leaves an atomic durable frame"
                 $durable=$state.Durable|ConvertFrom-Json
                 Assert-CcodEqual $false $durable.ok "$mode never leaves durable success"
@@ -614,7 +632,7 @@ try{
                 ExitMutex={param($Lease)$releases.Add($Lease.Kind);$true}.GetNewClosure()
                 WriteResult={param($Path,$Value)$writes.Add(($Value|ConvertTo-Json -Depth 16 -Compress))}.GetNewClosure();WriteStdout={param($Line)};WriteStderr={param($Line)};WriteLog={param($Path,$Line)}
             }
-            Assert-CcodEqual 'Transition' ($releases -join ',') 'the deceptive delegated release callback is attempted exactly once'
+            Assert-CcodEqual 'Transition,AccountTransition' ($releases -join ',') 'the deceptive delegated release callbacks are each attempted once'
             Assert-CcodEqual 2 $writes.Count 'deceptive release return retains provisional then publishes one unsafe correction'
             Assert-CcodEqual $false (($writes[0]|ConvertFrom-Json).ok) 'pre-release provisional is unsafe'
             Assert-CcodEqual $false (($writes[1]|ConvertFrom-Json).ok) 'post-release correction is unsafe'
@@ -633,7 +651,7 @@ try{
                 EngineInvoker={param($Action,$Request,$Paths)$engineCalls.Add($Action);if($mode -ceq 'Diagnostic'){throw 'engine failed'}else{New-CcodControllerResult $Action $Request.transactionId Activated}}.GetNewClosure()
                 ExitMutex={param($Lease)$releases.Add($Lease.Kind);Close-CcodControllerTestLease $Lease}.GetNewClosure();WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)};WriteLog={param($Path,$Line)throw 'log unavailable'}
             }
-            Assert-CcodEqual 'Transition' ($releases -join ',') "$mode still releases the delegated session lease"
+            Assert-CcodEqual 'Transition,AccountTransition' ($releases -join ',') "$mode still releases both delegated leases"
             Assert-CcodEqual 1 $engineCalls.Count "$mode retains the intended single engine dispatch"
             Assert-CcodTrue (($run.Result|ConvertTo-Json -Depth 16 -Compress) -cnotmatch 'private|hunter2|clock') "$mode returns bounded public framing"
         }
@@ -705,17 +723,18 @@ try{
         Assert-CcodTrue ($result.error.code -cne 'CCOD_REQUEST_INVALID') 'manual request reaches the same engine contract without a looser translation'
     }
 
-    Invoke-CcodTest 'routes both manual construction and strict request-file input through the lease wrapper' {
+    Invoke-CcodTest 'rejects manual construction and strict request-file input without a LifecycleWorker delegation' {
         $identity=[pscustomobject][ordered]@{pid=11;creationTimeUtc='2030-02-03T03:00:00.0000000Z';sessionId='1'}
         $manual=New-CcodManualControllerRequest -Action Inspect -RuntimeId runtime-1 -SupervisorIdentity $identity -ExistingOnly $true -RendererPort $null -MainPort $null -TimeoutMilliseconds 30000 -RestartOrdinary $true -TransactionId '5f496d99-c839-4458-a6a2-d37ea1afdbda'
         $requestFile=Join-Path $root 'leased-request.json';Write-CcodAtomicJson -Path $requestFile -Value (New-CcodControllerRequest -TransactionId 'f81b6259-8e99-45fb-b557-c5292f05dfa3');$fromFile=Read-CcodStrictJson -Path $requestFile -ExpectedSchema 2 -Kind 'session controller request'
         foreach($case in @($manual,$fromFile)){
             $events=[Collections.Generic.List[string]]::new()
             $run=Invoke-CcodLeasedTestController -Request $case -Paths $paths -ResultPath $resultPath -Adapters @{
-                EnterMutex={param($Kind,$UserSid,$SessionId,$TimeoutMilliseconds)$events.Add("enter:$Kind");New-CcodControllerTestLease $Kind}.GetNewClosure();EngineInvoker={param($Action,$Request,$Paths)$events.Add("engine:$Action");New-CcodControllerResult $Action $Request.transactionId}.GetNewClosure();WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}
+                GetDelegatedOwnership={$null};EnterMutex={param($Kind,$UserSid,$SessionId,$TimeoutMilliseconds)$events.Add("enter:$Kind");New-CcodControllerTestLease $Kind}.GetNewClosure();EngineInvoker={param($Action,$Request,$Paths)$events.Add("engine:$Action");New-CcodControllerResult $Action $Request.transactionId}.GetNewClosure();WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)}
             }
-            Assert-CcodEqual 'enter:Transition,engine:Inspect' (($events|Where-Object{$_ -like 'enter:*' -or $_ -like 'engine:*'})-join ',') 'both input origins execute through delegated ownership and the sole session lease'
-            Assert-CcodEqual 0 $run.ExitCode 'both strict input origins retain safe framing'
+            Assert-CcodEqual '' (($events|Where-Object{$_ -like 'enter:*' -or $_ -like 'engine:*'})-join ',') 'both external input origins reach neither mutex nor engine'
+            Assert-CcodEqual 'CCOD_REQUEST_INVALID' $run.Result.error.code 'both strict input origins require an execution-local worker delegation'
+            Assert-CcodEqual 1 $run.ExitCode 'both external input origins fail closed'
         }
     }
 
@@ -731,13 +750,11 @@ try{
         $workerRuntimePath=[IO.Path]::GetFullPath((Join-Path $repositoryRoot 'src\persistence\modules\WorkerRuntime.psm1'));$controllerPath=[IO.Path]::GetFullPath((Join-Path $repositoryRoot 'src\persistence\SessionController.ps1'));$lifecycleWorkerPath=[IO.Path]::GetFullPath((Join-Path $repositoryRoot 'src\persistence\LifecycleWorker.ps1'));$workersRoot=[IO.Path]::GetFullPath($workers);$installRoot=[IO.Path]::GetFullPath($install);$controllerPaths=New-CcodControllerPaths $integration
         $helperBody=@'
 [CmdletBinding()]
-param([string]$RequestPath,[string]$ResultPath,[string]$StartupGateName,[string]$StartupGateToken,[int]$ExpectedParentPid,[string]$ExpectedParentCreationTimeUtc)
+param([string]$RequestPath,[string]$ResultPath)
 $ErrorActionPreference='Stop'
 $summaryResultPath=$ResultPath
 trap{[IO.File]::WriteAllText($summaryResultPath,([pscustomobject][ordered]@{error=$_.Exception.Message;id=$_.FullyQualifiedErrorId}|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false));exit 0}
 [IO.File]::WriteAllText($summaryResultPath,'{"entered":true}',[Text.UTF8Encoding]::new($false))
-Import-Module '__WORKER_RUNTIME_PATH__' -Force
-[void](Wait-CcodWorkerStartupGate -GateName $StartupGateName -GateToken $StartupGateToken -ExpectedParentPid $ExpectedParentPid -ExpectedParentCreationTimeUtc $ExpectedParentCreationTimeUtc -TimeoutMilliseconds 10000)
 $config=Get-Content -LiteralPath $RequestPath -Raw|ConvertFrom-Json
 . $config.lifecycleWorkerPath
 . $config.controllerPath
@@ -753,11 +770,12 @@ foreach($action in @($config.actions)){
         GetScriptPath={$config.lifecycleWorkerPath}.GetNewClosure();GetBootstrapContext={[pscustomobject][ordered]@{InstallRoot=$config.installRoot;WorkersRoot=$config.workersRoot}}.GetNewClosure();ResolveRuntime={param($Path,$Runtime,$Generation)$context}.GetNewClosure();ReadRequest={param($Path)Get-Content -LiteralPath $Path -Raw|ConvertFrom-Json}
         AssertFence={param($Context,$Request)if($config.forceWorkerFence){return $true};$receipt=[pscustomobject][ordered]@{schemaVersion=1;lease=[pscustomobject][ordered]@{Released=$false};epoch=[UInt64]$Request.leaseEpoch;runtimeId=$Request.runtimeId;runtimeGeneration=[UInt64]$Request.runtimeGeneration;ownerIdentity=$Request.ownerIdentity;released=$false};Assert-CcodLifecycleFence -InstallRoot $Context.InstallRoot -Ownership $receipt}.GetNewClosure()
         InvokeController={
-            param($ActionName,$RequestValue,$ContextValue);$counts.Controller++
+            param($ActionName,$RequestValue,$ContextValue,$DelegationValue);$counts.Controller++
             $controllerRequest=[pscustomobject][ordered]@{schemaVersion=2;action=$ActionName;transactionId=$RequestValue.transactionId;runtimeId=$RequestValue.runtimeId;runtimeGeneration=[UInt64]$RequestValue.runtimeGeneration;leaseEpoch=[UInt64]$RequestValue.leaseEpoch;ownerIdentity=$RequestValue.ownerIdentity;supervisorIdentity=[pscustomobject][ordered]@{pid=[int]$RequestValue.ownerIdentity.pid;creationTimeUtc=$RequestValue.ownerIdentity.creationTimeUtc;sessionId=[string]$config.sessionId};source=$null;existingOnly=$true;rendererPort=$null;mainPort=$null;timeoutMilliseconds=700;restartOrdinary=($ActionName-cne'Close')}
             $controllerAdapters=Get-CcodControllerAdapters @{
                 EngineInvoker={param($InnerAction,$InnerRequest,$InnerPaths,$EngineAdapters)$outcome=if($InnerAction-ceq'Close'){'Closed'}elseif($InnerAction-ceq'Apply'){'NoAction'}else{'Inspected'};$safe=if($InnerAction-ceq'Close'){'Closed'}else{'NoCodex'};[pscustomobject][ordered]@{schemaVersion=1;action=$InnerAction;ok=$true;outcome=$outcome;safeState=$safe;stage='Completed';transactionId=$InnerRequest.transactionId;package=$null;source=$null;special=$null;probes=$null;recovery=$null;error=$null;logFile=$null}}
                 WriteResult={param($Path,$Value)};WriteStdout={param($Line)};WriteStderr={param($Line)};WriteLog={param($Path,$Line)}
+                GetDelegatedOwnership={$DelegationValue}.GetNewClosure()
             }
             $controllerRun=Invoke-CcodSessionController -Request $controllerRequest -Paths $config.controllerPaths -ResultPath $workerResultPath -Adapters $controllerAdapters;$counts.Last=$controllerRun.Result
             $controllerRun.Result
@@ -769,34 +787,40 @@ foreach($action in @($config.actions)){
 }
 [IO.File]::WriteAllText($summaryResultPath,([pscustomobject][ordered]@{runs=$runs.ToArray();controllerCalls=$counts.Controller}|ConvertTo-Json -Depth 10 -Compress),[Text.UTF8Encoding]::new($false))
 '@
-        $helperBody=$helperBody.Replace('__WORKER_RUNTIME_PATH__',$workerRuntimePath.Replace("'","''"))
         [IO.File]::WriteAllText($helper,$helperBody,[Text.UTF8Encoding]::new($false))
         $helperTokens=$null;$helperErrors=$null;[void][Management.Automation.Language.Parser]::ParseFile($helper,[ref]$helperTokens,[ref]$helperErrors);Assert-CcodEqual 0 @($helperErrors).Count 'delegated helper parses before process launch'
         function Invoke-CcodDelegatedChild($OwnerReceipt,[UInt64]$Epoch,[bool]$ForceWorkerFence,[string[]]$Actions,[string]$Leaf){
             $configPath=Join-Path $integration ($Leaf+'.request.json');$summaryPath=Join-Path $integration ($Leaf+'.result.json')
             Write-CcodAtomicJson -Path $configPath -Value ([ordered]@{epoch=$Epoch;ownerPid=[int]$OwnerReceipt.ownerIdentity.pid;ownerCreated=$OwnerReceipt.ownerIdentity.creationTimeUtc;sessionId=$sessionId;forceWorkerFence=$ForceWorkerFence;actions=$Actions;controllerPath=$controllerPath;lifecycleWorkerPath=$lifecycleWorkerPath;workersRoot=$workersRoot;installRoot=$installRoot;controllerPaths=$controllerPaths})
             $powershell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe';$started=Start-CcodWorkerProcess -Kind Lifecycle -ScriptPath $helper -RequestPath ([IO.Path]::GetFullPath($configPath)) -ResultPath ([IO.Path]::GetFullPath($summaryPath)) -StderrPath $null -PowerShellPath $powershell
-            $slot=[pscustomobject][ordered]@{ProcessId=$started.ProcessId;CreationTimeUtc=$started.CreationTimeUtc;Handle=$started.Handle;JobHandle=$started.JobHandle;StartupGate=$started.StartupGate;RequestPath=$configPath;ResultPath=$summaryPath;StderrPath=$null}
+            $slot=[pscustomobject][ordered]@{ProcessId=$started.ProcessId;CreationTimeUtc=$started.CreationTimeUtc;Handle=$started.Handle;JobHandle=$started.JobHandle;RequestPath=$configPath;ResultPath=$summaryPath;StderrPath=$null}
             try{Assert-CcodTrue (Wait-CcodWorkerExit -Slot $slot -TimeoutMilliseconds 10000) "$Leaf child exits";if(-not[IO.File]::Exists($summaryPath)){$slot.Handle.Refresh();throw "delegated helper wrote no summary; exit=$($slot.Handle.ExitCode)"};$summary=Get-Content -LiteralPath $summaryPath -Raw|ConvertFrom-Json;if($null-ne$summary.PSObject.Properties['error']){throw "delegated helper failed: $($summary.id) $($summary.error)"};return $summary}finally{Close-CcodWorkerHandle $slot}
         }
         $newOwnership=$null
         try{
+            [void](Suspend-CcodLifecycleOwnership -Ownership $ownership -InstallRoot ([IO.Path]::GetFullPath($install)))
             $valid=Invoke-CcodDelegatedChild $ownership ([UInt64]$ownership.epoch) $false @('Inspect','Close','Apply') 'valid'
             Assert-CcodEqual 3 $valid.controllerCalls 'all three operations reach the real SessionController while account ownership is held'
             Assert-CcodEqual ',,' (@($valid.runs.controllerError)-join ',') 'real controller operations return no stable controller error'
             Assert-CcodEqual 'True,True,True' (@($valid.runs.controllerOk)-join ',') 'real controller operations return safe results under delegated ownership'
             Assert-CcodEqual ',,' (@($valid.runs.errorCode)-join ',') 'valid delegated operations return no stable error'
             Assert-CcodEqual '0,0,0' (@($valid.runs.exitCode)-join ',') 'Inspect Close and Apply avoid transition-busy deadlock'
+            [void](Resume-CcodLifecycleOwnership -Ownership $ownership -InstallRoot ([IO.Path]::GetFullPath($install)) -UserSid $userSid -SessionId $sessionId)
             [void](Exit-CcodLifecycleOwnership $ownership)
             $newOwnership=Enter-CcodLifecycleOwnership -InstallRoot ([IO.Path]::GetFullPath($install)) -RuntimeId runtime-1 -RuntimeGeneration 1 -OwnerIdentity $owner -UserSid $userSid -SessionId $sessionId -TimeoutMilliseconds 5000
+            [void](Suspend-CcodLifecycleOwnership -Ownership $newOwnership -InstallRoot ([IO.Path]::GetFullPath($install)))
             $stale=Invoke-CcodDelegatedChild $ownership ([UInt64]$ownership.epoch) $true @('Inspect') 'stale'
-            Assert-CcodEqual 1 $stale.controllerCalls 'stale test reaches the controller boundary after isolating the worker fence'
+            Assert-CcodEqual 0 $stale.controllerCalls 'stale delegated epoch is rejected before the controller boundary'
             Assert-CcodEqual 1 $stale.runs[0].exitCode 'stale delegated operation fails closed'
-            Assert-CcodEqual 'CCOD_LIFECYCLE_FENCE_STALE' $stale.runs[0].errorCode 'controller rejects the stale owner before its session lease'
+            Assert-CcodEqual 'CCOD_LIFECYCLE_FENCE_STALE' $stale.runs[0].errorCode 'worker rejects the stale owner before its session lease'
+            [void](Resume-CcodLifecycleOwnership -Ownership $newOwnership -InstallRoot ([IO.Path]::GetFullPath($install)) -UserSid $userSid -SessionId $sessionId)
             [void](Exit-CcodLifecycleOwnership $newOwnership)
         }finally{
-            if($null-ne$newOwnership-and-not$newOwnership.released){[void](Exit-CcodLifecycleOwnership $newOwnership)}
-            if($null-ne$ownership-and-not$ownership.released){[void](Exit-CcodLifecycleOwnership $ownership)}
+            foreach($candidate in @($newOwnership,$ownership)){
+                if($null-eq$candidate-or$candidate.released){continue}
+                if($candidate.lease.Released){[void](Resume-CcodLifecycleOwnership -Ownership $candidate -InstallRoot ([IO.Path]::GetFullPath($install)) -UserSid $userSid -SessionId $sessionId)}
+                [void](Exit-CcodLifecycleOwnership $candidate)
+            }
         }
     }
 

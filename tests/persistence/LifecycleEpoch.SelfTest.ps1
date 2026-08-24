@@ -73,6 +73,34 @@ try {
         Assert-CcodThrows { Assert-CcodLifecycleFence -InstallRoot $root -Ownership $first -Adapters $fixture.Adapters } 'CCOD_LIFECYCLE_FENCE_STALE'
     }
 
+    Invoke-CcodTest 'hands off and reacquires the raw account lease without changing the epoch' {
+        $fixture=New-CcodEpochAdapters -Epoch 5;$fixture.Store.Initialized=$true
+        $owner=[pscustomobject][ordered]@{pid=101;creationTimeUtc='2030-02-03T04:05:06.0000000Z'}
+        $ownership=Enter-CcodLifecycleOwnership -InstallRoot $root -RuntimeId '2.5.0-a' -RuntimeGeneration 3 -OwnerIdentity $owner -UserSid 'S-1-5-21-1-2-3-1001' -SessionId 2 -Adapters $fixture.Adapters
+        Assert-CcodEqual 6 ([UInt64]$ownership.epoch) 'official acquisition increments once'
+        Assert-CcodEqual $true (Suspend-CcodLifecycleOwnership -Ownership $ownership -InstallRoot $root -Adapters $fixture.Adapters) 'Supervisor releases only the raw lease for handoff'
+        Assert-CcodEqual $false $ownership.released 'handoff retains the ownership receipt'
+        Assert-CcodEqual $true $ownership.lease.Released 'handoff releases the old mutex handle'
+        $delegation=Enter-CcodLifecycleDelegation -InstallRoot $root -RuntimeId $ownership.runtimeId -RuntimeGeneration $ownership.runtimeGeneration -LeaseEpoch $ownership.epoch -OwnerIdentity $ownership.ownerIdentity -UserSid 'S-1-5-21-1-2-3-1001' -SessionId 2 -Adapters $fixture.Adapters
+        Assert-CcodEqual 6 ([UInt64]$delegation.epoch) 'worker delegation retains the exact epoch'
+        Assert-CcodEqual $true (Exit-CcodLifecycleDelegation -Delegation $delegation -Adapters $fixture.Adapters) 'worker releases its raw lease after one operation'
+        Assert-CcodEqual $true (Resume-CcodLifecycleOwnership -Ownership $ownership -InstallRoot $root -UserSid 'S-1-5-21-1-2-3-1001' -SessionId 2 -Adapters $fixture.Adapters) 'Supervisor reacquires the same epoch'
+        Assert-CcodEqual $false $ownership.lease.Released 'reacquired raw lease is held'
+        Assert-CcodEqual 1 $fixture.Store.Writes 'handoff delegation and resume never increment the epoch'
+        Assert-CcodEqual $true (Assert-CcodLifecycleFence -InstallRoot $root -Ownership $ownership -Adapters $fixture.Adapters) 'reacquired ownership proves the same fence'
+        [void](Exit-CcodLifecycleOwnership -Ownership $ownership -Adapters $fixture.Adapters)
+    }
+
+    Invoke-CcodTest 'rejects parent reacquire when an official interloper advanced the epoch' {
+        $fixture=New-CcodEpochAdapters -Epoch 8;$fixture.Store.Initialized=$true
+        $owner=[pscustomobject][ordered]@{pid=101;creationTimeUtc='2030-02-03T04:05:06.0000000Z'}
+        $ownership=Enter-CcodLifecycleOwnership -InstallRoot $root -RuntimeId '2.5.0-a' -RuntimeGeneration 3 -OwnerIdentity $owner -UserSid 'S-1-5-21-1-2-3-1001' -SessionId 2 -Adapters $fixture.Adapters
+        [void](Suspend-CcodLifecycleOwnership -Ownership $ownership -InstallRoot $root -Adapters $fixture.Adapters)
+        $fixture.Store.Epoch=[UInt64]($ownership.epoch+1)
+        Assert-CcodThrows {Resume-CcodLifecycleOwnership -Ownership $ownership -InstallRoot $root -UserSid 'S-1-5-21-1-2-3-1001' -SessionId 2 -Adapters $fixture.Adapters|Out-Null} 'CCOD_LIFECYCLE_FENCE_STALE'
+        Assert-CcodEqual $true $ownership.lease.Released 'stale parent does not retain a forged reacquired lease'
+    }
+
     Invoke-CcodTest 'fails closed for missing-after-initialization malformed numeric values writes and read-back mismatches' {
         foreach ($case in @('missing', 'negative', 'floating', 'max', 'write', 'readback')) {
             $fixture = New-CcodEpochAdapters

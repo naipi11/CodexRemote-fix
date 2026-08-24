@@ -212,7 +212,6 @@ function New-CcodAuthorizedRuntimeFixture {
         'src\persistence\modules\LifecycleEpoch.psm1',
         'src\persistence\modules\KernelObjects.psm1',
         'src\persistence\modules\PersistenceIO.psm1',
-        'src\persistence\modules\WorkerRuntime.psm1',
         'src\persistence\modules\TrustedLogonIdentity.psm1',
         'src\persistence\modules\StateStore.psm1',
         'src\persistence\modules\CompatibilityProbe.psm1',
@@ -1302,10 +1301,10 @@ try {
 
     if($round2RedFailures.Count -gt 0){throw ("TASK10C1_ROUND2_RED:`n"+($round2RedFailures -join "`n"))}
 
-    Invoke-CcodTest 'AST exposes only framing and parent-bound startup-gate inputs with no forbidden mutation surface' {
+    Invoke-CcodTest 'AST exposes only framing inputs with no forbidden mutation surface' {
         $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($workerScript,[ref]$tokens,[ref]$errors)
         Assert-CcodEqual 0 @($errors).Count 'worker parses without errors'
-        Assert-CcodEqual 'RequestPath,ResultPath,StartupGateName,StartupGateToken,ExpectedParentPid,ExpectedParentCreationTimeUtc' (($ast.ParamBlock.Parameters.Name.VariablePath.UserPath)-join ',') 'production CLI exposes only framing and startup-gate binding inputs'
+        Assert-CcodEqual 'RequestPath,ResultPath' (($ast.ParamBlock.Parameters.Name.VariablePath.UserPath)-join ',') 'production CLI exposes only framing inputs'
         $paramNames=@($ast.FindAll({param($node)$node -is [Management.Automation.Language.ParameterAst]},$true)|ForEach-Object{$_.Name.VariablePath.UserPath})
         Assert-CcodEqual 0 @($paramNames|Where-Object{$_ -ieq 'Pid'}).Count 'worker avoids the read-only automatic PID variable name'
         $forbidden=@('SessionEngine.psm1','TransitionJournal.psm1','SessionController.ps1','Invoke-CcodApplySession','Invoke-CcodRepairRenderer','Invoke-CcodRecoverSession','Start-CcodProcess','Stop-CcodProcessIfMatch','Start-Process','Stop-Process','Write-CcodSettings','Write-CcodStatus','Write-CcodVerifiedPackages','Set-CcodAutomationEnabled','Set-CcodCandidateCompatibleOptIn')
