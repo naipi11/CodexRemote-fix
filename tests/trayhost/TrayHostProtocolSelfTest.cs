@@ -18,6 +18,37 @@ internal static class TrayHostProtocolSelfTest
         }
     }
 
+    private static void AssertEqual<T>(T expected, T actual, string message)
+    {
+        if (!Object.Equals(expected, actual)) { throw new InvalidOperationException(message + " expected=[" + expected + "] actual=[" + actual + "]"); }
+    }
+
+    private static void AssertThrowsProtocol(Action action, string message)
+    {
+        bool threw = false;
+        try { action(); } catch (ProtocolViolationException) { threw = true; }
+        AssertTrue(threw, message);
+    }
+
+    private static byte[] BuildHeader(ushort version, TrayHostMessageType type, uint payloadLength)
+    {
+        byte[] header = new byte[ProtocolCodec.HeaderSize];
+        header[0] = (byte)'C'; header[1] = (byte)'R'; header[2] = (byte)'T'; header[3] = (byte)'H';
+        Buffer.BlockCopy(BitConverter.GetBytes(version), 0, header, 4, 2);
+        Buffer.BlockCopy(BitConverter.GetBytes((ushort)type), 0, header, 6, 2);
+        Buffer.BlockCopy(BitConverter.GetBytes(payloadLength), 0, header, 8, 4);
+        return header;
+    }
+
+    private static byte[] BuildActionPayload(Guid actionId, TrayCommand command, ulong revision)
+    {
+        using (MemoryStream stream = new MemoryStream())
+        using (BinaryWriter writer = new BinaryWriter(stream))
+        {
+            writer.Write(actionId.ToByteArray()); writer.Write((ushort)command); writer.Write(revision); return stream.ToArray();
+        }
+    }
+
     private static byte[] Hex(string value)
     {
         byte[] result = new byte[value.Length / 2];
@@ -57,6 +88,13 @@ internal static class TrayHostProtocolSelfTest
         bool threw = false;
         try { ProtocolCodec.ReadBootstrap(stream, ProtocolDirection.ParentToHost); } catch (ProtocolViolationException) { threw = true; }
         AssertTrue(threw, "bootstrap direction mismatch is rejected");
+    }
+
+    private static void TestProtocolMajorRejectsV1()
+    {
+        AssertThrowsProtocol(delegate {
+            ProtocolCodec.ReadBootstrap(new MemoryStream(BuildHeader(1, TrayHostMessageType.ParentHello, 0U)), ProtocolDirection.ParentToHost);
+        }, "v1 bootstrap is rejected");
     }
 
     private static void TestBootstrapAcceptsUtf8Preamble()
@@ -126,6 +164,42 @@ internal static class TrayHostProtocolSelfTest
         AssertTrue(threw, "presentation control characters are rejected");
     }
 
+    private static void TestActionResultWireAndLegacyCommandRejection()
+    {
+        Guid actionId = Guid.NewGuid();
+        Guid transactionId = Guid.Parse("11111111-2222-3333-4444-555555555555");
+        TrayActionResult accepted = new TrayActionResult(actionId, 12UL, TrayActionResultStatus.Accepted, null, transactionId);
+        TrayActionResult roundTrip = TrayHostWire.ReadActionResult(TrayHostWire.WriteActionResult(accepted));
+        AssertEqual(actionId, roundTrip.ActionId, "action result keeps action id");
+        AssertEqual(12UL, roundTrip.Revision, "action result keeps revision");
+        AssertEqual(TrayActionResultStatus.Accepted, roundTrip.Status, "action result keeps status");
+        AssertEqual(transactionId, roundTrip.TransactionId.Value, "action result keeps transaction id");
+        AssertThrowsProtocol(delegate {
+            TrayHostWire.ReadAction(BuildActionPayload(Guid.NewGuid(), (TrayCommand)1001, 7UL));
+        }, "legacy command id is rejected");
+    }
+
+    private static void TestActionResultRejectsAChangedEpoch()
+    {
+        byte[] key = Enumerable.Repeat((byte)0x42, 32).ToArray();
+        TrayActionResult result = new TrayActionResult(Guid.NewGuid(), 7UL, TrayActionResultStatus.Completed, null, null);
+        MemoryStream stream = new MemoryStream();
+        ProtocolCodec.WriteAuthenticated(stream, ProtocolFrame.Authenticated(ProtocolDirection.ParentToHost, TrayHostMessageType.ActionResult, 18UL, 1UL, TrayHostWire.WriteActionResult(result)), key);
+        stream.Position = 0;
+        AssertThrowsProtocol(delegate { ProtocolCodec.ReadAuthenticated(stream, ProtocolDirection.ParentToHost, 17UL, 1UL, key); }, "action result after an epoch change is rejected");
+    }
+
+    private static void TestActionResultRejectsNoncanonicalPresenceFlags()
+    {
+        Guid transactionId = Guid.Parse("11111111-2222-3333-4444-555555555555");
+        byte[] transactionPayload = TrayHostWire.WriteActionResult(new TrayActionResult(Guid.NewGuid(), 7UL, TrayActionResultStatus.Accepted, null, transactionId));
+        transactionPayload[26] = 2;
+        AssertThrowsProtocol(delegate { TrayHostWire.ReadActionResult(transactionPayload); }, "noncanonical transaction-presence flag is rejected");
+        byte[] errorPayload = TrayHostWire.WriteActionResult(new TrayActionResult(Guid.NewGuid(), 8UL, TrayActionResultStatus.Rejected, "CCOD_TRAY_ACTION_REJECTED", null));
+        errorPayload[25] = 2;
+        AssertThrowsProtocol(delegate { TrayHostWire.ReadActionResult(errorPayload); }, "noncanonical error-presence flag is rejected");
+    }
+
     public static int Main(string[] args)
     {
         try
@@ -133,11 +207,15 @@ internal static class TrayHostProtocolSelfTest
             TestRfc5869Expand();
             TestBootstrapFrameRoundTrip();
             TestBootstrapRejectsWrongDirection();
+            TestProtocolMajorRejectsV1();
             TestBootstrapAcceptsUtf8Preamble();
             TestAuthenticatedFrameRejectsReplayAndTamper();
             TestLargeEpochUsesUnsignedWireEncoding();
             TestPresentationSnapshotValidation();
-            Console.WriteLine("TrayHost protocol self-tests passed: 7");
+            TestActionResultWireAndLegacyCommandRejection();
+            TestActionResultRejectsAChangedEpoch();
+            TestActionResultRejectsNoncanonicalPresenceFlags();
+            Console.WriteLine("TrayHost protocol self-tests passed: 11");
             return 0;
         }
         catch (Exception error)

@@ -98,7 +98,7 @@ public sealed class TrayHostParentClient : IDisposable
         ProtocolFrame ready = ReadAuthenticated();
         if (ready.MessageType != TrayHostMessageType.UiReady || TrayHostWire.ReadRevision(ready.Payload) != options.InitialPresentation.Revision) { throw new InvalidOperationException("CCOD_TRAYHOST_NOT_READY"); }
         _transport.MarkReady();
-        Receipt = new TrayHostStartReceipt { HostPid = _process.Id, HostCreationFileTimeUtc = _process.StartTime.ToFileTimeUtc(), RuntimeId = options.RuntimeId, ProtocolMajor = 1, Capabilities = 1UL };
+        Receipt = new TrayHostStartReceipt { HostPid = _process.Id, HostCreationFileTimeUtc = _process.StartTime.ToFileTimeUtc(), RuntimeId = options.RuntimeId, ProtocolMajor = ProtocolCodec.ProtocolMajor, Capabilities = 2UL };
         StartThreads();
     }
 
@@ -119,6 +119,12 @@ public sealed class TrayHostParentClient : IDisposable
     public bool TryDequeueEvent(out TrayHostEvent value)
     {
         lock (_eventGate) { if (_events.Count == 0) { value = null; return false; } value = _events.Dequeue(); return true; }
+    }
+
+    public bool TryAcknowledgeAction(TrayActionResult result)
+    {
+        if (IsClosing() || result == null || _transport == null || _transport.GetHealth() != TrayHostHealth.Ready) { return false; }
+        bool accepted = _transport.TryEnqueueActionResult(result); if (accepted) { SignalWork(); } return accepted;
     }
 
     public bool BeginShutdown(ShutdownReason reason, ulong finalRevision)
@@ -151,6 +157,7 @@ public sealed class TrayHostParentClient : IDisposable
                 {
                     if (outbound.Kind == TrayHostOutboundKind.Presentation) { WriteAuthenticated(TrayHostMessageType.Presentation, TrayHostWire.WritePresentation(outbound.Presentation)); }
                     else if (outbound.Kind == TrayHostOutboundKind.Action) { WriteAuthenticated(TrayHostMessageType.Action, TrayHostWire.WriteAction(outbound.Action)); }
+                    else if (outbound.Kind == TrayHostOutboundKind.ActionResult) { WriteAuthenticated(TrayHostMessageType.ActionResult, TrayHostWire.WriteActionResult(outbound.ActionResult)); }
                     else { WriteControl(outbound.Control); }
                 }
             }

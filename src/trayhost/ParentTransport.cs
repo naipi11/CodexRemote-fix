@@ -6,6 +6,8 @@ internal sealed class ParentTransport : IDisposable
     private readonly object _gate = new object();
     private readonly Queue<TrayHostControl> _controls = new Queue<TrayHostControl>();
     private readonly Queue<TrayHostAction> _actions = new Queue<TrayHostAction>();
+    private readonly Queue<TrayActionResult> _actionResults = new Queue<TrayActionResult>();
+    private readonly HashSet<Guid> _pendingActionResults = new HashSet<Guid>();
     private PresentationSnapshot _latestPresentation;
     private TrayHostHealth _health = TrayHostHealth.Starting;
     private string _faultCode = String.Empty;
@@ -59,11 +61,24 @@ internal sealed class ParentTransport : IDisposable
         }
     }
 
+    internal bool TryEnqueueActionResult(TrayActionResult result)
+    {
+        if (result == null) { return false; }
+        lock (_gate)
+        {
+            if (_disposed || _health == TrayHostHealth.Faulted || _health == TrayHostHealth.Stopped || _actionResults.Count >= 8 || _pendingActionResults.Contains(result.ActionId)) { return false; }
+            _pendingActionResults.Add(result.ActionId);
+            _actionResults.Enqueue(result);
+            return true;
+        }
+    }
+
     internal bool TryDequeueOutbound(out TrayHostOutbound outbound)
     {
         lock (_gate)
         {
             if (_controls.Count > 0) { outbound = TrayHostOutbound.FromControl(_controls.Dequeue()); return true; }
+            if (_actionResults.Count > 0) { TrayActionResult result = _actionResults.Dequeue(); _pendingActionResults.Remove(result.ActionId); outbound = TrayHostOutbound.FromActionResult(result); return true; }
             if (_latestPresentation != null) { outbound = TrayHostOutbound.FromPresentation(_latestPresentation); _latestPresentation = null; return true; }
             if (_actions.Count > 0) { outbound = TrayHostOutbound.FromAction(_actions.Dequeue()); return true; }
             outbound = null;
@@ -100,6 +115,8 @@ internal sealed class ParentTransport : IDisposable
             _health = TrayHostHealth.Stopped;
             _controls.Clear();
             _actions.Clear();
+            _actionResults.Clear();
+            _pendingActionResults.Clear();
             _latestPresentation = null;
         }
     }

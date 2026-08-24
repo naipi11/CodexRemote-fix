@@ -3,9 +3,15 @@ using System.Collections.Generic;
 
 internal sealed class HostTransport : IDisposable
 {
+    private sealed class PendingAction
+    {
+        internal TrayHostAction Action;
+        internal bool Accepted;
+    }
+
     private readonly object _gate = new object();
     private readonly Queue<TrayHostControl> _controls = new Queue<TrayHostControl>();
-    private readonly Queue<TrayHostAction> _actions = new Queue<TrayHostAction>();
+    private readonly Dictionary<Guid, PendingAction> _pendingActions = new Dictionary<Guid, PendingAction>();
     private readonly Queue<Guid> _recentActionOrder = new Queue<Guid>();
     private readonly HashSet<Guid> _recentActions = new HashSet<Guid>();
     private PresentationSnapshot _pendingPresentation;
@@ -41,26 +47,37 @@ internal sealed class HostTransport : IDisposable
         }
     }
 
-    internal bool TryAcceptAction(TrayHostAction action)
+    internal bool TryRegisterAction(TrayHostAction action)
     {
         if (action == null) { return false; }
         lock (_gate)
         {
-            if (_disposed || _recentActions.Contains(action.ActionId) || _actions.Count >= 8) { return false; }
+            if (_disposed || _recentActions.Contains(action.ActionId) || _pendingActions.Count >= 8) { return false; }
             _recentActions.Add(action.ActionId);
             _recentActionOrder.Enqueue(action.ActionId);
             while (_recentActionOrder.Count > 64) { _recentActions.Remove(_recentActionOrder.Dequeue()); }
-            _actions.Enqueue(action);
+            _pendingActions.Add(action.ActionId, new PendingAction { Action = action, Accepted = false });
             return true;
         }
     }
 
-    internal bool TryDequeueAction(out TrayHostAction action)
+    internal bool TryAcknowledgeAction(TrayActionResult result)
     {
+        if (result == null) { return false; }
         lock (_gate)
         {
-            if (_actions.Count == 0) { action = null; return false; }
-            action = _actions.Dequeue();
+            if (_disposed) { return false; }
+            PendingAction pending;
+            if (!_pendingActions.TryGetValue(result.ActionId, out pending) || pending.Action.Revision != result.Revision) { return false; }
+            if (result.Status == TrayActionResultStatus.Accepted)
+            {
+                if (pending.Accepted || (TrayCommandPolicy.RequiresTransactionWhenAccepted(pending.Action.Command) && !result.TransactionId.HasValue)) { return false; }
+                pending.Accepted = true;
+                return true;
+            }
+            if (result.Status != TrayActionResultStatus.Completed && result.Status != TrayActionResultStatus.Rejected && result.Status != TrayActionResultStatus.Failed) { return false; }
+            if (result.Status == TrayActionResultStatus.Completed && TrayCommandPolicy.RequiresAcceptedBeforeCompleted(pending.Action.Command) && !pending.Accepted) { return false; }
+            _pendingActions.Remove(result.ActionId);
             return true;
         }
     }
@@ -82,7 +99,7 @@ internal sealed class HostTransport : IDisposable
             if (_disposed) { return; }
             _disposed = true;
             _controls.Clear();
-            _actions.Clear();
+            _pendingActions.Clear();
             _recentActions.Clear();
             _recentActionOrder.Clear();
             _pendingPresentation = null;

@@ -44,13 +44,11 @@ internal static class Program
         TrayHostApplication application = null;
         Action<TrayCommand, ulong> command = delegate(TrayCommand selected, ulong revision)
         {
-            bool? boolValue = null; LanguageMode? languageValue = null;
-            if (selected == TrayCommand.SetAutomation) { boolValue = !window.AutomationChecked; }
-            else if (selected == TrayCommand.SetCandidateOptIn) { boolValue = !window.CandidateOptInChecked; }
-            else if (selected == TrayCommand.SetLanguageSystem) { languageValue = LanguageMode.System; }
-            else if (selected == TrayCommand.SetLanguageChinese) { languageValue = LanguageMode.Chinese; }
-            else if (selected == TrayCommand.SetLanguageEnglish) { languageValue = LanguageMode.English; }
-            lock (WriteGate) { ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.Action, epoch, outboundSequence++, TrayHostWire.WriteAction(new TrayHostAction(Guid.NewGuid(), selected, revision, boolValue, languageValue))), keys.HostToParent); }
+            TrayHostAction action;
+            try { action = new TrayHostAction(Guid.NewGuid(), selected, revision); }
+            catch (ArgumentException) { return; }
+            if (!transport.TryRegisterAction(action)) { return; }
+            lock (WriteGate) { ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.Action, epoch, outboundSequence++, TrayHostWire.WriteAction(action)), keys.HostToParent); }
         };
         Action work = delegate
         {
@@ -85,6 +83,7 @@ internal static class Program
                 {
                     ProtocolFrame frame = ProtocolCodec.ReadAuthenticated(input, ProtocolDirection.ParentToHost, epoch, inboundSequence++, keys.ParentToHost);
                     if (frame.MessageType == TrayHostMessageType.Presentation) { transport.TryAcceptPresentation(TrayHostWire.ReadPresentation(frame.Payload)); application.PostWork(); }
+                    else if (frame.MessageType == TrayHostMessageType.ActionResult) { if (!transport.TryAcknowledgeAction(TrayHostWire.ReadActionResult(frame.Payload))) { throw new ProtocolViolationException("action result is uncorrelated"); } }
                     else if (frame.MessageType == TrayHostMessageType.Shutdown) { lock (stateGate) { shutdownRequested = true; } application.PostWork(); }
                     else if (frame.MessageType == TrayHostMessageType.Ping) { lock (WriteGate) { ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.Pong, epoch, outboundSequence++, frame.Payload), keys.HostToParent); } }
                 }
