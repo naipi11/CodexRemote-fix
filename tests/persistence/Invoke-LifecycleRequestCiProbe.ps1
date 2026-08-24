@@ -35,6 +35,29 @@ function Write-CcodLifecycleCiProbeAclFacts {
     }
 }
 
+function Write-CcodLifecycleCiProbeFileAclFacts {
+    param([string]$Path)
+    Write-CcodLifecycleCiProbeFact 'requestExists' ([IO.File]::Exists($Path))
+    if (-not [IO.File]::Exists($Path)) { return }
+    try {
+        $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+        try {
+            $security=[IO.File]::GetAccessControl($Path)
+            $owner=$security.GetOwner([Security.Principal.SecurityIdentifier])
+            $rules=@($security.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+            $expected=@($identity.User.Value,'S-1-5-18','S-1-5-32-544')
+            $allowlisted=@($rules | Where-Object { $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and $_.FileSystemRights -eq [Security.AccessControl.FileSystemRights]::FullControl -and $expected -ccontains $_.IdentityReference.Value }).Count
+            Write-CcodLifecycleCiProbeFact 'requestAclOwnerCurrent' ($null -ne $owner -and $owner.Value -ceq $identity.User.Value)
+            Write-CcodLifecycleCiProbeFact 'requestAclProtected' $security.AreAccessRulesProtected
+            Write-CcodLifecycleCiProbeFact 'requestAclRuleCount' $rules.Count
+            Write-CcodLifecycleCiProbeFact 'requestAclAllowlistedFullControl' $allowlisted
+            Write-CcodLifecycleCiProbeFact 'requestAclInheritedRuleCount' @($rules | Where-Object { $_.IsInherited }).Count
+        } finally { $identity.Dispose() }
+    } catch {
+        Write-CcodLifecycleCiProbeFact 'requestAclProbeError' (([string]$_.FullyQualifiedErrorId -split ',')[0])
+    }
+}
+
 $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-lifecycle-ci-probe-' + [guid]::NewGuid().ToString('N'))
 try {
     [IO.Directory]::CreateDirectory((Join-Path $root 'state\lifecycle')) | Out-Null
@@ -61,7 +84,8 @@ try {
     Write-CcodLifecycleCiProbeFact 'errorCode' $receipt.errorCode
     $inbox=Join-Path $root 'state\lifecycle\inbox'
     Write-CcodLifecycleCiProbeAclFacts -Inbox $inbox
-    Write-CcodLifecycleCiProbeFact 'requestCount' @((Get-ChildItem -LiteralPath $inbox -Filter '*.request.json' -File -ErrorAction SilentlyContinue)).Count
+    $requestPath=Join-Path $inbox ($submissionId + '.request.json')
+    Write-CcodLifecycleCiProbeFileAclFacts -Path $requestPath
     Write-CcodLifecycleCiProbeFact 'receiptCount' @((Get-ChildItem -LiteralPath $inbox -Filter '*.receipt.json' -File -ErrorAction SilentlyContinue)).Count
 } catch {
     Write-CcodLifecycleCiProbeFact 'exception' (([string]$_.FullyQualifiedErrorId -split ',')[0])
