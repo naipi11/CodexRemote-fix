@@ -118,6 +118,7 @@ $results.Add((Invoke-CcodTest 'submits one durable request and returns only its 
             Write-CcodLifecycleSubmissionReceipt -StateRoot (Join-Path $root 'state') -SubmissionId $submission.submissionId -Accepted $true -TransactionId $transactionId -ErrorCode $null -Adapters @{GetUtcNow={ [DateTime]::ParseExact($timestamp,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind) }.GetNewClosure()}
         }.GetNewClosure()
         $submitted=Submit-CcodLifecycleRequest -InstallRoot $root -Kind RestartAndRepair -Origin Installer -RuntimeId '2.5.0-a' -RuntimeGeneration 7 -TimeoutMilliseconds 5000 -Adapters (New-CcodSubmissionAdapters $submissionId $onSignal)
+        [Console]::Out.WriteLine('CCOD_LIFECYCLE_TEST_DIAG_seenErrorCode=' + [string]$submitted.errorCode)
         if ($submitted.errorCode -ceq 'CCOD_LIFECYCLE_PATH_INVALID') {
             foreach ($fact in ((Get-CcodLifecycleSubmissionFailureDiagnostic -Root $root -SubmissionId $submissionId) -split ';')) {
                 [Console]::Out.WriteLine('CCOD_LIFECYCLE_TEST_DIAG_' + $fact)
