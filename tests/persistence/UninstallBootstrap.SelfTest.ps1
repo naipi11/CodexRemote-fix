@@ -141,6 +141,20 @@ function New-CcodUninstallBootstrapAdapters {
     }
 }
 
+function Set-CcodUninstallBootstrapFixtureDirectoryOwner {
+    param([Parameter(Mandatory)][string]$Path)
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        $security = [IO.Directory]::GetAccessControl($Path)
+        $security.SetOwner($identity.User)
+        [IO.Directory]::SetAccessControl($Path,$security)
+        $owner = [IO.Directory]::GetAccessControl($Path).GetOwner([Security.Principal.SecurityIdentifier])
+        Assert-CcodEqual $identity.User.Value $owner.Value 'installed-root fixture owner is the current user'
+    } finally {
+        $identity.Dispose()
+    }
+}
+
 function New-CcodVerifiedUninstallRuntimeFixture {
     param([Parameter(Mandatory)][string]$InstallRoot)
     $runtimeRoot = Join-Path $InstallRoot 'runtime\pending'
@@ -167,6 +181,7 @@ function New-CcodVerifiedUninstallRuntimeFixture {
     [IO.Directory]::Move($runtimeRoot,$finalRuntime)
     [IO.File]::WriteAllText((Join-Path $finalRuntime 'manifest.json'),($manifest | ConvertTo-Json -Depth 16),[Text.UTF8Encoding]::new($false))
     [IO.Directory]::CreateDirectory((Join-Path $InstallRoot 'state')) | Out-Null
+    Set-CcodUninstallBootstrapFixtureDirectoryOwner -Path $InstallRoot
     $timestamp = '2030-02-03T03:04:05.0000000Z'
     [IO.File]::WriteAllText((Join-Path $InstallRoot 'active.json'),([ordered]@{schemaVersion=2;activeRuntime=$manifest.runtimeId;previousRuntime=$null;generation=[uint64]7;updatedAtUtc=$timestamp}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $InstallRoot 'state\lifecycle-epoch.json'),([ordered]@{schemaVersion=1;epoch=[uint64]11}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))

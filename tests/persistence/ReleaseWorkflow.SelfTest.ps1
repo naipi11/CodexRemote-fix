@@ -171,6 +171,7 @@ Invoke-CcodTest 'package scripts build provenance and workflows retain the relea
     Assert-CcodTrue ($trayHost -match 'gitCommit') 'TrayHost provenance binds its source commit'
     Assert-CcodTrue ($trayHost -match 'buildTimestampUtc') 'TrayHost provenance binds its build timestamp'
     $ci = Get-Content -LiteralPath (Join-Path $repositoryRoot '.github\workflows\ci.yml') -Raw
+    Assert-CcodTrue ($ci -match 'UninstallBootstrap\.SelfTest\.ps1') 'CI runs the external uninstall bootstrap self-test before aggregate validation'
     Assert-CcodTrue ($ci -match 'test:installed-lifecycle') 'CI runs deterministic installed lifecycle tests'
     Assert-CcodTrue ($ci -match 'test:release-contract') 'CI runs release contract tests'
     $release = Get-Content -LiteralPath (Join-Path $repositoryRoot '.github\workflows\release.yml') -Raw

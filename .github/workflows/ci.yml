@@ -30,6 +30,10 @@ jobs:
         shell: pwsh
         run: choco install innosetup -y --no-progress
 
+      - name: Run uninstall bootstrap self-test
+        shell: pwsh
+        run: ./tests/persistence/UninstallBootstrap.SelfTest.ps1
+
       - name: Run repository validation
         shell: pwsh
         run: npm test
