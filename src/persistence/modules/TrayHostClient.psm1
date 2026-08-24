@@ -67,7 +67,7 @@ function New-CcodTrayHostContext {
     param($CommandQueue,$OnTick,$Catalog,[string]$LanguageMode,[string]$SystemCultureName)
     Import-CcodTrayHostAssembly
     $runtimeRoot=Get-CcodTrayHostRuntimeRoot;$runtimeId=Split-Path $runtimeRoot -Leaf;$exe=Join-Path $runtimeRoot 'bin\CodexRemote.TrayHost.exe'
-    $initialPresentation=[pscustomobject][ordered]@{Color='Gray';ConnectionState='WaitingForCodex';ProtectionState='Running';RepairEnabled=$false;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true;Busy=$false}
+    $initialPresentation=[pscustomobject][ordered]@{Color='Gray';ConnectionState='WaitingForCodex';ProtectionState='Running';RepairEnabled=$false;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$false;Busy=$false}
     $initial=New-CcodTrayHostSnapshot $initialPresentation $Catalog $LanguageMode $SystemCultureName ([UInt64]1) $runtimeId
     $process=[Diagnostics.Process]::GetCurrentProcess()
     try{

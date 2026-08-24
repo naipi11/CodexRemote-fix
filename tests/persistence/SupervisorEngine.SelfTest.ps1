@@ -639,7 +639,8 @@ $results += Invoke-CcodTest 'projects the truthful v2 connection and protection 
         Assert-CcodExactEqual $protection $view.ProtectionState "$protection is independently truthful"
     }
     $ready=Get-CcodTrayPresentation -ConnectionState Connected -ProtectionState Running -Busy:$false -StateDamageBlocksActions:$false
-    Assert-CcodExactEqual $false $ready.ExitEnabled 'Exit remains visible but disabled until Task 10 implements SafeExit'
+    # Production mutation caught: disabling Exit after the Supervisor has established a non-busy, undamaged presentation.
+    Assert-CcodExactEqual $true $ready.ExitEnabled 'SafeExit is available only after the Supervisor reaches a ready presentation'
     $busy=Get-CcodTrayPresentation -ConnectionState RepairNeeded -ProtectionState Reconnecting -Busy:$true -StateDamageBlocksActions:$false
     Assert-CcodExactEqual $false $busy.RepairEnabled 'busy lifecycle disables repair'
     Assert-CcodExactEqual $false $busy.LanguageEnabled 'busy lifecycle disables language changes'

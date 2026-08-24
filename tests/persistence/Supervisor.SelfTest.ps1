@@ -74,7 +74,7 @@ function New-CcodSupervisorFake {
         LifecycleOwnership=$null;LifecycleOwnershipEntries=0;LifecycleFenceAssertions=0;LifecycleOwnershipExits=0;LifecycleOwnershipSuspends=0;LifecycleOwnershipResumes=0
         ActiveLifecycleRequest=$null;LifecycleSubmissions=[Collections.Generic.Queue[object]]::new();LifecycleSubmissionReceipts=[Collections.Generic.List[object]]::new();CompletedLifecycleRequests=[Collections.Generic.List[object]]::new()
         LifecycleWrites=[Collections.Generic.List[object]]::new();LifecycleMoves=[Collections.Generic.List[string]]::new();StartedLifecycleRequests=[Collections.Generic.List[object]]::new();AutoCompleteLifecycleWorkers=$false
-        WorkerWaitResults=[Collections.Generic.Queue[bool]]::new();WorkerTerminateResults=[Collections.Generic.Queue[bool]]::new()
+        WorkerWaitResults=[Collections.Generic.Queue[bool]]::new();WorkerTerminateResults=[Collections.Generic.Queue[bool]]::new();SafeExitIntentWritten=$false
     }
     $adapters=@{}
     foreach($name in Get-CcodSupervisorAdapterNames){
@@ -121,6 +121,7 @@ function New-CcodSupervisorFake {
     $adapters.ReadState={param($StateRoot)$world.Calls.Add('Read:State');$world.StateReads++;if($world.FailAt -ceq 'ReadState'){throw 'PRIVATE_STATE_SECRET'};[pscustomobject]@{AutomationEnabled=$true;Settings=[pscustomobject]@{candidateCompatibleOptIn=$false};Damage=$null}}.GetNewClosure()
     $adapters.ReadActiveRuntime={param($InstallRoot)$world.Calls.Add('Read:ActiveRuntime');if($world.FailAt -ceq 'ReadActiveRuntime'){throw 'PRIVATE_RUNTIME_POINTER_SECRET'};$world.ActiveRuntime}.GetNewClosure()
     $adapters.GetTrustedLogonIdentity={param($ExpectedUserSid,$ExpectedSessionId)$world.Calls.Add('Read:LogonIdentity');if($world.FailAt -ceq 'GetTrustedLogonIdentity'){throw 'PRIVATE_LOGON_SECRET'};$world.LogonIdentity}.GetNewClosure()
+    $adapters.WriteSafeExitIntent={param($StateRoot,$LogonIdentity,$RuntimeId,$TransactionId,$NowUtc)$world.Calls.Add('Write:SafeExitIntent');if($world.FailAt -ceq 'WriteSafeExitIntent'){throw 'PRIVATE_SAFE_EXIT_INTENT_SECRET'};$world.SafeExitIntentWritten=$true}.GetNewClosure()
     $adapters.EnterLifecycleOwnership={
         param($InstallRoot,$RuntimeId,$RuntimeGeneration,$OwnerIdentity,$UserSid,$SessionId,$TimeoutMilliseconds)
         $world.Calls.Add("Enter:LifecycleOwnership:$RuntimeGeneration");if($world.FailAt -ceq 'EnterLifecycleOwnership'){throw 'PRIVATE_OWNERSHIP_SECRET'};$world.LifecycleOwnershipEntries++
@@ -474,6 +475,35 @@ Invoke-CcodTest 'rejects the removed tray uninstall command before any launcher 
     Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'ActionResult:*' -or $_ -like 'Exit:UI'}).Count 'removed tray uninstall command sends no protocol or process side effect'
 }
 
+Invoke-CcodTest 'Exit submits a durable SafeExit request instead of shutting down the tray directly' {
+    # Production mutation caught: replacing Exit with a direct RequestUiExit call, or submitting any kind other than SafeExit.
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $action=[pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command='Exit';Revision=[UInt64]1}
+    $result=Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action
+    Assert-CcodEqual 'Accepted' $result.Status 'Exit is accepted as a lifecycle action'
+    Assert-CcodEqual 'SafeExit' $hostState.LifecycleRequest.kind 'Exit creates a SafeExit lifecycle request'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object { $_ -ceq 'Exit:UI' }).Count 'Exit does not stop TrayHost before recovery and marker commit'
+}
+
+Invoke-CcodTest 'SafeExit commits its same-logon intent before it stops the tray' {
+    # Production mutation caught: omitting the marker write, writing it after RequestUiExit, or stopping after a failed marker write.
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $request=& (Get-Module LifecycleTransaction | Select-Object -First 1) {
+        param($RuntimeId,$Generation,$Epoch,$Owner,$Logon)
+        $value=New-CcodLifecycleRequest -Kind SafeExit -Origin Tray -RuntimeId $RuntimeId -RuntimeGeneration $Generation -LeaseEpoch $Epoch -OwnerIdentity $Owner -LogonIdentity $Logon -NowUtc '2030-02-03T03:04:05.0000000Z'
+        Move-CcodLifecyclePhase -Request $value -NextPhase CancelledBeforeClose -NowUtc '2030-02-03T03:04:06.0000000Z'
+    } $hostState.Layout.RuntimeId ([UInt64]$hostState.LifecycleOwnership.runtimeGeneration) ([UInt64]$hostState.LifecycleOwnership.epoch) $hostState.LifecycleOwnership.ownerIdentity $hostState.LogonIdentity
+    $hostState.LifecycleRequest=$request;$hostState.LifecycleObservation='Ordinary'
+    $fixture.Fake.Adapters.WriteSafeExitIntent={
+        param($StateRoot,$LogonIdentity,$RuntimeId,$TransactionId,$NowUtc)
+        $world.Calls.Add('Write:SafeExitIntent');$world.SafeExitIntentWritten=$true
+    }.GetNewClosure()
+    Complete-CcodSupervisorLifecycleTerminal $hostState $fixture.Fake.Adapters
+    Assert-CcodTrue $world.SafeExitIntentWritten 'same-logon marker is committed'
+    Assert-CcodTrue ([Array]::IndexOf(@($world.Calls),'Write:SafeExitIntent') -lt [Array]::IndexOf(@($world.Calls),'Exit:UI')) 'TrayHost stops only after marker commit'
+    Assert-CcodEqual 'Stopping' $hostState.ProtectionState 'SafeExit publishes stopping protection after intent commit'
+}
+
 Invoke-CcodTest 'adds the exact localization adapters and host fields at the frozen boundaries' {
     $names=Get-CcodSupervisorAdapterNames
     $first=[Array]::IndexOf($names,'ReadUiPreference')
@@ -590,9 +620,9 @@ Invoke-CcodTest 'reclaims exact stale lifecycle worker framing left by a killed 
 
 Invoke-CcodTest 'treats error-free CancelledBeforeClose as successful already-satisfied completion without mutation' {
     foreach($case in @(
-        [pscustomobject]@{Kind='CheckAndRepair';Observation='RemoteVerified';Connection='Connected';Id='40000000-0000-0000-0000-000000000001'},
-        [pscustomobject]@{Kind='SafeExit';Observation='Ordinary';Connection='RepairNeeded';Id='40000000-0000-0000-0000-000000000002'},
-        [pscustomobject]@{Kind='SafeExit';Observation='NoCodex';Connection='WaitingForCodex';Id='40000000-0000-0000-0000-000000000003'}
+        [pscustomobject]@{Kind='CheckAndRepair';Observation='RemoteVerified';Connection='Connected';Protection='Running';Id='40000000-0000-0000-0000-000000000001'},
+        [pscustomobject]@{Kind='SafeExit';Observation='Ordinary';Connection='RepairNeeded';Protection='Stopping';Id='40000000-0000-0000-0000-000000000002'},
+        [pscustomobject]@{Kind='SafeExit';Observation='NoCodex';Connection='WaitingForCodex';Protection='Stopping';Id='40000000-0000-0000-0000-000000000003'}
     )){
         $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
         $request=New-CcodPersistedLifecycleRequest -Kind $case.Kind -TransactionId $case.Id
@@ -603,7 +633,7 @@ Invoke-CcodTest 'treats error-free CancelledBeforeClose as successful already-sa
         Assert-CcodEqual 'CancelledBeforeClose' $world.CompletedLifecycleRequests[0].phase 'already-satisfied phase is the legal terminal edge'
         Assert-CcodEqual $null $world.CompletedLifecycleRequests[0].error 'already-satisfied completion carries no error'
         Assert-CcodEqual $case.Connection $hostState.ConnectionState 'connection state remains truthful after no-op completion'
-        Assert-CcodEqual 'Running' $hostState.ProtectionState 'owned Supervisor protection remains running'
+        Assert-CcodEqual $case.Protection $hostState.ProtectionState 'completion preserves the correct protection boundary'
         Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'Start:*'}).Count 'already-satisfied completion starts no worker mutation'
     }
 }

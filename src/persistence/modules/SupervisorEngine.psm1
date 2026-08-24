@@ -807,7 +807,7 @@ function Get-CcodTrayPresentation {
         LanguageEnabled=[bool](-not $actionsBlocked)
         OpenLogsEnabled=[bool]$true
         AboutEnabled=[bool]$true
-        ExitEnabled=$false
+        ExitEnabled=[bool](-not $actionsBlocked)
         Busy=[bool]$Busy
     }
 }
