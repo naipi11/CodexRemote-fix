@@ -83,7 +83,16 @@ if (-not $node) {
 
 if ($failures.Count -eq 0) {
     $powershellExecutable = (Get-Command powershell.exe -ErrorAction Stop).Source
-    $persistenceOutput = & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $persistenceSelfTest 2>&1
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # A failing child PowerShell writes a NativeCommandError to stderr. Capture
+        # that test evidence and inspect its exit code instead of terminating before
+        # the failure report and targeted diagnostic can run.
+        $ErrorActionPreference = 'Continue'
+        $persistenceOutput = & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $persistenceSelfTest 2>&1
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
     if ($LASTEXITCODE -ne 0) {
         $persistenceText = $persistenceOutput -join ' '
         if ($persistenceText -match 'ASSERT_EQUAL: submission error code expected=\[\] actual=\[CCOD_LIFECYCLE_PATH_INVALID\]') {
