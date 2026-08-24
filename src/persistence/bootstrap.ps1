@@ -378,7 +378,13 @@ function Invoke-CcodBootstrapSafeExitMarkerPolicy {
     }
     $identity=$null;try{$identity=&$Adapters.GetIdentity}catch{if($EntryMode-ceq'Task'){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Task startup requires a trusted logon identity' $null};Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_CONFIRMATION_REQUIRED' 'Explicit startup requires local confirmation before marker replacement' $null}
     $same=&$Adapters.TestSameLogon $intent $identity
-    if($same-and$EntryMode-ceq'Task'){&$Adapters.Log 'SAFE_EXIT_SUPPRESSED';return [pscustomobject]@{Suppressed=$true;Cleared=$false}}
+    if($same-and$EntryMode-ceq'Task'){
+        $active=&$Adapters.ReadActiveRequest
+        if($null-ne$active-and$active.kind-ceq'SafeExit'-and$active.transactionId-ceq$intent.recoveryTransactionId){return [pscustomobject]@{Suppressed=$false;Cleared=$false}}
+        $receipt=&$Adapters.ReadCompletionReceipt $intent.recoveryTransactionId
+        if($null-ne$receipt-and$receipt.kind-ceq'SafeExit'-and$receipt.transactionId-ceq$intent.recoveryTransactionId-and($receipt.phase-ceq'Completed'-or($receipt.phase-ceq'CancelledBeforeClose'-and$null-eq$receipt.error))){&$Adapters.Log 'SAFE_EXIT_SUPPRESSED';return [pscustomobject]@{Suppressed=$true;Cleared=$false}}
+        Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Task startup refuses an unpaired safe-exit marker' $null
+    }
     $ownership=&$Adapters.EnterOwnership
     try{&$Adapters.ClearIntent;$cleared=$true}finally{&$Adapters.ExitOwnership $ownership|Out-Null}
     return [pscustomobject]@{Suppressed=$false;Cleared=$cleared}
@@ -399,11 +405,13 @@ function Test-CcodBootstrapSafeExitSuppression {
         Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_CONFIRMATION_REQUIRED' 'Explicit startup requires local confirmation before replacing an unreadable safe-exit marker' $marker
     }
     $stateRoot=Join-Path $InstallRoot 'state'
-    $ownership=$null
+    $ownership=$null;$transaction=Import-Module -Name (Join-Path $validation.RuntimeDirectory 'src\persistence\modules\LifecycleTransaction.psm1') -Force -PassThru -ErrorAction Stop
     $policyAdapters=@{
         ReadIntent={& $trusted {param($Root)Read-CcodSafeExitIntent -StateRoot $Root} $stateRoot}
         GetIdentity={& $trusted {Get-CcodTrustedLogonIdentity}}
         TestSameLogon={param($Intent,$Identity)& $trusted {param($Value,$Current)Test-CcodSafeExitIntentForCurrentLogon -Intent $Value -LogonIdentity $Current} $Intent $Identity}
+        ReadActiveRequest={& $transaction {param($Root)Read-CcodLifecycleRequest -StateRoot $Root} $stateRoot}
+        ReadCompletionReceipt={param($TransactionId)& $transaction {param($Root,$Id)$path=Get-CcodLifecycleReceiptPath -StateRoot $Root -TransactionId $Id;if(-not[IO.File]::Exists($path)){return $null};$value=Read-CcodStrictJson -Path $path -ExpectedSchema 1 -Kind 'lifecycle receipt';Assert-CcodLifecycleRequest -Request $value;return $value} $stateRoot $TransactionId}
         Log={param($Message)Write-CcodBootstrapLog -InstallRoot $InstallRoot -Message $Message}
         ConfirmReplacement={Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop;[Windows.Forms.MessageBox]::Show('Replace the unreadable safe-exit marker and start CodexRemote-fix?','CodexRemote-fix',[Windows.Forms.MessageBoxButtons]::YesNo,[Windows.Forms.MessageBoxIcon]::Warning)-eq[Windows.Forms.DialogResult]::Yes}
         EnterOwnership={

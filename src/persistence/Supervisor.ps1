@@ -259,7 +259,7 @@ function Get-CcodSupervisorDefaultAdapters {
     $defaults.ReadActiveRuntime={param($InstallRoot)Read-CcodActiveRuntime -InstallRoot $InstallRoot}
     $defaults.GetTrustedLogonIdentity={param($ExpectedUserSid,$ExpectedSessionId)Get-CcodTrustedLogonIdentity -ExpectedUserSid $ExpectedUserSid -ExpectedSessionId $ExpectedSessionId}
     $defaults.WriteSafeExitIntent={param($StateRoot,$LogonIdentity,$RuntimeId,$RecoveryTransactionId,$NowUtc)Write-CcodSafeExitIntent -StateRoot $StateRoot -LogonIdentity $LogonIdentity -RuntimeId $RuntimeId -RecoveryTransactionId $RecoveryTransactionId -NowUtc $NowUtc}
-    $defaults.ClearSafeExitIntent={param($StateRoot)Clear-CcodSafeExitIntent -StateRoot $StateRoot}
+    $defaults.ClearSafeExitIntent={param($StateRoot)Clear-CcodSafeExitIntent -StateRoot $StateRoot|Out-Null}
     $defaults.EnterLifecycleOwnership={param($InstallRoot,$RuntimeId,$RuntimeGeneration,$OwnerIdentity,$UserSid,$SessionId,$TimeoutMilliseconds)Enter-CcodLifecycleOwnership -InstallRoot $InstallRoot -RuntimeId $RuntimeId -RuntimeGeneration $RuntimeGeneration -OwnerIdentity $OwnerIdentity -UserSid $UserSid -SessionId $SessionId -TimeoutMilliseconds $TimeoutMilliseconds}
     $defaults.AssertLifecycleFence={param($InstallRoot,$Ownership)Assert-CcodLifecycleFence -InstallRoot $InstallRoot -Ownership $Ownership}
     $defaults.SuspendLifecycleOwnership={param($Ownership,$InstallRoot)Suspend-CcodLifecycleOwnership -Ownership $Ownership -InstallRoot $InstallRoot}
@@ -709,18 +709,19 @@ function Complete-CcodSupervisorLifecycleTerminal {
             $markerWritten=$true
             $HostState.ProtectionState='Stopping'
             Set-CcodSupervisorCurrentTrayPresentation $HostState $Adapters -WaitForAcknowledgement
-            Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
-            Invoke-CcodSupervisorAdapter $Adapters.CompleteLifecycleRequest @($HostState.Layout.StateRoot,$request) 0
             if(-not(Complete-CcodSupervisorLifecycleTrayAction $HostState $Adapters $request $true)){
                 Invoke-CcodSupervisorAdapter $Adapters.ClearSafeExitIntent @($HostState.Layout.StateRoot) 0|Out-Null
-                $HostState.ProtectionState='Running';$HostState.LifecycleRequest=$null
+                $HostState.ProtectionState='Running';$request.error='SAFE_EXIT_RECOVERY_FAILED'
+                Invoke-CcodSupervisorAdapter $Adapters.WriteLifecycleRequest @($HostState.Layout.StateRoot,$request) 0
                 return
             }
+            Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
+            Invoke-CcodSupervisorAdapter $Adapters.CompleteLifecycleRequest @($HostState.Layout.StateRoot,$request) 0
             Invoke-CcodSupervisorAdapter $Adapters.RequestUiExit @($HostState.Tray) 0
             $HostState.ShutdownRequested=$true;$HostState.LifecycleRequest=$null
             return
         }catch{
-            if($markerWritten){try{Invoke-CcodSupervisorAdapter $Adapters.ClearSafeExitIntent @($HostState.Layout.StateRoot) 0|Out-Null}catch{}}
+            if($markerWritten){Invoke-CcodSupervisorAdapter $Adapters.ClearSafeExitIntent @($HostState.Layout.StateRoot) 0|Out-Null}
             $HostState.ProtectionState='Running';$request.error='SAFE_EXIT_RECOVERY_FAILED'
             try{Invoke-CcodSupervisorAdapter $Adapters.WriteLifecycleRequest @($HostState.Layout.StateRoot,$request) 0}catch{}
             [void](Complete-CcodSupervisorLifecycleTrayAction $HostState $Adapters $request $false 'SAFE_EXIT_RECOVERY_FAILED')

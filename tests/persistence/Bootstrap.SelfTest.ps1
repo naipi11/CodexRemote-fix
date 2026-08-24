@@ -251,15 +251,23 @@ $results = @()
 
 $results += Invoke-CcodTest 'marker policy deterministically suppresses only the same trusted Task logon' {
     # Production mutation caught: starting a supervisor on same-logon retry or suppressing a new logon.
-    $calls=[Collections.Generic.List[string]]::new();$intent=[pscustomobject]@{marker='valid'};$identity=[pscustomobject]@{logon='current'}
-    $adapters=@{ReadIntent={$calls.Add('Read');$intent};GetIdentity={$calls.Add('Identity');$identity};TestSameLogon={param($Value,$Current)$calls.Add('Compare');$true};Log={param($Message)$calls.Add("Log:$Message")};ConfirmReplacement={$true};EnterOwnership={$calls.Add('Enter');[pscustomobject]@{}};ExitOwnership={param($Lease)$calls.Add('Exit')};ClearIntent={$calls.Add('Clear')};ClearCorruptIntent={$calls.Add('ClearCorrupt')}}
+    $calls=[Collections.Generic.List[string]]::new();$intent=[pscustomobject]@{recoveryTransactionId='11111111-2222-3333-4444-555555555555'};$identity=[pscustomobject]@{logon='current'};$receipt=[pscustomobject]@{kind='SafeExit';transactionId=$intent.recoveryTransactionId;phase='Completed';error=$null}
+    $adapters=@{ReadIntent={$calls.Add('Read');$intent};GetIdentity={$calls.Add('Identity');$identity};TestSameLogon={param($Value,$Current)$calls.Add('Compare');$true};ReadActiveRequest={$calls.Add('Active');$null};ReadCompletionReceipt={param($Id)$calls.Add('Receipt');$receipt};Log={param($Message)$calls.Add("Log:$Message")};ConfirmReplacement={$true};EnterOwnership={$calls.Add('Enter');[pscustomobject]@{}};ExitOwnership={param($Lease)$calls.Add('Exit')};ClearIntent={$calls.Add('Clear')};ClearCorruptIntent={$calls.Add('ClearCorrupt')}}
     $same=Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Task -Adapters $adapters
     Assert-CcodExactEqual $true $same.Suppressed 'exact trusted Task marker suppresses startup'
-    Assert-CcodExactEqual 'Read|Identity|Compare|Log:SAFE_EXIT_SUPPRESSED' ($calls-join '|') 'suppression only reads compares and logs; it never launches or clears'
+    Assert-CcodExactEqual 'Read|Identity|Compare|Active|Receipt|Log:SAFE_EXIT_SUPPRESSED' ($calls-join '|') 'suppression requires completed receipt and never launches or clears'
     $calls.Clear();$adapters.TestSameLogon={param($Value,$Current)$calls.Add('Compare');$false}.GetNewClosure()
     $new=Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Task -Adapters $adapters
     Assert-CcodExactEqual $false $new.Suppressed 'new trusted identity is not suppressed'
     Assert-CcodExactEqual 'Read|Identity|Compare|Enter|Clear|Exit' ($calls-join '|') 'new trusted identity clears only under lifecycle ownership'
+}
+
+$results += Invoke-CcodTest 'active matching SafeExit marker resumes instead of suppressing Task startup' {
+    # Production mutation caught: suppressing the crash-after-marker active-request state.
+    $intent=[pscustomobject]@{recoveryTransactionId='22222222-2222-3333-4444-555555555555'};$active=[pscustomobject]@{kind='SafeExit';transactionId=$intent.recoveryTransactionId}
+    $adapters=@{ReadIntent={$intent};GetIdentity={[pscustomobject]@{}};TestSameLogon={param($a,$b)$true};ReadActiveRequest={$active};ReadCompletionReceipt={param($x)throw 'receipt must not be read'};Log={param($x)throw 'must not suppress'};ConfirmReplacement={$true};EnterOwnership={[pscustomobject]@{}};ExitOwnership={param($x){}};ClearIntent={};ClearCorruptIntent={}}
+    $result=Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Task -Adapters $adapters
+    Assert-CcodExactEqual $false $result.Suppressed 'pending matching SafeExit starts Supervisor for durable resume'
 }
 
 $results += Invoke-CcodTest 'marker policy requires positive Explicit confirmation before corrupt marker replacement' {
