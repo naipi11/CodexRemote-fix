@@ -122,12 +122,32 @@ function Assert-CcodLifecycleSubmissionAcl {
     try{
         $security=if($Directory){[IO.Directory]::GetAccessControl($Path)}else{[IO.File]::GetAccessControl($Path)}
         $owner=$security.GetOwner([Security.Principal.SecurityIdentifier]);$rules=@($security.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]));$expected=@($identity.User.Value,'S-1-5-18','S-1-5-32-544')
-        if($null-eq$identity.User -or $null-eq$owner -or $owner.Value-cne$identity.User.Value -or $rules.Count-ne 3 -or ($Directory -and -not$security.AreAccessRulesProtected)){
+        if($null-eq$identity.User -or $null-eq$owner -or $owner.Value-cne$identity.User.Value -or -not$security.AreAccessRulesProtected -or $rules.Count-ne 3){
             Throw-CcodLifecycleSubmissionError 'CCOD_LIFECYCLE_ACL_INVALID' 'Lifecycle inbox ACL is invalid' $Path
         }
-        foreach($rule in $rules){if($rule.AccessControlType-ne[Security.AccessControl.AccessControlType]::Allow -or $rule.FileSystemRights-ne[Security.AccessControl.FileSystemRights]::FullControl -or $expected-cnotcontains$rule.IdentityReference.Value){Throw-CcodLifecycleSubmissionError 'CCOD_LIFECYCLE_ACL_INVALID' 'Lifecycle inbox ACL is invalid' $Path}}
+        foreach($rule in $rules){if($rule.AccessControlType-ne[Security.AccessControl.AccessControlType]::Allow -or $rule.IsInherited -or $rule.FileSystemRights-ne[Security.AccessControl.FileSystemRights]::FullControl -or $expected-cnotcontains$rule.IdentityReference.Value){Throw-CcodLifecycleSubmissionError 'CCOD_LIFECYCLE_ACL_INVALID' 'Lifecycle inbox ACL is invalid' $Path}}
     }catch{if((Get-CcodLifecycleSubmissionErrorId $_)-ceq'CCOD_LIFECYCLE_ACL_INVALID'){throw};Throw-CcodLifecycleSubmissionError 'CCOD_LIFECYCLE_ACL_INVALID' 'Lifecycle inbox ACL could not be proven' $Path}
     finally{$identity.Dispose()}
+}
+
+function Get-CcodLifecycleSubmissionFileSecurity {
+    $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+    try{
+        if($null-eq$identity.User){Throw-CcodLifecycleSubmissionError 'CCOD_LIFECYCLE_ACL_INVALID' 'Current user SID is unavailable' $null}
+        $security=[Security.AccessControl.FileSecurity]::new();$security.SetOwner($identity.User);$security.SetAccessRuleProtection($true,$false)
+        foreach($sidValue in @($identity.User.Value,'S-1-5-18','S-1-5-32-544')){
+            [void]$security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sidValue),[Security.AccessControl.FileSystemRights]::FullControl,[Security.AccessControl.AccessControlType]::Allow))
+        }
+        return $security
+    }finally{$identity.Dispose()}
+}
+
+function Set-CcodLifecycleSubmissionFileAcl {
+    param([string]$Path)
+    try{
+        [IO.File]::SetAccessControl($Path,(Get-CcodLifecycleSubmissionFileSecurity))
+        Assert-CcodLifecycleSubmissionAcl $Path
+    }catch{if((Get-CcodLifecycleSubmissionErrorId $_)-ceq'CCOD_LIFECYCLE_ACL_INVALID'){throw};Throw-CcodLifecycleSubmissionError 'CCOD_LIFECYCLE_ACL_INVALID' 'Lifecycle submission file ACL could not be established' $Path}
 }
 
 function Get-CcodLifecycleInboxPath {
@@ -277,7 +297,7 @@ function Submit-CcodLifecycleRequest {
         $pending=@(Get-CcodLifecyclePendingFiles $inbox)
         if($pending.Count-ge$script:CcodLifecycleMaximumPending){return New-CcodLifecycleLocalReceipt $submissionId $false $null 'CCOD_LIFECYCLE_INBOX_FULL' $adapter}
         Write-CcodAtomicJsonIfAbsent -Path $requestPath -Value $submission
-        Assert-CcodLifecycleSubmissionAcl $requestPath
+        Set-CcodLifecycleSubmissionFileAcl $requestPath
     }catch{
         $id=Get-CcodLifecycleSubmissionErrorId $_
         $code=if($id-ceq'CCOD_ATOMIC_TARGET_EXISTS'){'CCOD_LIFECYCLE_SUBMISSION_DUPLICATE'}elseif($id-ceq'CCOD_LIFECYCLE_INBOX_FULL'){'CCOD_LIFECYCLE_INBOX_FULL'}elseif($id -in @('CCOD_LIFECYCLE_PATH_INVALID','CCOD_LIFECYCLE_ACL_INVALID')){'CCOD_LIFECYCLE_PATH_INVALID'}else{'CCOD_LIFECYCLE_SUBMISSION_FAILED'}
@@ -326,7 +346,7 @@ function Write-CcodLifecycleSubmissionReceipt {
     $receipt=New-CcodLifecycleLocalReceipt $SubmissionId $Accepted $TransactionId $ErrorCode $adapter
     $receiptPath=Get-CcodLifecycleSubmissionLeafPath $inbox $SubmissionId receipt;$requestPath=Get-CcodLifecycleSubmissionLeafPath $inbox $SubmissionId request
     Assert-CcodLifecycleSubmissionLeaf $receiptPath $inbox -AllowMissing
-    Write-CcodAtomicJson -Path $receiptPath -Value $receipt;Assert-CcodLifecycleSubmissionAcl $receiptPath
+    Write-CcodAtomicJson -Path $receiptPath -Value $receipt;Set-CcodLifecycleSubmissionFileAcl $receiptPath
     if([IO.File]::Exists($requestPath)){
         Assert-CcodLifecycleSubmissionLeaf $requestPath $inbox
         [IO.File]::Delete($requestPath)

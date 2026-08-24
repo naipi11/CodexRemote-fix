@@ -87,25 +87,13 @@ if ($failures.Count -eq 0) {
     try {
         # A failing child PowerShell writes a NativeCommandError to stderr. Capture
         # that test evidence and inspect its exit code instead of terminating before
-        # the failure report and targeted diagnostic can run.
+        # the consolidated failure report can run.
         $ErrorActionPreference = 'Continue'
         $persistenceOutput = & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $persistenceSelfTest 2>&1
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
     }
     if ($LASTEXITCODE -ne 0) {
-        $persistenceText = $persistenceOutput -join ' '
-        if ($persistenceText -match 'ASSERT_EQUAL: submission error code expected=\[\] actual=\[CCOD_LIFECYCLE_PATH_INVALID\]') {
-            $lifecycleProbe = Join-Path $PSScriptRoot 'persistence\Invoke-LifecycleRequestCiProbe.ps1'
-            if (Test-Path -LiteralPath $lifecycleProbe -PathType Leaf) {
-                Write-Host 'Lifecycle request CI probe follows:'
-                & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $lifecycleProbe
-            }
-        }
-        foreach ($line in @($persistenceOutput)) {
-            $text = [string]$line
-            if ($text -match 'CCOD_LIFECYCLE_TEST_DIAG_') { Write-Host $text }
-        }
         $failures.Add("Persistence self-test failed: $($persistenceOutput -join ' ')")
     }
 }

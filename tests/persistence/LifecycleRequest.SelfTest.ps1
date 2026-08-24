@@ -75,33 +75,31 @@ function Assert-CcodSubmissionReceipt {
     Assert-CcodEqual $timestamp $Receipt.completedAtUtc 'submission receipt time is canonical and deterministic'
 }
 
-function Get-CcodLifecycleSubmissionFailureDiagnostic {
-    param([string]$Root,[string]$SubmissionId)
-    $facts=[Collections.Generic.List[string]]::new()
-    $facts.Add(('host={0}:{1}' -f $PSVersionTable.PSEdition,$PSVersionTable.PSVersion))
+function Assert-CcodLifecycleSubmissionFileAcl {
+    param([string]$Path)
+    $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
     try {
-        $state=[IO.Path]::GetFullPath((Join-Path $Root 'state'))
-        $inbox=Resolve-CcodContainedPath -Root $state -RelativePath 'lifecycle\inbox' -AllowMissingLeaf
-        $facts.Add(('inboxExists={0}' -f [IO.Directory]::Exists($inbox)))
-        if ([IO.Directory]::Exists($inbox)) {
-            $item=Get-Item -LiteralPath $inbox -Force -ErrorAction Stop
-            $facts.Add(('inboxIsDirectory={0};inboxIsReparse={1}' -f $item.PSIsContainer,(($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)))
-            $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
-            try {
-                $security=[IO.Directory]::GetAccessControl($inbox)
-                $owner=$security.GetOwner([Security.Principal.SecurityIdentifier])
-                $rules=@($security.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
-                $expected=@($identity.User.Value,'S-1-5-18','S-1-5-32-544')
-                $allowlisted=@($rules | Where-Object { $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and $_.FileSystemRights -eq [Security.AccessControl.FileSystemRights]::FullControl -and $expected -ccontains $_.IdentityReference.Value }).Count
-                $facts.Add(('aclOwnerCurrent={0};aclProtected={1};aclRuleCount={2};aclAllowlistedFullControl={3};aclHasInherited={4}' -f ($null -ne $owner -and $owner.Value -ceq $identity.User.Value),$security.AreAccessRulesProtected,$rules.Count,$allowlisted,@($rules | Where-Object { $_.IsInherited }).Count))
-            } finally { $identity.Dispose() }
-            $requestPath=Join-Path $inbox ($SubmissionId + '.request.json')
-            $facts.Add(('requestExists={0}' -f [IO.File]::Exists($requestPath)))
+        $security=[IO.File]::GetAccessControl($Path)
+        $owner=$security.GetOwner([Security.Principal.SecurityIdentifier])
+        $rules=@($security.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+        $expected=@($identity.User.Value,'S-1-5-18','S-1-5-32-544')
+        Assert-CcodEqual $identity.User.Value $owner.Value 'submission file owner is the current user'
+        Assert-CcodTrue $security.AreAccessRulesProtected 'submission file inheritance is disabled'
+        Assert-CcodEqual 3 $rules.Count 'submission file ACL has only current user SYSTEM and Administrators'
+        foreach($rule in $rules){
+            Assert-CcodTrue ($expected -ccontains $rule.IdentityReference.Value) 'submission file ACL principal is allowlisted'
+            Assert-CcodEqual ([Security.AccessControl.AccessControlType]::Allow) $rule.AccessControlType 'submission file ACL contains only allows'
+            Assert-CcodEqual ([Security.AccessControl.FileSystemRights]::FullControl) $rule.FileSystemRights 'submission file ACL grants exact full control'
+            Assert-CcodEqual $false $rule.IsInherited 'submission file ACL has no inherited rules'
         }
-    } catch {
-        $facts.Add(('probeError={0}' -f (([string]$_.FullyQualifiedErrorId -split ',')[0])) )
-    }
-    return ($facts -join ';')
+    } finally { $identity.Dispose() }
+}
+
+function Set-CcodLifecycleSubmissionFixtureFileAcl {
+    param([string]$Path)
+    $module=Get-Module LifecycleRequest | Select-Object -First 1
+    [void](& $module { param($FilePath) [IO.File]::SetAccessControl($FilePath,(Get-CcodLifecycleSubmissionFileSecurity)) } $Path)
+    Assert-CcodLifecycleSubmissionFileAcl $Path
 }
 
 $results = [Collections.Generic.List[object]]::new()
@@ -118,15 +116,10 @@ $results.Add((Invoke-CcodTest 'submits one durable request and returns only its 
             Write-CcodLifecycleSubmissionReceipt -StateRoot (Join-Path $root 'state') -SubmissionId $submission.submissionId -Accepted $true -TransactionId $transactionId -ErrorCode $null -Adapters @{GetUtcNow={ [DateTime]::ParseExact($timestamp,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind) }.GetNewClosure()}
         }.GetNewClosure()
         $submitted=Submit-CcodLifecycleRequest -InstallRoot $root -Kind RestartAndRepair -Origin Installer -RuntimeId '2.5.0-a' -RuntimeGeneration 7 -TimeoutMilliseconds 5000 -Adapters (New-CcodSubmissionAdapters $submissionId $onSignal)
-        [Console]::Out.WriteLine('CCOD_LIFECYCLE_TEST_DIAG_seenErrorCode=' + [string]$submitted.errorCode)
-        if ($submitted.errorCode -ceq 'CCOD_LIFECYCLE_PATH_INVALID') {
-            foreach ($fact in ((Get-CcodLifecycleSubmissionFailureDiagnostic -Root $root -SubmissionId $submissionId) -split ';')) {
-                [Console]::Out.WriteLine('CCOD_LIFECYCLE_TEST_DIAG_' + $fact)
-            }
-        }
         Assert-CcodSubmissionReceipt $submitted $submissionId $true $transactionId $null
         Assert-CcodEqual 0 $controllerCalls 'submitter never runs controller recovery or apply'
         $inbox=Join-Path $root 'state\lifecycle\inbox'
+        Assert-CcodLifecycleSubmissionFileAcl (Join-Path $inbox ($submissionId+'.receipt.json'))
         Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath $inbox -Filter '*.request.json' -File).Count 'consumed request file is removed after receipt persistence'
         Assert-CcodEqual 1 @(Get-ChildItem -LiteralPath $inbox -Filter '*.receipt.json' -File).Count 'one correlated receipt remains durable'
     }finally{Remove-CcodLifecycleRequestTestRoot $root}
@@ -138,12 +131,15 @@ $results.Add((Invoke-CcodTest 'bounds the inbox at eight pending direct-child su
         $firstId='00000000-0000-0000-0000-000000000001'
         $first=Submit-CcodLifecycleRequest -InstallRoot $root -Kind CheckAndRepair -Origin Tray -RuntimeId '2.5.0-a' -RuntimeGeneration 7 -TimeoutMilliseconds 20 -Adapters (New-CcodSubmissionAdapters $firstId $null -OpenFails)
         Assert-CcodSubmissionReceipt $first $firstId $false $null 'CCOD_LIFECYCLE_SUPERVISOR_UNAVAILABLE'
+        Assert-CcodLifecycleSubmissionFileAcl (Join-Path $root ('state\lifecycle\inbox\'+$firstId+'.request.json'))
         $duplicate=Submit-CcodLifecycleRequest -InstallRoot $root -Kind CheckAndRepair -Origin Tray -RuntimeId '2.5.0-a' -RuntimeGeneration 7 -TimeoutMilliseconds 20 -Adapters (New-CcodSubmissionAdapters $firstId $null)
         Assert-CcodSubmissionReceipt $duplicate $firstId $false $null 'CCOD_LIFECYCLE_SUBMISSION_DUPLICATE'
         $inbox=Join-Path $root 'state\lifecycle\inbox'
         foreach($index in 2..8){
             $id=('00000000-0000-0000-0000-{0:D12}' -f $index)
-            Write-CcodAtomicJsonIfAbsent -Path (Join-Path $inbox ($id+'.request.json')) -Value (New-CcodSubmissionRecord $id)
+            $path=Join-Path $inbox ($id+'.request.json')
+            Write-CcodAtomicJsonIfAbsent -Path $path -Value (New-CcodSubmissionRecord $id)
+            Set-CcodLifecycleSubmissionFixtureFileAcl $path
         }
         $ninthId='00000000-0000-0000-0000-000000000009'
         $ninth=Submit-CcodLifecycleRequest -InstallRoot $root -Kind RestartAndRepair -Origin Installer -RuntimeId '2.5.0-a' -RuntimeGeneration 7 -TimeoutMilliseconds 20 -Adapters (New-CcodSubmissionAdapters $ninthId $null)
@@ -164,7 +160,9 @@ $results.Add((Invoke-CcodTest 'returns bounded failures for unavailable Supervis
             if($case.Stale){
                 $inbox=Join-Path $root 'state\lifecycle\inbox';[IO.Directory]::CreateDirectory($inbox)|Out-Null
                 $stale=[pscustomobject][ordered]@{schemaVersion=1;submissionId=$case.Id;accepted=$true;transactionId='11111111-2222-3333-4444-555555555555';errorCode=$null;completedAtUtc='2029-02-03T04:05:06.0000000Z'}
-                Write-CcodAtomicJson -Path (Join-Path $inbox ($case.Id+'.receipt.json')) -Value $stale
+                $path=Join-Path $inbox ($case.Id+'.receipt.json')
+                Write-CcodAtomicJson -Path $path -Value $stale
+                Set-CcodLifecycleSubmissionFixtureFileAcl $path
             }
             $parameters=@{InstallRoot=$root;Kind='CheckAndRepair';Origin='Tray';RuntimeId='2.5.0-a';RuntimeGeneration=[UInt64]7;TimeoutMilliseconds=20}
             $adapters=New-CcodSubmissionAdapters $case.Id $null -OpenFails:$case.Open -SignalFails:$case.Signal
