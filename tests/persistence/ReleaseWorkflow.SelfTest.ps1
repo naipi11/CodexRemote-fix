@@ -29,7 +29,7 @@ function New-CcodReleaseFixture {
         assets = $assets
     }
     [IO.File]::WriteAllText($manifest, ($record | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
-    return [pscustomobject]@{ Root = $root; Installer = $installer; Checksum = $checksum; Manifest = $manifest }
+    return [pscustomobject]@{ Root = $root; Installer = $installer; Checksum = $checksum; TrayHost = $trayHost; Manifest = $manifest }
 }
 
 Invoke-CcodTest 'release defender tool exposes manifest and scan functions without a live scan' {
@@ -50,6 +50,54 @@ Invoke-CcodTest 'release manifest binds the final asset names hashes version com
         Assert-CcodThrows {
             Test-CcodReleaseAssetManifest -ManifestPath $fixture.Manifest -AssetDirectory $fixture.Root -ExpectedVersion '2.5.0'
         } 'CCOD_RELEASE_ASSET_HASH_MISMATCH'
+    } finally {
+        if (Test-Path -LiteralPath $fixture.Root) { Remove-Item -LiteralPath $fixture.Root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'release timestamp validation reads the raw JSON string representation' {
+    . $defenderPath -Library
+    $canonical = '2026-08-24T00:00:00.0000000Z'
+    Assert-CcodEqual $canonical (Get-CcodReleaseDefenderRawJsonString -Json ('{"buildTimestampUtc":"' + $canonical + '"}') -PropertyName 'buildTimestampUtc') 'canonical raw timestamp is retained as text'
+    Assert-CcodEqual $null (Get-CcodReleaseDefenderRawJsonString -Json '{"buildTimestampUtc":123}' -PropertyName 'buildTimestampUtc') 'nonstring timestamp JSON is rejected'
+    Assert-CcodEqual $null (Get-CcodReleaseDefenderRawJsonString -Json ('{"buildTimestampUtc":"' + $canonical + '","buildTimestampUtc":"' + $canonical + '"}') -PropertyName 'buildTimestampUtc') 'duplicate timestamp JSON is rejected'
+    Assert-CcodEqual 'not-canonical' (Get-CcodReleaseDefenderRawJsonString -Json ('{"nested":{"buildTimestampUtc":"' + $canonical + '"},"buildTimestampUtc":"not-canonical"}') -PropertyName 'buildTimestampUtc') 'only the root timestamp property is selected'
+}
+
+Invoke-CcodTest 'release manifest rejects a numeric top-level timestamp hidden by a nested canonical timestamp' {
+    . $defenderPath -Library
+    $fixture = New-CcodReleaseFixture
+    try {
+        $canonical = '2026-08-24T00:00:00.0000000Z'
+        $maliciousProvenance = ('{"schemaVersion":1,"product":"CodexRemote-fix","version":"2.5.0","gitCommit":"' + ('a' * 40) + '","buildTimestampUtc":123,"nested":{"buildTimestampUtc":"' + $canonical + '"}}')
+        [IO.File]::WriteAllText($fixture.TrayHost, $maliciousProvenance, [Text.UTF8Encoding]::new($false))
+        $record = [IO.File]::ReadAllText($fixture.Manifest) | ConvertFrom-Json
+        $boundAsset = @($record.assets | Where-Object { $_.name -ceq [IO.Path]::GetFileName($fixture.TrayHost) })
+        Assert-CcodEqual 1 $boundAsset.Count 'fixture manifest binds the TrayHost provenance asset once'
+        $boundAsset[0].sha256 = Get-CcodTestFileSha256 -Path $fixture.TrayHost
+        [IO.File]::WriteAllText($fixture.Manifest, ($record | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows {
+            Test-CcodReleaseAssetManifest -ManifestPath $fixture.Manifest -AssetDirectory $fixture.Root -ExpectedVersion '2.5.0'
+        } 'CCOD_RELEASE_MANIFEST_INVALID'
+    } finally {
+        if (Test-Path -LiteralPath $fixture.Root) { Remove-Item -LiteralPath $fixture.Root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'release manifest binds the TrayHost provenance timestamp to its own timestamp' {
+    . $defenderPath -Library
+    $fixture = New-CcodReleaseFixture
+    try {
+        $mismatchedProvenance = ('{"schemaVersion":1,"product":"CodexRemote-fix","version":"2.5.0","gitCommit":"' + ('a' * 40) + '","buildTimestampUtc":"2026-08-24T00:00:01.0000000Z"}')
+        [IO.File]::WriteAllText($fixture.TrayHost, $mismatchedProvenance, [Text.UTF8Encoding]::new($false))
+        $record = [IO.File]::ReadAllText($fixture.Manifest) | ConvertFrom-Json
+        $boundAsset = @($record.assets | Where-Object { $_.name -ceq [IO.Path]::GetFileName($fixture.TrayHost) })
+        Assert-CcodEqual 1 $boundAsset.Count 'fixture manifest binds the TrayHost provenance asset once'
+        $boundAsset[0].sha256 = Get-CcodTestFileSha256 -Path $fixture.TrayHost
+        [IO.File]::WriteAllText($fixture.Manifest, ($record | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows {
+            Test-CcodReleaseAssetManifest -ManifestPath $fixture.Manifest -AssetDirectory $fixture.Root -ExpectedVersion '2.5.0'
+        } 'CCOD_RELEASE_MANIFEST_INVALID'
     } finally {
         if (Test-Path -LiteralPath $fixture.Root) { Remove-Item -LiteralPath $fixture.Root -Recurse -Force }
     }

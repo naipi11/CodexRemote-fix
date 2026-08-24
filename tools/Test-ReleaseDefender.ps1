@@ -44,6 +44,134 @@ function Test-CcodReleaseDefenderCanonicalUtc {
     return $parsed.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture) -ceq $Value
 }
 
+function Read-CcodReleaseDefenderJsonString {
+    param([Parameter(Mandatory)][string]$Json, [Parameter(Mandatory)][int]$Offset)
+    if ($Offset -ge $Json.Length -or $Json[$Offset] -ne [char]34) { return $null }
+    $builder = [Text.StringBuilder]::new()
+    [int]$index = $Offset + 1
+    [bool]$hasEscapes = $false
+    while ($index -lt $Json.Length) {
+        $character = $Json[$index]
+        if ($character -eq [char]34) {
+            return [pscustomobject]@{ Value = $builder.ToString(); End = $index + 1; HasEscapes = $hasEscapes }
+        }
+        if ($character -eq [char]92) {
+            $hasEscapes = $true
+            if (($index + 1) -ge $Json.Length) { return $null }
+            $null = $builder.Append($character)
+            $index++
+            $null = $builder.Append($Json[$index])
+            $index++
+            continue
+        }
+        if ([int][char]$character -lt 32) { return $null }
+        $null = $builder.Append($character)
+        $index++
+    }
+    return $null
+}
+
+function Skip-CcodReleaseDefenderJsonWhitespace {
+    param([Parameter(Mandatory)][string]$Json, [Parameter(Mandatory)][int]$Offset)
+    [int]$index = $Offset
+    while ($index -lt $Json.Length -and [char]::IsWhiteSpace($Json[$index])) { $index++ }
+    return $index
+}
+
+function Skip-CcodReleaseDefenderJsonValue {
+    param([Parameter(Mandatory)][string]$Json, [Parameter(Mandatory)][int]$Offset)
+    if ($Offset -ge $Json.Length) { return -1 }
+    $character = $Json[$Offset]
+    if ($character -eq [char]34) {
+        $token = Read-CcodReleaseDefenderJsonString -Json $Json -Offset $Offset
+        if ($null -eq $token) { return -1 }
+        return [int]$token.End
+    }
+    if ($character -eq [char]123 -or $character -eq [char]91) {
+        [int]$index = $Offset + 1
+        [int]$depth = 1
+        while ($index -lt $Json.Length -and $depth -gt 0) {
+            $nested = $Json[$index]
+            if ($nested -eq [char]34) {
+                $token = Read-CcodReleaseDefenderJsonString -Json $Json -Offset $index
+                if ($null -eq $token) { return -1 }
+                $index = [int]$token.End
+                continue
+            }
+            if ($nested -eq [char]123 -or $nested -eq [char]91) {
+                $depth++
+            } elseif ($nested -eq [char]125 -or $nested -eq [char]93) {
+                $depth--
+            }
+            $index++
+        }
+        if ($depth -ne 0) { return -1 }
+        return $index
+    }
+    [int]$primitiveStart = $Offset
+    [int]$index = $Offset
+    while ($index -lt $Json.Length) {
+        $current = $Json[$index]
+        if ($current -eq [char]44 -or $current -eq [char]125 -or $current -eq [char]93 -or [char]::IsWhiteSpace($current)) { break }
+        $index++
+    }
+    if ($index -eq $primitiveStart) { return -1 }
+    return $index
+}
+
+function Get-CcodReleaseDefenderRawJsonString {
+    param(
+        [Parameter(Mandatory)][string]$Json,
+        [Parameter(Mandatory)][ValidatePattern('^[A-Za-z][A-Za-z0-9]*$')][string]$PropertyName
+    )
+    [int]$index = Skip-CcodReleaseDefenderJsonWhitespace -Json $Json -Offset 0
+    if ($index -ge $Json.Length -or $Json[$index] -ne [char]123) { return $null }
+    $index++
+    [bool]$found = $false
+    $value = $null
+    while ($true) {
+        $index = Skip-CcodReleaseDefenderJsonWhitespace -Json $Json -Offset $index
+        if ($index -ge $Json.Length) { return $null }
+        if ($Json[$index] -eq [char]125) {
+            $index++
+            break
+        }
+        $key = Read-CcodReleaseDefenderJsonString -Json $Json -Offset $index
+        if ($null -eq $key) { return $null }
+        $index = [int]$key.End
+        $index = Skip-CcodReleaseDefenderJsonWhitespace -Json $Json -Offset $index
+        if ($index -ge $Json.Length -or $Json[$index] -ne [char]58) { return $null }
+        $index++
+        $index = Skip-CcodReleaseDefenderJsonWhitespace -Json $Json -Offset $index
+        $isTarget = -not $key.HasEscapes -and $key.Value -ceq $PropertyName
+        if ($isTarget) {
+            if ($found) { return $null }
+            $token = Read-CcodReleaseDefenderJsonString -Json $Json -Offset $index
+            if ($null -eq $token -or $token.HasEscapes) { return $null }
+            $value = $token.Value
+            $found = $true
+            $index = [int]$token.End
+        } else {
+            $index = Skip-CcodReleaseDefenderJsonValue -Json $Json -Offset $index
+            if ($index -lt 0) { return $null }
+        }
+        $index = Skip-CcodReleaseDefenderJsonWhitespace -Json $Json -Offset $index
+        if ($index -ge $Json.Length) { return $null }
+        if ($Json[$index] -eq [char]44) {
+            $index++
+            continue
+        }
+        if ($Json[$index] -eq [char]125) {
+            $index++
+            break
+        }
+        return $null
+    }
+    $index = Skip-CcodReleaseDefenderJsonWhitespace -Json $Json -Offset $index
+    if ($index -ne $Json.Length -or -not $found) { return $null }
+    return $value
+}
+
 function Assert-CcodReleaseDefenderRegularFile {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Kind)
     if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathRooted($Path)) {
@@ -154,15 +282,18 @@ function Test-CcodReleaseAssetManifest {
     )
     $manifestFile = Assert-CcodReleaseDefenderRegularFile -Path $ManifestPath -Kind 'Release manifest'
     $directory = Assert-CcodReleaseDefenderDirectory -Path $AssetDirectory -Kind 'Release asset directory'
-    try { $manifest = [IO.File]::ReadAllText($manifestFile) | ConvertFrom-Json -ErrorAction Stop }
+    $manifestRaw = [IO.File]::ReadAllText($manifestFile)
+    try { $manifest = $manifestRaw | ConvertFrom-Json -ErrorAction Stop }
     catch { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Release manifest is not valid JSON' $manifestFile }
+    $manifestTimestamp = Get-CcodReleaseDefenderRawJsonString -Json $manifestRaw -PropertyName 'buildTimestampUtc'
     $expectedFields = @('schemaVersion','product','version','gitCommit','buildTimestampUtc','assets')
     if ($null -eq $manifest -or (($manifest.PSObject.Properties.Name | Sort-Object) -join '|') -cne (($expectedFields | Sort-Object) -join '|') -or
         ($manifest.schemaVersion -isnot [int] -and $manifest.schemaVersion -isnot [long]) -or [int]$manifest.schemaVersion -ne 1 -or
         $manifest.product -isnot [string] -or $manifest.product -cne 'CodexRemote-fix' -or
         $manifest.version -isnot [string] -or $manifest.version -cne $ExpectedVersion -or
         $manifest.gitCommit -isnot [string] -or $manifest.gitCommit -cnotmatch '^[0-9a-f]{40}$' -or
-        $manifest.buildTimestampUtc -isnot [string] -or -not (Test-CcodReleaseDefenderCanonicalUtc $manifest.buildTimestampUtc)) {
+        ($manifest.buildTimestampUtc -isnot [string] -and $manifest.buildTimestampUtc -isnot [datetime]) -or
+        -not (Test-CcodReleaseDefenderCanonicalUtc $manifestTimestamp)) {
         Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Release manifest metadata does not have the required canonical shape' $manifestFile
     }
     $assets = @($manifest.assets)
@@ -197,22 +328,27 @@ function Test-CcodReleaseAssetManifest {
     if ($checksumText -cne ("{0} *{1}" -f $assetHashes[$expectedNames[0]], $expectedNames[0])) {
         Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Release checksum file is not bound to the manifest installer hash' $checksum
     }
-    try { $trayHost = [IO.File]::ReadAllText((Join-Path $directory $expectedNames[2])) | ConvertFrom-Json -ErrorAction Stop }
+    $trayHostFile = Join-Path $directory $expectedNames[2]
+    $trayHostRaw = [IO.File]::ReadAllText($trayHostFile)
+    try { $trayHost = $trayHostRaw | ConvertFrom-Json -ErrorAction Stop }
     catch { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'TrayHost provenance is not valid JSON' $expectedNames[2] }
     $trayHostVersion = $trayHost.PSObject.Properties['version']
     $trayHostCommit = $trayHost.PSObject.Properties['gitCommit']
     $trayHostTimestamp = $trayHost.PSObject.Properties['buildTimestampUtc']
+    $trayHostTimestampText = Get-CcodReleaseDefenderRawJsonString -Json $trayHostRaw -PropertyName 'buildTimestampUtc'
     if ($null -eq $trayHostVersion -or $null -eq $trayHostCommit -or $null -eq $trayHostTimestamp -or
         $trayHostVersion.Value -isnot [string] -or $trayHostVersion.Value -cne $ExpectedVersion -or
         $trayHostCommit.Value -isnot [string] -or $trayHostCommit.Value -cne $manifest.gitCommit -or
-        $trayHostTimestamp.Value -isnot [string] -or -not (Test-CcodReleaseDefenderCanonicalUtc $trayHostTimestamp.Value)) {
+        ($trayHostTimestamp.Value -isnot [string] -and $trayHostTimestamp.Value -isnot [datetime]) -or
+        -not (Test-CcodReleaseDefenderCanonicalUtc $trayHostTimestampText) -or
+        $trayHostTimestampText -cne $manifestTimestamp) {
         Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'TrayHost provenance is not bound to the release version, source commit, and timestamp' $expectedNames[2]
     }
     return [pscustomobject][ordered]@{
         Valid = $true
         Version = $ExpectedVersion
         GitCommit = [string]$manifest.gitCommit
-        BuildTimestampUtc = [string]$manifest.buildTimestampUtc
+        BuildTimestampUtc = $manifestTimestamp
         InstallerSha256 = [string]$assetHashes[$expectedNames[0]]
         InstallerName = $expectedNames[0]
     }
