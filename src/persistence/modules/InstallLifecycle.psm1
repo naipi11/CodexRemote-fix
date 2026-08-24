@@ -46,6 +46,12 @@ function Test-CcodActivationExactProperties {
     return $true
 }
 
+function Test-CcodLifecycleCanonicalGuid {
+    param($Value)
+    $parsed = [guid]::Empty
+    return $Value -is [string] -and [guid]::TryParseExact($Value, 'D', [ref]$parsed) -and $parsed.ToString('D') -ceq $Value
+}
+
 function Assert-CcodActivationReceipt {
     param($Receipt)
     if (-not (Test-CcodActivationExactProperties $Receipt) -or
@@ -460,7 +466,8 @@ function Write-CcodLifecycleLog {
         [Parameter(Mandatory)][hashtable]$Adapters,
         [Parameter(Mandatory)][string]$Stage,
         [Parameter(Mandatory)][string]$Code,
-        [Parameter(Mandatory)][string]$Outcome
+        [Parameter(Mandatory)][string]$Outcome,
+        [switch]$ThrowOnFailure
     )
 
     try {
@@ -475,6 +482,7 @@ function Write-CcodLifecycleLog {
         }
         & $Adapters.WriteLog $InstallRoot $record
     } catch {
+        if ($ThrowOnFailure) { throw }
     }
 }
 
@@ -1190,6 +1198,9 @@ function Invoke-CcodInstall {
     }
 
     if ([string]::IsNullOrWhiteSpace($ActivationId)) { $ActivationId = & $adapters.NewActivationId }
+    if (-not (Test-CcodLifecycleCanonicalGuid $ActivationId)) {
+        Throw-CcodLifecycleError 'CCOD_ACTIVATION_ID_INVALID' 'ActivationId must be a canonical lowercase GUID' $null
+    }
     $startedAt = & $adapters.UtcNow
     if ($startedAt -isnot [DateTime]) { Throw-CcodLifecycleError 'CCOD_INSTALL_CLOCK_INVALID' 'Activation clock must return DateTime' $null }
     $activation = [pscustomobject]@{
@@ -1223,8 +1234,8 @@ function Invoke-CcodInstall {
             if ($null -ne $oldSupervisor -and -not (Stop-CcodLifecycleSupervisor -InstallRoot $root -Adapters $adapters -Identity $oldSupervisor)) {
                 Throw-CcodLifecycleError 'CCOD_INSTALL_PREVIOUS_RUNTIME_BUSY' 'The verified previous Supervisor did not exit exactly' $null
             }
-            [void](Assert-CcodLifecycleTaskIdle -Adapters $adapters)
             $previousProtectionStopped = $true
+            [void](Assert-CcodLifecycleTaskIdle -Adapters $adapters)
             $installLease = & $adapters.EnterInstallLease $identity.UserSid
             if ($null -eq $installLease -or $installLease.Outcome -isnot [string] -or @('Acquired', 'TimedOut') -cnotcontains $installLease.Outcome) {
                 Throw-CcodLifecycleError 'CCOD_INSTALL_LEASE_INVALID' 'The installation lease contract is invalid' $installLease
@@ -1320,7 +1331,11 @@ function Invoke-CcodInstall {
                 try { Write-CcodLifecycleLog -InstallRoot $root -Adapters $adapters -Stage 'OldRuntimeCleanup' -Code 'CCOD_INSTALL_OLD_RUNTIME_CLEANUP_FAILED' -Outcome 'Retained' } catch { }
             }
         }
-        Write-CcodLifecycleLog -InstallRoot $root -Adapters $adapters -Stage $(if ($upgrade) { 'Upgrade' } else { 'Install' }) -Code 'CCOD_INSTALL_COMPLETED' -Outcome $(if ($upgrade) { 'Upgraded' } else { 'Installed' })
+        try {
+            Write-CcodLifecycleLog -InstallRoot $root -Adapters $adapters -Stage $(if ($upgrade) { 'Upgrade' } else { 'Install' }) -Code 'CCOD_INSTALL_COMPLETED' -Outcome $(if ($upgrade) { 'Upgraded' } else { 'Installed' }) -ThrowOnFailure
+        } catch {
+            try { Write-CcodLifecycleLog -InstallRoot $root -Adapters $adapters -Stage 'PostReady' -Code 'CCOD_INSTALL_POST_READY_LOG_FAILED' -Outcome 'ReadyRetained' } catch { }
+        }
     } catch {
         $caught = $_
         $errorCode = Get-CcodLifecycleErrorId $caught

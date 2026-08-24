@@ -49,11 +49,35 @@ function Write-CcodActivationRecord {
     } catch { }
 }
 
+function Assert-CcodActivationReceiptPathSafe {
+    param([Parameter(Mandatory)][string]$Root,[Parameter(Mandatory)][string]$Path)
+    $canonicalRoot = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $canonicalPath = [IO.Path]::GetFullPath($Path)
+    $prefix = $canonicalRoot + [IO.Path]::DirectorySeparatorChar
+    if (-not ($canonicalPath -ceq $canonicalRoot -or $canonicalPath.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase))) {
+        throw 'CCOD_ACTIVATION_RECEIPT_INVALID'
+    }
+    $current = $canonicalPath
+    while ($true) {
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'CCOD_ACTIVATION_RECEIPT_INVALID'
+        }
+        if ($current -ceq $canonicalRoot) { break }
+        $parent = Split-Path $current -Parent
+        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $current) {
+            throw 'CCOD_ACTIVATION_RECEIPT_INVALID'
+        }
+        $current = $parent
+    }
+}
+
 function Read-CcodTerminalActivationReceipt {
     param([Parameter(Mandatory)][string]$Root,[Parameter(Mandatory)][string]$ExpectedActivationId)
     $path = Join-Path $Root 'state\post-install-activation.json'
     if (-not [IO.File]::Exists($path)) { throw 'CCOD_ACTIVATION_RECEIPT_MISSING' }
     try {
+        Assert-CcodActivationReceiptPathSafe -Root $Root -Path $path
         $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
         if ($item -isnot [IO.FileInfo] -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
             $item.Length -le 0 -or $item.Length -gt $script:CcodActivationReceiptMaximumBytes) { throw 'invalid receipt file' }
