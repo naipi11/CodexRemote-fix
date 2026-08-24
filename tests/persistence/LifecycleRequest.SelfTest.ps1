@@ -75,6 +75,35 @@ function Assert-CcodSubmissionReceipt {
     Assert-CcodEqual $timestamp $Receipt.completedAtUtc 'submission receipt time is canonical and deterministic'
 }
 
+function Get-CcodLifecycleSubmissionFailureDiagnostic {
+    param([string]$Root,[string]$SubmissionId)
+    $facts=[Collections.Generic.List[string]]::new()
+    $facts.Add(('host={0}:{1}' -f $PSVersionTable.PSEdition,$PSVersionTable.PSVersion))
+    try {
+        $state=[IO.Path]::GetFullPath((Join-Path $Root 'state'))
+        $inbox=Resolve-CcodContainedPath -Root $state -RelativePath 'lifecycle\inbox' -AllowMissingLeaf
+        $facts.Add(('inboxExists={0}' -f [IO.Directory]::Exists($inbox)))
+        if ([IO.Directory]::Exists($inbox)) {
+            $item=Get-Item -LiteralPath $inbox -Force -ErrorAction Stop
+            $facts.Add(('inboxIsDirectory={0};inboxIsReparse={1}' -f $item.PSIsContainer,(($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)))
+            $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+            try {
+                $security=[IO.Directory]::GetAccessControl($inbox)
+                $owner=$security.GetOwner([Security.Principal.SecurityIdentifier])
+                $rules=@($security.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+                $expected=@($identity.User.Value,'S-1-5-18','S-1-5-32-544')
+                $allowlisted=@($rules | Where-Object { $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and $_.FileSystemRights -eq [Security.AccessControl.FileSystemRights]::FullControl -and $expected -ccontains $_.IdentityReference.Value }).Count
+                $facts.Add(('aclOwnerCurrent={0};aclProtected={1};aclRuleCount={2};aclAllowlistedFullControl={3};aclHasInherited={4}' -f ($null -ne $owner -and $owner.Value -ceq $identity.User.Value),$security.AreAccessRulesProtected,$rules.Count,$allowlisted,@($rules | Where-Object { $_.IsInherited }).Count))
+            } finally { $identity.Dispose() }
+            $requestPath=Join-Path $inbox ($SubmissionId + '.request.json')
+            $facts.Add(('requestExists={0}' -f [IO.File]::Exists($requestPath)))
+        }
+    } catch {
+        $facts.Add(('probeError={0}' -f (([string]$_.FullyQualifiedErrorId -split ',')[0])) )
+    }
+    return ($facts -join ';')
+}
+
 $results = [Collections.Generic.List[object]]::new()
 
 $results.Add((Invoke-CcodTest 'submits one durable request and returns only its correlated accepted receipt without controller mutation' {
@@ -89,6 +118,9 @@ $results.Add((Invoke-CcodTest 'submits one durable request and returns only its 
             Write-CcodLifecycleSubmissionReceipt -StateRoot (Join-Path $root 'state') -SubmissionId $submission.submissionId -Accepted $true -TransactionId $transactionId -ErrorCode $null -Adapters @{GetUtcNow={ [DateTime]::ParseExact($timestamp,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind) }.GetNewClosure()}
         }.GetNewClosure()
         $submitted=Submit-CcodLifecycleRequest -InstallRoot $root -Kind RestartAndRepair -Origin Installer -RuntimeId '2.5.0-a' -RuntimeGeneration 7 -TimeoutMilliseconds 5000 -Adapters (New-CcodSubmissionAdapters $submissionId $onSignal)
+        if ($submitted.errorCode -ceq 'CCOD_LIFECYCLE_PATH_INVALID') {
+            Write-Output ('CCOD_LIFECYCLE_TEST_DIAGNOSTIC: ' + (Get-CcodLifecycleSubmissionFailureDiagnostic -Root $root -SubmissionId $submissionId))
+        }
         Assert-CcodSubmissionReceipt $submitted $submissionId $true $transactionId $null
         Assert-CcodEqual 0 $controllerCalls 'submitter never runs controller recovery or apply'
         $inbox=Join-Path $root 'state\lifecycle\inbox'
