@@ -209,7 +209,10 @@ function New-CcodAuthorizedRuntimeFixture {
     foreach ($relative in @(
         'src\persistence\StaticProbeWorker.ps1',
         'src\persistence\modules\RuntimeManifest.psm1',
+        'src\persistence\modules\LifecycleEpoch.psm1',
+        'src\persistence\modules\KernelObjects.psm1',
         'src\persistence\modules\PersistenceIO.psm1',
+        'src\persistence\modules\TrustedLogonIdentity.psm1',
         'src\persistence\modules\StateStore.psm1',
         'src\persistence\modules\CompatibilityProbe.psm1',
         'src\persistence\modules\ProcessControl.psm1',
@@ -515,6 +518,13 @@ try {
         Complete-CcodStaticProbeRuntimeAuthorization -Context $context -RuntimeApi $api|Out-Null
         foreach($forbidden in @('Start-CcodProcess','Stop-CcodProcessIfMatch','Write-CcodSettings','Write-CcodStatus','Write-CcodVerifiedPackages','Set-CcodAutomationEnabled','Set-CcodCandidateCompatibleOptIn','ProcessControl\Start-CcodProcess','ProcessControl\Stop-CcodProcessIfMatch','StateStore\Write-CcodSettings','StateStore\Write-CcodStatus','StateStore\Write-CcodVerifiedPackages')){Assert-CcodEqual $null (Get-Command $forbidden -ErrorAction SilentlyContinue) "$forbidden is unreachable after private binding"}
         foreach($path in @($api.ModulePaths.PSObject.Properties.Value)){Assert-CcodEqual 0 @(Get-Module|Where-Object{$_.Path -ceq $path}).Count "$path is unloaded after binding"}
+    }
+
+    Invoke-CcodTest 'authorizes the trusted logon module required by the StateStore import closure' {
+        $fixture=New-CcodAuthorizedRuntimeFixture -Root (Join-Path $root 'trusted-logon-runtime-closure')
+        [IO.File]::AppendAllText((Join-Path $fixture.RuntimeRoot 'src\persistence\modules\TrustedLogonIdentity.psm1'), "`n# unverified mutation", [Text.UTF8Encoding]::new($false))
+
+        Assert-CcodThrows { Get-CcodStaticProbeRuntimeAuthorization -ScriptPath $fixture.WorkerPath | Out-Null } 'CCOD_STATIC_RUNTIME_UNAUTHORIZED'
     }
 
     Invoke-CcodTest 'production defaults import the verified runtime before strict request read and atomic result write' {
@@ -1291,10 +1301,10 @@ try {
 
     if($round2RedFailures.Count -gt 0){throw ("TASK10C1_ROUND2_RED:`n"+($round2RedFailures -join "`n"))}
 
-    Invoke-CcodTest 'AST exposes only the two CLI paths and no forbidden mutation surface' {
+    Invoke-CcodTest 'AST exposes only framing inputs with no forbidden mutation surface' {
         $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($workerScript,[ref]$tokens,[ref]$errors)
         Assert-CcodEqual 0 @($errors).Count 'worker parses without errors'
-        Assert-CcodEqual 'RequestPath,ResultPath' (($ast.ParamBlock.Parameters.Name.VariablePath.UserPath)-join ',') 'production CLI exposes only framing paths'
+        Assert-CcodEqual 'RequestPath,ResultPath' (($ast.ParamBlock.Parameters.Name.VariablePath.UserPath)-join ',') 'production CLI exposes only framing inputs'
         $paramNames=@($ast.FindAll({param($node)$node -is [Management.Automation.Language.ParameterAst]},$true)|ForEach-Object{$_.Name.VariablePath.UserPath})
         Assert-CcodEqual 0 @($paramNames|Where-Object{$_ -ieq 'Pid'}).Count 'worker avoids the read-only automatic PID variable name'
         $forbidden=@('SessionEngine.psm1','TransitionJournal.psm1','SessionController.ps1','Invoke-CcodApplySession','Invoke-CcodRepairRenderer','Invoke-CcodRecoverSession','Start-CcodProcess','Stop-CcodProcessIfMatch','Start-Process','Stop-Process','Write-CcodSettings','Write-CcodStatus','Write-CcodVerifiedPackages','Set-CcodAutomationEnabled','Set-CcodCandidateCompatibleOptIn')

@@ -16,7 +16,7 @@ internal enum TrayHostMessageType : ushort
     Presentation = 3,
     PresentationAck = 4,
     Action = 5,
-    ActionAck = 6,
+    ActionResult = 6,
     Ping = 7,
     Pong = 8,
     Shutdown = 9,
@@ -28,16 +28,13 @@ internal enum TrayHostMessageType : ushort
 public enum TrayCommand : ushort
 {
     None = 0,
-    ApplyNow = 1001,
-    ManualRetry = 1002,
-    SetAutomation = 1003,
-    SetCandidateOptIn = 1004,
-    SetLanguageSystem = 1005,
-    SetLanguageChinese = 1006,
-    SetLanguageEnglish = 1007,
-    OpenLogs = 1008,
-    ConfirmUninstall = 1009,
-    ShowAbout = 1010
+    CheckAndRepair = 2001,
+    SetLanguageSystem = 2002,
+    SetLanguageChinese = 2003,
+    SetLanguageEnglish = 2004,
+    OpenLogs = 2005,
+    ShowAbout = 2006,
+    Exit = 2007
 }
 
 internal sealed class ProtocolViolationException : IOException
@@ -129,6 +126,7 @@ internal static class HkdfSha256
 
 internal static class ProtocolCodec
 {
+    internal const ushort ProtocolMajor = 2;
     internal const int HeaderSize = 60;
     internal const int MaximumPayload = 16 * 1024;
     private static readonly byte[] Magic = new byte[] { (byte)'C', (byte)'R', (byte)'T', (byte)'H' };
@@ -139,7 +137,7 @@ internal static class ProtocolCodec
         {
             throw new ProtocolViolationException("handshake key material is invalid");
         }
-        byte[] label = Encoding.ASCII.GetBytes("CodexRemote.TrayHost/v1");
+        byte[] label = Encoding.ASCII.GetBytes("CodexRemote.TrayHost/v2");
         byte[] saltInput = new byte[label.Length + 32 + 32 + 8];
         Buffer.BlockCopy(label, 0, saltInput, 0, label.Length);
         Buffer.BlockCopy(parentChallenge, 0, saltInput, label.Length, 32);
@@ -147,8 +145,8 @@ internal static class ProtocolCodec
         WriteUInt64(saltInput, label.Length + 64, hostEpoch);
         byte[] salt;
         using (SHA256 sha = SHA256.Create()) { salt = sha.ComputeHash(saltInput); }
-        byte[] p2h = HkdfSha256.Derive(sessionSeed, salt, Encoding.ASCII.GetBytes("CodexRemote.TrayHost/v1/parent-to-host"), 32);
-        byte[] h2p = HkdfSha256.Derive(sessionSeed, salt, Encoding.ASCII.GetBytes("CodexRemote.TrayHost/v1/host-to-parent"), 32);
+        byte[] p2h = HkdfSha256.Derive(sessionSeed, salt, Encoding.ASCII.GetBytes("CodexRemote.TrayHost/v2/parent-to-host"), 32);
+        byte[] h2p = HkdfSha256.Derive(sessionSeed, salt, Encoding.ASCII.GetBytes("CodexRemote.TrayHost/v2/host-to-parent"), 32);
         return new SessionKeys(p2h, h2p, hostEpoch);
     }
 
@@ -205,7 +203,7 @@ internal static class ProtocolCodec
         uint payloadLength = BitConverter.ToUInt32(header, 8);
         ulong epoch = BitConverter.ToUInt64(header, 12);
         ulong sequence = BitConverter.ToUInt64(header, 20);
-        if (version != 1 || payloadLength > MaximumPayload) { throw new ProtocolViolationException("frame header is invalid"); }
+        if (version != ProtocolMajor || payloadLength > MaximumPayload) { throw new ProtocolViolationException("frame header is invalid"); }
         if (bootstrap != (epoch == 0UL && sequence == 0UL)) { throw new ProtocolViolationException("frame phase is invalid"); }
         if (!bootstrap && (epoch != expectedEpoch || sequence != expectedSequence)) { throw new ProtocolViolationException("frame replay identity is invalid"); }
         byte[] tag = new byte[32];
@@ -237,7 +235,7 @@ internal static class ProtocolCodec
     {
         byte[] header = new byte[HeaderSize];
         Buffer.BlockCopy(Magic, 0, header, 0, 4);
-        WriteUInt16(header, 4, 1);
+        WriteUInt16(header, 4, ProtocolMajor);
         WriteUInt16(header, 6, (ushort)frame.MessageType);
         WriteUInt32(header, 8, (uint)frame.Payload.Length);
         WriteUInt64(header, 12, frame.Epoch);

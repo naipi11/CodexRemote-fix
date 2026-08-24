@@ -12,7 +12,7 @@ Import-Module (Join-Path $moduleRoot 'TransitionJournal.psm1') -Force
 $script:CcodSessionStableErrorCodes=@(
     'BRIDGE_PROOF_INCOMPLETE',
     'CCOD_ATOMIC_NAME_EXHAUSTED','CCOD_ATOMIC_NAME_INVALID','CCOD_ATOMIC_RECOVERY_FAILED','CCOD_ATOMIC_REPLACE_FAILED',
-    'CCOD_BRIDGE_JSON_INVALID','CCOD_CLOCK_INVALID','CCOD_CLOSE_UNPROVEN','CCOD_CODEX_HOME_INVALID',
+    'CCOD_BRIDGE_JSON_INVALID','CCOD_CLOCK_INVALID','CCOD_CLOSE_UNPROVEN','CCOD_CODEX_HOME_INVALID','CCOD_LIFECYCLE_FENCE_STALE',
     'CCOD_LIVE_PROBE_INVALID','CCOD_LIVE_PROBE_MISMATCH','CCOD_LIVE_PROBE_REQUIRED','CCOD_LOG_ENTRY_TOO_LARGE',
     'CCOD_MAIN_INSPECTOR_OPEN','CCOD_NODE_CANDIDATE_INVALID','CCOD_PATH_MISSING','CCOD_PATH_OUTSIDE_ROOT','CCOD_PATHS_INVALID',
     'CCOD_PORT_UNAVAILABLE','CCOD_RECOVERY_UNPROVEN','CCOD_REPARSE_PATH','CCOD_REPLAY_INPUT_INVALID','CCOD_REQUEST_INVALID',
@@ -54,6 +54,15 @@ function Test-CcodSessionCanonicalGuid([object]$Value) {
     return [guid]::TryParseExact($Value, 'D', [ref]$parsed) -and $parsed.ToString('D') -ceq $Value
 }
 
+function Test-CcodSessionPositiveUInt64([object]$Value) {
+    if ($Value -isnot [byte] -and $Value -isnot [uint16] -and $Value -isnot [uint32] -and $Value -isnot [uint64] -and
+        $Value -isnot [sbyte] -and $Value -isnot [int16] -and $Value -isnot [int32] -and $Value -isnot [int64] -and $Value -isnot [decimal]) { return $false }
+    try {
+        $number=[decimal]$Value
+        return $number -ge 1 -and $number -le [decimal][UInt64]::MaxValue -and [decimal]::Truncate($number) -eq $number
+    } catch { return $false }
+}
+
 function Assert-CcodSessionSnapshot {
     param($Snapshot)
     Assert-CcodSessionExactProperties $Snapshot @('Pid','CreationTimeUtc','SessionId','UserSid','Path','PackageFamilyName','CommandLine','ParentPid','IsTopLevel','Mode','RendererPort','MainPort') 'CCOD_REQUEST_INVALID' 'source'
@@ -76,15 +85,29 @@ function Assert-CcodSessionSnapshot {
 
 function Assert-CcodSessionRequest {
     param($Request, [string]$ExpectedAction)
-    Assert-CcodSessionExactProperties $Request @('schemaVersion','action','transactionId','runtimeId','supervisorIdentity','source','existingOnly','rendererPort','mainPort','timeoutMilliseconds','restartOrdinary') 'CCOD_REQUEST_INVALID' 'request'
-    if (($Request.schemaVersion -isnot [int] -and $Request.schemaVersion -isnot [long]) -or $Request.schemaVersion -ne 1 -or
-        $Request.action -isnot [string] -or @('Inspect','Apply','RepairStale','RepairRenderer','Recover') -cnotcontains $Request.action -or
+    $schema2=$null -ne $Request -and $null -ne $Request.PSObject.Properties['schemaVersion'] -and $Request.schemaVersion -eq 2
+    if($schema2){
+        Assert-CcodSessionExactProperties $Request @('schemaVersion','action','transactionId','runtimeId','runtimeGeneration','leaseEpoch','ownerIdentity','supervisorIdentity','source','existingOnly','rendererPort','mainPort','timeoutMilliseconds','restartOrdinary') 'CCOD_REQUEST_INVALID' 'request'
+    }else{
+        Assert-CcodSessionExactProperties $Request @('schemaVersion','action','transactionId','runtimeId','supervisorIdentity','source','existingOnly','rendererPort','mainPort','timeoutMilliseconds','restartOrdinary') 'CCOD_REQUEST_INVALID' 'request'
+    }
+    $allowed=if($schema2){@('Inspect','Close','Apply','RepairRenderer')}else{@('Inspect','Apply','RepairStale','RepairRenderer','Recover')}
+    if (($Request.schemaVersion -isnot [int] -and $Request.schemaVersion -isnot [long]) -or @([int]1,[int]2) -cnotcontains [int]$Request.schemaVersion -or
+        $Request.action -isnot [string] -or $allowed -cnotcontains $Request.action -or
         $Request.action -cne $ExpectedAction -or -not (Test-CcodSessionCanonicalGuid $Request.transactionId) -or
         $Request.runtimeId -isnot [string] -or [string]::IsNullOrWhiteSpace($Request.runtimeId) -or
         $Request.existingOnly -isnot [bool] -or $Request.restartOrdinary -isnot [bool] -or
         ($Request.timeoutMilliseconds -isnot [int] -and $Request.timeoutMilliseconds -isnot [long]) -or
         $Request.timeoutMilliseconds -lt 500 -or $Request.timeoutMilliseconds -gt 120000) {
         Throw-CcodSessionError 'CCOD_REQUEST_INVALID' 'request scalar fields are invalid' $Request
+    }
+    if($schema2){
+        Assert-CcodSessionExactProperties $Request.ownerIdentity @('pid','creationTimeUtc') 'CCOD_REQUEST_INVALID' 'ownerIdentity'
+        if(-not (Test-CcodSessionPositiveUInt64 $Request.runtimeGeneration) -or -not (Test-CcodSessionPositiveUInt64 $Request.leaseEpoch) -or
+            ($Request.ownerIdentity.pid -isnot [int] -and $Request.ownerIdentity.pid -isnot [long]) -or $Request.ownerIdentity.pid -lt 1 -or $Request.ownerIdentity.pid -gt [int]::MaxValue -or
+            -not (Test-CcodSessionCanonicalUtc $Request.ownerIdentity.creationTimeUtc)){
+            Throw-CcodSessionError 'CCOD_REQUEST_INVALID' 'lifecycle fence fields are invalid' $Request
+        }
     }
     Assert-CcodSessionExactProperties $Request.supervisorIdentity @('pid','creationTimeUtc','sessionId') 'CCOD_REQUEST_INVALID' 'supervisorIdentity'
     if (($Request.supervisorIdentity.pid -isnot [int] -and $Request.supervisorIdentity.pid -isnot [long]) -or
@@ -113,6 +136,12 @@ function Assert-CcodSessionRequest {
                 Throw-CcodSessionError 'CCOD_REQUEST_INVALID' 'Apply fields are inconsistent' $Request
             }
         }
+        'Close' {
+            if (-not $Request.existingOnly -or $Request.restartOrdinary -or $null -ne $Request.rendererPort -or $null -ne $Request.mainPort -or
+                ($null -ne $Request.source -and (-not $Request.source.IsTopLevel -or @('Ordinary','Special') -cnotcontains $Request.source.Mode))) {
+                Throw-CcodSessionError 'CCOD_REQUEST_INVALID' 'Close fields are inconsistent' $Request
+            }
+        }
         'RepairStale' {
             if ($null -eq $Request.source -or -not $Request.existingOnly -or -not $Request.restartOrdinary -or
                 -not $Request.source.IsTopLevel -or $Request.source.Mode -cne 'Unrelated' -or
@@ -133,6 +162,33 @@ function Assert-CcodSessionRequest {
             }
         }
     }
+}
+
+function Test-CcodSessionLifecycleFenceFailure($Record) {
+    if($null -eq $Record){return $false}
+    $code=[string]$Record.FullyQualifiedErrorId
+    if($code.Contains(',')){$code=$code.Split(',')[0]}
+    return $code -ceq 'CCOD_LIFECYCLE_FENCE_STALE'
+}
+
+function Assert-CcodSessionMutationFence {
+    param($Request,[hashtable]$Adapter)
+    if($Request.schemaVersion -ne 2){return}
+    if($null -eq $Adapter -or -not $Adapter.ContainsKey('AssertLifecycleFence') -or $null -eq $Adapter.AssertLifecycleFence){
+        Throw-CcodSessionError 'CCOD_LIFECYCLE_FENCE_STALE' 'Lifecycle mutation lacks an exact fence assertion' $Request.ownerIdentity
+    }
+    try{[void](& $Adapter.AssertLifecycleFence $Request.runtimeGeneration $Request.leaseEpoch $Request.ownerIdentity)}catch{
+        if(Test-CcodSessionLifecycleFenceFailure $_){throw}
+        Throw-CcodSessionError 'CCOD_LIFECYCLE_FENCE_STALE' 'Lifecycle fence could not be revalidated' $Request.ownerIdentity
+    }
+}
+
+function Invoke-CcodSessionMutation {
+    param($Request,[hashtable]$Adapter,[Parameter(Mandatory)][string]$Operation,[AllowEmptyCollection()][object[]]$Arguments=@())
+    Assert-CcodSessionMutationFence $Request $Adapter
+    if(-not $Adapter.ContainsKey($Operation) -or $null -eq $Adapter[$Operation]){Throw-CcodSessionError 'CCOD_SESSION_FAILED' "Mutation adapter $Operation is unavailable" $null}
+    $callback=$Adapter[$Operation]
+    return & $callback @Arguments
 }
 
 function Assert-CcodSessionPaths {
@@ -267,6 +323,7 @@ function ConvertTo-CcodPublicBridgeProbes {
 
 function Invoke-CcodSessionBridge {
     param(
+        $Request,
         [ValidateSet('Full','Renderer','Probe')][string]$Mode,
         [string]$NodePath,
         $Paths,
@@ -283,7 +340,8 @@ function Invoke-CcodSessionBridge {
     if($Mode -ceq 'Full'){
         $arguments+=@('--main-port',[string]$MainPort,'--main-payload',$Paths.MainPayloadPath)
     }
-    $invocation=& $Adapter.InvokeNode $NodePath $arguments
+    if($Mode -ceq 'Probe'){$invocation=& $Adapter.InvokeNode $NodePath $arguments}
+    else{$invocation=Invoke-CcodSessionMutation $Request $Adapter 'InvokeNode' @($NodePath,@($arguments))}
     return Test-CcodBridgeResult -Mode $Mode -Invocation $invocation
 }
 
@@ -310,7 +368,7 @@ function Get-CcodStageAwareSpecialObservation {
         if($outcome -ceq 'Confirmed' -and $candidates.Count -eq 1 -and $conflicts.Count -eq 0){$candidate=$candidates[0]}
         if($null -ne $candidate -and (Test-CcodReplaySpecialRoot $candidate $Transition $Probe $Request $Adapter)){
             $mode='Full'
-            try{$bridge=Invoke-CcodSessionBridge -Mode Full -NodePath $Probe.NodePath -Paths $Paths -RendererPort $Transition.rendererPort -MainPort $Transition.mainPort -TimeoutMilliseconds $Request.timeoutMilliseconds -Adapter $Adapter;$validation='Valid'}catch{$validation='Invalid'}
+            try{$bridge=Invoke-CcodSessionBridge -Request $Request -Mode Full -NodePath $Probe.NodePath -Paths $Paths -RendererPort $Transition.rendererPort -MainPort $Transition.mainPort -TimeoutMilliseconds $Request.timeoutMilliseconds -Adapter $Adapter;$validation='Valid'}catch{if(Test-CcodSessionLifecycleFenceFailure $_){throw};$validation='Invalid'}
         }elseif($null -ne $candidate){$validation='Invalid'}
     } else {
         $candidate=& $Adapter.GetProcess $Transition.specialPid $State.Status
@@ -319,7 +377,7 @@ function Get-CcodStageAwareSpecialObservation {
             $mainClosed=& $Adapter.WaitPortClosed $Transition.mainPort (Get-CcodProcessControlTimeout $Request.timeoutMilliseconds)
             if($Transition.stage -ceq 'SpecialStarted' -and -not $mainClosed){$mode='Full'}elseif($mainClosed){$mode='Renderer'}
             if($null -ne $mode){
-                try{$bridge=Invoke-CcodSessionBridge -Mode $mode -NodePath $Probe.NodePath -Paths $Paths -RendererPort $Transition.rendererPort -MainPort $(if($mode -ceq 'Full'){$Transition.mainPort}else{$null}) -TimeoutMilliseconds $Request.timeoutMilliseconds -Adapter $Adapter;$validation='Valid'}catch{$validation='Invalid'}
+                try{$bridge=Invoke-CcodSessionBridge -Request $Request -Mode $mode -NodePath $Probe.NodePath -Paths $Paths -RendererPort $Transition.rendererPort -MainPort $(if($mode -ceq 'Full'){$Transition.mainPort}else{$null}) -TimeoutMilliseconds $Request.timeoutMilliseconds -Adapter $Adapter;$validation='Valid'}catch{if(Test-CcodSessionLifecycleFenceFailure $_){throw};$validation='Invalid'}
             }else{$validation='Invalid'}
         }elseif($null -ne $candidate){$validation='Invalid'}
     }
@@ -330,9 +388,9 @@ function Complete-CcodActivatedReplay {
     param($Result,$Request,$Paths,[hashtable]$Adapter,$Probe,$Special,$Bridge,[string]$JournalTransactionId)
     $status=[pscustomobject][ordered]@{schemaVersion=1;session=[pscustomobject][ordered]@{supervisorPid=[int]$Request.supervisorIdentity.pid;supervisorCreationTimeUtc=$Request.supervisorIdentity.creationTimeUtc;sessionId=$Request.supervisorIdentity.sessionId;runtimeId=$Request.runtimeId;sessionState='Active';codex=[pscustomobject][ordered]@{pid=[int]$Special.Pid;creationTimeUtc=$Special.CreationTimeUtc;packageFullName=$Probe.PackageFullName;packageVersion=$Probe.PackageVersion;appAsarSha256=$Probe.AppAsarSha256;mainPort=[int]$Special.MainPort;rendererPort=[int]$Special.RendererPort;mainProbe='Closed';rendererProbe='BridgeValid'}}}
     $live=[pscustomobject][ordered]@{Valid=$true;runtimeId=$Request.runtimeId;pid=[int]$Special.Pid;creationTimeUtc=$Special.CreationTimeUtc;packageFullName=$Probe.PackageFullName;packageVersion=$Probe.PackageVersion;appAsarSha256=$Probe.AppAsarSha256;mainPort=[int]$Special.MainPort;rendererPort=[int]$Special.RendererPort;mainProbe='Closed';rendererProbe='BridgeValid'}
-    & $Adapter.WriteStatus $Paths.StateRoot $status $live
-    $verified=& $Adapter.ReadVerified $Paths.StateRoot;$succeeded=New-CcodVerifiedStoreWithRecord $verified $Probe $Request.runtimeId 'Succeeded' 'Valid' (& $Adapter.UtcNow);& $Adapter.WriteVerified $Paths.StateRoot $succeeded
-    & $Adapter.CompleteTransition $Paths.TransitionPath $Paths.TransitionLogPath $JournalTransactionId 'Activated'|Out-Null
+    Invoke-CcodSessionMutation $Request $Adapter 'WriteStatus' @($Paths.StateRoot,$status,$live)|Out-Null
+    $verified=& $Adapter.ReadVerified $Paths.StateRoot;$succeeded=New-CcodVerifiedStoreWithRecord $verified $Probe $Request.runtimeId 'Succeeded' 'Valid' (& $Adapter.UtcNow);Invoke-CcodSessionMutation $Request $Adapter 'WriteVerified' @($Paths.StateRoot,$succeeded)|Out-Null
+    Invoke-CcodSessionMutation $Request $Adapter 'CompleteTransition' @($Paths.TransitionPath,$Paths.TransitionLogPath,$JournalTransactionId,'Activated')|Out-Null
     $Result.special=ConvertTo-CcodSessionSpecial $Special
     if($null -ne $Bridge){$mode=if($null -ne $Bridge.PSObject.Properties['main']){'Full'}else{'Renderer'};$Result.probes=ConvertTo-CcodPublicBridgeProbes $Bridge $mode}
     $Result.ok=$true;$Result.outcome='NoAction';$Result.safeState='SpecialValidated';$Result.stage='Activated';return $Result
@@ -340,9 +398,9 @@ function Complete-CcodActivatedReplay {
 
 function Complete-CcodRecoveredReplay {
     param($Result,$Request,$Paths,[hashtable]$Adapter,$Probe,$Ordinary,[string]$JournalTransactionId)
-    & $Adapter.WriteStatus $Paths.StateRoot ([pscustomobject][ordered]@{schemaVersion=1;session=$null}) $null
-    $store=& $Adapter.ReadVerified $Paths.StateRoot;$failed=New-CcodVerifiedStoreWithRecord $store $Probe $Request.runtimeId 'Failed' 'NotRun' (& $Adapter.UtcNow);& $Adapter.WriteVerified $Paths.StateRoot $failed
-    & $Adapter.CompleteTransition $Paths.TransitionPath $Paths.TransitionLogPath $JournalTransactionId 'Recovered'|Out-Null
+    Invoke-CcodSessionMutation $Request $Adapter 'WriteStatus' @($Paths.StateRoot,([pscustomobject][ordered]@{schemaVersion=1;session=$null}),$null)|Out-Null
+    $store=& $Adapter.ReadVerified $Paths.StateRoot;$failed=New-CcodVerifiedStoreWithRecord $store $Probe $Request.runtimeId 'Failed' 'NotRun' (& $Adapter.UtcNow);Invoke-CcodSessionMutation $Request $Adapter 'WriteVerified' @($Paths.StateRoot,$failed)|Out-Null
+    Invoke-CcodSessionMutation $Request $Adapter 'CompleteTransition' @($Paths.TransitionPath,$Paths.TransitionLogPath,$JournalTransactionId,'Recovered')|Out-Null
     $ignore=Get-CcodRecoveryIgnoreKey -Pid $Ordinary.Pid -CreationTimeUtc $Ordinary.CreationTimeUtc -TransactionId $JournalTransactionId
     $suppression=Get-CcodSuppressionKey -PackageFullName $Probe.PackageFullName -AppAsarSha256 $Probe.AppAsarSha256 -RuntimeId $Request.runtimeId
     $Result.source=ConvertTo-CcodSessionSource $Ordinary;$Result.special=$null
@@ -459,7 +517,7 @@ function Invoke-CcodRecoveryOperation {
             $current=& $Adapter.GetProcess $member.Pid $State.Status
             if($null -eq $current){continue}
             if(-not (& $Adapter.ProcessMatch $member $current)){Throw-CcodSessionError 'CCOD_RECOVERY_UNPROVEN' 'Verified tree identity changed before stop' $member}
-            $receipt=& $Adapter.StopProcess $member $State.Status $processTimeout
+            $receipt=Invoke-CcodSessionMutation $Request $Adapter 'StopProcess' @($member,$State.Status,$processTimeout)
             if($receipt.Outcome -cne 'Stopped' -and $receipt.Outcome -cne 'SourceExited'){Throw-CcodSessionError 'CCOD_RECOVERY_UNPROVEN' 'A verified tree member did not stop safely' $member}
         }
     }
@@ -469,21 +527,21 @@ function Invoke-CcodRecoveryOperation {
     }
     if(-not $portsClosed){Throw-CcodSessionError 'CCOD_RECOVERY_UNPROVEN' 'Recorded debug ports did not explicitly refuse' $Special}
     if($CurrentStage -cne 'RecoveryLaunchRequested'){
-        $transition=& $Adapter.SetTransition $Paths.TransitionPath $PriorTransactionId $CurrentStage 'RecoveryLaunchRequested' $null $null $null $null
+        $transition=Invoke-CcodSessionMutation $Request $Adapter 'SetTransition' @($Paths.TransitionPath,$PriorTransactionId,$CurrentStage,'RecoveryLaunchRequested',$null,$null,$null,$null)
     }
     $ordinary=Wait-CcodOrdinarySnapshot $State.Status $Adapter;$disposition='AdoptedDuringObservation'
     if($null -eq $ordinary){
-        $start=& $Adapter.StartOrdinary $processTimeout
+        $start=Invoke-CcodSessionMutation $Request $Adapter 'StartOrdinary' @($processTimeout)
         $disposition='LaunchedOnce'
         if($null -ne $start.Snapshot){$ordinary=$start.Snapshot}else{$ordinary=Wait-CcodOrdinarySnapshot $State.Status $Adapter}
     }
     if($null -eq $ordinary -or $ordinary.Mode -cne 'Ordinary' -or -not $ordinary.IsTopLevel){Throw-CcodSessionError 'CCOD_RECOVERY_UNPROVEN' 'Ordinary recovery identity was not proven' $ordinary}
-    $transition=& $Adapter.SetTransition $Paths.TransitionPath $PriorTransactionId 'RecoveryLaunchRequested' 'Recovered' $null $ordinary $null $null
+    $transition=Invoke-CcodSessionMutation $Request $Adapter 'SetTransition' @($Paths.TransitionPath,$PriorTransactionId,'RecoveryLaunchRequested','Recovered',$null,$ordinary,$null,$null)
     $store=& $Adapter.ReadVerified $Paths.StateRoot
     $failed=New-CcodVerifiedStoreWithRecord $store $Probe $Request.runtimeId 'Failed' 'NotRun' (& $Adapter.UtcNow)
-    & $Adapter.WriteVerified $Paths.StateRoot $failed
-    & $Adapter.WriteStatus $Paths.StateRoot ([pscustomobject][ordered]@{schemaVersion=1;session=$null}) $null
-    & $Adapter.CompleteTransition $Paths.TransitionPath $Paths.TransitionLogPath $PriorTransactionId 'Recovered'|Out-Null
+    Invoke-CcodSessionMutation $Request $Adapter 'WriteVerified' @($Paths.StateRoot,$failed)|Out-Null
+    Invoke-CcodSessionMutation $Request $Adapter 'WriteStatus' @($Paths.StateRoot,([pscustomobject][ordered]@{schemaVersion=1;session=$null}),$null)|Out-Null
+    Invoke-CcodSessionMutation $Request $Adapter 'CompleteTransition' @($Paths.TransitionPath,$Paths.TransitionLogPath,$PriorTransactionId,'Recovered')|Out-Null
     $ignore=Get-CcodRecoveryIgnoreKey -Pid $ordinary.Pid -CreationTimeUtc $ordinary.CreationTimeUtc -TransactionId $PriorTransactionId
     $suppression=Get-CcodSuppressionKey -PackageFullName $Probe.PackageFullName -AppAsarSha256 $Probe.AppAsarSha256 -RuntimeId $Request.runtimeId
     $Result.source=ConvertTo-CcodSessionSource $ordinary
@@ -493,7 +551,7 @@ function Invoke-CcodRecoveryOperation {
 }
 
 function Invoke-CcodCloseVerifiedTree {
-    param([object[]]$Tree,$StatusEvidence,[hashtable]$Adapter,[int]$TimeoutMilliseconds,$RendererPort,$MainPort)
+    param($Request,[object[]]$Tree,$StatusEvidence,[hashtable]$Adapter,[int]$TimeoutMilliseconds,$RendererPort,$MainPort)
     if($Tree.Count -lt 1){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Close target tree was not verified' $null}
     $processTimeout=Get-CcodProcessControlTimeout $TimeoutMilliseconds
     $byPid=@{};foreach($member in $Tree){$byPid[[int]$member.Pid]=$member}
@@ -502,7 +560,7 @@ function Invoke-CcodCloseVerifiedTree {
         $current=& $Adapter.GetProcess $member.Pid $StatusEvidence
         if($null -eq $current){continue}
         if(-not (& $Adapter.ProcessMatch $member $current)){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Close tree identity changed before stop' $member}
-        $receipt=& $Adapter.StopProcess $member $StatusEvidence $processTimeout
+        $receipt=Invoke-CcodSessionMutation $Request $Adapter 'StopProcess' @($member,$StatusEvidence,$processTimeout)
         if($receipt.Outcome -cne 'Stopped' -and $receipt.Outcome -cne 'SourceExited'){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Close tree member did not stop safely' $member}
     }
     foreach($member in $Tree){
@@ -515,9 +573,9 @@ function Invoke-CcodCloseVerifiedTree {
 }
 
 function Complete-CcodCloseResult {
-    param($Result,$Paths,[hashtable]$Adapter,[string]$JournalTransactionId)
-    & $Adapter.WriteStatus $Paths.StateRoot ([pscustomobject][ordered]@{schemaVersion=1;session=$null}) $null
-    & $Adapter.CompleteTransition $Paths.TransitionPath $Paths.TransitionLogPath $JournalTransactionId 'Closed'|Out-Null
+    param($Result,$Request,$Paths,[hashtable]$Adapter,[string]$JournalTransactionId)
+    Invoke-CcodSessionMutation $Request $Adapter 'WriteStatus' @($Paths.StateRoot,([pscustomobject][ordered]@{schemaVersion=1;session=$null}),$null)|Out-Null
+    Invoke-CcodSessionMutation $Request $Adapter 'CompleteTransition' @($Paths.TransitionPath,$Paths.TransitionLogPath,$JournalTransactionId,'Closed')|Out-Null
     $Result.ok=$true;$Result.outcome='Closed';$Result.safeState='Closed';$Result.stage='Closed';$Result.special=$null
     return $Result
 }
@@ -588,6 +646,7 @@ function Merge-CcodSessionAdapters($Adapters) {
                 [pscustomobject][ordered]@{Pid=[int]$process.Id;CreationTimeUtc=$created;SessionId=[string]$process.SessionId}
             }catch{return $null}finally{if($null -ne $process){$process.Dispose()}}
         }
+        AssertLifecycleFence={param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity)Throw-CcodSessionError 'CCOD_LIFECYCLE_FENCE_STALE' 'No lifecycle fence adapter was supplied' $OwnerIdentity}
     }
     if ($null -ne $Adapters) {
         foreach($key in $Adapters.Keys){$defaults[$key]=$Adapters[$key]}
@@ -900,6 +959,7 @@ function Invoke-CcodSessionCore {
         $adapter = if($InspectionAdapters){Merge-CcodInspectionAdapters $Adapters}else{Merge-CcodSessionAdapters $Adapters}
         return & $Body $result $adapter
     } catch {
+        if(Test-CcodSessionLifecycleFenceFailure $_){throw}
         $result=Set-CcodSessionFailure -Result $result -Record $_ -Stage $result.stage
         if($pathsValidated -and -not $SuppressDiagnostic){Write-CcodSessionDiagnostic $result $Action $result.transactionId $result.stage $result.error.code $Paths $adapter}
         return $result
@@ -956,7 +1016,7 @@ function Invoke-CcodInspectSession {
             }
         }
         if(-not $nodeAuthorized){Throw-CcodSessionError 'CCOD_NODE_CANDIDATE_INVALID' 'Resolved Node is outside configured candidates' $node}
-        $result.stage='InspectProbe';$bridge=Invoke-CcodSessionBridge -Mode Probe -NodePath $node.Path -Paths $Paths -RendererPort $codex.rendererPort -MainPort $codex.mainPort -TimeoutMilliseconds $Request.timeoutMilliseconds -Adapter $adapter
+        $result.stage='InspectProbe';$bridge=Invoke-CcodSessionBridge -Request $Request -Mode Probe -NodePath $node.Path -Paths $Paths -RendererPort $codex.rendererPort -MainPort $codex.mainPort -TimeoutMilliseconds $Request.timeoutMilliseconds -Adapter $adapter
         $postRoots=@(Get-CcodInspectionRoots $state.Status $package $Request $identity $adapter)
         if($postRoots.Count -eq 0){$result.ok=$true;$result.outcome='Inspected';$result.safeState='NoCodex';$result.stage='Inspected';return $result}
         if($postRoots.Count -eq 1 -and $postRoots[0].Mode -ceq 'Ordinary' -and $null -eq $postRoots[0].RendererPort -and $null -eq $postRoots[0].MainPort){
@@ -985,10 +1045,7 @@ function Invoke-CcodActivationSession {
         $suppressionKey=Get-CcodSuppressionKey -PackageFullName $probe.PackageFullName -AppAsarSha256 $probe.AppAsarSha256 -RuntimeId $Request.runtimeId
         $state=& $adapter.ReadState $Paths.StateRoot $suppressionKey
         if($state.StatusRebuildRequired){Throw-CcodSessionError 'CCOD_STATE_BLOCKED' 'Status requires a dedicated live rebuild before activation' $state.Damage}
-        $prior=$null
-        if($null -ne $state.VerifiedPackages -and $null -ne $state.VerifiedPackages.packages){$property=$state.VerifiedPackages.packages.PSObject.Properties[$suppressionKey];if($null -ne $property){$prior=$property.Value}}
-        $priorSucceeded=$null -ne $prior -and $prior.dynamicOutcome -ceq 'Succeeded' -and $prior.probeState -ceq 'Valid'
-        if($probe.StaticClassification -cne 'CandidateCompatible' -or -not $probe.Ready -or (-not $state.AutomaticCandidateTrialsAllowed -and -not $priorSucceeded)){Throw-CcodSessionError 'CCOD_STATE_BLOCKED' 'Package is not authorized for activation' $probe}
+        if($probe.StaticClassification -cne 'CandidateCompatible' -or -not $probe.Ready){Throw-CcodSessionError 'CCOD_STATE_BLOCKED' 'Package is not authorized for activation' $probe}
         $source=$Request.source
         if($repairStale){
             $result.source=ConvertTo-CcodSessionStaleSource $source
@@ -1023,18 +1080,18 @@ function Invoke-CcodActivationSession {
             }
         }
         $journalPackage=ConvertTo-CcodJournalPackage $probe
-        $result.stage='IntentWritten';$transition=& $adapter.NewTransition $Paths.TransitionPath $source $journalPackage $Request.runtimeId $null $null $Request.transactionId
+        $result.stage='IntentWritten';$transition=Invoke-CcodSessionMutation $Request $adapter 'NewTransition' @($Paths.TransitionPath,$source,$journalPackage,$Request.runtimeId,$null,$null,$Request.transactionId)
         if($null -ne $source){
-            $result.stage='StopRequested';$transition=& $adapter.SetTransition $Paths.TransitionPath $Request.transactionId 'IntentWritten' 'StopRequested' $null $null $null $null
-            $stop=& $adapter.StopProcess $source $state.Status (Get-CcodProcessControlTimeout $Request.timeoutMilliseconds)
+            $result.stage='StopRequested';$transition=Invoke-CcodSessionMutation $Request $adapter 'SetTransition' @($Paths.TransitionPath,$Request.transactionId,'IntentWritten','StopRequested',$null,$null,$null,$null)
+            $stop=Invoke-CcodSessionMutation $Request $adapter 'StopProcess' @($source,$state.Status,(Get-CcodProcessControlTimeout $Request.timeoutMilliseconds))
             if($stop.Outcome -cne 'Stopped' -or $stop.StoppedByController -isnot [bool] -or -not $stop.StoppedByController){
-                & $adapter.CompleteTransition $Paths.TransitionPath $Paths.TransitionLogPath $Request.transactionId 'Cancelled' | Out-Null
+                Invoke-CcodSessionMutation $Request $adapter 'CompleteTransition' @($Paths.TransitionPath,$Paths.TransitionLogPath,$Request.transactionId,'Cancelled')|Out-Null
                 if($stop.Outcome -ceq 'SourceExited'){$result.ok=$true;$result.outcome='NoAction';$result.safeState='NoCodex';$result.stage='Cancelled';return $result}
                 Throw-CcodSessionError 'CCOD_STOP_UNCONFIRMED' 'Only an exact Stopped receipt authorizes special launch' $stop
             }
-            $result.stage='OrdinaryStopped';$transition=& $adapter.SetTransition $Paths.TransitionPath $Request.transactionId 'StopRequested' 'OrdinaryStopped' $null $null $null $null
+            $result.stage='OrdinaryStopped';$transition=Invoke-CcodSessionMutation $Request $adapter 'SetTransition' @($Paths.TransitionPath,$Request.transactionId,'StopRequested','OrdinaryStopped',$null,$null,$null,$null)
         } else {
-            $result.stage='OrdinaryStopped';$transition=& $adapter.SetTransition $Paths.TransitionPath $Request.transactionId 'IntentWritten' 'OrdinaryStopped' $null $null $null $null
+            $result.stage='OrdinaryStopped';$transition=Invoke-CcodSessionMutation $Request $adapter 'SetTransition' @($Paths.TransitionPath,$Request.transactionId,'IntentWritten','OrdinaryStopped',$null,$null,$null,$null)
         }
         $currentStage='OrdinaryStopped';$special=$null;$renderer=$Request.rendererPort;$main=$Request.mainPort;$recoveryAttempted=$false
         try {
@@ -1043,21 +1100,22 @@ function Invoke-CcodActivationSession {
             if($null -eq $renderer){$renderer=& $adapter.GetPort @rendererExcluded}
             if($null -eq $main){$main=& $adapter.GetPort @($renderer)}
             if($null -eq $renderer -or $null -eq $main -or $renderer -eq $main){Throw-CcodSessionError 'CCOD_PORT_UNAVAILABLE' 'Two distinct loopback ports are required' $null}
-            $result.stage='SpecialLaunchRequested';$transition=& $adapter.SetTransition $Paths.TransitionPath $Request.transactionId 'OrdinaryStopped' 'SpecialLaunchRequested' $null $null $renderer $main;$currentStage='SpecialLaunchRequested'
-            $start=& $adapter.StartSpecial $renderer $main (Get-CcodProcessControlTimeout $Request.timeoutMilliseconds)
+            $result.stage='SpecialLaunchRequested';$transition=Invoke-CcodSessionMutation $Request $adapter 'SetTransition' @($Paths.TransitionPath,$Request.transactionId,'OrdinaryStopped','SpecialLaunchRequested',$null,$null,$renderer,$main);$currentStage='SpecialLaunchRequested'
+            $start=Invoke-CcodSessionMutation $Request $adapter 'StartSpecial' @($renderer,$main,(Get-CcodProcessControlTimeout $Request.timeoutMilliseconds))
             if($start.Outcome -cne 'Started' -or $null -eq $start.Snapshot){Throw-CcodSessionError 'CCOD_SPECIAL_START_FAILED' 'Special startup was not proven' $start}
             $special=$start.Snapshot;$result.special=ConvertTo-CcodSessionSpecial $special
-            $result.stage='SpecialStarted';$transition=& $adapter.SetTransition $Paths.TransitionPath $Request.transactionId 'SpecialLaunchRequested' 'SpecialStarted' $special $null $null $null;$currentStage='SpecialStarted'
-            $bridge=Invoke-CcodSessionBridge -Mode Full -NodePath $probe.NodePath -Paths $Paths -RendererPort $renderer -MainPort $main -TimeoutMilliseconds $Request.timeoutMilliseconds -Adapter $adapter
+            $result.stage='SpecialStarted';$transition=Invoke-CcodSessionMutation $Request $adapter 'SetTransition' @($Paths.TransitionPath,$Request.transactionId,'SpecialLaunchRequested','SpecialStarted',$special,$null,$null,$null);$currentStage='SpecialStarted'
+            $bridge=Invoke-CcodSessionBridge -Request $Request -Mode Full -NodePath $probe.NodePath -Paths $Paths -RendererPort $renderer -MainPort $main -TimeoutMilliseconds $Request.timeoutMilliseconds -Adapter $adapter
             $result.probes=ConvertTo-CcodPublicBridgeProbes $bridge Full
-            $result.stage='Validated';$transition=& $adapter.SetTransition $Paths.TransitionPath $Request.transactionId 'SpecialStarted' 'Validated' $null $null $null $null;$currentStage='Validated'
+            $result.stage='Validated';$transition=Invoke-CcodSessionMutation $Request $adapter 'SetTransition' @($Paths.TransitionPath,$Request.transactionId,'SpecialStarted','Validated',$null,$null,$null,$null);$currentStage='Validated'
             $status=[pscustomobject][ordered]@{schemaVersion=1;session=[pscustomobject][ordered]@{supervisorPid=[int]$Request.supervisorIdentity.pid;supervisorCreationTimeUtc=$Request.supervisorIdentity.creationTimeUtc;sessionId=$Request.supervisorIdentity.sessionId;runtimeId=$Request.runtimeId;sessionState='Active';codex=[pscustomobject][ordered]@{pid=[int]$special.Pid;creationTimeUtc=$special.CreationTimeUtc;packageFullName=$probe.PackageFullName;packageVersion=$probe.PackageVersion;appAsarSha256=$probe.AppAsarSha256;mainPort=[int]$main;rendererPort=[int]$renderer;mainProbe='Closed';rendererProbe='BridgeValid'}}}
             $live=[pscustomobject][ordered]@{Valid=$true;runtimeId=$Request.runtimeId;pid=[int]$special.Pid;creationTimeUtc=$special.CreationTimeUtc;packageFullName=$probe.PackageFullName;packageVersion=$probe.PackageVersion;appAsarSha256=$probe.AppAsarSha256;mainPort=[int]$main;rendererPort=[int]$renderer;mainProbe='Closed';rendererProbe='BridgeValid'}
-            & $adapter.WriteStatus $Paths.StateRoot $status $live
-            $verified=& $adapter.ReadVerified $Paths.StateRoot;$succeeded=New-CcodVerifiedStoreWithRecord $verified $probe $Request.runtimeId 'Succeeded' 'Valid' (& $adapter.UtcNow);& $adapter.WriteVerified $Paths.StateRoot $succeeded
-            & $adapter.CompleteTransition $Paths.TransitionPath $Paths.TransitionLogPath $Request.transactionId 'Activated' | Out-Null
+            Invoke-CcodSessionMutation $Request $adapter 'WriteStatus' @($Paths.StateRoot,$status,$live)|Out-Null
+            $verified=& $adapter.ReadVerified $Paths.StateRoot;$succeeded=New-CcodVerifiedStoreWithRecord $verified $probe $Request.runtimeId 'Succeeded' 'Valid' (& $adapter.UtcNow);Invoke-CcodSessionMutation $Request $adapter 'WriteVerified' @($Paths.StateRoot,$succeeded)|Out-Null
+            Invoke-CcodSessionMutation $Request $adapter 'CompleteTransition' @($Paths.TransitionPath,$Paths.TransitionLogPath,$Request.transactionId,'Activated')|Out-Null
             $result.ok=$true;$result.outcome='Activated';$result.safeState='SpecialValidated';$result.stage='Completed';return $result
         } catch {
+            if(Test-CcodSessionLifecycleFenceFailure $_){throw}
             Write-CcodSessionDiagnostic $result $Action $Request.transactionId $result.stage (Get-CcodSessionErrorCode $_) $Paths $adapter
             if($recoveryAttempted){Throw-CcodSessionError 'CCOD_RECOVERY_UNPROVEN' 'Recursive recovery is forbidden' $_}
             $recoveryAttempted=$true
@@ -1117,7 +1175,7 @@ function Invoke-CcodRepairRenderer {
         $recoveryAttempted=$false
         try{
             if(-not (& $adapter.WaitPortClosed $codex.mainPort (Get-CcodProcessControlTimeout $Request.timeoutMilliseconds))){Throw-CcodSessionError 'CCOD_MAIN_INSPECTOR_OPEN' 'Main Inspector refusal is not proven before renderer repair' $codex.mainPort}
-            $bridge=Invoke-CcodSessionBridge -Mode Renderer -NodePath $probe.NodePath -Paths $Paths -RendererPort $codex.rendererPort -MainPort $null -TimeoutMilliseconds $Request.timeoutMilliseconds -Adapter $adapter
+            $bridge=Invoke-CcodSessionBridge -Request $Request -Mode Renderer -NodePath $probe.NodePath -Paths $Paths -RendererPort $codex.rendererPort -MainPort $null -TimeoutMilliseconds $Request.timeoutMilliseconds -Adapter $adapter
             $result.probes=ConvertTo-CcodPublicBridgeProbes $bridge Renderer;$result.special=ConvertTo-CcodSessionSpecial $current
             $migratedStatus=[pscustomobject][ordered]@{schemaVersion=1;session=[pscustomobject][ordered]@{
                 supervisorPid=[int]$Request.supervisorIdentity.pid
@@ -1128,23 +1186,66 @@ function Invoke-CcodRepairRenderer {
                 codex=$codex
             }}
             $live=[pscustomobject][ordered]@{Valid=$true;runtimeId=$Request.runtimeId;pid=[int]$codex.pid;creationTimeUtc=$codex.creationTimeUtc;packageFullName=$codex.packageFullName;packageVersion=$codex.packageVersion;appAsarSha256=$codex.appAsarSha256;mainPort=[int]$codex.mainPort;rendererPort=[int]$codex.rendererPort;mainProbe='Closed';rendererProbe='BridgeValid'}
-            & $adapter.WriteStatus $Paths.StateRoot $migratedStatus $live
+            Invoke-CcodSessionMutation $Request $adapter 'WriteStatus' @($Paths.StateRoot,$migratedStatus,$live)|Out-Null
             $verified=& $adapter.ReadVerified $Paths.StateRoot
             $succeeded=New-CcodVerifiedStoreWithRecord $verified $probe $Request.runtimeId 'Succeeded' 'Valid' (& $adapter.UtcNow)
-            & $adapter.WriteVerified $Paths.StateRoot $succeeded
+            Invoke-CcodSessionMutation $Request $adapter 'WriteVerified' @($Paths.StateRoot,$succeeded)|Out-Null
             $result.ok=$true;$result.outcome='NoAction';$result.safeState='SpecialValidated';$result.stage='RendererRepaired';return $result
         }catch{
+            if(Test-CcodSessionLifecycleFenceFailure $_){throw}
             Write-CcodSessionDiagnostic $result 'RepairRenderer' $Request.transactionId $result.stage (Get-CcodSessionErrorCode $_) $Paths $adapter
             if($recoveryAttempted){Throw-CcodSessionError 'CCOD_RECOVERY_UNPROVEN' 'Recursive renderer recovery is forbidden' $_}
             $recoveryAttempted=$true
             $journalPackage=ConvertTo-CcodJournalPackage $probe
-            $transition=& $adapter.NewTransition $Paths.TransitionPath $null $journalPackage $Request.runtimeId $null $null $Request.transactionId
-            $transition=& $adapter.SetTransition $Paths.TransitionPath $Request.transactionId 'IntentWritten' 'OrdinaryStopped' $null $null $null $null
-            $transition=& $adapter.SetTransition $Paths.TransitionPath $Request.transactionId 'OrdinaryStopped' 'SpecialLaunchRequested' $null $null $codex.rendererPort $codex.mainPort
-            $transition=& $adapter.SetTransition $Paths.TransitionPath $Request.transactionId 'SpecialLaunchRequested' 'SpecialStarted' $current $null $null $null
+            $transition=Invoke-CcodSessionMutation $Request $adapter 'NewTransition' @($Paths.TransitionPath,$null,$journalPackage,$Request.runtimeId,$null,$null,$Request.transactionId)
+            $transition=Invoke-CcodSessionMutation $Request $adapter 'SetTransition' @($Paths.TransitionPath,$Request.transactionId,'IntentWritten','OrdinaryStopped',$null,$null,$null,$null)
+            $transition=Invoke-CcodSessionMutation $Request $adapter 'SetTransition' @($Paths.TransitionPath,$Request.transactionId,'OrdinaryStopped','SpecialLaunchRequested',$null,$null,$codex.rendererPort,$codex.mainPort)
+            $transition=Invoke-CcodSessionMutation $Request $adapter 'SetTransition' @($Paths.TransitionPath,$Request.transactionId,'SpecialLaunchRequested','SpecialStarted',$current,$null,$null,$null)
             return Invoke-CcodRecoveryOperation $result $Request $Paths $adapter $state $probe 'SpecialStarted' $current $codex.rendererPort $codex.mainPort $Request.transactionId
         }
     } -SuppressDiagnostic
+}
+
+function Invoke-CcodCloseSession {
+    [CmdletBinding()] param([Parameter(Mandatory)]$Request,[Parameter(Mandatory)]$Paths,$Adapters)
+    return Invoke-CcodSessionCore Close $Request $Paths $Adapters {
+        param($result,$adapter)
+        $result.stage='CloseState';$state=& $adapter.ReadState $Paths.StateRoot $null
+        if(-not $state.TransitionActionsAllowed){Throw-CcodSessionError 'CCOD_STATE_BLOCKED' 'State damage blocks close' $state.Damage}
+        $probe=& $adapter.StaticProbe $state.Settings.nodeCandidates $Paths.CheckerPath;$result.package=ConvertTo-CcodSessionPackage $probe
+        $roots=@(Get-CcodCurrentPackageRoots $state.Status $probe $Request $adapter)
+        $statusCodex=$null;if($null -ne $state.Status.session){$statusCodex=$state.Status.session.codex}
+        $target=$null;$isSpecial=$false
+        if($null -ne $statusCodex){
+            $candidate=& $adapter.GetProcess $statusCodex.pid $state.Status
+            if($roots.Count -ne 1 -or $null -eq $candidate -or $candidate.CreationTimeUtc -cne $statusCodex.creationTimeUtc -or -not (& $adapter.ProcessMatch $roots[0] $candidate)){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Recorded Active root is missing, changed, or accompanied by another root' $statusCodex}
+            $target=$candidate;$isSpecial=$true
+        }else{
+            if($roots.Count -gt 1){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Multiple current-package close roots are ambiguous' $roots}
+            if($roots.Count -eq 1){
+                $target=$roots[0]
+                if($target.Mode -cne 'Ordinary'){
+                    if($null -eq $target.RendererPort -or $null -eq $target.MainPort -or $target.RendererPort -eq $target.MainPort){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'A status-less debug root lacks one valid distinct port pair' $target}
+                    $isSpecial=$true
+                }
+            }
+        }
+        if($null -ne $Request.source){
+            if($null -eq $target -or -not (& $adapter.ProcessMatch $Request.source $target)){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Requested close source is not the one verified current root' $Request.source}
+        }
+        if($null -eq $target){$result.ok=$true;$result.outcome='Closed';$result.safeState='Closed';$result.stage='Closed';return $result}
+        $tree=@(& $adapter.GetTree $target $state.Status)
+        if($tree.Count -lt 1){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Current close target tree is not exact and verified' $target}
+        $renderer=$null;$main=$null;$source=$target
+        if($isSpecial){if($null -ne $statusCodex){$renderer=$statusCodex.rendererPort;$main=$statusCodex.mainPort}else{$renderer=$target.RendererPort;$main=$target.MainPort};$source=$null;$result.special=ConvertTo-CcodSessionSpecial $target}else{$result.source=ConvertTo-CcodSessionSource $target}
+        $journalPackage=ConvertTo-CcodJournalPackage $probe
+        $result.stage='IntentWritten';$transition=Invoke-CcodSessionMutation $Request $adapter 'NewTransition' @($Paths.TransitionPath,$source,$journalPackage,$Request.runtimeId,$renderer,$main,$Request.transactionId)
+        $result.stage='CloseRequested';$specialIdentity=if($isSpecial){$target}else{$null}
+        $transition=Invoke-CcodSessionMutation $Request $adapter 'SetTransition' @($Paths.TransitionPath,$Request.transactionId,'IntentWritten','CloseRequested',$specialIdentity,$null,$null,$null)
+        Invoke-CcodCloseVerifiedTree $Request $tree $state.Status $adapter $Request.timeoutMilliseconds $renderer $main
+        $transition=Invoke-CcodSessionMutation $Request $adapter 'SetTransition' @($Paths.TransitionPath,$Request.transactionId,'CloseRequested','Closed',$null,$null,$null,$null)
+        return Complete-CcodCloseResult $result $Request $Paths $adapter $Request.transactionId
+    }
 }
 
 function Invoke-CcodRecoverSession {
@@ -1224,9 +1325,9 @@ function Invoke-CcodRecoverSession {
         $result.stage='IntentWritten';$transition=& $adapter.NewTransition $Paths.TransitionPath $source $journalPackage $Request.runtimeId $renderer $main $Request.transactionId
         $result.stage='CloseRequested';$specialIdentity=if($isSpecial){$target}else{$null}
         $transition=& $adapter.SetTransition $Paths.TransitionPath $Request.transactionId 'IntentWritten' 'CloseRequested' $specialIdentity $null $null $null
-        Invoke-CcodCloseVerifiedTree $tree $state.Status $adapter $Request.timeoutMilliseconds $renderer $main
+        Invoke-CcodCloseVerifiedTree $Request $tree $state.Status $adapter $Request.timeoutMilliseconds $renderer $main
         $transition=& $adapter.SetTransition $Paths.TransitionPath $Request.transactionId 'CloseRequested' 'Closed' $null $null $null $null
-        return Complete-CcodCloseResult $result $Paths $adapter $Request.transactionId
+        return Complete-CcodCloseResult $result $Request $Paths $adapter $Request.transactionId
     }
 }
 
@@ -1242,7 +1343,7 @@ function Invoke-CcodReplayTransition {
             $observed=[pscustomobject][ordered]@{StopObservation='CloseTreeAbsent';RecoveryObservation='NotApplicable';SpecialObservation='NoCandidate';PortObservation=$portObservation;SpecialCandidates=@();OrdinaryCandidates=@()}
             $decision=Get-CcodReplayDecision -Transition $Transition -Observed $observed
             if($decision.Action -cne 'CompleteClosed'){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Closed replay did not select archival completion' $decision}
-            return Complete-CcodCloseResult $result $Paths $adapter $Transition.transactionId
+            return Complete-CcodCloseResult $result $Request $Paths $adapter $Transition.transactionId
         }
         $probe=& $adapter.StaticProbe $state.Settings.nodeCandidates $Paths.CheckerPath;$result.package=ConvertTo-CcodSessionPackage $probe
         $crossRuntimeCloseReplay=$Transition.stage -ceq 'CloseRequested' -and $Request.restartOrdinary -and
@@ -1308,13 +1409,13 @@ function Invoke-CcodReplayTransition {
             }
             $decision=Get-CcodReplayDecision -Transition $Transition -Observed $present
             if($decision.Action -cne 'CloseRecordedTree'){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Close replay did not authorize the exact recorded tree' $decision}
-            Invoke-CcodCloseVerifiedTree $tree $state.Status $adapter $Request.timeoutMilliseconds $Transition.rendererPort $Transition.mainPort
+            Invoke-CcodCloseVerifiedTree $Request $tree $state.Status $adapter $Request.timeoutMilliseconds $Transition.rendererPort $Transition.mainPort
             $closedPort=if($null -eq $Transition.mainPort){'NotApplicable'}else{'BothRefused'}
             $absent=[pscustomobject][ordered]@{StopObservation='CloseTreeAbsent';RecoveryObservation='NotApplicable';SpecialObservation='NoCandidate';PortObservation=$closedPort;SpecialCandidates=@();OrdinaryCandidates=@()}
             $decision=Get-CcodReplayDecision -Transition $Transition -Observed $absent
             if($decision.Action -cne 'CompleteClosed'){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Close tree absence did not authorize completion' $decision}
             $transition=& $adapter.SetTransition $Paths.TransitionPath $Transition.transactionId 'CloseRequested' 'Closed' $null $null $null $null
-            return Complete-CcodCloseResult $result $Paths $adapter $Transition.transactionId
+            return Complete-CcodCloseResult $result $Request $Paths $adapter $Transition.transactionId
         }
         $ordinary=@(Get-CcodCurrentPackageRoots $state.Status $probe $Request $adapter|Where-Object{$_.Mode -ceq 'Ordinary'})
         $stopObservation='NotApplicable';$recoveryObservation='NotApplicable'
@@ -1354,7 +1455,7 @@ function Invoke-CcodReplayTransition {
                 $validation='Indeterminate'
                 if(@('SpecialStarted','Validated') -ccontains $Transition.stage -and (& $adapter.WaitPortClosed $Transition.mainPort (Get-CcodProcessControlTimeout $Request.timeoutMilliseconds))){
                     try{
-                        Invoke-CcodSessionBridge -Mode Renderer -NodePath $probe.NodePath -Paths $Paths -RendererPort $Transition.rendererPort -MainPort $null -TimeoutMilliseconds $Request.timeoutMilliseconds -Adapter $adapter|Out-Null;$validation='Valid'
+                        Invoke-CcodSessionBridge -Request $Request -Mode Renderer -NodePath $probe.NodePath -Paths $Paths -RendererPort $Transition.rendererPort -MainPort $null -TimeoutMilliseconds $Request.timeoutMilliseconds -Adapter $adapter|Out-Null;$validation='Valid'
                     }catch{$validation='Indeterminate'}
                 }
                 $specialObservation=[pscustomobject]@{Outcome='Confirmed';Snapshot=$recorded;Candidates=@($recorded);ConflictOwners=@();Validation=$validation}
@@ -1408,6 +1509,6 @@ function Invoke-CcodReplayTransition {
 }
 
 Export-ModuleMember -Function @(
-    'Invoke-CcodInspectSession','Invoke-CcodApplySession','Invoke-CcodRepairStaleSession','Invoke-CcodRepairRenderer',
+    'Invoke-CcodInspectSession','Invoke-CcodCloseSession','Invoke-CcodApplySession','Invoke-CcodRepairStaleSession','Invoke-CcodRepairRenderer',
     'Invoke-CcodRecoverSession','Invoke-CcodReplayTransition','Test-CcodBridgeResult'
 )

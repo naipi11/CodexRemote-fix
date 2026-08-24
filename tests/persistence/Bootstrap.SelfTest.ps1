@@ -5,6 +5,7 @@ $repositoryRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $bootstrapScript = Join-Path $repositoryRoot 'src\persistence\bootstrap.ps1'
 $runtimeManifestModule = Join-Path $repositoryRoot 'src\persistence\modules\RuntimeManifest.psm1'
 $kernelObjectsModule = Join-Path $repositoryRoot 'src\persistence\modules\KernelObjects.psm1'
+$trustedLogonModule = Join-Path $repositoryRoot 'src\persistence\modules\TrustedLogonIdentity.psm1'
 $powershellExecutable = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
 if (-not (Test-Path -LiteralPath $bootstrapScript -PathType Leaf)) {
@@ -18,6 +19,8 @@ if (-not (Test-Path -LiteralPath $kernelObjectsModule -PathType Leaf)) {
 }
 Import-Module $runtimeManifestModule -Force
 Import-Module $kernelObjectsModule -Force
+Import-Module $trustedLogonModule -Force
+. $bootstrapScript
 
 function Assert-CcodExactEqual($Expected, $Actual, [string]$Message) {
     if (-not [object]::Equals($Expected, $Actual)) {
@@ -79,6 +82,19 @@ Start-Sleep -Milliseconds 300
 exit 9
 "@
         }
+        'ReadyLongLived' {
+            return @"
+param([string]`$ReadyToken)
+[IO.File]::WriteAllText('$MarkerPath',[string]`$PID)
+`$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+`$session=[Diagnostics.Process]::GetCurrentProcess().SessionId
+`$name="Local\CodexControlOtherDevices.Ready.`$sid.`$session.`$ReadyToken"
+`$event=[Threading.EventWaitHandle]::OpenExisting(`$name)
+`$event.Set() | Out-Null
+Start-Sleep -Seconds 60
+exit 0
+"@
+        }
         default { throw "Unknown fake supervisor kind: $Kind" }
     }
 }
@@ -96,7 +112,9 @@ function Add-CcodTestRuntime {
     param(
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$SupervisorScript,
-        [AllowNull()][string]$RuntimeId
+        [AllowNull()][string]$RuntimeId,
+        [bool]$IncludeFenceModules = $true,
+        [bool]$FailLifecycleRelease = $false
     )
 
     if ([string]::IsNullOrWhiteSpace($RuntimeId)) {
@@ -113,12 +131,28 @@ function Add-CcodTestRuntime {
     New-Item -ItemType Directory -Path $kernelDirectory -Force | Out-Null
     $kernelPath = Join-Path $kernelDirectory 'KernelObjects.psm1'
     [IO.File]::Copy($kernelObjectsModule, $kernelPath, $true)
+    if ($IncludeFenceModules) {
+        foreach ($moduleName in @('PersistenceIO.psm1','LifecycleEpoch.psm1','LifecycleTransaction.psm1','RuntimeManifest.psm1','TrustedLogonIdentity.psm1')) {
+            [IO.File]::Copy((Join-Path $repositoryRoot ('src\persistence\modules\' + $moduleName)), (Join-Path $kernelDirectory $moduleName), $true)
+        }
+        if ($FailLifecycleRelease) {
+            [IO.File]::AppendAllText((Join-Path $kernelDirectory 'LifecycleEpoch.psm1'), @'
+
+function Exit-CcodLifecycleOwnership {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Ownership, [hashtable]$Adapters)
+    throw [Management.Automation.ErrorRecord]::new(
+        [InvalidOperationException]::new('injected lifecycle release failure'),
+        'CCOD_LIFECYCLE_RELEASE_FAILED',
+        [Management.Automation.ErrorCategory]::CloseError,
+        $Ownership)
+}
+'@, [Text.UTF8Encoding]::new($false))
+        }
+    }
+    $manifest = New-CcodRuntimeManifest -RuntimeDirectory $runtimeDirectory -ProjectVersion '0.0.0-bootstrap-test'
     if ([string]::IsNullOrWhiteSpace($RuntimeId)) {
-        $files = @(
-            [pscustomobject]@{ path = 'src/persistence/Supervisor.ps1'; length = [int64](Get-Item -LiteralPath $supervisorPath).Length; sha256 = Get-CcodTestFileSha256 -Path $supervisorPath },
-            [pscustomobject]@{ path = 'src/persistence/modules/KernelObjects.psm1'; length = [int64](Get-Item -LiteralPath $kernelPath).Length; sha256 = Get-CcodTestFileSha256 -Path $kernelPath }
-        )
-        $RuntimeId = Get-CcodRuntimeId -ProjectVersion '0.0.0-bootstrap-test' -Files $files
+        $RuntimeId = $manifest.runtimeId
         $targetDirectory = Join-Path $Root "runtime\$RuntimeId"
         if ($targetDirectory -cne $runtimeDirectory) {
             [IO.Directory]::Move($runtimeDirectory, $targetDirectory)
@@ -126,15 +160,8 @@ function Add-CcodTestRuntime {
             $supervisorPath = Join-Path $runtimeDirectory 'src\persistence\Supervisor.ps1'
             $kernelPath = Join-Path $runtimeDirectory 'src\persistence\modules\KernelObjects.psm1'
         }
-    }
-    $manifest = [ordered]@{
-        schemaVersion = 1
-        projectVersion = '0.0.0-bootstrap-test'
-        runtimeId = $RuntimeId
-        files = @(
-            [ordered]@{ path = 'src/persistence/Supervisor.ps1'; length = [int64](Get-Item -LiteralPath $supervisorPath).Length; sha256 = Get-CcodTestFileSha256 -Path $supervisorPath },
-            [ordered]@{ path = 'src/persistence/modules/KernelObjects.psm1'; length = [int64](Get-Item -LiteralPath $kernelPath).Length; sha256 = Get-CcodTestFileSha256 -Path $kernelPath }
-        )
+    } else {
+        $manifest.runtimeId = $RuntimeId
     }
     [IO.File]::WriteAllText(
         (Join-Path $runtimeDirectory 'manifest.json'),
@@ -148,15 +175,18 @@ function Set-CcodTestActivePointer {
     param(
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$ActiveRuntime,
-        [AllowNull()][string]$PreviousRuntime
+        [AllowNull()][string]$PreviousRuntime,
+        [int]$SchemaVersion = 1,
+        [UInt64]$Generation = 1
     )
 
     $pointer = [ordered]@{
-        schemaVersion = 1
+        schemaVersion = $SchemaVersion
         activeRuntime = $ActiveRuntime
         previousRuntime = $PreviousRuntime
-        updatedAtUtc = [DateTime]::UtcNow.ToString('o')
     }
+    if ($SchemaVersion -eq 2) { $pointer.generation = $Generation }
+    $pointer.updatedAtUtc = [DateTime]::UtcNow.ToString('o')
     [IO.File]::WriteAllText(
         (Join-Path $Root 'active.json'),
         ($pointer | ConvertTo-Json -Depth 5),
@@ -174,15 +204,129 @@ function Invoke-CcodBootstrapUnderTest {
     param(
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$ReadyToken,
-        [int]$ReadyTimeoutSeconds = 3
+        [int]$ReadyTimeoutSeconds = 3,
+        [ValidateSet('Task','Explicit')][string]$EntryMode = 'Explicit'
     )
 
-    & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $bootstrapScript `
-        -InstallRoot $Root -ReadyToken $ReadyToken -ReadyTimeoutSeconds $ReadyTimeoutSeconds 2>&1
-    return [int]$LASTEXITCODE
+    $output = & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $bootstrapScript `
+        -InstallRoot $Root -ReadyToken $ReadyToken -ReadyTimeoutSeconds $ReadyTimeoutSeconds -EntryMode $EntryMode 2>&1
+    $exitCode = [int]$LASTEXITCODE
+    return $exitCode
+}
+
+function Invoke-CcodBootstrapTimed {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$ReadyToken,
+        [int]$TimeoutMilliseconds = 4000
+    )
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $powershellExecutable
+    $startInfo.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -InstallRoot "{1}" -ReadyToken {2} -ReadyTimeoutSeconds 3' -f $bootstrapScript,$Root,$ReadyToken
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        [void]$process.Start()
+        $exited = $process.WaitForExit($TimeoutMilliseconds)
+        if (-not $exited) {
+            $process.Kill()
+            $process.WaitForExit()
+        }
+        return [pscustomobject][ordered]@{
+            TimedOut = -not $exited
+            ExitCode = if ($exited) { [int]$process.ExitCode } else { $null }
+            ElapsedMilliseconds = [long]$stopwatch.ElapsedMilliseconds
+        }
+    } finally {
+        $stopwatch.Stop()
+        $process.Dispose()
+    }
 }
 
 $results = @()
+
+$results += Invoke-CcodTest 'marker policy deterministically suppresses only the same trusted Task logon' {
+    # Production mutation caught: starting a supervisor on same-logon retry or suppressing a new logon.
+    $calls=[Collections.Generic.List[string]]::new();$intent=[pscustomobject]@{recoveryTransactionId='11111111-2222-3333-4444-555555555555'};$identity=[pscustomobject]@{logon='current'};$receipt=[pscustomobject]@{kind='SafeExit';transactionId=$intent.recoveryTransactionId;phase='Completed';error=$null}
+    $adapters=@{ReadIntent={$calls.Add('Read');$intent};GetIdentity={$calls.Add('Identity');$identity};TestSameLogon={param($Value,$Current)$calls.Add('Compare');$true};ReadActiveRequest={$calls.Add('Active');$null};ReadCompletionReceipt={param($Id)$calls.Add('Receipt');$receipt};Log={param($Message)$calls.Add("Log:$Message")};ConfirmReplacement={$true};EnterOwnership={$calls.Add('Enter');[pscustomobject]@{}};ExitOwnership={param($Lease)$calls.Add('Exit')};ClearIntent={$calls.Add('Clear')};ClearCorruptIntent={$calls.Add('ClearCorrupt')}}
+    $same=Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Task -Adapters $adapters
+    Assert-CcodExactEqual $true $same.Suppressed 'exact trusted Task marker suppresses startup'
+    Assert-CcodExactEqual 'Read|Identity|Compare|Active|Receipt|Log:SAFE_EXIT_SUPPRESSED' ($calls-join '|') 'suppression requires completed receipt and never launches or clears'
+    $calls.Clear();$adapters.TestSameLogon={param($Value,$Current)$calls.Add('Compare');$false}.GetNewClosure()
+    $new=Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Task -Adapters $adapters
+    Assert-CcodExactEqual $false $new.Suppressed 'new trusted identity is not suppressed'
+    Assert-CcodExactEqual 'Read|Identity|Compare|Enter|Clear|Exit' ($calls-join '|') 'new trusted identity clears only under lifecycle ownership'
+}
+
+$results += Invoke-CcodTest 'active matching SafeExit marker resumes instead of suppressing Task startup' {
+    # Production mutation caught: suppressing the crash-after-marker active-request state.
+    $intent=[pscustomobject]@{recoveryTransactionId='22222222-2222-3333-4444-555555555555'};$active=[pscustomobject]@{kind='SafeExit';transactionId=$intent.recoveryTransactionId}
+    $adapters=@{ReadIntent={$intent};GetIdentity={[pscustomobject]@{}};TestSameLogon={param($a,$b)$true};ReadActiveRequest={$active};ReadCompletionReceipt={param($x)throw 'receipt must not be read'};Log={param($x)throw 'must not suppress'};ConfirmReplacement={$true};EnterOwnership={[pscustomobject]@{}};ExitOwnership={param($x){}};ClearIntent={};ClearCorruptIntent={}}
+    $result=Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Task -Adapters $adapters
+    Assert-CcodExactEqual $false $result.Suppressed 'pending matching SafeExit starts Supervisor for durable resume'
+}
+
+$results += Invoke-CcodTest 'marker policy requires positive Explicit confirmation before corrupt marker replacement' {
+    # Production mutation caught: clearing an unreadable marker in Explicit mode without a local confirmation boundary.
+    $calls=[Collections.Generic.List[string]]::new()
+    $adapters=@{ReadIntent={throw 'corrupt'};GetIdentity={$null};TestSameLogon={param($Value,$Current)$false};Log={param($Message)$calls.Add("Log:$Message")};ConfirmReplacement={$calls.Add('Confirm');$false};EnterOwnership={$calls.Add('Enter');[pscustomobject]@{}};ExitOwnership={param($Lease)$calls.Add('Exit')};ClearIntent={$calls.Add('Clear')};ClearCorruptIntent={$calls.Add('ClearCorrupt')}}
+    Assert-CcodThrows {Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Explicit -Adapters $adapters} 'CCOD_SAFE_EXIT_INTENT_CONFIRMATION_REQUIRED'
+    Assert-CcodExactEqual 'Confirm' ($calls-join '|') 'negative confirmation does not acquire ownership or clear'
+    $calls.Clear();$adapters.ConfirmReplacement={$calls.Add('Confirm');$true}.GetNewClosure()
+    $result=Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Explicit -Adapters $adapters
+    Assert-CcodTrue $result.Cleared 'positive confirmation replaces corrupt marker'
+    Assert-CcodExactEqual 'Confirm|Enter|ClearCorrupt|Exit' ($calls-join '|') 'corrupt replacement clears only after ownership'
+    $task=@{ReadIntent={throw 'corrupt'};GetIdentity={$null};TestSameLogon={param($Value,$Current)$false};Log={param($Message){}};ConfirmReplacement={$true};EnterOwnership={[pscustomobject]@{}};ExitOwnership={param($Lease){}};ClearIntent={};ClearCorruptIntent={}}
+    Assert-CcodThrows {Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Task -Adapters $task} 'CCOD_SAFE_EXIT_INTENT_INVALID'
+}
+
+$results += Invoke-CcodTest 'identity and comparison failures use the same Explicit confirmation replacement boundary' {
+    # Production mutation caught: treating token/comparison failures as a bare confirmation-required error without showing confirmation.
+    foreach($failure in @('Identity','Compare')){
+        $calls=[Collections.Generic.List[string]]::new();$intent=[pscustomobject]@{recoveryTransactionId='33333333-2222-3333-4444-555555555555'}
+        $adapters=@{ReadIntent={$intent};GetIdentity={if($failure-ceq'Identity'){throw 'token'};[pscustomobject]@{}};TestSameLogon={param($a,$b)if($failure-ceq'Compare'){throw 'compare'};$false};ReadActiveRequest={$null};ReadCompletionReceipt={param($x)$null};Log={param($x){}};ConfirmReplacement={$calls.Add('Confirm');$false};EnterOwnership={$calls.Add('Enter');[pscustomobject]@{}};ExitOwnership={param($x)$calls.Add('Exit')};ClearIntent={$calls.Add('Clear')};ClearCorruptIntent={$calls.Add('ClearCorrupt')}}
+        Assert-CcodThrows {Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Task -Adapters $adapters} 'CCOD_SAFE_EXIT_INTENT_INVALID'
+        Assert-CcodThrows {Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Explicit -Adapters $adapters} 'CCOD_SAFE_EXIT_INTENT_CONFIRMATION_REQUIRED'
+        $calls.Clear();$adapters.ConfirmReplacement={$calls.Add('Confirm');$true}.GetNewClosure()
+        $result=Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode Explicit -Adapters $adapters
+        Assert-CcodTrue $result.Cleared "$failure Explicit Yes replaces marker"
+        Assert-CcodExactEqual 'Confirm|Enter|ClearCorrupt|Exit' ($calls-join '|') "$failure replacement acquires ownership after confirmation"
+    }
+}
+
+$results += Invoke-CcodTest 'production suppression caller fails closed for unsafe marker inspection and proceeds only on absence' {
+    # Production mutation caught: bypassing the injected marker-item boundary or treating access, directory, or reparse results as absent.
+    $arguments = @{
+        InstallRoot = 'C:\ccod-bootstrap-marker-boundary'
+        Pointer = [pscustomobject]@{ ActiveRuntime = 'unused-for-preflight' }
+        UserSid = 'S-1-5-21-1-2-3-1001'
+        SessionId = 1
+        EntryMode = 'Task'
+    }
+
+    Assert-CcodExactEqual $false (Test-CcodBootstrapSafeExitSuppression @arguments -GetMarkerItem { $null }) 'true absence proceeds without marker suppression'
+    Assert-CcodThrows { Test-CcodBootstrapSafeExitSuppression @arguments -GetMarkerItem { throw 'access denied' } } 'CCOD_SAFE_EXIT_INTENT_INVALID'
+
+    $directory = Get-Item -LiteralPath ([IO.Path]::GetTempPath()) -Force
+    Assert-CcodThrows { Test-CcodBootstrapSafeExitSuppression @arguments -GetMarkerItem { $directory } } 'CCOD_SAFE_EXIT_INTENT_INVALID'
+
+    $reparse = [IO.FileInfo]::new('C:\synthetic-safe-exit-reparse')
+    $instanceNonPublic = [Reflection.BindingFlags]'Instance,NonPublic'
+    $dataField = [IO.FileInfo].BaseType.GetField('_data', $instanceNonPublic)
+    $initializedField = [IO.FileInfo].BaseType.GetField('_dataInitialised', $instanceNonPublic)
+    $boxedData = [object]$dataField.GetValue($reparse)
+    $attributeField = $dataField.FieldType.GetField('fileAttributes', [Reflection.BindingFlags]'Instance,Public,NonPublic')
+    $attributeField.SetValue($boxedData, [int][IO.FileAttributes]::ReparsePoint)
+    $dataField.SetValue($reparse, $boxedData)
+    $initializedField.SetValue($reparse, 0)
+    Assert-CcodTrue (($reparse.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) 'fixture is a FileInfo marked ReparsePoint'
+    Assert-CcodThrows { Test-CcodBootstrapSafeExitSuppression @arguments -GetMarkerItem { $reparse } } 'CCOD_SAFE_EXIT_INTENT_INVALID'
+}
+
 
 $results += Invoke-CcodTest 'selects previous runtime after active exits before ready and swaps pointer' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-" + [guid]::NewGuid().ToString('N'))
@@ -222,6 +366,79 @@ $results += Invoke-CcodTest 'keeps a ready active runtime and does not rewrite t
         $pointer = Read-CcodTestActivePointer -Root $root
         Assert-CcodExactEqual $activeId $pointer.activeRuntime 'active pointer is unchanged'
     } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+$results += Invoke-CcodTest 'launches a schema-two active pointer without downgrading its generation' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-" + [guid]::NewGuid().ToString('N'))
+    try {
+        New-CcodBootstrapFixture -Root $root | Out-Null
+        $activeId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'Ready' -MarkerPath (Join-Path $root 'schema2.started'))
+        Set-CcodTestActivePointer -Root $root -ActiveRuntime $activeId -PreviousRuntime $null -SchemaVersion 2 -Generation 9
+        Assert-CcodExactEqual 0 (Invoke-CcodBootstrapUnderTest -Root $root -ReadyToken (New-CcodBootstrapToken)) 'schema-two active pointer launches'
+        $pointer = Read-CcodTestActivePointer -Root $root
+        Assert-CcodExactEqual 2 $pointer.schemaVersion 'healthy schema-two pointer is never downgraded'
+        Assert-CcodExactEqual ([UInt64]9) ([UInt64]$pointer.generation) 'healthy schema-two generation remains exact'
+    } finally { if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force } }
+}
+
+$results += Invoke-CcodTest 'launches a healthy legacy active runtime without requiring fallback fence modules' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-" + [guid]::NewGuid().ToString('N'))
+    try {
+        New-CcodBootstrapFixture -Root $root | Out-Null
+        $activeId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'Ready' -MarkerPath (Join-Path $root 'legacy.started')) -IncludeFenceModules $false
+        Set-CcodTestActivePointer -Root $root -ActiveRuntime $activeId -PreviousRuntime $null -SchemaVersion 1
+        Assert-CcodExactEqual 0 (Invoke-CcodBootstrapUnderTest -Root $root -ReadyToken (New-CcodBootstrapToken)) 'healthy legacy active runtime launches without pointer mutation'
+        $pointer = Read-CcodTestActivePointer -Root $root
+        Assert-CcodExactEqual 1 $pointer.schemaVersion 'healthy legacy active pointer remains unchanged'
+    } finally { if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force } }
+}
+
+$results += Invoke-CcodTest 'preserves schema-two generation when fallback promotes the previous runtime' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-" + [guid]::NewGuid().ToString('N'))
+    try {
+        New-CcodBootstrapFixture -Root $root | Out-Null
+        $activeId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'ExitEarly' -MarkerPath (Join-Path $root 'schema2-active.started'))
+        $previousId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'Ready' -MarkerPath (Join-Path $root 'schema2-previous.started'))
+        Set-CcodTestActivePointer -Root $root -ActiveRuntime $activeId -PreviousRuntime $previousId -SchemaVersion 2 -Generation 9
+        Assert-CcodExactEqual 0 (Invoke-CcodBootstrapUnderTest -Root $root -ReadyToken (New-CcodBootstrapToken)) 'schema-two fallback launches verified previous runtime'
+        $pointer = Read-CcodTestActivePointer -Root $root
+        Assert-CcodExactEqual 2 $pointer.schemaVersion 'fallback retains schema two'
+        Assert-CcodExactEqual ([UInt64]10) ([UInt64]$pointer.generation) 'fallback increments generation rather than discarding it'
+        Assert-CcodExactEqual $previousId $pointer.activeRuntime 'fallback commits the ready previous runtime'
+    } finally { if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force } }
+}
+
+$results += Invoke-CcodTest 'fails promptly when fallback lifecycle ownership cannot be released' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-" + [guid]::NewGuid().ToString('N'))
+    $supervisorPid = $null
+    $lease = $null
+    try {
+        New-CcodBootstrapFixture -Root $root | Out-Null
+        $activeId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'ExitEarly' -MarkerPath (Join-Path $root 'release-active.started'))
+        $pidPath = Join-Path $root 'release-previous.pid'
+        $previousId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'ReadyLongLived' -MarkerPath $pidPath) -FailLifecycleRelease $true
+        Set-CcodTestActivePointer -Root $root -ActiveRuntime $activeId -PreviousRuntime $previousId -SchemaVersion 2 -Generation 9
+
+        $run = Invoke-CcodBootstrapTimed -Root $root -ReadyToken (New-CcodBootstrapToken)
+        if ([IO.File]::Exists($pidPath)) { $supervisorPid = [int][IO.File]::ReadAllText($pidPath) }
+        Assert-CcodExactEqual $false $run.TimedOut 'release failure exits instead of waiting for the ready long-lived Supervisor'
+        Assert-CcodExactEqual 1 $run.ExitCode 'release failure is a stable nonzero bootstrap outcome'
+        Assert-CcodTrue ($run.ElapsedMilliseconds -lt 4000) 'release failure returns within the bounded prompt-exit window'
+        $log = [IO.File]::ReadAllText((Join-Path $root 'logs\bootstrap.log'))
+        Assert-CcodTrue ($log.Contains('CCOD_BOOTSTRAP_FENCE_RELEASE_FAILED')) 'release failure is normalized to the stable bootstrap code'
+        Assert-CcodTrue (-not $log.Contains('signaled ready; active pointer switched')) 'release failure never logs successful fallback readiness'
+
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $lease = Enter-CcodMutex -Kind AccountTransition -UserSid $sid -TimeoutMilliseconds 1000
+        Assert-CcodExactEqual 'Acquired' $lease.Outcome 'bootstrap exit lets OS cleanup release any recursive mutex ownership'
+    } finally {
+        if ($null -ne $lease -and $lease.Outcome -ceq 'Acquired' -and -not $lease.Released) { Exit-CcodMutex -Lease $lease | Out-Null }
+        if ($null -ne $supervisorPid) {
+            $leftover = Get-Process -Id $supervisorPid -ErrorAction SilentlyContinue
+            if ($null -ne $leftover) { try { $leftover.Kill(); $leftover.WaitForExit(2000) | Out-Null } finally { $leftover.Dispose() } }
+        }
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
     }
 }
@@ -400,6 +617,31 @@ $results += Invoke-CcodTest 'defaults InstallRoot to the bootstrap script direct
     Assert-CcodTrue ($null -ne $param) 'InstallRoot parameter exists'
     Assert-CcodTrue (-not $param.Attributes.Where({ $_.TypeName.Name -ceq 'Parameter' -and $_.NamedArguments.Where({ $_.ArgumentName -ceq 'Mandatory' -and $_.Argument.Extent.Text -match 'true' }) }).Count) 'InstallRoot is not mandatory'
     Assert-CcodTrue ($param.DefaultValue.Extent.Text -match 'PSScriptRoot') 'InstallRoot defaults to PSScriptRoot for scheduled-task launches'
+    $entryMode = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -ceq 'EntryMode' } | Select-Object -First 1
+    Assert-CcodTrue ($null -ne $entryMode -and $entryMode.DefaultValue.Extent.Text -match "'Explicit'") 'bootstrap defaults manual launches to Explicit entry mode'
+    Assert-CcodTrue (@($entryMode.Attributes | Where-Object { $_.TypeName.Name -ceq 'ValidateSet' }).Count -eq 1) 'bootstrap constrains entry mode to the declared safe modes'
+}
+
+$results += Invoke-CcodTest 'prelaunch evaluates safe-exit policy before lease acquisition and suppression skips the lease' {
+    # Production mutation caught: acquiring AccountTransition before marker policy, or acquiring it after same-logon suppression.
+    $calls = [Collections.Generic.List[string]]::new()
+    $lease = [pscustomobject]@{ Outcome = 'Acquired'; Released = $false }
+    $adapters = @{
+        TestSafeExitSuppression = { $calls.Add('MarkerPolicy'); $false }
+        AcquireLaunchLease = { $calls.Add('AccountTransition'); [pscustomobject]@{ KernelModule = 'kernel'; LaunchLease = $lease } }
+    }
+
+    $proceed = Invoke-CcodBootstrapPrelaunch -Adapters $adapters
+    Assert-CcodExactEqual 'MarkerPolicy|AccountTransition' ($calls -join '|') 'marker policy runs before AccountTransition acquisition'
+    Assert-CcodExactEqual $false $proceed.Suppressed 'ordinary startup proceeds'
+    Assert-CcodExactEqual $lease $proceed.LaunchLease 'ordinary startup returns the acquired launch lease'
+
+    $calls.Clear()
+    $adapters.TestSafeExitSuppression = { $calls.Add('MarkerPolicy'); $true }.GetNewClosure()
+    $suppressed = Invoke-CcodBootstrapPrelaunch -Adapters $adapters
+    Assert-CcodExactEqual 'MarkerPolicy' ($calls -join '|') 'same-logon suppression never acquires AccountTransition'
+    Assert-CcodExactEqual $true $suppressed.Suppressed 'same-logon marker suppresses startup'
+    Assert-CcodExactEqual $null $suppressed.LaunchLease 'suppressed startup owns no launch lease'
 }
 
 $results | Format-Table -AutoSize

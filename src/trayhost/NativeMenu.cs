@@ -56,27 +56,21 @@ internal sealed class NativeMenu : IDisposable
         {
             Append(_menu, TrayNativeConstants.MfString | TrayNativeConstants.MfDisabled | TrayNativeConstants.MfGrayed, 0U, 0);
             Append(_menu, TrayNativeConstants.MfString | TrayNativeConstants.MfDisabled | TrayNativeConstants.MfGrayed, 0U, 1);
-            Append(_menu, TrayNativeConstants.MfString, 0U, 2);
-            Append(_menu, TrayNativeConstants.MfString | Enabled(3), (uint)TrayCommand.ApplyNow, 3);
-            Append(_menu, TrayNativeConstants.MfString | Enabled(4), (uint)TrayCommand.ManualRetry, 4);
-            Append(_menu, TrayNativeConstants.MfString | Enabled(5) | Checked(5), (uint)TrayCommand.SetAutomation, 5);
-            Append(_menu, TrayNativeConstants.MfString | Enabled(6) | Checked(6), (uint)TrayCommand.SetCandidateOptIn, 6);
+            Append(_menu, TrayNativeConstants.MfString | TrayNativeConstants.MfDisabled | TrayNativeConstants.MfGrayed, 0U, 2);
+            AppendSeparator(_menu);
+            Append(_menu, TrayNativeConstants.MfString | Enabled(PresentationFlags.RepairEnabled), (uint)TrayCommand.CheckAndRepair, 3);
 
             IntPtr language = _native.CreateSubMenu();
             if (language == IntPtr.Zero) { throw new InvalidOperationException("CreateLanguageMenu failed"); }
-            if (!_native.AppendSubMenu(_menu, language, _snapshot.Strings[7])) { throw new InvalidOperationException("AppendLanguageMenu failed"); }
-            Append(language, TrayNativeConstants.MfString | LanguageChecked(LanguageMode.System), (uint)TrayCommand.SetLanguageSystem, 8);
-            Append(language, TrayNativeConstants.MfString | LanguageChecked(LanguageMode.Chinese), (uint)TrayCommand.SetLanguageChinese, 9);
-            Append(language, TrayNativeConstants.MfString | LanguageChecked(LanguageMode.English), (uint)TrayCommand.SetLanguageEnglish, 10);
+            if (!_native.AppendSubMenu(_menu, language, _snapshot.Strings[4])) { throw new InvalidOperationException("AppendLanguageMenu failed"); }
+            Append(language, TrayNativeConstants.MfString | Enabled(PresentationFlags.LanguageEnabled) | LanguageChecked(LanguageMode.System), (uint)TrayCommand.SetLanguageSystem, 5);
+            Append(language, TrayNativeConstants.MfString | Enabled(PresentationFlags.LanguageEnabled) | LanguageChecked(LanguageMode.Chinese), (uint)TrayCommand.SetLanguageChinese, 6);
+            Append(language, TrayNativeConstants.MfString | Enabled(PresentationFlags.LanguageEnabled) | LanguageChecked(LanguageMode.English), (uint)TrayCommand.SetLanguageEnglish, 7);
 
-            Append(_menu, TrayNativeConstants.MfString | Enabled(11), (uint)TrayCommand.OpenLogs, 11);
-            Append(_menu, TrayNativeConstants.MfString, (uint)TrayCommand.ShowAbout, 12);
-            IntPtr uninstall = _native.CreateSubMenu();
-            if (uninstall == IntPtr.Zero) { throw new InvalidOperationException("CreateUninstallMenu failed"); }
-            if (!_native.AppendSubMenu(_menu, uninstall, _snapshot.Strings[13])) { throw new InvalidOperationException("AppendUninstallMenu failed"); }
-            Append(uninstall, TrayNativeConstants.MfString | TrayNativeConstants.MfDisabled | TrayNativeConstants.MfGrayed, 0U, 14);
-            Append(uninstall, TrayNativeConstants.MfString | (Has(PresentationFlags.UninstallEnabled) ? 0U : TrayNativeConstants.MfDisabled | TrayNativeConstants.MfGrayed), (uint)TrayCommand.ConfirmUninstall, 15);
-            Append(_menu, TrayNativeConstants.MfString | TrayNativeConstants.MfDisabled | TrayNativeConstants.MfGrayed, 0U, 16);
+            Append(_menu, TrayNativeConstants.MfString | Enabled(PresentationFlags.OpenLogsEnabled), (uint)TrayCommand.OpenLogs, 8);
+            Append(_menu, TrayNativeConstants.MfString | Enabled(PresentationFlags.AboutEnabled), (uint)TrayCommand.ShowAbout, 9);
+            AppendSeparator(_menu);
+            Append(_menu, TrayNativeConstants.MfString | Enabled(PresentationFlags.ExitEnabled), (uint)TrayCommand.Exit, 10);
         }
         catch
         {
@@ -85,22 +79,7 @@ internal sealed class NativeMenu : IDisposable
         }
     }
 
-    private uint Enabled(int stringIndex)
-    {
-        if (stringIndex == 3) { return Has(PresentationFlags.ApplyNowEnabled) ? 0U : TrayNativeConstants.MfDisabled | TrayNativeConstants.MfGrayed; }
-        if (stringIndex == 4) { return Has(PresentationFlags.ManualRetryEnabled) ? 0U : TrayNativeConstants.MfDisabled | TrayNativeConstants.MfGrayed; }
-        if (stringIndex == 5) { return Has(PresentationFlags.AutomationToggleEnabled) ? 0U : TrayNativeConstants.MfDisabled | TrayNativeConstants.MfGrayed; }
-        if (stringIndex == 6) { return Has(PresentationFlags.CandidateOptInToggleEnabled) ? 0U : TrayNativeConstants.MfDisabled | TrayNativeConstants.MfGrayed; }
-        if (stringIndex == 11) { return Has(PresentationFlags.OpenLogsEnabled) ? 0U : TrayNativeConstants.MfDisabled | TrayNativeConstants.MfGrayed; }
-        return 0U;
-    }
-
-    private uint Checked(int stringIndex)
-    {
-        if (stringIndex == 5) { return Has(PresentationFlags.AutomationChecked) ? TrayNativeConstants.MfChecked : 0U; }
-        if (stringIndex == 6) { return Has(PresentationFlags.CandidateOptInChecked) ? TrayNativeConstants.MfChecked : 0U; }
-        return 0U;
-    }
+    private uint Enabled(PresentationFlags flag) { return Has(flag) ? 0U : TrayNativeConstants.MfDisabled | TrayNativeConstants.MfGrayed; }
 
     private uint LanguageChecked(LanguageMode mode)
     {
@@ -112,6 +91,11 @@ internal sealed class NativeMenu : IDisposable
     private void Append(IntPtr menu, uint flags, uint command, int stringIndex)
     {
         if (!_native.AppendMenu(menu, flags, new UIntPtr(command), _snapshot.Strings[stringIndex])) { throw new InvalidOperationException("AppendMenu failed"); }
+    }
+
+    private void AppendSeparator(IntPtr menu)
+    {
+        if (!_native.AppendMenu(menu, TrayNativeConstants.MfSeparator, UIntPtr.Zero, String.Empty)) { throw new InvalidOperationException("AppendSeparator failed"); }
     }
 
     public void Dispose()

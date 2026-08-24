@@ -5,7 +5,7 @@ $modulePath=Join-Path $repositoryRoot 'src\persistence\modules\TrayHostClient.ps
 Invoke-CcodTest 'TrayHost client wrapper is source-auditable and does not start a host on import' {
     Assert-CcodTrue (Test-Path -LiteralPath $modulePath -PathType Leaf) 'TrayHost client module exists'
     Import-Module $modulePath -Force
-    foreach($name in @('New-CcodTrayHostContext','Set-CcodTrayHostPresentation','Invoke-CcodTrayHostRunLoop','Request-CcodTrayHostExit','Close-CcodTrayHostContext','Show-CcodTrayHostError','End-CcodTrayHostMenu')){Assert-CcodTrue ($null -ne (Get-Command $name -ErrorAction SilentlyContinue)) "wrapper export exists: $name"}
+    foreach($name in @('New-CcodTrayHostContext','Set-CcodTrayHostPresentation','Receive-CcodTrayHostEvents','Send-CcodTrayHostActionResult','Invoke-CcodTrayHostRunLoop','Request-CcodTrayHostExit','Close-CcodTrayHostContext','Show-CcodTrayHostError','End-CcodTrayHostMenu')){Assert-CcodTrue ($null -ne (Get-Command $name -ErrorAction SilentlyContinue)) "wrapper export exists: $name"}
     Assert-CcodTrue ($null -eq (Get-Command New-CcodTrayContext -ErrorAction SilentlyContinue)) 'wrapper does not re-export the legacy UI constructor'
 }
 
@@ -22,6 +22,31 @@ Invoke-CcodTest 'TrayHost client carries the localized About item and active run
     Assert-CcodTrue ($source -cmatch "RuntimeId -is \[string\].*\^\(\?<version\>\\d\+\\\.\\d\+\\\.\\d\+\)-") 'snapshot extracts the semantic version from the active runtime id'
     Assert-CcodTrue ($source -cmatch "Menu\.About',") 'snapshot carries the localized About menu label'
     Assert-CcodTrue ($source -cmatch '\$aboutVersion') 'snapshot appends the About message to the presentation payload'
+}
+
+Invoke-CcodTest 'TrayHost client maps only v2 actions and returns correlated action receipts' {
+    $source = Get-Content -LiteralPath $modulePath -Raw -Encoding UTF8
+    $receive=[regex]::Match($source,'function Receive-CcodTrayHostEvents \{(?s:.*?)\n\}\n\nfunction Send-CcodTrayHostActionResult').Value
+    Assert-CcodTrue ($source -cmatch 'CheckAndRepair') 'wrapper maps the v2 repair action'
+    Assert-CcodTrue ($source -cmatch 'ActionId') 'wrapper preserves the authenticated action identifier'
+    Assert-CcodTrue ($source -cmatch 'TryAcknowledgeAction') 'wrapper sends one correlated action result through the parent client'
+    Assert-CcodTrue ($source -cmatch 'ActionId=\$event\.ActionId;Command=\$command;Revision=\[UInt64\]\$event\.Revision') 'wrapper queues the exact v2 action identity command and revision contract'
+    Assert-CcodTrue ($receive -cnotmatch 'ConfirmUninstall|SetCandidateOptIn|SetAutomation|ApplyNow|ManualRetry') 'receive path does not expose legacy wire actions'
+}
+
+Invoke-CcodTest 'TrayHost client emits the fixed v2 connection protection snapshot fields' {
+    $source = Get-Content -LiteralPath $modulePath -Raw -Encoding UTF8
+    Assert-CcodTrue ($source -cmatch 'Convert-CcodTrayHostConnection') 'snapshot converts the v2 connection state'
+    Assert-CcodTrue ($source -cmatch 'Convert-CcodTrayHostProtection') 'snapshot converts the v2 protection state'
+    Assert-CcodTrue ($source -cmatch 'ConnectionState') 'snapshot carries the current connection state'
+    Assert-CcodTrue ($source -cmatch 'ProtectionState') 'snapshot carries the current protection state'
+}
+
+Invoke-CcodTest 'TrayHost starts fail-closed until the Supervisor publishes an eligible Exit presentation' {
+    # Production mutation caught: enabling the native Exit action in the initial pre-Supervisor snapshot.
+    $presentation=New-CcodTrayHostInitialPresentation
+    Assert-CcodEqual $false $presentation.ExitEnabled 'initial native presentation keeps Exit disabled before lifecycle ownership and recovery checks'
+    Assert-CcodEqual $false $presentation.Busy 'initial presentation is an idle disabled action surface, not a synthetic busy state'
 }
 
 Write-Host 'TrayHost client self-tests passed.'

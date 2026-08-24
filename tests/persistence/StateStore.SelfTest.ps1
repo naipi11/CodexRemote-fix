@@ -3,6 +3,7 @@ $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\StateStore.psm1') -Force
+Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\LifecycleTransaction.psm1') -Force
 
 function New-CcodStateTestAdapters {
     $fixedUtc = [DateTime]::Parse('2030-02-03T04:05:06.0000000Z').ToUniversalTime()
@@ -125,6 +126,13 @@ function Assert-CcodFailedAttemptClearReceipt {
 
 $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-state-selftest-' + [Guid]::NewGuid().ToString('N'))
 try {
+    Invoke-CcodTest 'exposes trusted safe-exit persistence with the state-store contract' {
+        $commands = @('Get-CcodTrustedLogonIdentity', 'Read-CcodSafeExitIntent', 'Write-CcodSafeExitIntent', 'Test-CcodSafeExitIntentForCurrentLogon', 'Clear-CcodSafeExitIntent')
+        foreach ($name in $commands) {
+            Assert-CcodEqual 'StateStore' (Get-Command $name -ErrorAction Stop).ModuleName "state store exposes $name"
+        }
+    }
+
     Invoke-CcodTest 'initializes independent automation consent and installer-verified absolute Node paths' {
         $state = Join-Path $root 'initial'
         Initialize-CcodStateFixture -StateRoot $state
@@ -137,6 +145,30 @@ try {
         Assert-CcodEqual $true $loaded.TransitionActionsAllowed 'healthy initialized transition store permits actions'
         Assert-CcodEqual '2030-02-03T04:05:06.0000000Z' $loaded.Settings.updatedAtUtc 'state uses injected UTC clock'
         Assert-CcodThrows { Initialize-CcodState -StateRoot (Join-Path $root 'relative-node') -NodeCandidates @('node.exe') -Adapters (New-CcodStateTestAdapters) } 'CCOD_NODE_CANDIDATE_INVALID'
+    }
+
+    Invoke-CcodTest 'migrates an initialized 2.4 state root only by creating idle lifecycle storage' {
+        $state = Join-Path $root 'lifecycle-migration'
+        Initialize-CcodStateFixture -StateRoot $state
+        $preserved = @{}
+        foreach ($leaf in @('settings.json', 'status.json', 'verified-packages.json', 'transition.json')) {
+            $preserved[$leaf] = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $state $leaf)))
+        }
+        $preferencesPath = Join-Path $state 'ui-preferences.json'
+        [IO.File]::WriteAllText($preferencesPath, '{"preserved":true}', [Text.UTF8Encoding]::new($false))
+        $preferenceBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($preferencesPath))
+
+        Initialize-CcodState -StateRoot $state -Adapters (New-CcodStateTestAdapters) | Out-Null
+
+        Assert-CcodTrue ([IO.Directory]::Exists((Join-Path $state 'lifecycle\receipts'))) 'migration creates lifecycle receipt storage'
+        Assert-CcodEqual $null (Read-CcodLifecycleRequest -StateRoot $state) 'migration creates no active lifecycle request'
+        foreach ($leaf in $preserved.Keys) {
+            Assert-CcodEqual $preserved[$leaf] ([Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $state $leaf))) ) "$leaf bytes remain untouched by lifecycle migration"
+        }
+        Assert-CcodEqual $preferenceBytes ([Convert]::ToBase64String([IO.File]::ReadAllBytes($preferencesPath))) 'UI preferences remain untouched by lifecycle migration'
+
+        [IO.File]::WriteAllText((Join-Path $state 'lifecycle\active-request.json'), '{broken', [Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows { Initialize-CcodState -StateRoot $state -Adapters (New-CcodStateTestAdapters) } 'CCOD_LIFECYCLE_STATE_INVALID'
     }
 
     Invoke-CcodTest 'fails closed for every missing malformed and unknown-schema state file' {

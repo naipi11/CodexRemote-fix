@@ -431,9 +431,6 @@ function Get-CcodSupervisorDecision {
     if (Test-CcodRecoveryMembership $Context.RecoveryIgnoreKeys $attemptKey) {
         return New-CcodSupervisorDecision 'KeepOrdinary' 'RecoveryIgnored' $target $attemptKey $suppressionKey $effectiveClassification
     }
-    if (-not $Context.AutomationEnabled) {
-        return New-CcodSupervisorDecision 'KeepOrdinary' 'AutomationDisabled' $target $attemptKey $suppressionKey $effectiveClassification
-    }
     $failedHistory = $null -ne $history -and $history.packageFullName -ceq $Context.PackageFullName -and
         $history.appAsarSha256 -ceq $Context.AppAsarSha256 -and $history.runtimeId -ceq $Context.RuntimeId -and
         $history.dynamicOutcome -ceq 'Failed'
@@ -448,12 +445,6 @@ function Get-CcodSupervisorDecision {
     }
     if (@('NativeModulePresent','UnknownOrIncompatible') -ccontains $effectiveClassification) {
         return New-CcodSupervisorDecision 'KeepOrdinary' $effectiveClassification $target $attemptKey $suppressionKey $effectiveClassification
-    }
-    if ($effectiveClassification -ceq 'CandidateCompatible' -and -not $Context.CandidateCompatibleOptIn) {
-        return New-CcodSupervisorDecision 'KeepOrdinary' 'CandidateOptInRequired' $target $attemptKey $suppressionKey $effectiveClassification
-    }
-    if ($effectiveClassification -ceq 'CandidateCompatible' -and -not $Context.AutomaticCandidateTrialsAllowed) {
-        return New-CcodSupervisorDecision 'KeepOrdinary' 'CandidateTrialBlocked' $target $attemptKey $suppressionKey $effectiveClassification
     }
     return New-CcodSupervisorDecision 'ApplyOrdinary' 'Compatible' $target $attemptKey $suppressionKey $effectiveClassification
 }
@@ -785,69 +776,39 @@ function Complete-CcodControllerRun {
 function Get-CcodTrayPresentation {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]$SessionState,
-        [Parameter(Mandatory)]$AutomationEnabled,
-        [Parameter(Mandatory)]$CandidateCompatibleOptIn,
-        [Parameter(Mandatory)]$HasOrdinary,
-        [Parameter(Mandatory)]$ControllerRunning,
-        [Parameter(Mandatory)]$StateDamageBlocksActions,
-        [Parameter(Mandatory)]$HasActiveTransaction,
-        [AllowNull()]$Reason=$null
+        [Parameter(Mandatory)][string]$ConnectionState,
+        [Parameter(Mandatory)][string]$ProtectionState,
+        [Parameter(Mandatory)]$Busy,
+        [Parameter(Mandatory)]$StateDamageBlocksActions
     )
     $code = 'CCOD_TRAY_INPUT_INVALID'
-    if ($SessionState -isnot [string] -or @('Waiting','Inspecting','Transitioning','Active','Suppressed','Recovered','Error') -cnotcontains $SessionState) {
-        Throw-CcodSupervisorError $code 'Tray state is invalid' $SessionState
+    if (@('WaitingForCodex','Checking','Connected','RepairNeeded','Error') -cnotcontains $ConnectionState) {
+        Throw-CcodSupervisorError $code 'Tray connection state is invalid' $ConnectionState
     }
-    foreach ($value in @($AutomationEnabled,$CandidateCompatibleOptIn,$HasOrdinary,$ControllerRunning,$StateDamageBlocksActions,$HasActiveTransaction)) {
+    if (@('Running','Reconnecting','Stopping') -cnotcontains $ProtectionState) {
+        Throw-CcodSupervisorError $code 'Tray protection state is invalid' $ProtectionState
+    }
+    foreach ($value in @($Busy,$StateDamageBlocksActions)) {
         if ($value -isnot [bool]) { Throw-CcodSupervisorError $code 'Tray Boolean is invalid' $value }
     }
-    if ($null -ne $Reason -and ($Reason -isnot [string] -or $Reason -cnotmatch '^[A-Za-z][A-Za-z0-9_.-]{0,62}$')) {
-        Throw-CcodSupervisorError $code 'Tray reason is invalid' $Reason
+    $color = switch ($ConnectionState) {
+        'Connected' { 'Green' }
+        'Checking' { 'Yellow' }
+        'RepairNeeded' { 'Yellow' }
+        'Error' { 'Red' }
+        default { 'Gray' }
     }
-    $stateTable = [ordered]@{
-        Waiting = @{ Color='Gray'; StateKey='Waiting' }
-        Inspecting = @{ Color='Gray'; StateKey='Inspecting' }
-        Transitioning = @{ Color='Gray'; StateKey='Transitioning' }
-        Active = @{ Color='Green'; StateKey='Active' }
-        Suppressed = @{ Color='Yellow'; StateKey='Suppressed' }
-        Recovered = @{ Color='Red'; StateKey='Recovered' }
-        Error = @{ Color='Red'; StateKey='Error' }
-    }
-    $stateProjection = $stateTable[$SessionState]
-    if ($null -eq $stateProjection) {
-        Throw-CcodSupervisorError 'CCOD_TRAY_PRESENTATION_INVALID' 'Tray presentation state is invalid' $SessionState
-    }
-    $stateKey = $stateProjection.StateKey
-    $color = $stateProjection.Color
-    if ($SessionState -ceq 'Active' -and $Reason -ceq 'RendererHandoff') {
-        $stateKey = 'RendererHandoff'
-        $color = 'Yellow'
-    } elseif ($SessionState -ceq 'Active' -and -not $AutomationEnabled) {
-        $stateKey = 'ActivePaused'
-    }
-    $transitioning = @('Inspecting','Transitioning') -ccontains $SessionState
-    $busy = $ControllerRunning -or $HasActiveTransaction -or $transitioning
-    $actionsBlocked = $busy -or $StateDamageBlocksActions
-    $sessionReadyVisible = $SessionState -ceq 'Active'
-    $applyNowVisible = $HasOrdinary
-    $applyNowEnabled = $applyNowVisible -and -not $actionsBlocked
-    $manualRetryVisible = @('Suppressed','Recovered','Error') -ccontains $SessionState
-    $manualRetryEnabled = $manualRetryVisible -and -not $actionsBlocked
+    $actionsBlocked = $Busy -or $StateDamageBlocksActions -or $ProtectionState -ceq 'Stopping'
     return [pscustomobject][ordered]@{
         Color=$color
-        StateKey=$stateKey
-        SessionReadyVisible=[bool]$sessionReadyVisible
-        ApplyNowVisible=[bool]$applyNowVisible
-        ApplyNowEnabled=[bool]$applyNowEnabled
-        ManualRetryVisible=[bool]$manualRetryVisible
-        ManualRetryEnabled=[bool]$manualRetryEnabled
-        AutomationToggleEnabled=[bool]$true
-        AutomationChecked=[bool]$AutomationEnabled
-        CandidateOptInToggleEnabled=[bool]$true
-        CandidateOptInChecked=[bool]$CandidateCompatibleOptIn
+        ConnectionState=$ConnectionState
+        ProtectionState=$ProtectionState
+        RepairEnabled=[bool]($ConnectionState -ceq 'RepairNeeded' -and -not $actionsBlocked)
+        LanguageEnabled=[bool](-not $actionsBlocked)
         OpenLogsEnabled=[bool]$true
-        UninstallEnabled=[bool](-not $busy)
-        Busy=[bool]$busy
+        AboutEnabled=[bool]$true
+        ExitEnabled=[bool](-not $actionsBlocked -and $ProtectionState -ceq 'Running')
+        Busy=[bool]$Busy
     }
 }
 

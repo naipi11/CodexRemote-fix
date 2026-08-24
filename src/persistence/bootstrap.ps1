@@ -9,7 +9,11 @@ param(
 
     [Parameter(Mandatory = $false)]
     [ValidateRange(1, 120)]
-    [int]$ReadyTimeoutSeconds = 15
+    [int]$ReadyTimeoutSeconds = 15,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('Task','Explicit')]
+    [string]$EntryMode = 'Explicit'
 )
 
 Set-StrictMode -Version 2.0
@@ -125,14 +129,24 @@ function Read-CcodBootstrapActivePointer {
 
     $path = Assert-CcodBootstrapContained -Root $InstallRoot -Path (Join-Path $InstallRoot 'active.json') -AllowMissingLeaf
     $value = Read-CcodBootstrapJson -Path $path -Kind 'active.json'
-    if ($null -eq $value.PSObject.Properties['schemaVersion'] -or $value.schemaVersion -isnot [int] -or $value.schemaVersion -ne 1 -or
+    if ($null -eq $value.PSObject.Properties['schemaVersion'] -or $value.schemaVersion -isnot [int] -or $value.schemaVersion -notin @(1,2) -or
         $null -eq $value.PSObject.Properties['activeRuntime'] -or $value.activeRuntime -isnot [string] -or
         [string]::IsNullOrWhiteSpace($value.activeRuntime) -or
         $null -eq $value.PSObject.Properties['previousRuntime'] -or
         ($null -ne $value.previousRuntime -and $value.previousRuntime -isnot [string]) -or
         $null -eq $value.PSObject.Properties['updatedAtUtc'] -or $value.updatedAtUtc -isnot [string] -or
         [string]::IsNullOrWhiteSpace($value.updatedAtUtc)) {
-        Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'active.json is not a valid schema-1 pointer' $path
+        Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'active.json is not a valid active runtime pointer' $path
+    }
+    [UInt64]$generation = 1
+    if ($value.schemaVersion -eq 2) {
+        if ($null -eq $value.PSObject.Properties['generation'] -or $value.generation -isnot [byte] -and $value.generation -isnot [uint16] -and $value.generation -isnot [uint32] -and $value.generation -isnot [uint64] -and $value.generation -isnot [int16] -and $value.generation -isnot [int32] -and $value.generation -isnot [int64] -and $value.generation -isnot [decimal]) {
+            Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'active.json has an invalid generation' $path
+        }
+        try { $generation = [UInt64]$value.generation } catch { Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'active.json has an invalid generation' $path }
+        if ($generation -eq 0 -or ($value.generation -is [decimal] -and [decimal]::Truncate($value.generation) -ne $value.generation)) {
+            Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'active.json has an invalid generation' $path
+        }
     }
     Assert-CcodBootstrapRuntimeId -RuntimeId $value.activeRuntime | Out-Null
     if ($null -ne $value.previousRuntime -and -not [string]::IsNullOrWhiteSpace($value.previousRuntime)) {
@@ -141,6 +155,8 @@ function Read-CcodBootstrapActivePointer {
     return [pscustomobject]@{
         ActiveRuntime = [string]$value.activeRuntime
         PreviousRuntime = if ($null -eq $value.previousRuntime -or [string]::IsNullOrWhiteSpace($value.previousRuntime)) { $null } else { [string]$value.previousRuntime }
+        SchemaVersion = [int]$value.schemaVersion
+        Generation = $generation
     }
 }
 
@@ -308,7 +324,8 @@ function Test-CcodBootstrapRuntime {
             }
         }
         $computedRuntimeId = Get-CcodBootstrapRuntimeId -ProjectVersion ([string]$manifest.projectVersion) -Files $actualFiles
-        if ($computedRuntimeId -cne $manifestRuntimeId -or -not $manifestPaths.Contains('src/persistence/Supervisor.ps1')) {
+        $requiredRuntimeFiles = @('src/persistence/Supervisor.ps1')
+        if ($computedRuntimeId -cne $manifestRuntimeId -or @($requiredRuntimeFiles | Where-Object { -not $manifestPaths.Contains($_) }).Count -ne 0) {
             return New-CcodBootstrapRuntimeValidation -Valid $false -Code 'CCOD_BOOTSTRAP_RUNTIME_ID_MISMATCH' -RuntimeDirectory $runtimeDirectory -SupervisorPath $null
         }
         $supervisorPath = Assert-CcodBootstrapContained -Root $runtimeDirectory -Path (Join-Path $runtimeDirectory 'src\persistence\Supervisor.ps1')
@@ -334,18 +351,151 @@ function Import-CcodBootstrapKernelObjects {
 
     foreach ($runtimeId in $candidates) {
         $validation = Test-CcodBootstrapRuntime -InstallRoot $InstallRoot -RuntimeId $runtimeId
-        if (-not $validation.Valid) { continue }
+        if (-not $validation.Valid) {
+            Write-CcodBootstrapLog -InstallRoot $InstallRoot -Message ("Runtime {0} rejected while locating kernel objects: {1}" -f $runtimeId, $validation.Code)
+            continue
+        }
         $modulePath = Assert-CcodBootstrapContained -Root $validation.RuntimeDirectory -Path (Join-Path $validation.RuntimeDirectory 'src\persistence\modules\KernelObjects.psm1') -AllowMissingLeaf
         if (-not [IO.File]::Exists($modulePath)) { continue }
         try {
-            Import-Module -Name $modulePath -Force -ErrorAction Stop
-            return
+            return Import-Module -Name $modulePath -Force -PassThru -ErrorAction Stop
         } catch {
             Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_KERNEL_IMPORT_FAILED' 'The verified runtime kernel-object module could not be loaded' $modulePath
         }
     }
 
     Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_KERNEL_MISSING' 'No verified runtime contains the kernel-object module required for launch serialization' $InstallRoot
+}
+
+function Invoke-CcodBootstrapExplicitMarkerReplacement {param([hashtable]$Adapters)if(-not(&$Adapters.ConfirmReplacement)){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_CONFIRMATION_REQUIRED' 'Explicit startup requires local confirmation before marker replacement' $null};$ownership=&$Adapters.EnterOwnership;try{&$Adapters.ClearCorruptIntent}finally{&$Adapters.ExitOwnership $ownership|Out-Null};return [pscustomobject]@{Suppressed=$false;Cleared=$true}}
+function Get-CcodBootstrapSafeExitMarkerPreflight {param([hashtable]$Adapters)try{$item=&$Adapters.GetMarkerItem}catch{Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Safe-exit marker inspection failed' $null};if($null-eq$item){return 'Absent'};if($item-isnot[IO.FileInfo]-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){return 'Invalid'};return 'File'}
+function Invoke-CcodBootstrapSafeExitMarkerPolicy {
+    param([Parameter(Mandatory)][ValidateSet('Task','Explicit')][string]$EntryMode,[Parameter(Mandatory)][hashtable]$Adapters)
+    try{$intent=&$Adapters.ReadIntent}catch{
+        if($EntryMode-ceq'Task'){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Task startup refuses an unreadable safe-exit marker' $null}
+        return Invoke-CcodBootstrapExplicitMarkerReplacement $Adapters
+    }
+    if($null-eq$intent){return [pscustomobject]@{Suppressed=$false;Cleared=$false}}
+    $identity=$null;try{$identity=&$Adapters.GetIdentity}catch{
+        if($EntryMode-ceq'Task'){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Task startup requires a trusted logon identity' $null}
+        return Invoke-CcodBootstrapExplicitMarkerReplacement $Adapters
+    }
+    try{$same=&$Adapters.TestSameLogon $intent $identity}catch{if($EntryMode-ceq'Task'){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Task startup requires trusted marker comparison' $null};return Invoke-CcodBootstrapExplicitMarkerReplacement $Adapters}
+    if($same-and$EntryMode-ceq'Task'){
+        $active=&$Adapters.ReadActiveRequest
+        if($null-ne$active-and$active.kind-ceq'SafeExit'-and$active.transactionId-ceq$intent.recoveryTransactionId){return [pscustomobject]@{Suppressed=$false;Cleared=$false}}
+        $receipt=&$Adapters.ReadCompletionReceipt $intent.recoveryTransactionId
+        if($null-ne$receipt-and$receipt.kind-ceq'SafeExit'-and$receipt.transactionId-ceq$intent.recoveryTransactionId-and($receipt.phase-ceq'Completed'-or($receipt.phase-ceq'CancelledBeforeClose'-and$null-eq$receipt.error))){&$Adapters.Log 'SAFE_EXIT_SUPPRESSED';return [pscustomobject]@{Suppressed=$true;Cleared=$false}}
+        Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Task startup refuses an unpaired safe-exit marker' $null
+    }
+    $ownership=&$Adapters.EnterOwnership
+    try{&$Adapters.ClearIntent;$cleared=$true}finally{&$Adapters.ExitOwnership $ownership|Out-Null}
+    return [pscustomobject]@{Suppressed=$false;Cleared=$cleared}
+}
+
+function Test-CcodBootstrapSafeExitSuppression {
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)]$Pointer,
+        [Parameter(Mandatory)][string]$UserSid,
+        [Parameter(Mandatory)][int]$SessionId,
+        [Parameter(Mandatory)][ValidateSet('Task','Explicit')][string]$EntryMode,
+        [scriptblock]$GetMarkerItem
+    )
+    $marker=Join-Path $InstallRoot 'state\lifecycle\safe-exit-intent.json'
+    if($null-eq$GetMarkerItem){
+        $GetMarkerItem={try{Get-Item -LiteralPath $marker -Force -ErrorAction Stop}catch [Management.Automation.ItemNotFoundException]{return $null}}.GetNewClosure()
+    }
+    $preflight=Get-CcodBootstrapSafeExitMarkerPreflight @{GetMarkerItem=$GetMarkerItem}
+    if($preflight-ceq'Absent'){return $false}
+    if($preflight-ceq'Invalid'){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Safe-exit marker path is not a regular file' $marker}
+    $validation=Test-CcodBootstrapRuntime -InstallRoot $InstallRoot -RuntimeId $Pointer.ActiveRuntime
+    if(-not$validation.Valid){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Safe-exit marker cannot be verified against the active runtime' $marker}
+    $modulePath=Join-Path $validation.RuntimeDirectory 'src\persistence\modules\TrustedLogonIdentity.psm1'
+    if(-not[IO.File]::Exists($modulePath)){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Safe-exit marker support is missing from the verified active runtime' $marker}
+    try{
+        $trusted=Import-Module -Name $modulePath -Force -PassThru -ErrorAction Stop
+    }catch{
+        if($EntryMode-ceq'Task'){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Task startup refuses an unreadable safe-exit marker' $marker}
+        Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_CONFIRMATION_REQUIRED' 'Explicit startup requires local confirmation before replacing an unreadable safe-exit marker' $marker
+    }
+    $stateRoot=Join-Path $InstallRoot 'state'
+    $ownership=$null;$transaction=Import-Module -Name (Join-Path $validation.RuntimeDirectory 'src\persistence\modules\LifecycleTransaction.psm1') -Force -PassThru -ErrorAction Stop
+    $policyAdapters=@{
+        ReadIntent={& $trusted {param($Root)Read-CcodSafeExitIntent -StateRoot $Root} $stateRoot}
+        GetIdentity={& $trusted {Get-CcodTrustedLogonIdentity}}
+        TestSameLogon={param($Intent,$Identity)& $trusted {param($Value,$Current)Test-CcodSafeExitIntentForCurrentLogon -Intent $Value -LogonIdentity $Current} $Intent $Identity}
+        ReadActiveRequest={& $transaction {param($Root)Read-CcodLifecycleRequest -StateRoot $Root} $stateRoot}
+        ReadCompletionReceipt={param($TransactionId)& $transaction {param($Root,$Id)$path=Get-CcodLifecycleReceiptPath -StateRoot $Root -TransactionId $Id;if(-not[IO.File]::Exists($path)){return $null};$value=Read-CcodStrictJson -Path $path -ExpectedSchema 1 -Kind 'lifecycle receipt';Assert-CcodLifecycleRequest -Request $value;return $value} $stateRoot $TransactionId}
+        Log={param($Message)Write-CcodBootstrapLog -InstallRoot $InstallRoot -Message $Message}
+        ConfirmReplacement={Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop;[Windows.Forms.MessageBox]::Show('Replace the unreadable safe-exit marker and start CodexRemote-fix?','CodexRemote-fix',[Windows.Forms.MessageBoxButtons]::YesNo,[Windows.Forms.MessageBoxIcon]::Warning)-eq[Windows.Forms.DialogResult]::Yes}
+        EnterOwnership={
+        $epochPath=Join-Path $validation.RuntimeDirectory 'src\persistence\modules\LifecycleEpoch.psm1'
+        if(-not[IO.File]::Exists($epochPath)){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Safe-exit marker cannot be cleared without the verified lifecycle fence module' $marker}
+        $epoch=Import-Module -Name $epochPath -Force -PassThru -ErrorAction Stop;$process=[Diagnostics.Process]::GetCurrentProcess()
+        try{
+            $owner=[pscustomobject][ordered]@{pid=[int]$process.Id;creationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)}
+            $ownership=& $epoch {param($Root,$RuntimeId,$Generation,$Owner,$Sid,$Session)Enter-CcodLifecycleOwnership -InstallRoot $Root -RuntimeId $RuntimeId -RuntimeGeneration $Generation -OwnerIdentity $Owner -UserSid $Sid -SessionId $Session} $InstallRoot $Pointer.ActiveRuntime ([UInt64]$Pointer.Generation) $owner $UserSid $SessionId
+            if($null-eq$ownership){throw 'lifecycle ownership was not acquired'};return $ownership
+        }finally{$process.Dispose()}}
+        ExitOwnership={param($Lease)& $epoch {param($Value)Exit-CcodLifecycleOwnership -Ownership $Value} $Lease}
+        ClearIntent={& $trusted {param($Root)Clear-CcodSafeExitIntent -StateRoot $Root|Out-Null} $stateRoot;Write-CcodBootstrapLog -InstallRoot $InstallRoot -Message 'SAFE_EXIT_MARKER_CLEARED'}
+        ClearCorruptIntent={& $trusted {param($Root)$path=Get-CcodSafeExitIntentPath -StateRoot $Root;Assert-CcodSafeExitIntentFileAcl -Path $path;[IO.File]::Delete($path)} $stateRoot;Write-CcodBootstrapLog -InstallRoot $InstallRoot -Message 'SAFE_EXIT_MARKER_CLEARED'}
+    }
+    $result=Invoke-CcodBootstrapSafeExitMarkerPolicy -EntryMode $EntryMode -Adapters $policyAdapters
+    return [bool]$result.Suppressed
+}
+
+function Invoke-CcodBootstrapFencedPointerPromotion {
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)]$Pointer,
+        [Parameter(Mandatory)]$Validation,
+        [Parameter(Mandatory)][string]$NewRuntimeId,
+        [Parameter(Mandatory)][string]$UserSid,
+        [Parameter(Mandatory)][int]$SessionId
+    )
+
+    $runtimeDirectory = $Validation.RuntimeDirectory
+    $lifecyclePath = Assert-CcodBootstrapContained -Root $runtimeDirectory -Path (Join-Path $runtimeDirectory 'src\persistence\modules\LifecycleEpoch.psm1')
+    $manifestPath = Assert-CcodBootstrapContained -Root $runtimeDirectory -Path (Join-Path $runtimeDirectory 'src\persistence\modules\RuntimeManifest.psm1')
+    if (-not [IO.File]::Exists($lifecyclePath) -or -not [IO.File]::Exists($manifestPath)) {
+        Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_FENCE_MODULE_MISSING' 'Verified fallback runtime is missing lifecycle fence modules' $runtimeDirectory
+    }
+    $lifecycleModule = $null
+    $runtimeModule = $null
+    $ownership = $null
+    $process = [Diagnostics.Process]::GetCurrentProcess()
+    try {
+        $runtimeModule = Import-Module -Name $manifestPath -Force -PassThru -ErrorAction Stop
+        $lifecycleModule = $runtimeModule.NestedModules | Where-Object { $null -ne $_.Path -and [IO.Path]::GetFullPath($_.Path) -ceq [IO.Path]::GetFullPath($lifecyclePath) } | Select-Object -First 1
+        if ($null -eq $lifecycleModule) { Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_FENCE_MODULE_MISSING' 'Verified runtime did not load its exact lifecycle fence module' $lifecyclePath }
+        $ownerIdentity = [pscustomobject][ordered]@{ pid=[int]$process.Id; creationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o') }
+        $ownership = & $lifecycleModule {
+            param($Root,$RuntimeId,$Generation,$Owner,$Sid,$Session)
+            Enter-CcodLifecycleOwnership -InstallRoot $Root -RuntimeId $RuntimeId -RuntimeGeneration $Generation -OwnerIdentity $Owner -UserSid $Sid -SessionId $Session
+        } $InstallRoot $Pointer.ActiveRuntime ([UInt64]$Pointer.Generation) $ownerIdentity $UserSid $SessionId
+        return & $runtimeModule { param($Root,$RuntimeId,$Lease) Set-CcodActiveRuntime -InstallRoot $Root -NewRuntimeId $RuntimeId -Ownership $Lease } $InstallRoot $NewRuntimeId $ownership
+    } catch {
+        $fenceErrorId = Get-CcodBootstrapErrorId -ErrorRecord $_
+        Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_FENCE_FAILED' ("Verified fallback runtime could not prove lifecycle ownership before active pointer mutation: {0} {1}" -f $fenceErrorId, $_.Exception.Message) $runtimeDirectory
+    } finally {
+        try {
+            if ($null -ne $ownership -and $null -ne $lifecycleModule) {
+                try {
+                    $released = & $lifecycleModule { param($Lease) Exit-CcodLifecycleOwnership -Ownership $Lease } $ownership
+                    if ($released -isnot [bool] -or -not $released -or -not $ownership.released) {
+                        Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_FENCE_RELEASE_FAILED' 'Verified fallback lifecycle ownership did not prove mutex release' $runtimeDirectory
+                    }
+                } catch {
+                    if ((Get-CcodBootstrapErrorId -ErrorRecord $_) -ceq 'CCOD_BOOTSTRAP_FENCE_RELEASE_FAILED') { throw }
+                    Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_FENCE_RELEASE_FAILED' 'Verified fallback lifecycle ownership could not be released' $runtimeDirectory
+                }
+            }
+        } finally {
+            $process.Dispose()
+        }
+    }
 }
 
 function New-CcodBootstrapReadyToken {
@@ -627,13 +777,36 @@ function Write-CcodBootstrapLog {
     }
 }
 
+function Invoke-CcodBootstrapPrelaunch {
+    param([Parameter(Mandatory)][hashtable]$Adapters)
+
+    $suppressed = [bool](& $Adapters.TestSafeExitSuppression)
+    if ($suppressed) {
+        return [pscustomobject]@{
+            Suppressed = $true
+            KernelModule = $null
+            LaunchLease = $null
+        }
+    }
+
+    $acquired = & $Adapters.AcquireLaunchLease
+    return [pscustomobject]@{
+        Suppressed = $false
+        KernelModule = $acquired.KernelModule
+        LaunchLease = $acquired.LaunchLease
+    }
+}
+
+if($MyInvocation.InvocationName -ne '.'){
 $exitCode = 1
 $root = $null
 $readyEvent = $null
 $child = $null
 $launchLease = $null
+$kernelModule = $null
 $identity = $null
 $currentProcess = $null
+$safeExitSuppressed = $false
 try {
     $root = Get-CcodBootstrapCanonicalRoot -InstallRoot $InstallRoot
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -648,8 +821,21 @@ try {
     }
 
     $initialPointer = Read-CcodBootstrapActivePointer -InstallRoot $root
-    Import-CcodBootstrapKernelObjects -InstallRoot $root -Pointer $initialPointer
-    $launchLease = Enter-CcodMutex -Kind 'AccountTransition' -UserSid $userSid -TimeoutMilliseconds ([int]($ReadyTimeoutSeconds * 1000))
+    $prelaunch = Invoke-CcodBootstrapPrelaunch -Adapters @{
+        TestSafeExitSuppression = {
+            Test-CcodBootstrapSafeExitSuppression -InstallRoot $root -Pointer $initialPointer -UserSid $userSid -SessionId $sessionId -EntryMode $EntryMode
+        }
+        AcquireLaunchLease = {
+            $module = Import-CcodBootstrapKernelObjects -InstallRoot $root -Pointer $initialPointer
+            $lease = & $module { param($Sid,$Timeout) Enter-CcodMutex -Kind 'AccountTransition' -UserSid $Sid -TimeoutMilliseconds $Timeout } $userSid ([int]($ReadyTimeoutSeconds * 1000))
+            [pscustomobject]@{ KernelModule = $module; LaunchLease = $lease }
+        }
+    }
+    $safeExitSuppressed = $prelaunch.Suppressed
+    if($safeExitSuppressed){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_SUPPRESSED' 'Task startup was intentionally suppressed by the same-logon safe-exit marker' $root}
+
+    $kernelModule = $prelaunch.KernelModule
+    $launchLease = $prelaunch.LaunchLease
     if ($launchLease.Outcome -cne 'Acquired') {
         Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_LAUNCH_BUSY' 'An installation transition is in progress; bootstrap will retry through the scheduled task' $root
     }
@@ -680,16 +866,10 @@ try {
         $outcome = Wait-CcodBootstrapReady -Event $readyEvent -Process $child -TimeoutSeconds $ReadyTimeoutSeconds
         if ($outcome -ceq 'Ready') {
             if ($runtimeId -cne $pointer.ActiveRuntime) {
-                $updated = [ordered]@{
-                    schemaVersion = 1
-                    activeRuntime = $runtimeId
-                    previousRuntime = $pointer.ActiveRuntime
-                    updatedAtUtc = [DateTime]::UtcNow.ToString('o')
-                }
-                Write-CcodBootstrapAtomicJson -Path (Join-Path $root 'active.json') -Value $updated
+                $updated = Invoke-CcodBootstrapFencedPointerPromotion -InstallRoot $root -Pointer $pointer -Validation $validation -NewRuntimeId $runtimeId -UserSid $userSid -SessionId $sessionId
                 Write-CcodBootstrapLog -InstallRoot $root -Message ("Runtime {0} signaled ready; active pointer switched from {1}" -f $runtimeId, $pointer.ActiveRuntime)
             }
-            $released = Exit-CcodMutex -Lease $launchLease
+            $released = & $kernelModule { param($Lease) Exit-CcodMutex -Lease $Lease } $launchLease
             if ($released -isnot [bool] -or -not $released) {
                 Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_LAUNCH_RELEASE_FAILED' 'The launch serialization lease could not be released after Supervisor readiness' $root
             }
@@ -719,10 +899,13 @@ try {
     }
 } catch {
     $errorId = Get-CcodBootstrapErrorId -ErrorRecord $_
+    if($errorId-ceq'CCOD_SAFE_EXIT_SUPPRESSED'){$exitCode=0}
+    else{
     if ($null -ne $root) {
         Write-CcodBootstrapLog -InstallRoot $root -Message ("Bootstrap failed: {0} {1}" -f $errorId, $_.Exception.Message)
     }
     $exitCode = 1
+    }
 } finally {
     if ($null -ne $child) {
         try { Stop-CcodBootstrapChild -Process $child } catch { }
@@ -732,10 +915,11 @@ try {
         try { $readyEvent.Handle.Dispose() } catch { }
     }
     if ($null -ne $launchLease -and $launchLease.Outcome -ceq 'Acquired' -and -not $launchLease.Released) {
-        try { Exit-CcodMutex -Lease $launchLease | Out-Null } catch { }
+        try { & $kernelModule { param($Lease) Exit-CcodMutex -Lease $Lease | Out-Null } $launchLease } catch { }
     }
     if ($null -ne $currentProcess) { $currentProcess.Dispose() }
     if ($null -ne $identity) { $identity.Dispose() }
 }
 
 exit $exitCode
+}

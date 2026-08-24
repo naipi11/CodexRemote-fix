@@ -144,10 +144,8 @@ normal launches, crashes, and compatible updates.
 The tray layer deliberately separates policy from presentation:
 
 - `SupervisorEngine.psm1` returns only the semantic presentation object
-  `{Color, StateKey, SessionReadyVisible, ApplyNowVisible, ApplyNowEnabled,
-  ManualRetryVisible, ManualRetryEnabled, AutomationToggleEnabled,
-  AutomationChecked, CandidateOptInToggleEnabled, CandidateOptInChecked,
-  OpenLogsEnabled, UninstallEnabled, Busy}`.
+  `{Color, ConnectionState, ProtectionState, RepairEnabled, LanguageEnabled,
+  OpenLogsEnabled, AboutEnabled, ExitEnabled, Busy}`.
 - `Supervisor.ps1` owns preference reads, locale resolution, command routing, and
   error containment.
 - `TrayHostClient.psm1` loads the manifest-bound `CodexRemote.TrayHost.exe`,
@@ -164,19 +162,17 @@ The tray layer deliberately separates policy from presentation:
 `src/persistence/resources/ui.en-US.json` and `ui.zh-CN.json` are immutable UTF-8
 resources. Each catalog must have exactly these ordered top-level properties:
 `schemaVersion`, `locale`, `strings`. `schemaVersion` is integer `1`; `locale`
-must exactly match the filename; `strings` must contain the same 32 ordered keys:
+must exactly match the filename; `strings` must contain the same 22 ordered keys:
 
 ```text
 Tray.Title
-Status.Waiting, Status.Inspecting, Status.Transitioning, Status.Active,
-Status.ActivePaused, Status.Suppressed, Status.Recovered, Status.Error
-Tooltip.Waiting, Tooltip.Inspecting, Tooltip.Transitioning, Tooltip.Active,
-Tooltip.ActivePaused, Tooltip.Suppressed, Tooltip.Recovered, Tooltip.Error
-Menu.SessionReady, Menu.ApplyNow, Menu.ManualRetry, Menu.Automation,
-Menu.CandidateOptIn, Menu.Language, Menu.FollowSystem, Menu.Chinese,
-Menu.English, Menu.OpenLogs, Menu.Uninstall
-Dialog.UninstallTitle, Dialog.UninstallMessage
-Error.UninstallStart, Error.LanguageChange
+Connection.WaitingForCodex, Connection.Checking, Connection.Connected,
+Connection.RepairNeeded, Connection.Error
+Protection.Running, Protection.Reconnecting, Protection.Stopping
+Menu.CheckAndRepair, Menu.Language, Menu.FollowSystem, Menu.Chinese,
+Menu.English, Menu.OpenLogs, Menu.About, Menu.AboutVersion, Menu.Exit
+Dialog.ExitTitle, Dialog.ExitMessage
+Error.ActionFailed, Error.LanguageChange
 ```
 
 The loader rejects a BOM, malformed JSON, duplicate properties (including
@@ -212,8 +208,8 @@ The display preference is independent of `settings.json` and has this exact sche
 canonical UTC round-trip timestamp. `Initialize-CcodUiPreference` creates the file
 only on first install, while `Set-CcodUiLanguageMode` replaces it atomically.
 `Read-CcodUiPreference` returns `System` with a stable fallback code for missing or
-malformed data. That fallback never sets `StateDamageBlocksActions`, changes either
-automation-consent switch, quarantines safety state, or blocks a controller action.
+malformed data. That fallback never changes lifecycle ownership, quarantines safety
+state, or blocks a controller action.
 
 #### Live language changes and resource ownership
 
@@ -242,15 +238,15 @@ resource allowlist. They are copied into the staged runtime, hashed in
 supervisor therefore uses the same immutable catalog bytes as the runtime
 manifest; do not manually copy UI files into an active runtime.
 
-Tray uninstall is a verified launch, not an in-process cleanup shortcut. After the
-native Yes/No warning (default button No), `UiActions.psm1` verifies the active
-runtime pointer, manifest hashes, contained `Uninstall-CodexControlOtherDevices.ps1`,
-reparse-point status, approved Windows PowerShell host, and the exact argument vector.
-Only then does it start the runtime-bound uninstaller. The uninstaller performs the
-existing normalization, task removal, supervisor shutdown/wait, and runtime/state
-cleanup sequence, preserving the DPAPI device-key store by default. A launch
-failure is logged as `CCOD_UNINSTALL_START_FAILED` and leaves the tray and current
-Codex session usable.
+The tray has no uninstall command. Windows Settings and the installed `unins000.exe`
+both enter the same Inno-owned, external cleanup path. Before Inno may remove app-owned
+files, `UninstallBootstrap.ps1` verifies the active schema-2 runtime pointer, manifest
+hashes, contained cleanup payload, reparse-point safety, current user/session identity,
+and the lifecycle epoch. It writes a protected external uninstaller receipt bound to the
+runtime ID, runtime generation, lease epoch, SID, and session. Inno accepts only that
+receipt and fails closed on any mismatch. The transaction stops the verified supervisor,
+normalizes the owned session when its identity can be proven, and removes only app-owned
+runtime/state data. It neither copies, moves, nor deletes the DPAPI device-key store.
 
 ### Source and installed layouts
 
@@ -261,7 +257,7 @@ allowlist into a versioned runtime below `%LOCALAPPDATA%\CodexControlOtherDevice
 %LOCALAPPDATA%\CodexControlOtherDevices\
 ├── bootstrap.ps1                        # stable self-contained bootstrap
 ├── Uninstall-CodexControlOtherDevices.ps1
-├── active.json                          # schema 1 active/previous pointer
+├── active.json                          # schema 2 active/previous pointer + generation
 ├── runtime\<runtime-id>\                # staged, hashed, immutable runtime
 │   ├── manifest.json                    # schema 1 file records + runtime-id
 │   ├── src\persistence\Supervisor.ps1
@@ -292,12 +288,13 @@ against the source SHA-256 before the manifest is trusted.
   and a sorted `files` array with `path`, `length`, and lowercase `sha256`;
   it never lists itself and never accepts absolute, empty, duplicate, or
   `..`-escaping paths.
-- `active.json` schema 1: `schemaVersion`, `activeRuntime`, nullable
-  `previousRuntime`, and `updatedAtUtc`. The pointer is replaced atomically
-  through a native handle; a failed switch restores the old bytes.
-- `settings.json` schema 1: `automationEnabled` and `candidateCompatibleOptIn`
-  are independent booleans, `nodeCandidates` are absolute installer-verified
-  `node.exe` paths, and `updatedAtUtc` is a canonical UTC string.
+- `active.json` schema 2: `schemaVersion`, `activeRuntime`, nullable
+  `previousRuntime`, positive `generation`, and `updatedAtUtc`. The pointer is
+  replaced atomically through a native handle; a failed switch restores the old
+  bytes and no lifecycle worker may cross the generation fence.
+- `settings.json` schema 1: strict runtime policy state, installer-verified
+  absolute `node.exe` candidates, and canonical `updatedAtUtc`. It is internal
+  policy state, not a tray control surface.
 - `ui-preferences.json` schema 1: display-only `languageMode` and canonical
   `updatedAtUtc`; it is not safety state and malformed bytes fall back to
   `System`.
@@ -309,7 +306,8 @@ against the source SHA-256 before the manifest is trusted.
   `packageFullName|appAsarSha256|runtimeId` with static classification,
   dynamic outcome, probe state, and confirmation time.
 - `transition.json` schema 1: `activeTransaction` null or one exact
-  transaction object; damaged or missing transition state disables automation.
+  transaction object; damaged or missing transition state quarantines automatic
+  repair until an explicit recovery path validates it.
 
 ### Controller envelope
 
@@ -361,6 +359,28 @@ to 15 seconds. If the active runtime exits early or times out, bootstrap stops
 that exact child, validates the previous runtime, launches it, and atomically
 switches the pointer on success. If neither runtime signals ready, bootstrap
 fails closed and logs the reason.
+
+### Lifecycle ownership, trusted logon, and tray protocol
+
+Every lifecycle request carries a lifecycle epoch/generation fence: the active
+runtime ID, its schema-2 runtime generation, the current lease epoch, and the
+owner PID plus creation time. `SessionController.ps1`, lifecycle workers, and
+uninstall preparation re-read and assert that fence before any state-changing
+step. A stale runtime, PID reuse, generation change, or released lease is a
+hard failure rather than permission to continue work from an older runtime.
+
+The trusted LUID marker is the current process token's `AuthenticationId`, read
+from `TOKEN_STATISTICS` and stored with the current SID and Windows session ID.
+Safe Exit intent and lifecycle ownership records must match all three values;
+thread identity, a display name, or a PID alone is not accepted as proof of the
+same interactive logon.
+
+The PowerShell parent and native TrayHost use protocol v2 over their private
+pipe. Bootstrap binds the parent PID, parent creation time, and runtime ID;
+the authenticated frames use directional keys, host epoch, monotonic sequence
+numbers, bounded UTF-8 payloads, and a revision-bound action/result exchange.
+Unknown commands, stale revisions, malformed frames, and protocol mismatch
+terminate the presentation channel rather than executing a tray action.
 
 ### Scheduled task
 
@@ -426,9 +446,10 @@ The device-key bridge is unchanged by the persistence layer. Keys remain
 P-256 + DPAPI `CurrentUser` at the resolved
 `%CODEX_HOME%\remote-control-device-keys.windows.json` (or `~/.codex`), the
 legacy flat store remains readable and migrates on write, and the supervisor
-never logs key material. Uninstall preserves the store by default; explicit
-backup moves it to a timestamped sibling, and explicit removal deletes it,
-neither of which revokes server-side authorization.
+never logs key material. The external uninstall transaction leaves that file
+in place: it has no key backup, export, or remove option. Leaving or removing
+a local key never revokes server-side authorization; revoke the device in
+Codex when that is the intended operation.
 
 ## Failure and update behavior
 
@@ -446,20 +467,20 @@ mismatches and operational failures:
 
 The persistent supervisor adds these rules:
 
-- a first-seen `CandidateCompatible` package is tried at most once, and only
-  when `automationEnabled` and `candidateCompatibleOptIn` are both true;
+- a first-seen compatible package is considered at most once under its internal
+  safety policy; the tray does not expose policy toggles;
 - `UnknownOrIncompatible` and `NativeModulePresent` builds stay ordinary and
   are never stopped or reopened;
 - a failed dynamic probe records a suppression key for
-  `packageFullName|appAsarSha256|runtimeId`; only manual retry or a new
-  runtime id clears it;
-- damaged or missing state quarantines the evidence and disables automation
-  until explicit `-RepairState`, which resets both consent switches to false;
+  `packageFullName|appAsarSha256|runtimeId`; only an explicit repair or a new
+  runtime ID clears it;
+- damaged or missing state quarantines evidence and blocks automatic repair
+  until an explicit recovery validates it;
 - a validated special session survives an upgrade: the new supervisor
   reconciles and adopts it instead of restarting Codex;
-- default uninstall normalizes a validated special session back to ordinary,
-  verifies both debugger ports closed, and only then removes the task and
-  runtime.
+- external uninstall normalizes a special session only after it proves the
+  current lifecycle fence and process identity, verifies both debugger ports
+  closed, and receives an Inno-validated cleanup receipt.
 
 This is safer than relying only on a static version list, but it is not a
 structured control-flow or binary-integrity check. A future build that retains

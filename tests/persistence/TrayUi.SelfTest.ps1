@@ -104,7 +104,6 @@ function New-CcodTrayFakeAdapters {
             $state.IconClones.Add($icon);$icon
         }.GetNewClosure()
         ShowErrorDialog={param($Title,$Message)$state.Dialogs.Add([pscustomobject][ordered]@{Title=$Title;Message=$Message})}.GetNewClosure()
-        ConfirmUninstall={param($Title,$Message)$true}
         EndMenu={$state.MenuEndCount++;$state.Calls.Add('Menu:End')}.GetNewClosure()
         DestroyIcon={param($Hicon)$state.Calls.Add("DestroyIcon:$([long]$Hicon)")}.GetNewClosure()
         DisposeIconResource={param($Resource)if($Resource.PSObject.Properties['Kind']){$state.Calls.Add("DisposeResource:$($Resource.Kind):$($Resource.Name)")}else{$state.Calls.Add("DisposeIcon:$($Resource.Color):$($Resource.Size)")};$Resource.Disposed=$true;$Resource.DisposeCount++}.GetNewClosure()
@@ -138,7 +137,7 @@ function New-CcodValidPresentation {
     [pscustomobject][ordered]@{
         Color='Green';StateKey='Active';SessionReadyVisible=$true;ApplyNowVisible=$false;ApplyNowEnabled=$false;ManualRetryVisible=$false;ManualRetryEnabled=$false
         AutomationToggleEnabled=$true;AutomationChecked=$true
-        CandidateOptInToggleEnabled=$true;CandidateOptInChecked=$false;OpenLogsEnabled=$true;UninstallEnabled=$true;Busy=$false
+        CandidateOptInToggleEnabled=$true;CandidateOptInChecked=$false;OpenLogsEnabled=$true;Busy=$false
     }
 }
 
@@ -239,6 +238,13 @@ $results.Add((Invoke-CcodTest 'exports exactly the six frozen TrayUi functions' 
     Assert-CcodEqual $expected $actual 'public export surface remains exact'
 }))
 
+$results.Add((Invoke-CcodTest 'removes the uninstall adapter and native menu command surface' {
+    $defaults=& (Get-Module TrayUi) { Get-CcodTrayDefaultAdapters }
+    Assert-CcodTrue (-not $defaults.ContainsKey('ConfirmUninstall')) 'default adapter set has no uninstall confirmation callback'
+    $source=[IO.File]::ReadAllText($modulePath)
+    Assert-CcodTrue ($source -notmatch '(?i)uninstall|1009') 'TrayUi source has no uninstall text or command id'
+}))
+
 $results.Add((Invoke-CcodTest 'cold Windows PowerShell STA binds one persistent ContextMenu and supports two Popup Collapse lifecycles without MouseUp dispatch' {
     $escapedModulePath=$modulePath.Replace("'","''")
     $escapedLocalizationPath=$localizationPath.Replace("'","''")
@@ -250,7 +256,7 @@ Import-Module '$escapedModulePath' -Force
 `$catalog=Get-CcodUiCatalog -ResourcesRoot '$escapedResourcesRoot' -LanguageMode en-US -SystemCultureName en-US
 `$presentation=[pscustomobject][ordered]@{
     Color='Green';StateKey='Active';SessionReadyVisible=`$true;ApplyNowVisible=`$false;ApplyNowEnabled=`$false;ManualRetryVisible=`$false;ManualRetryEnabled=`$false
-    AutomationToggleEnabled=`$true;AutomationChecked=`$true;CandidateOptInToggleEnabled=`$true;CandidateOptInChecked=`$false;OpenLogsEnabled=`$true;UninstallEnabled=`$true;Busy=`$false
+    AutomationToggleEnabled=`$true;AutomationChecked=`$true;CandidateOptInToggleEnabled=`$true;CandidateOptInChecked=`$false;OpenLogsEnabled=`$true;Busy=`$false
 }
 `$context=`$null
 try {
@@ -295,22 +301,22 @@ $results.Add((Invoke-CcodTest 'prebuilds one bilingual ContextMenu graph, defers
         $context=New-CcodTrayContext -CommandQueue $queue -OnTick {} -Adapters $fake.Adapters
         Assert-CcodEqual 'ContextMenu' $context.Menu.Kind 'one persistent legacy ContextMenu is constructed'
         Assert-CcodTrue ([object]::ReferenceEquals($context.Menu,$context.NotifyIcon.Properties.ContextMenu)) 'NotifyIcon is bound before it is visible'
-        Assert-CcodEqual 'Title,Status,SessionReady,ApplyNow,ManualRetry,Automation,CandidateOptIn,Language,OpenLogs,Uninstall' (@($context.Items.Keys)-join ',') 'complete top-level menu graph is prebuilt in system order'
+        Assert-CcodEqual 'Title,Status,SessionReady,ApplyNow,ManualRetry,Automation,CandidateOptIn,Language,OpenLogs' (@($context.Items.Keys)-join ',') 'complete top-level menu graph is prebuilt in system order'
         Assert-CcodEqual 'System,Chinese,English' (@($context.LanguageItems.Keys)-join ',') 'complete language submenu is prebuilt'
         Assert-CcodEqual 'Popup,Collapse' (@($context.Callbacks|Where-Object {$_.EventName -in @('Popup','Collapse')}|ForEach-Object {$_.EventName}) -join ',') 'only ContextMenu lifecycle callbacks are attached to the menu'
         Assert-CcodTrue (@($context.Callbacks|Where-Object {$_.EventName -eq 'MouseUp'}).Count -eq 0) 'automatic tray menu path never attaches MouseUp'
 
         $active=New-CcodValidPresentation
         Set-CcodTrayPresentation -Context $context -Presentation $active
-        Assert-CcodEqual 'Codex Device Connection' $context.Items.Title.Properties.Text 'English title is rendered in the persistent menu'
-        Assert-CcodEqual ([char]0x201c+'Control other devices'+[char]0x201d+' is active for this session') $context.Items.Status.Properties.Text 'English status is rendered in the persistent menu'
+        Assert-CcodEqual 'CodexRemote-fix' $context.Items.Title.Properties.Text 'legacy diagnostic tray renders the current product title'
+        Assert-CcodEqual 'Connection: Connected' $context.Items.Status.Properties.Text 'legacy diagnostic tray maps current connected evidence'
         & $context.Menu.Events.Popup $context.Menu $null
         Assert-CcodEqual $true $context.MenuOpen 'Popup begins the menu-open window'
         Set-CcodTrayPresentation -Context $context -Presentation $active -Catalog $script:TestSystemCatalog -LanguageMode System -SystemCultureName zh-CN
-        Assert-CcodEqual 'Codex Device Connection' $context.Items.Title.Properties.Text 'open menu keeps its current presentation until Collapse'
+        Assert-CcodEqual 'CodexRemote-fix' $context.Items.Title.Properties.Text 'open menu keeps its current presentation until Collapse'
         Assert-CcodTrue ($null -ne $context.PendingRender) 'open menu coalesces the next render'
         & $context.Menu.Events.Collapse $context.Menu $null
-        $zhTitle='Codex '+[string]::Concat([char[]]@(0x8bbe,0x5907,0x8fde,0x63a5))
+        $zhTitle='CodexRemote-fix'
         Assert-CcodEqual $false $context.MenuOpen 'Collapse clears menu-open state'
         Assert-CcodEqual $zhTitle $context.Items.Title.Properties.Text 'Collapse flushes the newest bilingual render in place'
         Assert-CcodEqual $null $context.PendingRender 'Collapse clears the rendered pending snapshot'
@@ -345,9 +351,9 @@ $results.Add((Invoke-CcodTest 'renders the optional External renderer handoff wa
         $presentation.Color='Yellow'
         $presentation.StateKey='RendererHandoff'
         Set-CcodTrayPresentation -Context $context -Presentation $presentation -Catalog $script:TestEnglishCatalog -LanguageMode en-US -SystemCultureName en-US
-        Assert-CcodEqual 'Codex device connection: working' $context.NotifyIcon.Properties.Text 'External renderer warning keeps the active tooltip'
-        Assert-CcodEqual 'Yellow' $context.NotifyIcon.Properties.Icon.Color 'External renderer warning uses the yellow icon'
-        Assert-CcodEqual 'External renderer handoff was not completed; Codex remains active' $context.Items.Status.Properties.Text 'warning text is rendered in the persistent ContextMenu'
+        Assert-CcodEqual 'Connection: Connected' $context.NotifyIcon.Properties.Text 'legacy diagnostic tray maps the active tooltip to current connected evidence'
+        Assert-CcodEqual 'Yellow' $context.NotifyIcon.Properties.Icon.Color 'legacy diagnostic renderer warning keeps its warning icon'
+        Assert-CcodEqual 'Connection: Error' $context.Items.Status.Properties.Text 'legacy diagnostic renderer warning maps to the v2 error connection text'
     }finally{if($null -ne $context -and $context.State -cne 'Closed'){Close-CcodTrayContext -Context $context|Out-Null}}
 }))
 
@@ -898,9 +904,9 @@ $results += Invoke-CcodTest 'production AttachUiCallback handlers capture the ca
     Assert-CcodTrue ($tail.StartsWith('.GetNewClosure()')) 'every event handler needle is immediately closed over'
 }
 
-$results += Invoke-CcodTest 'accepts the External renderer handoff status key from the validated UI catalog' {
+$results += Invoke-CcodTest 'maps the legacy renderer handoff label through the validated v2 catalog' {
     $localized=& (Get-Module TrayUi) {param($Catalog)Resolve-CcodTrayLocalizedStrings -Catalog $Catalog -LanguageMode en-US -SystemCultureName en-US} $script:TestEnglishCatalog
-    Assert-CcodEqual 'External renderer handoff was not completed; Codex remains active' $localized['Status.RendererHandoff'] 'tray resolves the validated optional handoff status key'
+    Assert-CcodEqual 'Connection: Error' $localized['Status.RendererHandoff'] 'legacy diagnostic tray maps renderer handoff to the v2 error connection key'
 }
 
 $results|ForEach-Object{"PASS $($_.Name)"}

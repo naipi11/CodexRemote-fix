@@ -6,66 +6,37 @@ param(
     [switch]$RemoveDeviceKeyStore
 )
 
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-function Resolve-CcodUninstallerModule {
-    param([Parameter(Mandatory)][string]$ScriptRoot)
-
-    $checkoutModule = [IO.Path]::GetFullPath((Join-Path $ScriptRoot 'src\persistence\modules\InstallLifecycle.psm1'))
-    if (Test-Path -LiteralPath $checkoutModule -PathType Leaf) {
-        return $checkoutModule
-    }
-    $activePath = Join-Path $ScriptRoot 'active.json'
-    if (Test-Path -LiteralPath $activePath -PathType Leaf) {
-        try {
-            $active = Get-Content -LiteralPath $activePath -Raw | ConvertFrom-Json -ErrorAction Stop
-            if ($null -ne $active -and $active.activeRuntime -is [string] -and $active.activeRuntime -cmatch '^[A-Za-z0-9._-]{1,96}$') {
-                $runtimeModule = [IO.Path]::GetFullPath((Join-Path $ScriptRoot "runtime\$($active.activeRuntime)\src\persistence\modules\InstallLifecycle.psm1"))
-                if (Test-Path -LiteralPath $runtimeModule -PathType Leaf) {
-                    return $runtimeModule
-                }
-            }
-        } catch {
-        }
-    }
+function Throw-CcodPublicUninstallError {
+    param([Parameter(Mandatory)][string]$Id,[Parameter(Mandatory)][string]$Message,$Target)
     throw [Management.Automation.ErrorRecord]::new(
-        [InvalidOperationException]::new('InstallLifecycle.psm1 could not be located. Run this uninstaller from the checkout or from the installed root.'),
-        'CCOD_UNINSTALLER_MODULE_MISSING',
-        [Management.Automation.ErrorCategory]::ObjectNotFound,
-        $ScriptRoot
-    )
+        [InvalidOperationException]::new($Message),$Id,[Management.Automation.ErrorCategory]::InvalidOperation,$Target)
 }
 
-$script:UninstallerModule = Resolve-CcodUninstallerModule -ScriptRoot $PSScriptRoot
-Import-Module $script:UninstallerModule -Force
-
-if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
-    $InstallRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'CodexControlOtherDevices'
+if ($KeepCurrentSpecialSession -or $BackupDeviceKeyStore -or $RemoveDeviceKeyStore) {
+    Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_OPTION_REMOVED' 'Legacy session and device-key uninstall options were removed; use Windows Settings or unins000.exe. The device key remains in place.' $PSBoundParameters
+}
+if ($PSBoundParameters.ContainsKey('InstallRoot')) {
+    Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_OPTION_REMOVED' 'The public uninstaller no longer accepts an install-root override; use Windows Settings or the installed unins000.exe.' $InstallRoot
 }
 
-$receipt = Invoke-CcodUninstall `
-    -InstallRoot $InstallRoot `
-    -KeepCurrentSpecialSession:([bool]$KeepCurrentSpecialSession) `
-    -BackupDeviceKeyStore:([bool]$BackupDeviceKeyStore) `
-    -RemoveDeviceKeyStore:([bool]$RemoveDeviceKeyStore)
+$uninstaller = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'unins000.exe'))
+if (-not [IO.File]::Exists($uninstaller)) {
+    Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_USE_INNO' 'The fail-closed uninstall bootstrap is owned by the installed unins000.exe. Run Windows Settings or unins000.exe from the installed application folder.' $uninstaller
+}
+$item = Get-Item -LiteralPath $uninstaller -Force -ErrorAction Stop
+if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_USE_INNO' 'The installed Inno uninstaller is not a safe regular file.' $uninstaller
+}
 
-Write-Host ''
-Write-Host 'CodexRemote-fix - uninstall result' -ForegroundColor Cyan
-Write-Host ('  Outcome:          {0}' -f $receipt.Outcome)
-if ($receipt.BackupPath) {
-    Write-Host ("  Key backup:       {0}" -f $receipt.BackupPath)
+if (-not $PSCmdlet.ShouldProcess($uninstaller,'Launch the installed Inno uninstaller and its fail-closed cleanup bootstrap')) {
+    return [pscustomobject][ordered]@{ Outcome='WhatIf'; KeptDeviceKeyStore=$true }
 }
-if ($receipt.KeptDeviceKeyStore) {
-    Write-Host '  Device key store: preserved' -ForegroundColor Green
+
+$process = Start-Process -FilePath $uninstaller -PassThru -Wait -ErrorAction Stop
+if ($process.ExitCode -ne 0) {
+    Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_INNO_FAILED' 'The installed Inno uninstaller did not complete successfully. Installer files were protected if pre-deletion cleanup failed.' $process.ExitCode
 }
-if ($RemoveDeviceKeyStore) {
-    Write-Host '  Device key store: removed locally' -ForegroundColor Yellow
-    Write-Host '  Server authorization is NOT revoked by this local removal; revoke the device in Codex.' -ForegroundColor Yellow
-}
-if ($KeepCurrentSpecialSession) {
-    Write-Host '  The special Codex session was left running unmonitored.' -ForegroundColor Yellow
-    Write-Host '  Its renderer CDP endpoint remains open on 127.0.0.1 with no tray supervision.' -ForegroundColor Yellow
-}
-Write-Host ''
-Write-Host 'The persistent tray supervisor, runtime, state, and logs were removed.' -ForegroundColor Green
-Write-Host ''
+return [pscustomobject][ordered]@{ Outcome='DelegatedToInno'; KeptDeviceKeyStore=$true }

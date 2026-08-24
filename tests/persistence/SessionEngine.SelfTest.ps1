@@ -28,7 +28,8 @@ function New-CcodEngineSnapshot {
 
 function New-CcodEngineRequest {
     param(
-        [ValidateSet('Inspect','Apply','RepairStale','RepairRenderer','Recover')][string]$Action = 'Inspect',
+        [ValidateSet('Inspect','Close','Apply','RepairStale','RepairRenderer','Recover')][string]$Action = 'Inspect',
+        [ValidateSet(1,2)][int]$SchemaVersion = 1,
         [string]$RuntimeId = 'runtime-1',
         [int]$SupervisorPid = 11,
         [string]$SupervisorCreationTimeUtc = '2030-02-03T03:00:00.0000000Z',
@@ -40,12 +41,18 @@ function New-CcodEngineRequest {
         [ValidateRange(1,120000)][int]$TimeoutMilliseconds = 30000,
         [string]$TransactionId = '5f496d99-c839-4458-a6a2-d37ea1afdbda'
     )
-    [pscustomobject][ordered]@{
-        schemaVersion=1; action=$Action; transactionId=$TransactionId; runtimeId=$RuntimeId
-        supervisorIdentity=[pscustomobject][ordered]@{ pid=$SupervisorPid; creationTimeUtc=$SupervisorCreationTimeUtc; sessionId='1' }
-        source=$Source; existingOnly=$ExistingOnly; rendererPort=$RendererPort; mainPort=$MainPort
-        timeoutMilliseconds=$TimeoutMilliseconds; restartOrdinary=$RestartOrdinary
+    $request=[ordered]@{
+        schemaVersion=$SchemaVersion; action=$Action; transactionId=$TransactionId; runtimeId=$RuntimeId
     }
+    if($SchemaVersion -eq 2){
+        $request.runtimeGeneration=[UInt64]4
+        $request.leaseEpoch=[UInt64]9
+        $request.ownerIdentity=[pscustomobject][ordered]@{pid=401;creationTimeUtc='2030-02-03T04:05:06.0000000Z'}
+    }
+    $request.supervisorIdentity=[pscustomobject][ordered]@{ pid=$SupervisorPid; creationTimeUtc=$SupervisorCreationTimeUtc; sessionId='1' }
+    $request.source=$Source;$request.existingOnly=$ExistingOnly;$request.rendererPort=$RendererPort;$request.mainPort=$MainPort
+    $request.timeoutMilliseconds=$TimeoutMilliseconds;$request.restartOrdinary=$RestartOrdinary
+    [pscustomobject]$request
 }
 
 function New-CcodEnginePaths([string]$Root) {
@@ -308,6 +315,7 @@ function New-CcodEngineAdapters {
         Delay={ param($Milliseconds) }
         CurrentIdentity={ [pscustomobject][ordered]@{SessionId='1';UserSid='S-1-5-21-test'} }
         GetSupervisorProcess={ param($ProcessId) [pscustomobject][ordered]@{Pid=[int]$ProcessId;CreationTimeUtc='2030-02-03T03:00:00.0000000Z';SessionId='1'} }
+        AssertLifecycleFence={param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity)$true}
         Events=$eventsValue
         Counters=$counts
     }
@@ -322,8 +330,8 @@ $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-engine-selftest-' + [guid]::
 try {
     $paths = New-CcodEnginePaths -Root $root
 
-    Invoke-CcodTest 'exports exactly the seven public SessionEngine functions' {
-        Assert-CcodEqual 'Invoke-CcodApplySession,Invoke-CcodInspectSession,Invoke-CcodRecoverSession,Invoke-CcodRepairRenderer,Invoke-CcodRepairStaleSession,Invoke-CcodReplayTransition,Test-CcodBridgeResult' `
+    Invoke-CcodTest 'exports the fenced Close boundary with the existing session operations' {
+        Assert-CcodEqual 'Invoke-CcodApplySession,Invoke-CcodCloseSession,Invoke-CcodInspectSession,Invoke-CcodRecoverSession,Invoke-CcodRepairRenderer,Invoke-CcodRepairStaleSession,Invoke-CcodReplayTransition,Test-CcodBridgeResult' `
             ((Get-Command -Module SessionEngine | Sort-Object Name | ForEach-Object Name) -join ',') 'public API remains exact'
     }
 
@@ -918,6 +926,19 @@ try {
         Assert-CcodEqual 0 $foreignSourceCounters.SpecialStart 'foreign-session explicit source is never stopped or replaced'
     }
 
+    Invoke-CcodTest 'schema-v2 Apply ignores legacy false preferences when internal package compatibility is healthy' {
+        $source=New-CcodEngineSnapshot
+        $state=New-CcodEngineState
+        $state.AutomationEnabled=$false
+        $state.AutomaticCandidateTrialsAllowed=$false
+        $state.Settings.automationEnabled=$false
+        $state.Settings.candidateCompatibleOptIn=$false
+        $events=[Collections.Generic.List[string]]::new();$counters=[pscustomobject]@{SpecialStart=0;OrdinaryStart=0;Recover=0;Node=0}
+        $result=Invoke-CcodApplySession -Request (New-CcodEngineRequest -Action Apply -Source $source -TransactionId '4dd6f31d-874f-49d4-8705-c1813d5a5ae0') -Paths $paths -Adapters (New-CcodEngineAdapters -State $state -Processes @($source) -Events $events -Counters $counters)
+        Assert-CcodEqual 'Activated' $result.outcome 'healthy internal compatibility still applies under false migration preferences'
+        Assert-CcodEqual 1 $counters.SpecialStart 'false migration preferences do not suppress the schema-v2 operation'
+    }
+
     Invoke-CcodTest 'rejects damaged status before old verified history can authorize Apply' {
         $state=New-CcodEngineState
         $state.StatusRebuildRequired=$true
@@ -1114,6 +1135,57 @@ try {
         Assert-CcodEqual 'NoAction' $result.outcome 'same live source is kept after both windows'
         Assert-CcodEqual 0 $counters.OrdinaryStart 'guard completion does not launch recovery ordinary'
         Assert-CcodEqual 0 $counters.SpecialStart 'stop replay never starts special'
+    }
+
+    Invoke-CcodTest 'schema-v2 Close stops a verified tree child-first without ordinary relaunch' {
+        $special=New-CcodEngineSnapshot -Pid 201 -CreationTimeUtc '2030-02-03T04:05:07.0000000Z' -Mode Special -RendererPort 41001 -MainPort 41002
+        $child=New-CcodEngineSnapshot -Pid 202 -CreationTimeUtc '2030-02-03T04:05:08.0000000Z' -Mode Unrelated -ParentPid 201 -RendererPort 41001 -MainPort 41002 -IsTopLevel $false
+        $status=New-CcodEngineActiveStatus;$events=[Collections.Generic.List[string]]::new();$alive=@{201=$special;202=$child}
+        $counters=[pscustomobject]@{SpecialStart=0;OrdinaryStart=0;Recover=0;Node=0}
+        $adapters=New-CcodEngineAdapters -State (New-CcodEngineState -Status $status) -Processes @($special) -Events $events -Counters $counters
+        $adapters.ListProcesses={param($StatusEvidence)@($alive.Values)}.GetNewClosure()
+        $adapters.GetProcess={param($ProcessId,$StatusEvidence)if($alive.ContainsKey([int]$ProcessId)){$alive[[int]$ProcessId]}else{$null}}.GetNewClosure()
+        $adapters.GetTree={param($Root,$StatusEvidence)@($special,$child)}.GetNewClosure()
+        $adapters.StopProcess={param($Expected,$StatusEvidence,$TimeoutMilliseconds)$events.Add("Stop:$($Expected.Pid)");$alive.Remove([int]$Expected.Pid);[pscustomobject]@{Outcome='Stopped';StoppedByController=$true;Snapshot=$Expected}}.GetNewClosure()
+        $request=New-CcodEngineRequest -SchemaVersion 2 -Action Close -Source $special -RestartOrdinary $false
+        $result=Invoke-CcodCloseSession -Request $request -Paths $paths -Adapters $adapters
+        Assert-CcodEqual 'Closed' $result.outcome 'verified Close reaches the explicit closed outcome'
+        Assert-CcodEqual 'Stop:202,Stop:201' ((@($events|Where-Object{$_ -like 'Stop:*'}))-join ',') 'verified Close stops child before root'
+        Assert-CcodEqual 0 $counters.OrdinaryStart 'Close never requests ordinary activation'
+    }
+
+    Invoke-CcodTest 'schema-v2 mutations revalidate the lifecycle fence immediately before stop launch bridge status and terminal commit' {
+        $targets=@(
+            @{Name='stop';Prior='StopRequested';Mutation='StopProcess'},
+            @{Name='special launch';Prior='SpecialLaunchRequested';Mutation='StartSpecial'},
+            @{Name='bridge injection';Prior='SpecialStarted';Mutation='InvokeNode'},
+            @{Name='status write';Prior='Validated';Mutation='WriteStatus'},
+            @{Name='transition completion';Prior='WriteVerified';Mutation='Complete:Activated'}
+        )
+        foreach($target in $targets){
+            $source=New-CcodEngineSnapshot;$events=[Collections.Generic.List[string]]::new();$world=[pscustomobject]@{StopCalls=0;StartCalls=0;BridgeCalls=0;StatusWrites=0;Completions=0}
+            $adapters=New-CcodEngineAdapters -Processes @($source) -Events $events
+            $adapters.StopProcess={param($Expected,$StatusEvidence,$TimeoutMilliseconds)$world.StopCalls++;$events.Add('StopProcess');[pscustomobject]@{Outcome='Stopped';StoppedByController=$true;Snapshot=$Expected}}.GetNewClosure()
+            $baseStart=$adapters.StartSpecial
+            $adapters.StartSpecial={param($RendererPort,$MainPort,$TimeoutMilliseconds)$world.StartCalls++;& $baseStart $RendererPort $MainPort $TimeoutMilliseconds}.GetNewClosure()
+            $baseNode=$adapters.InvokeNode
+            $adapters.InvokeNode={param($NodePath,$Arguments)$world.BridgeCalls++;& $baseNode $NodePath $Arguments}.GetNewClosure()
+            $adapters.WriteStatus={param($StateRoot,$Status,$LiveProbe)$world.StatusWrites++;$events.Add('WriteStatus')}.GetNewClosure()
+            $adapters.CompleteTransition={param($Path,$LogPath,$TransactionId,$Disposition)$world.Completions++;$events.Add("Complete:$Disposition");[pscustomobject]@{Outcome='Completed'}}.GetNewClosure()
+            $prior=[string]$target.Prior
+            $adapters.AssertLifecycleFence={
+                param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity)
+                if($events.Count -gt 0 -and $events[$events.Count-1] -ceq $prior){
+                    $exception=[InvalidOperationException]::new('stale lifecycle owner')
+                    throw [Management.Automation.ErrorRecord]::new($exception,'CCOD_LIFECYCLE_FENCE_STALE',[Management.Automation.ErrorCategory]::SecurityError,$OwnerIdentity)
+                }
+                $true
+            }.GetNewClosure()
+            $request=New-CcodEngineRequest -SchemaVersion 2 -Action Apply -Source $source -ExistingOnly $true
+            Assert-CcodThrows { Invoke-CcodApplySession -Request $request -Paths $paths -Adapters $adapters } 'CCOD_LIFECYCLE_FENCE_STALE'
+            $actual=@{StopProcess=$world.StopCalls;StartSpecial=$world.StartCalls;InvokeNode=$world.BridgeCalls;WriteStatus=$world.StatusWrites;'Complete:Activated'=$world.Completions}[[string]$target.Mutation]
+            Assert-CcodEqual 0 $actual "$($target.Name) does not run after its fence becomes stale"
+        }
     }
 
     Invoke-CcodTest 'durably closes current special or ordinary trees without any ordinary restart' {

@@ -46,28 +46,28 @@ that existing page and leaves the Codex UI, account authorization, and enrollmen
 
 ## Quick start
 
-1. Download `CodexRemote-fix-2.4.24-setup.exe` and `CodexRemote-fix-2.4.24-setup.exe.sha256.txt` from the [Releases](https://github.com/naipi11/CodexRemote-fix/releases) page, then verify the SHA-256.
-2. Run `CodexRemote-fix-2.4.24-setup.exe`; no administrator rights are required.
+1. Download `CodexRemote-fix-2.5.0-setup.exe` and `CodexRemote-fix-2.5.0-setup.exe.sha256.txt` from the [Releases](https://github.com/naipi11/CodexRemote-fix/releases) page, then verify the SHA-256.
+2. Run `CodexRemote-fix-2.5.0-setup.exe`; no administrator rights are required.
    Windows 10 users should ensure that .NET Framework 4.8 is installed for the native TrayHost.
-3. The tray supervisor starts automatically and creates the desktop shortcut **CodexRemote-fix**. When the tray icon is green, open **Settings → Connections → Control other devices** to enroll or use the device.
+3. The tray supervisor starts automatically and creates the desktop shortcut **CodexRemote-fix**. Setup waits until the new runtime and TrayHost are ready, then offers **Restart now** or **Later**. Choose **Restart now** only when it is safe for Codex to close and relaunch into a repaired session; choose **Later** to leave the current Codex session untouched and resume safely after a later manual or normal Codex launch. When the connection reports **Connected**, open **Settings → Connections → Control other devices** to enroll or use the device.
 
 The current installer and its SHA-256 checksum are always published on the
 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) page.
 
 To upgrade, run the new installer over the previous installation. Existing settings and device
-keys are preserved. The installer also replaces a legacy supervisor that did not record its
-session state, including one left behind by an earlier interrupted upgrade, so a restart is not
-needed after upgrading.
+keys are preserved in place. The installer waits for the new runtime and tray before it offers
+the restart choice, and it safely clears only completed recovery work left by an interrupted
+upgrade.
 
 Verified on Windows 11 · Codex Desktop `26.818.2441.0` · Node.js `22.23.1`:
 the hidden controller tab, native tray menu, bilingual menu switching, and persistent
 supervisor are working.
 
-## What's new in v2.4.24
+## What's new in v2.5.0
 
-- Fixed upgrades leaving the controlled Codex session active but no tray supervisor running.
-- The installer now waits for the previous `IgnoreNew` scheduled-task instance to stop before starting the new Supervisor.
-- Added a bounded lifecycle regression test for this upgrade race.
+- Rebuilt restart and repair as a durable Supervisor-owned lifecycle that resumes safely after delayed or manual Codex launches.
+- Simplified the tray to truthful connection/protection status, one repair action, language, logs, About, and safe Exit.
+- Made upgrades wait for the new runtime and tray, preserved authorized devices, and unified Windows Settings and direct uninstall behind a fail-closed cleanup flow.
 
 ## What's new in v2.4.23
 
@@ -128,18 +128,27 @@ supervisor are working.
 
 - The logon task `Codex Control Other Devices Supervisor` starts the tray supervisor automatically; no manual steps are needed.
 - The desktop shortcut **CodexRemote-fix** is an optional way to start the tray supervisor if its icon is not visible. It does not start a repair or change a Codex session by itself.
-- A green tray icon means the current session is active. Open **Settings → Connections → Control other devices** to enroll or use it.
+- When the connection status is **Connected**, open **Settings → Connections → Control other devices** to enroll or use it.
 - New Codex builds start with `--remote-debugging-port` but no `--inspect`; the supervisor recognizes that launch shape and performs the takeover automatically.
 - The tray menu supports Follow system, Chinese, and English; switching applies immediately without restarting anything.
 - Updating this project or Codex does not require reinstalling the supervisor; the installer atomically switches versioned runtimes.
-- If an explicit repair is needed, Codex may close and relaunch once. Use **Retry last repair** from the tray menu; existing device pairing and authorization are preserved. A completed recovery left behind by an interrupted upgrade is cleared safely on the next supervisor start.
+- If an explicit repair is needed, use **Check and repair remote connection**. Codex may close and relaunch once, and existing device pairing and authorization are preserved. A completed recovery left behind by an interrupted upgrade is cleared safely on the next supervisor start.
+
+## Connection and protection status
+
+The tray reports two independent, truthful status lines instead of inferring readiness from color alone.
+
+- Connection is one of **Waiting for Codex**, **Checking**, **Connected**, **Repair needed**, or **Error**.
+- Protection is one of **Running**, **Reconnecting**, or **Stopping**.
+- **Check and repair remote connection** is the one repair action. It may request a controlled Codex restart only when needed; it never removes device authorization.
+- **Exit** is a Safe Exit: it stops CodexRemote-fix protection and may restore Codex to ordinary mode before the tray host exits. Relaunch the desktop shortcut or sign in again to resume protection.
 
 ## Releases
 
 Every tagged release ships a Windows installer and its SHA-256 checksum as release assets.
 The `.github/workflows/release.yml` workflow builds the installer from the tag automatically,
-so the 2.4.24 release includes the ready-to-run `CodexRemote-fix-2.4.24-setup.exe`
-and `CodexRemote-fix-2.4.24-setup.exe.sha256.txt`.
+so the 2.5.0 release includes the ready-to-run `CodexRemote-fix-2.5.0-setup.exe`
+and `CodexRemote-fix-2.5.0-setup.exe.sha256.txt`.
 
 Each release appends a short English change summary to the GitHub release body. The README and
 [CHANGELOG.md](CHANGELOG.md) retain the bilingual documentation history.
@@ -175,22 +184,15 @@ Neither Codex nor External renderer installation files are modified.
 
 *Real Windows capture; UI language is mixed Chinese/English and no desktop or skin is included.*
 
-The compiled native Win32 TrayHost menu shows actions only when their semantic state allows them: Apply now, Retry,
-Automation, Candidate-compatible trial, Logs, and Uninstall. Uninstall always requires explicit confirmation.
-
-| Color | State | Meaning |
-|---|---|---|
-| Gray | Waiting / Inspecting / Transitioning | Waiting for Codex, inspecting the current session, or applying the bridge |
-| Green | Active / ActivePaused | Current session is verified and usable |
-| Yellow | Suppressed | Compatibility action is suppressed until a manual retry or a new runtime |
-| Yellow | RendererHandoff | External renderer handoff did not complete; the verified Codex session remains active |
-| Red | Recovered / Error | Ordinary Codex was safely restored, or automatic actions are blocked |
+The compiled native Win32 TrayHost menu presents the connection and protection status, then only
+**Check and repair remote connection**, language, logs, About, and **Exit**. It has no automation,
+candidate-trial, or uninstall command.
 
 ## Troubleshooting
 
 Still no **Control other devices** tab?
 
-1. Confirm the tray icon is green (gray means waiting for Codex or automation is paused).
+1. Check the tray's connection and protection labels; **Waiting for Codex** or **Checking** means it is not yet ready.
 2. Run the **CodexRemote-fix compatibility check** shortcut from the Start menu and confirm `Ready: True`.
 3. Check the logs under `%LOCALAPPDATA%\CodexControlOtherDevices\logs\`.
 4. Make sure security software is not blocking `node.exe` from loopback access.
@@ -208,10 +210,12 @@ Exit Codex, open **CodexRemote-fix** from the desktop, then relaunch Codex.
 
 ## Uninstall
 
-Use the tray menu → **Uninstall**, or uninstall **CodexRemote-fix** from
-Windows Settings → Apps → Installed apps. The device key store is preserved or backed up
-on uninstall; removing it locally does not revoke server authorization, so revoke the
-device in Codex first.
+The tray has no uninstall command. Use **Windows Settings → Apps → Installed apps** to uninstall
+**CodexRemote-fix**, or run the installed `unins000.exe` directly from the application folder.
+Both entries use the same external, fail-closed cleanup transaction; if it cannot prove the current
+runtime and session identity, it protects the installed files instead of guessing. The DPAPI device
+key store remains in place, so existing authorized devices are preserved. Removing a local key would
+not revoke server authorization; revoke the device in Codex first if that is your intent.
 
 ## What it fixes
 

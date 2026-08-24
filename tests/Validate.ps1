@@ -4,11 +4,39 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# npm normally launches this Windows PowerShell entry point from a PowerShell 7
+# shell. Preserve the Desktop module discovery paths so child Windows PowerShell
+# tests can resolve inbox cmdlets such as Get-FileHash instead of inheriting only
+# the PowerShell 7 module layout.
+if ($PSVersionTable.PSEdition -eq 'Desktop') {
+    $desktopModulePaths = @(
+        [Environment]::GetEnvironmentVariable('PSModulePath', 'User'),
+        [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    if ($desktopModulePaths.Count -gt 0) {
+        $env:PSModulePath = $desktopModulePaths -join ';'
+    }
+}
+
 $projectRoot = Split-Path $PSScriptRoot -Parent
 $failures = [System.Collections.Generic.List[string]]::new()
 $cleanRoomSelfTest = Join-Path $PSScriptRoot 'CleanroomSelfTest.js'
 $packageCheckerSelfTest = Join-Path $PSScriptRoot 'PackageCheckerSelfTest.mjs'
 $persistenceSelfTest = Join-Path $PSScriptRoot 'PersistenceSelfTest.ps1'
+
+function Get-CcodValidationSafeChildMarkers {
+    param($Output)
+    $markers = [Collections.Generic.List[string]]::new()
+    foreach ($entry in @($Output)) {
+        $line = [string]$entry
+        if ($line -cmatch '^CCOD_[A-Z0-9_]+(?: [A-Za-z0-9_.:-]+=[A-Za-z0-9_.:-]+)*$') {
+            $markers.Add($line)
+        }
+    }
+    if ($markers.Count -eq 0) { return '<no-safe-child-marker>' }
+    return ($markers -join ';')
+}
 
 foreach ($script in Get-ChildItem -Recurse -File -LiteralPath $projectRoot -Filter '*.ps1') {
     $tokens = $null
@@ -68,9 +96,19 @@ if (-not $node) {
 
 if ($failures.Count -eq 0) {
     $powershellExecutable = (Get-Command powershell.exe -ErrorAction Stop).Source
-    $persistenceOutput = & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $persistenceSelfTest 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        $failures.Add("Persistence self-test failed: $($persistenceOutput -join ' ')")
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # A failing child PowerShell writes a NativeCommandError to stderr. Capture
+        # that test evidence and inspect its exit code instead of terminating before
+        # the consolidated failure report can run.
+        $ErrorActionPreference = 'Continue'
+        $persistenceOutput = & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $persistenceSelfTest 2>&1
+        $persistenceExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($persistenceExitCode -ne 0) {
+        $failures.Add("Persistence self-test failed with exit code $persistenceExitCode; $(Get-CcodValidationSafeChildMarkers $persistenceOutput)")
     }
 }
 
@@ -87,13 +125,19 @@ foreach ($required in @(
     'Install-CodexControlOtherDevices.ps1',
     'Uninstall-CodexControlOtherDevices.ps1',
     'src\persistence\bootstrap.ps1',
+    'src\persistence\UninstallBootstrap.ps1',
     'src\persistence\modules\InstallLifecycle.psm1',
     'src\persistence\modules\ScheduledTask.psm1',
     'src\persistence\modules\WorkerRuntime.psm1',
     'tests\PersistenceSelfTest.ps1',
+    'tests\installed\Invoke-InstalledLifecycleIntegration.ps1',
     'tests\persistence\Bootstrap.SelfTest.ps1',
     'tests\persistence\ScheduledTask.SelfTest.ps1',
     'tests\persistence\InstallLifecycle.SelfTest.ps1',
+    'tests\persistence\UninstallBootstrap.SelfTest.ps1',
+    'tests\persistence\InstalledLifecycleHarness.SelfTest.ps1',
+    'tests\persistence\ReleaseWorkflow.SelfTest.ps1',
+    'tools\Test-ReleaseDefender.ps1',
     'tests\persistence\WorkerRuntime.SelfTest.ps1'
 )) {
     if (-not (Test-Path -LiteralPath (Join-Path $projectRoot $required) -PathType Leaf)) {
@@ -110,8 +154,12 @@ if (-not $SkipInstalledPackageCheck -and $failures.Count -eq 0) {
 }
 
 if ($failures.Count -gt 0) {
-    Write-Host 'Validation failed:' -ForegroundColor Red
-    foreach ($failure in $failures) { Write-Host "  - $failure" }
+    [Console]::Error.WriteLine('CCOD_VALIDATION_FAILED')
+    for ($failureIndex = 0; $failureIndex -lt $failures.Count; $failureIndex++) {
+        $failure = [string]$failures[$failureIndex]
+        if ([string]::IsNullOrWhiteSpace($failure)) { $failure = '<empty-failure-record>' }
+        [Console]::Error.WriteLine(('CCOD_VALIDATION_FAILURE[{0}] {1}' -f $failureIndex,$failure))
+    }
     exit 1
 }
 

@@ -25,6 +25,10 @@ $transportFiles=@(
     (Join-Path $repositoryRoot 'src\trayhost\ParentTransport.cs'),
     (Join-Path $repositoryRoot 'src\trayhost\HostTransport.cs')
 )
+$protocolSupportFiles=@(
+    (Join-Path $repositoryRoot 'src\trayhost\TransportMessages.cs'),
+    (Join-Path $repositoryRoot 'src\trayhost\TrayHostWire.cs')
+)
 $parentClientFiles=@(
     (Join-Path $repositoryRoot 'src\trayhost\TrayHostWire.cs'),
     (Join-Path $repositoryRoot 'src\trayhost\JobObject.cs'),
@@ -32,6 +36,7 @@ $parentClientFiles=@(
 )
 $testPath=if($ProtocolOnly){Join-Path $repositoryRoot 'tests\trayhost\TrayHostProtocolSelfTest.cs'}elseif($NativeOnly){Join-Path $repositoryRoot 'tests\trayhost\TrayHostNativeSelfTest.cs'}elseif($TransportOnly){Join-Path $repositoryRoot 'tests\trayhost\TrayHostTransportSelfTest.cs'}else{Join-Path $repositoryRoot 'tests\trayhost\TrayHostParentClientSelfTest.cs'}
 $requiredFiles=@($protocolPath,$presentationPath,$testPath)
+if($ProtocolOnly){$requiredFiles+=$protocolSupportFiles}
 if($NativeOnly){$requiredFiles+=$nativeFiles}
 if($TransportOnly){$requiredFiles+=$transportFiles}
 if($ParentClientOnly){$requiredFiles+=$transportFiles+$parentClientFiles}
@@ -53,6 +58,7 @@ try{
     else
     {
         $args+=@($protocolPath,$presentationPath)
+        if($ProtocolOnly){$args+=$protocolSupportFiles}
         if($NativeOnly){$args+=$nativeFiles}
         if($TransportOnly){$args+=$transportFiles}
         if($ParentClientOnly){$args+=$transportFiles+$parentClientFiles}

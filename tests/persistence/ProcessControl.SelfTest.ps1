@@ -885,6 +885,116 @@ try {
         Assert-CcodEqual $false $notClosed 'unrelated socket errors never prove closure'
     }
 
+    Invoke-CcodTest 'separates an AppsFolder launch request from delayed verified ordinary observation' {
+        $sid='S-1-5-21-test'
+        $requestedAt='2030-02-03T04:05:06.0000000Z'
+        $ordinary=New-CcodSnapshot -ProcessId 9001 -CreationTimeUtc '2030-02-03T04:05:07.0000000Z' -SessionId 2 -UserSid $sid
+        $ordinary.Path='C:\Codex\ChatGPT.exe'
+        $world=[pscustomobject]@{Starts=0;Observations=0;Elapsed=0;Delays=[Collections.Generic.List[int]]::new();Path=$null;Arguments=@();WindowStyle='unset'}
+        $adapters=@{
+            StartProcess={
+                param($FilePath,$Arguments,$WindowStyle)
+                $world.Starts++;$world.Path=$FilePath;$world.Arguments=@($Arguments);$world.WindowStyle=$WindowStyle
+                [pscustomobject]@{Id=777}
+            }.GetNewClosure()
+            GetPackageIdentity={ [pscustomobject]@{Found=$true;FullName='OpenAI.Codex_1.0.0.0_x64__2p2nqsd0c76g0';FamilyName='OpenAI.Codex_2p2nqsd0c76g0';Version='1.0.0.0';ExecutablePath='C:\Codex\ChatGPT.exe'} }
+            ListProcessIds={ $world.Observations++;if($world.Observations -ge 8){@(9001)}else{@()} }.GetNewClosure()
+            GetProcess={param($ProcessId,$StatusEvidence)$ordinary}.GetNewClosure()
+            ParseCommandLine={param($CommandLine)@('C:\Codex\ChatGPT.exe')}
+            StartStopwatch={ $world }.GetNewClosure()
+            GetElapsedMilliseconds={param($Clock)[long]$Clock.Elapsed}.GetNewClosure()
+            Delay={param($Milliseconds)$world.Delays.Add([int]$Milliseconds);$world.Elapsed+=[int]$Milliseconds}.GetNewClosure()
+        }
+
+        $ownership=[pscustomobject][ordered]@{runtimeGeneration=[UInt64]4;leaseEpoch=[UInt64]9;ownerIdentity=[pscustomobject][ordered]@{pid=401;creationTimeUtc='2030-02-03T04:05:06.0000000Z'}}
+        $receipt=Request-CcodOrdinaryPackagedLaunch -RequestedAtUtc $requestedAt -Ownership $ownership -AssertLifecycleFence {param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity)$true} -Adapters $adapters
+        Assert-CcodEqual 'outcome,requestedAtUtc,launcherPid' (($receipt.PSObject.Properties.Name)-join ',') 'launch receipt has only the request contract'
+        Assert-CcodEqual 'LaunchRequested' $receipt.outcome 'Explorer receipt is only a launch request'
+        Assert-CcodEqual $requestedAt $receipt.requestedAtUtc 'receipt preserves the lifecycle request time'
+        Assert-CcodEqual 777 $receipt.launcherPid 'receipt exposes only the Explorer launcher pid'
+        Assert-CcodEqual $null $receipt.PSObject.Properties['Snapshot'] 'launch receipt cannot claim a Codex snapshot'
+        Assert-CcodEqual ([IO.Path]::GetFullPath((Join-Path $env:WINDIR 'explorer.exe'))) $world.Path 'ordinary request uses system Explorer'
+        Assert-CcodEqual 'shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App' ($world.Arguments -join ',') 'ordinary request uses the exact Codex AUMID'
+        Assert-CcodEqual $null $world.WindowStyle 'ordinary request remains visible'
+
+        $status=[pscustomobject]@{schemaVersion=1;session=$null}
+        $observed=Wait-CcodVerifiedOrdinaryRoot -NotBeforeUtc $receipt.requestedAtUtc -ExpectedUserSid $sid -ExpectedSessionId 2 -StatusEvidence $status -TimeoutMilliseconds 45000 -Adapters $adapters
+        Assert-CcodEqual 9001 $observed.Pid 'delayed verified ordinary root is observed'
+        Assert-CcodEqual '250,500,1000,2000,2000,2000,2000' ($world.Delays -join ',') 'observation uses the central capped backoff'
+        Assert-CcodEqual 8 $world.Observations 'observation tolerates delayed packaged process creation'
+    }
+
+    Invoke-CcodTest 'ordinary observation rejects every unverified identity and stops at its monotonic deadline' {
+        $sid='S-1-5-21-test';$notBefore='2030-02-03T04:05:06.0000000Z'
+        $base=New-CcodSnapshot -ProcessId 9001 -CreationTimeUtc '2030-02-03T04:05:07.0000000Z' -SessionId 2 -UserSid $sid
+        $base.Path='C:\Codex\ChatGPT.exe'
+        $cases=@(
+            @{Name='pre-existing';Mutate={param($v)$v.CreationTimeUtc='2030-02-03T04:05:05.0000000Z'}},
+            @{Name='debug argv';Mutate={param($v)$v.CommandLine='"C:\Codex\ChatGPT.exe" --remote-debugging-port=41001'};Arguments=@('C:\Codex\ChatGPT.exe','--remote-debugging-port=41001')},
+            @{Name='special mode';Mutate={param($v)$v.Mode='Special'}},
+            @{Name='wrong package';Mutate={param($v)$v.PackageFamilyName='Other.Package_family'}},
+            @{Name='wrong path';Mutate={param($v)$v.Path='C:\Other\ChatGPT.exe'}},
+            @{Name='wrong sid';Mutate={param($v)$v.UserSid='S-1-5-21-other'}},
+            @{Name='wrong session';Mutate={param($v)$v.SessionId=3}},
+            @{Name='not top-level';Mutate={param($v)$v.IsTopLevel=$false}}
+        )
+        foreach($case in $cases){
+            $snapshot=$base|ConvertTo-Json -Depth 5|ConvertFrom-Json
+            $snapshot.Pid=[int]$snapshot.Pid;$snapshot.SessionId=[int]$snapshot.SessionId;$snapshot.IsTopLevel=[bool]$snapshot.IsTopLevel
+            & $case.Mutate $snapshot
+            $arguments=if($case.ContainsKey('Arguments')){$case.Arguments}else{@('C:\Codex\ChatGPT.exe')}
+            $clock=[pscustomobject]@{Elapsed=0}
+            $result=Wait-CcodVerifiedOrdinaryRoot -NotBeforeUtc $notBefore -ExpectedUserSid $sid -ExpectedSessionId 2 -StatusEvidence ([pscustomobject]@{schemaVersion=1;session=$null}) -TimeoutMilliseconds 1 -Adapters @{
+                GetPackageIdentity={ [pscustomobject]@{Found=$true;FullName='OpenAI.Codex_1.0.0.0_x64__2p2nqsd0c76g0';FamilyName='OpenAI.Codex_2p2nqsd0c76g0';Version='1.0.0.0';ExecutablePath='C:\Codex\ChatGPT.exe'} }
+                ListProcessIds={@(9001)}
+                GetProcess={param($ProcessId,$StatusEvidence)$snapshot}.GetNewClosure()
+                ParseCommandLine={param($CommandLine)$arguments}.GetNewClosure()
+                StartStopwatch={$clock}.GetNewClosure();GetElapsedMilliseconds={param($Clock)[long]$Clock.Elapsed}.GetNewClosure()
+                Delay={param($Milliseconds)$clock.Elapsed+=[int]$Milliseconds}.GetNewClosure()
+            }
+            Assert-CcodEqual $null $result "$($case.Name) never becomes an ordinary launch proof"
+        }
+
+        $deadline=[pscustomobject]@{Elapsed=0;Delays=[Collections.Generic.List[int]]::new();Observations=0}
+        $missing=Wait-CcodVerifiedOrdinaryRoot -NotBeforeUtc $notBefore -ExpectedUserSid $sid -ExpectedSessionId 2 -StatusEvidence ([pscustomobject]@{schemaVersion=1;session=$null}) -TimeoutMilliseconds 45000 -Adapters @{
+            GetPackageIdentity={ [pscustomobject]@{Found=$true;FullName='OpenAI.Codex_1.0.0.0_x64__2p2nqsd0c76g0';FamilyName='OpenAI.Codex_2p2nqsd0c76g0';Version='1.0.0.0';ExecutablePath='C:\Codex\ChatGPT.exe'} }
+            ListProcessIds={$deadline.Observations++;@()}.GetNewClosure()
+            StartStopwatch={$deadline}.GetNewClosure();GetElapsedMilliseconds={param($Clock)[long]$Clock.Elapsed}.GetNewClosure()
+            Delay={param($Milliseconds)$deadline.Delays.Add([int]$Milliseconds);$deadline.Elapsed+=[int]$Milliseconds}.GetNewClosure()
+        }
+        Assert-CcodEqual $null $missing 'deadline without Codex returns no proof'
+        Assert-CcodEqual 45000 $deadline.Elapsed 'observation does not exceed its monotonic bound'
+        Assert-CcodTrue (@($deadline.Delays|Where-Object{$_ -gt 2000}).Count -eq 0) 'central backoff never exceeds two seconds'
+        Assert-CcodEqual '250,500,1000,2000' (($deadline.Delays|Select-Object -First 4)-join ',') 'deadline uses the central initial backoff sequence'
+    }
+
+    Invoke-CcodTest 'ordinary launch request performs exactly one AppsFolder request per operation' {
+        $world=[pscustomobject]@{Starts=0}
+        $adapters=@{StartProcess={param($FilePath,$Arguments,$WindowStyle)$world.Starts++;[pscustomobject]@{Id=(700+$world.Starts)}}.GetNewClosure()}
+        $ownership=[pscustomobject][ordered]@{runtimeGeneration=[UInt64]4;leaseEpoch=[UInt64]9;ownerIdentity=[pscustomobject][ordered]@{pid=401;creationTimeUtc='2030-02-03T04:05:06.0000000Z'}}
+        foreach($index in 1..3){
+            $receipt=Request-CcodOrdinaryPackagedLaunch -RequestedAtUtc '2030-02-03T04:05:06.0000000Z' -Ownership $ownership -AssertLifecycleFence {param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity)$true} -Adapters $adapters
+            Assert-CcodEqual 'LaunchRequested' $receipt.outcome "operation $index returns only a request receipt"
+        }
+        Assert-CcodEqual 3 $world.Starts 'three coordinator operations produce at most three AppsFolder requests'
+    }
+
+    Invoke-CcodTest 'stale lifecycle ownership blocks ordinary AppsFolder launch before StartProcess' {
+        $world=[pscustomobject]@{Starts=0}
+        $ownership=[pscustomobject][ordered]@{runtimeGeneration=[UInt64]4;leaseEpoch=[UInt64]9;ownerIdentity=[pscustomobject][ordered]@{pid=401;creationTimeUtc='2030-02-03T04:05:06.0000000Z'}}
+        $stale={
+            param($RuntimeGeneration,$LeaseEpoch,$OwnerIdentity)
+            $exception=[InvalidOperationException]::new('stale lifecycle owner')
+            throw [Management.Automation.ErrorRecord]::new($exception,'CCOD_LIFECYCLE_FENCE_STALE',[Management.Automation.ErrorCategory]::SecurityError,$OwnerIdentity)
+        }
+        Assert-CcodThrows {
+            Request-CcodOrdinaryPackagedLaunch -RequestedAtUtc '2030-02-03T04:05:06.0000000Z' -Ownership $ownership -AssertLifecycleFence $stale -Adapters @{
+                StartProcess={param($FilePath,$Arguments,$WindowStyle)$world.Starts++;throw 'must not start'}.GetNewClosure()
+            }
+        } 'CCOD_LIFECYCLE_FENCE_STALE'
+        Assert-CcodEqual 0 $world.Starts 'stale lifecycle owner never reaches system Explorer'
+    }
+
     Invoke-CcodTest 'adopts an existing ordinary root before starting recovery' {
         $ordinary = New-CcodSnapshot -ProcessId 300
         $calls = [pscustomobject]@{ Start = 0; Package = 0 }

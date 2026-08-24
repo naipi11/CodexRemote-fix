@@ -26,9 +26,25 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Run uninstall bootstrap self-test
+        shell: pwsh
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./tests/persistence/UninstallBootstrap.SelfTest.ps1
+
       - name: Run repository validation
         shell: pwsh
         run: npm test
+
+      - name: Run deterministic installed lifecycle harness tests
+        shell: pwsh
+        run: npm run test:installed-lifecycle
+
+      - name: Run release contract tests
+        shell: pwsh
+        run: npm run test:release-contract
 
       - name: Run TrayHost protocol self-test
         shell: pwsh

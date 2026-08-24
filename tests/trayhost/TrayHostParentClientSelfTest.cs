@@ -13,9 +13,9 @@ internal static class TrayHostParentClientSelfTest
 
     private static PresentationSnapshot Snapshot(ulong revision)
     {
-        string[] strings = new string[20];
+        string[] strings = new string[16];
         for (int i = 0; i < strings.Length; i++) { strings[i] = "string-" + i; }
-        return new PresentationSnapshot(revision, TrayColor.Green, TrayState.Active, LanguageMode.Chinese, PresentationFlags.OpenLogsEnabled, strings);
+        return new PresentationSnapshot(revision, TrayColor.Green, ConnectionState.Connected, ProtectionState.Running, LanguageMode.Chinese, PresentationFlags.OpenLogsEnabled, strings);
     }
 
     private static Process StartPeer(ProcessStartInfo requested)
@@ -29,7 +29,7 @@ internal static class TrayHostParentClientSelfTest
         return Process.Start(requested);
     }
 
-    private static void RunPeer(bool emitFaultAndIgnoreShutdown)
+    private static void RunPeer(bool emitFaultAndIgnoreShutdown, bool emitAction)
     {
         Stream input = Console.OpenStandardInput();
         Stream output = Console.OpenStandardOutput();
@@ -47,6 +47,21 @@ internal static class TrayHostParentClientSelfTest
         ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.UiReady, epoch, 2UL, TrayHostWire.WriteRevision(TrayHostWire.ReadPresentation(presentation.Payload).Revision)), keys.HostToParent);
         ulong inboundSequence = 2UL;
         ulong outboundSequence = 3UL;
+        if (emitAction)
+        {
+            Guid actionId = Guid.Parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+            Guid transactionId = Guid.Parse("11111111-2222-3333-4444-555555555555");
+            ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.Action, epoch, outboundSequence++, TrayHostWire.WriteAction(new TrayHostAction(actionId, TrayCommand.CheckAndRepair, 1UL))), keys.HostToParent);
+            ProtocolFrame acceptedFrame = ProtocolCodec.ReadAuthenticated(input, ProtocolDirection.ParentToHost, epoch, inboundSequence++, keys.ParentToHost);
+            AssertTrue(acceptedFrame.MessageType == TrayHostMessageType.ActionResult, "peer receives one parent action result");
+            TrayActionResult accepted = TrayHostWire.ReadActionResult(acceptedFrame.Payload);
+            AssertTrue(accepted.ActionId == actionId && accepted.Revision == 1UL && accepted.Status == TrayActionResultStatus.Accepted && accepted.TransactionId.HasValue && accepted.TransactionId.Value == transactionId, "peer receives the correlated accepted result");
+            ProtocolFrame completedFrame = ProtocolCodec.ReadAuthenticated(input, ProtocolDirection.ParentToHost, epoch, inboundSequence++, keys.ParentToHost);
+            AssertTrue(completedFrame.MessageType == TrayHostMessageType.ActionResult, "peer receives one parent terminal result");
+            TrayActionResult completed = TrayHostWire.ReadActionResult(completedFrame.Payload);
+            AssertTrue(completed.ActionId == actionId && completed.Status == TrayActionResultStatus.Completed && completed.TransactionId.HasValue && completed.TransactionId.Value == transactionId, "peer receives the correlated completed result");
+            return;
+        }
         if (emitFaultAndIgnoreShutdown)
         {
             ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.Fault, epoch, outboundSequence++, new byte[0]), keys.HostToParent);
@@ -143,15 +158,44 @@ internal static class TrayHostParentClientSelfTest
         }
     }
 
+    private static void TestCorrelatedActionResults()
+    {
+        PeerArguments = "--action-peer";
+        TrayHostParentClient client = null;
+        try
+        {
+            client = TrayHostParentClient.Start(Options());
+            TrayHostEvent action = null; DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+            while (action == null && DateTime.UtcNow < deadline)
+            {
+                client.WaitForActivity(TimeSpan.FromMilliseconds(100));
+                TrayHostEvent value;
+                while (client.TryDequeueEvent(out value)) { if (value.Kind == TrayHostEventKind.Action) { action = value; break; } }
+            }
+            AssertTrue(action != null && action.Command == TrayCommand.CheckAndRepair && action.Revision == 1UL, "parent receives the exact v2 action event");
+            Guid transactionId = Guid.Parse("11111111-2222-3333-4444-555555555555");
+            AssertTrue(client.TryAcknowledgeAction(new TrayActionResult(action.ActionId, action.Revision, TrayActionResultStatus.Accepted, null, transactionId)), "parent queues the accepted action result");
+            bool completed = false; deadline = DateTime.UtcNow.AddSeconds(2);
+            while (!completed && DateTime.UtcNow < deadline)
+            {
+                completed = client.TryAcknowledgeAction(new TrayActionResult(action.ActionId, action.Revision, TrayActionResultStatus.Completed, null, transactionId));
+                if (!completed) { Thread.Sleep(20); }
+            }
+            AssertTrue(completed, "parent queues the terminal result after the accepted result drains");
+        }
+        finally { if (client != null) { client.Dispose(); } PeerArguments = "--peer"; }
+    }
+
     public static int Main(string[] args)
     {
         try
         {
-            if (args.Length == 1 && args[0] == "--peer") { RunPeer(false); return 0; }
-            if (args.Length == 1 && args[0] == "--fault-peer") { RunPeer(true); return 0; }
+            if (args.Length == 1 && args[0] == "--peer") { RunPeer(false, false); return 0; }
+            if (args.Length == 1 && args[0] == "--fault-peer") { RunPeer(true, false); return 0; }
+            if (args.Length == 1 && args[0] == "--action-peer") { RunPeer(false, true); return 0; }
             TrayHostParentClient.TestProcessFactory = StartPeer;
             TrayHostParentClient client = TrayHostParentClient.Start(Options());
-            AssertTrue(client.Receipt.ProtocolMajor == 1 && client.GetHealth() == TrayHostHealth.Ready, "parent waits for verified ready");
+            AssertTrue(client.Receipt.ProtocolMajor == 2 && client.GetHealth() == TrayHostHealth.Ready, "parent waits for verified v2 ready");
             AssertTrue(client.TryPublish(Snapshot(2UL)), "parent publishes presentation without blocking");
             AssertTrue(client.WaitForActivity(TimeSpan.FromSeconds(2)), "parent observes host acknowledgement");
             TrayHostEvent value;
@@ -161,7 +205,8 @@ internal static class TrayHostParentClientSelfTest
             client.Dispose();
             TestDisposeRequestsGracefulShutdown();
             TestDisposeAfterRemoteFaultDoesNotCrashParentReader();
-            Console.WriteLine("TrayHost parent-client self-tests passed: 3");
+            TestCorrelatedActionResults();
+            Console.WriteLine("TrayHost parent-client self-tests passed: 4");
             return 0;
         }
         catch (Exception error)

@@ -43,24 +43,24 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 ## 快速开始
 
-1. 从 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 下载 `CodexRemote-fix-2.4.24-setup.exe` 和 `CodexRemote-fix-2.4.24-setup.exe.sha256.txt`，并核对 SHA-256。
-2. 运行 `CodexRemote-fix-2.4.24-setup.exe`，无需管理员权限。
+1. 从 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 下载 `CodexRemote-fix-2.5.0-setup.exe` 和 `CodexRemote-fix-2.5.0-setup.exe.sha256.txt`，并核对 SHA-256。
+2. 运行 `CodexRemote-fix-2.5.0-setup.exe`，无需管理员权限。
    Windows 10 用户请确认已安装 .NET Framework 4.8，原生 TrayHost 需要该组件。
-3. 托盘守护程序会自动启动，并创建桌面快捷方式 **CodexRemote-fix**。托盘图标为绿色时，打开 **设置 → 连接 → 控制其他设备** 即可注册或使用。
+3. 托盘守护程序会自动启动，并创建桌面快捷方式 **CodexRemote-fix**。安装器会等待新 runtime 与 TrayHost 就绪，再让你选择 **立即重启** 或 **稍后**：仅在可以关闭并重新启动 Codex 时选择 **立即重启**；选择 **稍后** 会保持当前 Codex 会话不受影响，并会在之后手动或正常启动 Codex 时安全恢复。连接状态显示 **已连接** 后，打开 **设置 → 连接 → 控制其他设备** 即可注册或使用。
 
 当前安装包及其 SHA-256 校验值始终发布在
 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 页面。
 
-升级时直接运行新版安装包即可，现有设置与设备密钥会保留。
+升级时直接运行新版安装包即可，现有设置与设备密钥会原地保留。安装器会等待新 runtime 与托盘就绪后才提供重启选择，并且只会安全清理中断升级遗留的已完成恢复工作。
 
 已验证：Windows 11 · Codex Desktop `26.818.2441.0` · Node.js `22.23.1`；
 隐藏的控制器标签、原生托盘菜单、双语菜单切换和常驻守护程序均可用。
 
-## v2.4.24 更新内容
+## v2.5.0 更新内容
 
-- 修复升级后受控 Codex 已生效、但托盘 Supervisor 没有运行的问题。
-- 安装器会等待旧 `IgnoreNew` 计划任务实例停止后，再启动新 Supervisor。
-- 新增该升级竞态的有界生命周期回归测试。
+- 将重启和修复重建为由 Supervisor 持有的持久生命周期，可在延迟或手动启动 Codex 后安全恢复。
+- 托盘精简为真实的连接/守护状态、一个修复操作、语言、日志、关于和安全退出。
+- 升级会等待新 runtime 与托盘，保留已授权设备，并把 Windows 设置与直接卸载统一到失败即停止的清理流程。
 
 ## v2.4.23 更新内容
 
@@ -121,18 +121,27 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 - 登录后计划任务 `Codex Control Other Devices Supervisor` 自动启动托盘守护程序，无需手动操作。
 - 若未看到托盘图标，可双击桌面上的 **CodexRemote-fix** 启动托盘守护程序；它本身不会启动修复，也不会改变当前 Codex 会话。
-- 托盘图标为绿色时，当前会话已生效；打开 **设置 → 连接 → 控制其他设备** 即可注册或使用。
+- 连接状态显示 **已连接** 时，当前会话已生效；打开 **设置 → 连接 → 控制其他设备** 即可注册或使用。
 - 新版 Codex 正常启动自带 `--remote-debugging-port`（没有 `--inspect`），守护程序已能识别这种启动方式并自动完成接管。
 - 托盘菜单支持跟随系统、中文、English，切换即时生效，无需重启。
 - 升级本项目或 Codex 后无需重装守护程序本体，安装器只会原子切换版本化运行时。
-- 如需显式修复，Codex 可能会关闭并重新启动一次。请从托盘菜单选择 **重试上次修复**；已有设备配对和授权会被保留。若升级中断后遗留了已完成的恢复事务，守护程序会在下次启动时安全清理它。
+- 如需显式修复，请从托盘菜单选择 **检查并修复远程连接**。Codex 可能会关闭并重新启动一次；已有设备配对和授权会被保留。若升级中断后遗留了已完成的恢复事务，守护程序会在下次启动时安全清理它。
+
+## 连接与守护状态
+
+托盘会分别报告真实的连接与守护状态，不再仅凭图标颜色推断是否可用。
+
+- 连接状态为 **等待 Codex**、**正在检查**、**已连接**、**需要修复** 或 **错误** 之一。
+- 守护状态为 **运行中**、**正在重连** 或 **正在停止** 之一。
+- **检查并修复远程连接** 是唯一的修复操作；只有确有需要时才会请求受控重启 Codex，绝不会移除设备授权。
+- **退出** 是安全退出：它会停止 CodexRemote-fix 守护，并可能先让 Codex 恢复普通模式再退出托盘宿主。重新启动桌面快捷方式或重新登录即可恢复守护。
 
 ## 发布（Releases）
 
 每个带 tag 的发布都会附带 Windows 安装包及其 SHA-256 校验文件。
-`.github/workflows/release.yml` 会在 tag 上自动构建安装包，因此后续每次更新都会
-为 2.4.24 发布提供可直接运行的 `CodexRemote-fix-2.4.24-setup.exe`
-及 `CodexRemote-fix-2.4.24-setup.exe.sha256.txt`。
+`.github/workflows/release.yml` 会在 tag 上自动构建安装包，因此 2.5.0 发布提供
+可直接运行的 `CodexRemote-fix-2.5.0-setup.exe`
+及 `CodexRemote-fix-2.5.0-setup.exe.sha256.txt`。
 
 GitHub Release 正文只发布英文更新说明；本 README 继续保留中英文使用说明。
 完整历史见 [CHANGELOG.md](CHANGELOG.md)。
@@ -166,22 +175,14 @@ External renderer 的 `pause` 标记会跳过集成。External renderer 状态�
 
 *真实 Windows 截图；未包含桌面皮肤和其他应用。*
 
-编译后的原生 Win32 TrayHost 菜单按语义状态显示或隐藏操作：立即应用、重试、自动化开关、兼容更新试用、日志、卸载。
-卸载必须先确认。
-
-| 颜色 | 状态 | 含义 |
-|---|---|---|
-| 灰色 | Waiting / Inspecting / Transitioning | 等待 Codex、检查当前会话或正在应用桥接 |
-| 绿色 | Active / ActivePaused | 当前会话已验证可用 |
-| 黄色 | Suppressed | 兼容操作被抑制，需手动重试或新运行时 |
-| 黄色 | RendererHandoff | External renderer handoff 未完成；已验证的 Codex 会话仍保持可用 |
-| 红色 | Recovered / Error | 已安全恢复普通 Codex，或自动操作被阻止 |
+编译后的原生 Win32 TrayHost 菜单先显示连接与守护状态，然后只提供
+**检查并修复远程连接**、语言、日志、关于和 **退出**；没有自动化、兼容更新试用或卸载命令。
 
 ## 常见问题
 
 仍然没有“控制其他设备”标签？
 
-1. 确认托盘图标为绿色（灰色表示等待 Codex 或自动化已暂停）。
+1. 查看托盘的连接与守护状态；显示 **等待 Codex** 或 **正在检查** 时，说明尚未就绪。
 2. 从开始菜单运行 **CodexRemote-fix compatibility check（兼容性检查）**，确认 `Ready: True`。
 3. 查看 `%LOCALAPPDATA%\CodexControlOtherDevices\logs\` 下的日志。
 4. 确认安全软件没有阻止 `node.exe` 访问本机回环端口。
@@ -200,9 +201,11 @@ External renderer 未附加到已经运行的会话？
 
 ## 卸载
 
-通过托盘菜单 → **卸载**，或在 Windows 设置 → 应用 → 已安装的应用中卸载
-**CodexRemote-fix**。卸载时会保留或备份设备密钥；本地移除密钥不会撤销
-服务器授权，请先在 Codex 中撤销设备。
+托盘中没有卸载命令。请在 **Windows 设置 → 应用 → 已安装的应用** 中卸载
+**CodexRemote-fix**，或直接从应用安装目录运行已安装的 `unins000.exe`。
+两个入口都会使用同一个外部、失败即停止的清理事务；如果它无法证明当前 runtime 与会话身份，
+会保护已安装文件而不会猜测性删除。DPAPI 设备密钥会原地保留，因此已授权设备会被保留。
+本地删除密钥不会撤销服务器授权；如需撤销，请先在 Codex 中撤销设备。
 
 ## 它解决了什么
 

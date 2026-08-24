@@ -103,7 +103,7 @@ function Get-CcodSupervisorTaskSpec {
     $canonicalRoot = [IO.Path]::GetFullPath($InstallRoot)
     $bootstrapPath = [IO.Path]::GetFullPath((Join-Path $canonicalRoot 'bootstrap.ps1'))
     $execute = [IO.Path]::GetFullPath((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
-    $argument = '-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "' + $bootstrapPath + '" -InstallRoot "' + $canonicalRoot + '"'
+    $argument = '-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "' + $bootstrapPath + '" -InstallRoot "' + $canonicalRoot + '" -EntryMode Task'
 
     return [pscustomobject][ordered]@{
         TaskName = $script:CcodTaskName

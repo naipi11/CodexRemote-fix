@@ -1,6 +1,7 @@
 Set-StrictMode -Version Latest
 
 Import-Module (Join-Path $PSScriptRoot 'PersistenceIO.psm1')
+Import-Module (Join-Path $PSScriptRoot 'LifecycleEpoch.psm1') -Force
 
 function Throw-CcodRuntimeError {
     param(
@@ -35,13 +36,49 @@ function Assert-CcodRuntimeId {
 function Get-CcodRuntimeAdapters {
     param([hashtable]$Adapters)
 
-    $resolved = @{ UtcNow = { [DateTime]::UtcNow } }
+    $resolved = @{
+        UtcNow = { [DateTime]::UtcNow }
+        AssertLifecycleFence = {
+            param($InstallRoot, $Ownership, $ExpectActivePointer, $NewRuntimeId)
+            $path = Resolve-CcodContainedPath -Root $InstallRoot -RelativePath 'active.json' -AllowMissingLeaf
+            if ([bool]$ExpectActivePointer) {
+                if (-not [IO.File]::Exists($path)) { Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Expected active pointer disappeared during lifecycle mutation' $path }
+                return Assert-CcodLifecycleFence -InstallRoot $InstallRoot -Ownership $Ownership
+            }
+            if ([IO.File]::Exists($path)) { Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Unexpected active pointer appeared during lifecycle initialization' $path }
+            if ([UInt64]$Ownership.runtimeGeneration -ne 1 -or [string]$Ownership.runtimeId -cne [string]$NewRuntimeId) {
+                Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Initial active pointer requires generation-one ownership of the new runtime' $Ownership
+            }
+            $virtualPointer = [pscustomobject][ordered]@{
+                schemaVersion=2; activeRuntime=[string]$Ownership.runtimeId; previousRuntime=$null
+                generation=[UInt64]$Ownership.runtimeGeneration; updatedAtUtc='1970-01-01T00:00:00.0000000Z'
+            }
+            $readVirtualPointer = { param($Root) $virtualPointer }.GetNewClosure()
+            return Assert-CcodLifecycleFence -InstallRoot $InstallRoot -Ownership $Ownership -Adapters @{ ReadActiveRuntime=$readVirtualPointer }
+        }
+    }
     if ($null -ne $Adapters) {
         foreach ($name in $Adapters.Keys) {
             $resolved[$name] = $Adapters[$name]
         }
     }
     return $resolved
+}
+
+function ConvertTo-CcodRuntimeGeneration {
+    param([Parameter(Mandatory)]$Value, [Parameter(Mandatory)][string]$Path)
+
+    if ($Value -is [decimal]) {
+        if ($Value -lt 1 -or [decimal]::Truncate($Value) -ne $Value) {
+            Throw-CcodRuntimeError 'CCOD_RUNTIME_GENERATION_INVALID' 'Active runtime generation must be a positive unsigned integer' $Path
+        }
+        try { return [UInt64]$Value } catch { Throw-CcodRuntimeError 'CCOD_RUNTIME_GENERATION_INVALID' 'Active runtime generation is outside the unsigned 64-bit range' $Path }
+    }
+    if ($Value -isnot [byte] -and $Value -isnot [uint16] -and $Value -isnot [uint32] -and $Value -isnot [uint64] -and
+        $Value -isnot [int16] -and $Value -isnot [int32] -and $Value -isnot [int64] -or $Value -lt 1) {
+        Throw-CcodRuntimeError 'CCOD_RUNTIME_GENERATION_INVALID' 'Active runtime generation must be a positive unsigned integer' $Path
+    }
+    return [UInt64]$Value
 }
 
 function Get-CcodRuntimeRoot {
@@ -294,7 +331,20 @@ function Read-CcodActiveRuntime {
     param([Parameter(Mandatory)][string]$InstallRoot)
 
     $path = Resolve-CcodContainedPath -Root $InstallRoot -RelativePath 'active.json' -AllowMissingLeaf
-    $active = Read-CcodStrictJson -Path $path -ExpectedSchema 1 -Kind 'active runtime'
+    $active = $null
+    $legacy = $false
+    try {
+        $active = Read-CcodStrictJson -Path $path -ExpectedSchema 2 -Kind 'active runtime'
+    } catch {
+        if ((Get-CcodErrorId -ErrorRecord $_) -cne 'CCOD_SCHEMA_UNSUPPORTED') { throw }
+        $active = Read-CcodStrictJson -Path $path -ExpectedSchema 1 -Kind 'active runtime'
+        $legacy = $true
+    }
+    $expected = if ($legacy) { @('schemaVersion', 'activeRuntime', 'previousRuntime', 'updatedAtUtc') } else { @('schemaVersion', 'activeRuntime', 'previousRuntime', 'generation', 'updatedAtUtc') }
+    $actual = @($active.PSObject.Properties.Name)
+    if ($actual.Count -ne $expected.Count -or ($actual -join "`0") -cne ($expected -join "`0")) {
+        Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active runtime pointer has unexpected fields' $path
+    }
     foreach ($name in @('activeRuntime', 'previousRuntime', 'updatedAtUtc')) {
         if ($null -eq $active.PSObject.Properties[$name]) {
             Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' "Active runtime pointer is missing $name" $path
@@ -310,7 +360,44 @@ function Read-CcodActiveRuntime {
         }
         Assert-CcodRuntimeId -RuntimeId $active.previousRuntime | Out-Null
     }
-    return $active
+    if ($legacy) {
+        return [pscustomobject][ordered]@{ schemaVersion=2; activeRuntime=$active.activeRuntime; previousRuntime=$active.previousRuntime; generation=[UInt64]1; updatedAtUtc=$active.updatedAtUtc }
+    }
+    $generation = ConvertTo-CcodRuntimeGeneration -Value $active.generation -Path $path
+    return [pscustomobject][ordered]@{ schemaVersion=2; activeRuntime=$active.activeRuntime; previousRuntime=$active.previousRuntime; generation=$generation; updatedAtUtc=$active.updatedAtUtc }
+}
+
+function Resolve-CcodActiveRuntimeContext {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$ExpectedRuntimeId,
+        [Parameter(Mandatory)][UInt64]$ExpectedGeneration,
+        [Parameter(Mandatory)][string]$ExpectedScriptPath,
+        [Parameter(Mandatory)][string]$ScriptRelativePath
+    )
+    try {
+        $root=[IO.Path]::GetFullPath($InstallRoot)
+        if(-not [IO.Path]::IsPathRooted($InstallRoot) -or $root -cne $InstallRoot -or $ExpectedGeneration -eq 0){throw 'input'}
+        Assert-CcodRuntimeId $ExpectedRuntimeId|Out-Null
+        $relative=Assert-CcodManifestRelativePath $ScriptRelativePath
+        $active=Read-CcodActiveRuntime -InstallRoot $root
+        if($active.activeRuntime -cne $ExpectedRuntimeId -or [UInt64]$active.generation -ne $ExpectedGeneration){throw 'active mismatch'}
+        $runtimeRoot=Get-CcodRuntimeDirectoryForId -InstallRoot $root -RuntimeId $ExpectedRuntimeId
+        $validation=Test-CcodRuntimeManifest -RuntimeDirectory $runtimeRoot -ExpectedRuntimeId $ExpectedRuntimeId
+        if(-not $validation.Valid){throw 'manifest'}
+        $scriptPath=[IO.Path]::GetFullPath((Join-Path $runtimeRoot $relative.Replace('/','\')))
+        $expected=[IO.Path]::GetFullPath($ExpectedScriptPath)
+        if(-not [IO.Path]::IsPathRooted($ExpectedScriptPath) -or $expected -cne $ExpectedScriptPath -or $expected -cne $scriptPath -or -not [IO.File]::Exists($scriptPath)){throw 'script'}
+        $records=@($validation.Manifest.files|Where-Object{$_.path -ceq $relative})
+        if($records.Count -ne 1){throw 'manifest script'}
+        return [pscustomobject][ordered]@{
+            InstallRoot=$root;RuntimeRoot=$runtimeRoot;RuntimeId=$ExpectedRuntimeId;RuntimeGeneration=[UInt64]$ExpectedGeneration
+            ScriptPath=$scriptPath;Manifest=$validation.Manifest
+        }
+    } catch {
+        Throw-CcodRuntimeError 'CCOD_RUNTIME_UNAUTHORIZED' 'The requested worker is not the exact active manifest runtime and generation' $ExpectedScriptPath
+    }
 }
 
 function Set-CcodActiveRuntime {
@@ -318,10 +405,14 @@ function Set-CcodActiveRuntime {
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
         [Parameter(Mandatory)][string]$NewRuntimeId,
+        $Ownership,
         [hashtable]$Adapters
     )
 
     $Adapters = Get-CcodRuntimeAdapters -Adapters $Adapters
+    if ($null -eq $Ownership) {
+        Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_REQUIRED' 'Active runtime mutation requires proven lifecycle ownership' $InstallRoot
+    }
     Assert-CcodRuntimeId -RuntimeId $NewRuntimeId | Out-Null
     $runtimeDirectory = Get-CcodRuntimeDirectoryForId -InstallRoot $InstallRoot -RuntimeId $NewRuntimeId
     $validation = Test-CcodRuntimeManifest -RuntimeDirectory $runtimeDirectory -ExpectedRuntimeId $NewRuntimeId
@@ -330,23 +421,34 @@ function Set-CcodActiveRuntime {
     }
 
     $activePath = Resolve-CcodContainedPath -Root $InstallRoot -RelativePath 'active.json' -AllowMissingLeaf
+    $expectActivePointer = [IO.File]::Exists($activePath)
+    try { [void](& $Adapters.AssertLifecycleFence $InstallRoot $Ownership $expectActivePointer $NewRuntimeId) }
+    catch { Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Active runtime mutation lifecycle fence is stale before pointer read' $InstallRoot }
     $previousRuntime = $null
-    if ([IO.File]::Exists($activePath)) {
+    [UInt64]$currentGeneration = 0
+    if ($expectActivePointer) {
         $current = Read-CcodActiveRuntime -InstallRoot $InstallRoot
+        $currentGeneration = [UInt64]$current.generation
         if ($current.activeRuntime -cne $NewRuntimeId) {
             $previousRuntime = [string]$current.activeRuntime
         } elseif ($null -ne $current.previousRuntime -and $current.previousRuntime -cne $NewRuntimeId) {
             $previousRuntime = [string]$current.previousRuntime
         }
     }
+    if ($currentGeneration -eq [UInt64]::MaxValue) {
+        Throw-CcodRuntimeError 'CCOD_RUNTIME_GENERATION_EXHAUSTED' 'Active runtime generation cannot wrap' $activePath
+    }
+    try { [void](& $Adapters.AssertLifecycleFence $InstallRoot $Ownership $expectActivePointer $NewRuntimeId) }
+    catch { Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Active runtime mutation lifecycle fence is stale before pointer commit' $InstallRoot }
     $pointer = [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         activeRuntime = $NewRuntimeId
         previousRuntime = $previousRuntime
+        generation = [UInt64]($currentGeneration + 1)
         updatedAtUtc = (& $Adapters.UtcNow).ToUniversalTime().ToString('o')
     }
     Write-CcodAtomicJson -Path $activePath -Value $pointer
     return [pscustomobject]$pointer
 }
 
-Export-ModuleMember -Function Get-CcodRuntimeId, New-CcodRuntimeManifest, Test-CcodRuntimeManifest, Read-CcodActiveRuntime, Set-CcodActiveRuntime
+Export-ModuleMember -Function Get-CcodRuntimeId, New-CcodRuntimeManifest, Test-CcodRuntimeManifest, Read-CcodActiveRuntime, Resolve-CcodActiveRuntimeContext, Set-CcodActiveRuntime

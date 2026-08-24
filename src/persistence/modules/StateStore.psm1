@@ -1,6 +1,32 @@
 Set-StrictMode -Version Latest
 
 Import-Module (Join-Path $PSScriptRoot 'PersistenceIO.psm1') -Force
+$script:CcodTrustedLogonIdentityModule = Import-Module (Join-Path $PSScriptRoot 'TrustedLogonIdentity.psm1') -Force -PassThru
+
+function Get-CcodTrustedLogonIdentity {
+    param([hashtable]$Adapters)
+    return & $script:CcodTrustedLogonIdentityModule { param($Value) Get-CcodTrustedLogonIdentity -Adapters $Value } $Adapters
+}
+
+function Read-CcodSafeExitIntent {
+    param([Parameter(Mandatory)][string]$StateRoot, [hashtable]$Adapters)
+    return & $script:CcodTrustedLogonIdentityModule { param($Root, $Value) Read-CcodSafeExitIntent -StateRoot $Root -Adapters $Value } $StateRoot $Adapters
+}
+
+function Write-CcodSafeExitIntent {
+    param([Parameter(Mandatory)][string]$StateRoot, [Parameter(Mandatory)]$LogonIdentity, [Parameter(Mandatory)][string]$RuntimeId, [Parameter(Mandatory)][string]$RecoveryTransactionId, [Parameter(Mandatory)][string]$NowUtc, [hashtable]$Adapters)
+    return & $script:CcodTrustedLogonIdentityModule { param($Root, $Identity, $Runtime, $Transaction, $Now, $Value) Write-CcodSafeExitIntent -StateRoot $Root -LogonIdentity $Identity -RuntimeId $Runtime -RecoveryTransactionId $Transaction -NowUtc $Now -Adapters $Value } $StateRoot $LogonIdentity $RuntimeId $RecoveryTransactionId $NowUtc $Adapters
+}
+
+function Test-CcodSafeExitIntentForCurrentLogon {
+    param([Parameter(Mandatory)]$Intent, [Parameter(Mandatory)]$LogonIdentity)
+    return & $script:CcodTrustedLogonIdentityModule { param($Value, $Identity) Test-CcodSafeExitIntentForCurrentLogon -Intent $Value -LogonIdentity $Identity } $Intent $LogonIdentity
+}
+
+function Clear-CcodSafeExitIntent {
+    param([Parameter(Mandatory)][string]$StateRoot, [hashtable]$Adapters)
+    return & $script:CcodTrustedLogonIdentityModule { param($Root, $Value) Clear-CcodSafeExitIntent -StateRoot $Root -Adapters $Value } $StateRoot $Adapters
+}
 
 function Throw-CcodStateError {
     param([string]$Id, [string]$Message, $TargetObject)
@@ -16,6 +42,8 @@ function Get-CcodStateAdapters {
     $result = @{
         UtcNow = { [DateTime]::UtcNow }
         TestVerifiedNodeCandidate = { param($Path) Test-Path -LiteralPath $Path -PathType Leaf }
+        DirectoryExists = { param($Path) [IO.Directory]::Exists($Path) }
+        CreateDirectory = { param($Path) [IO.Directory]::CreateDirectory($Path) | Out-Null }
         BeforeFailedPackageAttemptRecheck = { param($Path, $SuppressionKey) }
         WriteAtomicJson = { param($Path, $Value) Write-CcodAtomicJson -Path $Path -Value $Value }
     }
@@ -374,12 +402,20 @@ function Initialize-CcodState {
     )
 
     $adapters = Get-CcodStateAdapters -Adapters $Adapters
-    [IO.Directory]::CreateDirectory($StateRoot) | Out-Null
+    Import-Module (Join-Path $PSScriptRoot 'LifecycleTransaction.psm1')
+    if (-not (& $adapters.DirectoryExists $StateRoot)) { & $adapters.CreateDirectory $StateRoot }
     $paths = @('settings.json', 'status.json', 'verified-packages.json', 'transition.json')
-    foreach ($leaf in $paths) {
-        if ([IO.File]::Exists((Get-CcodStatePath -StateRoot $StateRoot -Leaf $leaf))) {
-            Throw-CcodStateError 'CCOD_STATE_ALREADY_INITIALIZED' 'State initialization refuses to overwrite existing evidence; use explicit repair' $StateRoot
-        }
+    $existing = @($paths | Where-Object { [IO.File]::Exists((Get-CcodStatePath -StateRoot $StateRoot -Leaf $_)) })
+    $lifecycleRoot = Join-Path $StateRoot 'lifecycle'
+    if (-not (& $adapters.DirectoryExists $lifecycleRoot)) { & $adapters.CreateDirectory $lifecycleRoot }
+    $receiptRoot = Join-Path $lifecycleRoot 'receipts'
+    if (-not (& $adapters.DirectoryExists $receiptRoot)) { & $adapters.CreateDirectory $receiptRoot }
+    Read-CcodLifecycleRequest -StateRoot $StateRoot | Out-Null
+    if ($existing.Count -eq $paths.Count) {
+        return
+    }
+    if ($existing.Count -ne 0) {
+        Throw-CcodStateError 'CCOD_STATE_ALREADY_INITIALIZED' 'State initialization refuses to overwrite existing evidence; use explicit repair' $StateRoot
     }
 
     Write-CcodSettings -StateRoot $StateRoot -Settings (New-CcodSettings -NodeCandidates $NodeCandidates -CandidateCompatibleOptIn $CandidateCompatibleOptIn -AutomationEnabled $true -UpdatedAtUtc (Get-CcodStateTimestamp -Adapters $adapters)) -Adapters $adapters
@@ -745,4 +781,4 @@ function Resolve-CcodDeviceKeyStorePath {
     return (Join-Path $codexHome 'remote-control-device-keys.windows.json')
 }
 
-Export-ModuleMember -Function Initialize-CcodState, Read-CcodState, Repair-CcodState, Read-CcodSettings, Write-CcodSettings, Read-CcodStatus, Write-CcodStatus, Read-CcodVerifiedPackages, Write-CcodVerifiedPackages, Clear-CcodFailedPackageAttempt, Set-CcodAutomationEnabled, Set-CcodCandidateCompatibleOptIn, Get-CcodAttemptKey, Get-CcodRecoveryIgnoreKey, Get-CcodSuppressionKey, Get-CcodStaticKey, Resolve-CcodDeviceKeyStorePath
+Export-ModuleMember -Function Initialize-CcodState, Read-CcodState, Repair-CcodState, Read-CcodSettings, Write-CcodSettings, Read-CcodStatus, Write-CcodStatus, Read-CcodVerifiedPackages, Write-CcodVerifiedPackages, Clear-CcodFailedPackageAttempt, Set-CcodAutomationEnabled, Set-CcodCandidateCompatibleOptIn, Get-CcodAttemptKey, Get-CcodRecoveryIgnoreKey, Get-CcodSuppressionKey, Get-CcodStaticKey, Resolve-CcodDeviceKeyStorePath, Get-CcodTrustedLogonIdentity, Read-CcodSafeExitIntent, Write-CcodSafeExitIntent, Test-CcodSafeExitIntentForCurrentLogon, Clear-CcodSafeExitIntent

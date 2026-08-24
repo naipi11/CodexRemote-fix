@@ -37,6 +37,10 @@ internal static class TrayNativeConstants
     internal const uint LrDefaultSize = 0x00000040;
     internal const uint MbOk = 0x00000000;
     internal const uint MbIconInformation = 0x00000040;
+    internal const uint MbYesNo = 0x00000004;
+    internal const uint MbIconWarning = 0x00000030;
+    internal const uint MbDefButton2 = 0x00000100;
+    internal const int IdYes = 6;
 }
 
 [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -94,6 +98,7 @@ internal interface INativeTrayPlatform
     bool PostMessage(IntPtr owner, uint message, UIntPtr wParam, IntPtr lParam);
     bool SetNotificationFocus(ref TrayIconData icon);
     bool ShowMessageBox(IntPtr owner, string text, string caption);
+    bool ConfirmExit(IntPtr owner, string text, string caption);
     bool DestroyMenu(IntPtr menu);
     bool EndMenu();
     bool DestroyOwner(IntPtr owner);
@@ -155,6 +160,7 @@ internal sealed class Win32TrayPlatform : INativeTrayPlatform
     public bool DeleteIcon(ref TrayIconData icon) { return Shell_NotifyIconW(TrayNativeConstants.NimDelete, ref icon); }
     public bool SetNotificationFocus(ref TrayIconData icon) { return Shell_NotifyIconW(TrayNativeConstants.NimSetFocus, ref icon); }
     public bool ShowMessageBox(IntPtr owner, string text, string caption) { return MessageBoxW(owner, text ?? String.Empty, caption ?? String.Empty, TrayNativeConstants.MbOk | TrayNativeConstants.MbIconInformation) != 0; }
+    public bool ConfirmExit(IntPtr owner, string text, string caption) { return MessageBoxW(owner, text ?? String.Empty, caption ?? String.Empty, TrayNativeConstants.MbYesNo | TrayNativeConstants.MbIconWarning | TrayNativeConstants.MbDefButton2) == TrayNativeConstants.IdYes; }
 
     public IntPtr CreatePopupMenu() { return CreatePopupMenuNative(); }
     public IntPtr CreateSubMenu() { return CreatePopupMenuNative(); }

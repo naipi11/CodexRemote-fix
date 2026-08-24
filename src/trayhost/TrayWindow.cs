@@ -17,8 +17,6 @@ internal sealed class TrayWindow : IDisposable
     internal bool MenuOpen { get { return _menuOpen; } }
     internal IntPtr OwnerHandle { get { return _owner; } }
     internal LanguageMode CurrentLanguage { get { return _current == null ? LanguageMode.System : _current.Language; } }
-    internal bool AutomationChecked { get { return _current != null && (_current.Flags & PresentationFlags.AutomationChecked) == PresentationFlags.AutomationChecked; } }
-    internal bool CandidateOptInChecked { get { return _current != null && (_current.Flags & PresentationFlags.CandidateOptInChecked) == PresentationFlags.CandidateOptInChecked; } }
 
     internal TrayWindow(INativeTrayPlatform native)
     {
@@ -67,14 +65,12 @@ internal sealed class TrayWindow : IDisposable
         {
             _inputGuard.VerifyNoOwnerInputContext(_owner);
             using (NativeMenu menu = new NativeMenu(_native, _owner, _current)) { result = menu.Show(point); }
-            if (result == (uint)TrayCommand.ShowAbout)
-            {
-                _native.ShowMessageBox(_owner, _current.Strings[19], _current.Strings[12]);
-            }
-            else if (result != 0U && Enum.IsDefined(typeof(TrayCommand), (ushort)result) && (TrayCommand)result != TrayCommand.None)
+            if (result != 0U && Enum.IsDefined(typeof(TrayCommand), (ushort)result) && (TrayCommand)result != TrayCommand.None)
             {
                 Action<TrayCommand, ulong> handler = CommandSelected;
-                if (handler != null) { handler((TrayCommand)result, _current.Revision); }
+                TrayCommand command = (TrayCommand)result;
+                if (command == TrayCommand.Exit && !_native.ConfirmExit(_owner, _current.Strings[14], _current.Strings[13])) { return result; }
+                if (handler != null) { handler(command, _current.Revision); }
             }
             return result;
         }
@@ -100,6 +96,12 @@ internal sealed class TrayWindow : IDisposable
     internal void RequestShutdown()
     {
         if (_menuOpen) { _native.EndMenu(); }
+    }
+
+    internal void ShowAbout()
+    {
+        if (!_created || _disposed || _current == null) { throw new InvalidOperationException("tray window is not active"); }
+        _native.ShowMessageBox(_owner, _current.Strings[12], _current.Strings[11]);
     }
 
     private TrayIconData CreateIconData(IntPtr owner)
