@@ -638,6 +638,8 @@ $results += Invoke-CcodTest 'projects the truthful v2 connection and protection 
         $view=Get-CcodTrayPresentation -ConnectionState RepairNeeded -ProtectionState $protection -Busy:$false -StateDamageBlocksActions:$false
         Assert-CcodExactEqual $protection $view.ProtectionState "$protection is independently truthful"
     }
+    $ready=Get-CcodTrayPresentation -ConnectionState Connected -ProtectionState Running -Busy:$false -StateDamageBlocksActions:$false
+    Assert-CcodExactEqual $false $ready.ExitEnabled 'Exit remains visible but disabled until Task 10 implements SafeExit'
     $busy=Get-CcodTrayPresentation -ConnectionState RepairNeeded -ProtectionState Reconnecting -Busy:$true -StateDamageBlocksActions:$false
     Assert-CcodExactEqual $false $busy.RepairEnabled 'busy lifecycle disables repair'
     Assert-CcodExactEqual $false $busy.LanguageEnabled 'busy lifecycle disables language changes'
