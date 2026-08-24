@@ -6,6 +6,18 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.1
+
+### English
+
+- Fixed a Supervisor startup contract mismatch that rejected the complete schema-two active runtime pointer immediately after installation.
+- Added regression coverage that reads the canonical active pointer before Supervisor readiness, including upgrade pointers with a previous runtime.
+
+### 简体中文
+
+- 修复 Supervisor 启动时错误拒绝完整 schema-two active runtime 指针、导致安装后立即退出的问题。
+- 新增回归覆盖：Supervisor 就绪前读取标准 active 指针，并覆盖带有 previous runtime 的升级指针。
+
 ## v2.5.0
 
 ### English

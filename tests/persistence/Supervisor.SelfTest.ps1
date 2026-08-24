@@ -8,6 +8,7 @@ $supervisorEnginePath = Join-Path $repositoryRoot 'src\persistence\modules\Super
 $lifecycleTransactionPath = Join-Path $repositoryRoot 'src\persistence\modules\LifecycleTransaction.psm1'
 $lifecycleCoordinatorPath = Join-Path $repositoryRoot 'src\persistence\modules\LifecycleCoordinator.psm1'
 $workerRuntimePath = Join-Path $repositoryRoot 'src\persistence\modules\WorkerRuntime.psm1'
+$runtimeManifestPath = Join-Path $repositoryRoot 'src\persistence\modules\RuntimeManifest.psm1'
 $resourcesRoot = Join-Path $repositoryRoot 'src\persistence\resources'
 if (-not [IO.File]::Exists($supervisorPath)) {
     throw 'CCOD_TEST_SUPERVISOR_CONTRACT_MISSING'
@@ -19,6 +20,7 @@ Import-Module $supervisorEnginePath -Force
 Import-Module $lifecycleTransactionPath -Force
 Import-Module $lifecycleCoordinatorPath -Force -WarningAction SilentlyContinue
 Import-Module $workerRuntimePath -Force
+Import-Module $runtimeManifestPath -Force
 $script:TestSystemCatalog=Get-CcodUiCatalog -ResourcesRoot $resourcesRoot -LanguageMode System -SystemCultureName zh-CN
 $script:TestChineseCatalog=Get-CcodUiCatalog -ResourcesRoot $resourcesRoot -LanguageMode zh-CN -SystemCultureName zh-CN
 $script:TestEnglishCatalog=Get-CcodUiCatalog -ResourcesRoot $resourcesRoot -LanguageMode en-US -SystemCultureName zh-CN
@@ -69,7 +71,7 @@ function New-CcodSupervisorFake {
         TrayActionResults=[Collections.Generic.List[object]]::new()
         PresentationInputs=[Collections.Generic.List[object]]::new()
         UiFailureRecords=[Collections.Generic.List[object]]::new();TrayErrors=[Collections.Generic.List[object]]::new()
-        ActiveRuntime=[pscustomobject][ordered]@{schemaVersion=2;activeRuntime='runtime-1';generation=[UInt64]7}
+        ActiveRuntime=[pscustomobject][ordered]@{schemaVersion=2;activeRuntime='runtime-1';previousRuntime=$null;generation=[UInt64]7;updatedAtUtc='2030-02-03T03:00:00.0000000Z'}
         LogonIdentity=[pscustomobject][ordered]@{authenticationId='00000000:00001234';userSid='S-1-5-21-111-222-333-1001';sessionId=[int]1}
         LifecycleOwnership=$null;LifecycleOwnershipEntries=0;LifecycleFenceAssertions=0;LifecycleOwnershipExits=0;LifecycleOwnershipSuspends=0;LifecycleOwnershipResumes=0
         ActiveLifecycleRequest=$null;LifecycleSubmissions=[Collections.Generic.Queue[object]]::new();LifecycleSubmissionReceipts=[Collections.Generic.List[object]]::new();CompletedLifecycleRequests=[Collections.Generic.List[object]]::new()
@@ -330,6 +332,23 @@ Invoke-CcodTest 'exposes only the frozen ReadyToken CLI and rejects an invalid t
     $receipt=Invoke-CcodSupervisorHost -ReadyToken ('A'*64) -Adapters $fake.Adapters
     Assert-CcodReceipt $receipt 'StartupRejected' 2
     Assert-CcodEqual 0 $fake.World.Calls.Count 'invalid token invokes no adapter'
+}
+
+Invoke-CcodTest 'accepts the canonical five-field active runtime pointer returned by RuntimeManifest' {
+    $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-supervisor-active-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($root)|Out-Null
+        $pointer=[ordered]@{
+            schemaVersion=2;activeRuntime='runtime-1';previousRuntime='runtime-0'
+            generation=[UInt64]7;updatedAtUtc='2030-02-03T03:00:00.0000000Z'
+        }
+        [IO.File]::WriteAllText((Join-Path $root 'active.json'),($pointer|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
+        $active=Read-CcodActiveRuntime -InstallRoot $root
+        Assert-CcodEqual 'schemaVersion,activeRuntime,previousRuntime,generation,updatedAtUtc' (@($active.PSObject.Properties.Name)-join ',') 'RuntimeManifest returns the complete schema-two pointer'
+        Assert-CcodTrue (Test-CcodSupervisorActiveRuntime $active 'runtime-1') 'Supervisor accepts the RuntimeManifest pointer without weakening its exact schema'
+    } finally {
+        if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}
+    }
 }
 
 Invoke-CcodTest 'acquires both lifetime leases and signals Ready only after all prerequisites' {
