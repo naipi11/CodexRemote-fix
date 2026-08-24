@@ -1207,6 +1207,7 @@ function Invoke-CcodInstall {
     $installLease = $null
     $shutdownGate = $null
     $lifecycleOwnership = $null
+    $previousProtectionStopped = $false
     try {
         if ($upgrade) {
             $pending = & $adapters.ReadActiveLifecycleRequest (Join-Path $root 'state')
@@ -1223,6 +1224,7 @@ function Invoke-CcodInstall {
                 Throw-CcodLifecycleError 'CCOD_INSTALL_PREVIOUS_RUNTIME_BUSY' 'The verified previous Supervisor did not exit exactly' $null
             }
             [void](Assert-CcodLifecycleTaskIdle -Adapters $adapters)
+            $previousProtectionStopped = $true
             $installLease = & $adapters.EnterInstallLease $identity.UserSid
             if ($null -eq $installLease -or $installLease.Outcome -isnot [string] -or @('Acquired', 'TimedOut') -cnotcontains $installLease.Outcome) {
                 Throw-CcodLifecycleError 'CCOD_INSTALL_LEASE_INVALID' 'The installation lease contract is invalid' $installLease
@@ -1312,7 +1314,12 @@ function Invoke-CcodInstall {
             Throw-CcodLifecycleError 'CCOD_INSTALL_NEW_RUNTIME_NOT_READY' 'The new Supervisor and authenticated TrayHost readiness were not proven' $null
         }
         Write-CcodInstallActivationPhase -Activation $activation -Phase 'Ready' -RuntimeId $runtimeId -PreviousRuntimeId $pointer.previousRuntime -ErrorCode $null -Adapters $adapters -InstallRoot $root | Out-Null
-        if ($upgrade) { Remove-CcodLifecycleOldRuntimes -InstallRoot $root -ActiveRuntimeId $runtimeId -PreviousRuntimeId $pointer.previousRuntime }
+        if ($upgrade) {
+            try { Remove-CcodLifecycleOldRuntimes -InstallRoot $root -ActiveRuntimeId $runtimeId -PreviousRuntimeId $pointer.previousRuntime }
+            catch {
+                try { Write-CcodLifecycleLog -InstallRoot $root -Adapters $adapters -Stage 'OldRuntimeCleanup' -Code 'CCOD_INSTALL_OLD_RUNTIME_CLEANUP_FAILED' -Outcome 'Retained' } catch { }
+            }
+        }
         Write-CcodLifecycleLog -InstallRoot $root -Adapters $adapters -Stage $(if ($upgrade) { 'Upgrade' } else { 'Install' }) -Code 'CCOD_INSTALL_COMPLETED' -Outcome $(if ($upgrade) { 'Upgraded' } else { 'Installed' })
     } catch {
         $caught = $_
@@ -1334,6 +1341,43 @@ function Invoke-CcodInstall {
                 }
             } catch { }
         }
+        if (-not $pointerCommitted -and $upgrade -and $previousProtectionStopped) {
+            $rollbackFailure = $null
+            try {
+                if ($null -ne $shutdownGate) {
+                    & $adapters.CloseSupervisorShutdownGate $shutdownGate
+                    $shutdownGate = $null
+                }
+                if ($null -ne $lifecycleOwnership -and -not $lifecycleOwnership.released) {
+                    $ownershipReleased = & $adapters.ExitLifecycleOwnership $lifecycleOwnership
+                    if ($ownershipReleased -isnot [bool] -or -not $ownershipReleased -or -not $lifecycleOwnership.released) {
+                        throw 'Previous runtime ownership release was not proven'
+                    }
+                }
+                if ($null -ne $installLease -and $installLease.Outcome -ceq 'Acquired') {
+                    $installReleased = & $adapters.ExitInstallLease $installLease
+                    if ($installReleased -isnot [bool] -or -not $installReleased) {
+                        throw 'Previous runtime installation lease release was not proven'
+                    }
+                    $installLease = $null
+                }
+                $rollbackStartedAt = & $adapters.UtcNow
+                if ($rollbackStartedAt -isnot [DateTime]) { throw 'Previous runtime restart clock is invalid' }
+                & $adapters.StartSupervisorTask
+                $rollbackProof = & $adapters.WaitNewRuntimeReady $root ([string]$existingPointer.activeRuntime) ([UInt64]$existingPointer.generation) $identity $rollbackStartedAt 15000
+                if ($null -eq $rollbackProof -or $rollbackProof.SupervisorReady -isnot [bool] -or $rollbackProof.TrayReady -isnot [bool] -or
+                    -not $rollbackProof.SupervisorReady -or -not $rollbackProof.TrayReady) {
+                    throw 'Previous runtime readiness was not proven'
+                }
+                try { Write-CcodLifecycleLog -InstallRoot $root -Adapters $adapters -Stage 'UpgradeRollback' -Code 'CCOD_INSTALL_PREVIOUS_RUNTIME_RESTORED' -Outcome 'Restored' } catch { }
+            } catch {
+                $rollbackFailure = $_
+            }
+            if ($null -ne $rollbackFailure) {
+                $errorCode = 'CCOD_INSTALL_ROLLBACK_FAILED'
+                try { Write-CcodLifecycleLog -InstallRoot $root -Adapters $adapters -Stage 'UpgradeRollback' -Code $errorCode -Outcome 'Failed' } catch { }
+            }
+        }
         if (-not $pointerCommitted -and $runtimeCreated -and $null -ne $runtimeRoot -and [IO.Directory]::Exists($runtimeRoot)) {
             try { Remove-Item -LiteralPath $runtimeRoot -Recurse -Force -ErrorAction Stop } catch { }
         }
@@ -1342,7 +1386,7 @@ function Invoke-CcodInstall {
                 Write-CcodInstallActivationPhase -Activation $activation -Phase 'Failed' -RuntimeId $runtimeId -PreviousRuntimeId $(if ($null -ne $existingPointer) { [string]$existingPointer.activeRuntime } else { $null }) -ErrorCode $errorCode -Adapters $adapters -InstallRoot $root | Out-Null
             } catch { }
         }
-        if ((Get-CcodLifecycleErrorId $caught) -match '^CCOD_[A-Z0-9_]+$') { throw $caught }
+        if ((Get-CcodLifecycleErrorId $caught) -ceq $errorCode) { throw $caught }
         Throw-CcodLifecycleError $errorCode 'Installation failed at a protected activation boundary' $null
     } finally {
         if ($null -ne $shutdownGate) {

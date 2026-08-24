@@ -3,12 +3,30 @@ param(
     [Parameter(Mandatory)][string]$AppRoot,
     [Parameter(Mandatory)][string]$InstallRoot,
     [string]$ActivationId,
+    [switch]$ValidateReceiptOnly,
     [switch]$Prompt,
     [switch]$NoUi
 )
 
 $ErrorActionPreference = 'Stop'
 $script:CcodActivationReceiptFields = @('schemaVersion','activationId','phase','runtimeId','previousRuntimeId','startedAtUtc','updatedAtUtc','ready','errorCode')
+$script:CcodActivationReceiptPhases = @('StoppingPreviousRuntime','InstallingRuntime','ActivatingRuntime','StartingProtection','Ready','Failed')
+$script:CcodActivationReceiptMaximumBytes = 16384
+
+function Test-CcodCanonicalGuid {
+    param($Value)
+    $parsed = [guid]::Empty
+    return $Value -is [string] -and [guid]::TryParseExact($Value,'D',[ref]$parsed) -and $parsed.ToString('D') -ceq $Value
+}
+
+function Test-CcodCanonicalUtc {
+    param($Value)
+    $parsed = [DateTime]::MinValue
+    return $Value -is [string] -and
+        [DateTime]::TryParseExact($Value,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$parsed) -and
+        $parsed.Kind -eq [DateTimeKind]::Utc -and
+        $parsed.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture) -ceq $Value
+}
 
 function Write-CcodActivationRecord {
     param([Parameter(Mandatory)][string]$Code,[Parameter(Mandatory)][long]$DurationMilliseconds)
@@ -29,23 +47,47 @@ function Write-CcodActivationRecord {
     } catch { }
 }
 
-function Read-CcodFinalActivationReceipt {
+function Read-CcodTerminalActivationReceipt {
     param([Parameter(Mandatory)][string]$Root,[Parameter(Mandatory)][string]$ExpectedActivationId)
     $path = Join-Path $Root 'state\post-install-activation.json'
     if (-not [IO.File]::Exists($path)) { throw 'CCOD_ACTIVATION_RECEIPT_MISSING' }
-    try { $receipt = [IO.File]::ReadAllText($path,[Text.Encoding]::UTF8) | ConvertFrom-Json -ErrorAction Stop }
+    try {
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if ($item -isnot [IO.FileInfo] -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $item.Length -le 0 -or $item.Length -gt $script:CcodActivationReceiptMaximumBytes) { throw 'invalid receipt file' }
+        $content = [IO.File]::ReadAllText($path,[Text.Encoding]::UTF8)
+        if ($content.TrimStart()[0] -cne '{' -or $content.TrimEnd()[-1] -cne '}') { throw 'receipt is not one object' }
+        $receipt = $content | ConvertFrom-Json -ErrorAction Stop
+    }
     catch { throw 'CCOD_ACTIVATION_RECEIPT_INVALID' }
+    if ($receipt -isnot [pscustomobject]) { throw 'CCOD_ACTIVATION_RECEIPT_INVALID' }
     $actual = @($receipt.PSObject.Properties.Name)
     if ($actual.Count -ne $script:CcodActivationReceiptFields.Count) { throw 'CCOD_ACTIVATION_RECEIPT_INVALID' }
     for ($index=0;$index-lt$actual.Count;$index++) { if ($actual[$index] -cne $script:CcodActivationReceiptFields[$index]) { throw 'CCOD_ACTIVATION_RECEIPT_INVALID' } }
     if ($receipt.schemaVersion -isnot [int] -or $receipt.schemaVersion -ne 1 -or
-        $receipt.activationId -isnot [string] -or $receipt.activationId -cne $ExpectedActivationId -or
-        $receipt.phase -isnot [string] -or $receipt.phase -cne 'Ready' -or
-        $receipt.ready -isnot [bool] -or -not $receipt.ready -or $null -ne $receipt.errorCode -or
-        $receipt.runtimeId -isnot [string] -or $receipt.runtimeId -cnotmatch '^[A-Za-z0-9._-]{1,96}$' -or
-        ($null -ne $receipt.previousRuntimeId -and ($receipt.previousRuntimeId -isnot [string] -or $receipt.previousRuntimeId -cnotmatch '^[A-Za-z0-9._-]{1,96}$'))) {
-        throw 'CCOD_ACTIVATION_RECEIPT_NOT_READY'
+        -not (Test-CcodCanonicalGuid $receipt.activationId) -or $receipt.activationId -cne $ExpectedActivationId -or
+        $receipt.phase -isnot [string] -or $script:CcodActivationReceiptPhases -cnotcontains $receipt.phase -or
+        $receipt.ready -isnot [bool] -or
+        ($null -ne $receipt.runtimeId -and ($receipt.runtimeId -isnot [string] -or $receipt.runtimeId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$')) -or
+        ($null -ne $receipt.previousRuntimeId -and ($receipt.previousRuntimeId -isnot [string] -or $receipt.previousRuntimeId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$')) -or
+        -not (Test-CcodCanonicalUtc $receipt.startedAtUtc) -or -not (Test-CcodCanonicalUtc $receipt.updatedAtUtc)) {
+        throw 'CCOD_ACTIVATION_RECEIPT_INVALID'
     }
+    $started = [DateTime]::ParseExact($receipt.startedAtUtc,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind)
+    $updated = [DateTime]::ParseExact($receipt.updatedAtUtc,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind)
+    if ($updated -lt $started -or
+        ($receipt.phase -ceq 'Ready' -and ($receipt.runtimeId -isnot [string] -or -not $receipt.ready -or $null -ne $receipt.errorCode)) -or
+        ($receipt.phase -ceq 'Failed' -and ($receipt.ready -or $receipt.errorCode -isnot [string] -or $receipt.errorCode -cnotmatch '^CCOD_[A-Z0-9_]{1,96}$')) -or
+        ($receipt.phase -cnotin @('Ready','Failed') -and ($receipt.ready -or $null -ne $receipt.errorCode))) {
+        throw 'CCOD_ACTIVATION_RECEIPT_INVALID'
+    }
+    return $receipt
+}
+
+function Read-CcodFinalActivationReceipt {
+    param([Parameter(Mandatory)][string]$Root,[Parameter(Mandatory)][string]$ExpectedActivationId)
+    $receipt = Read-CcodTerminalActivationReceipt -Root $Root -ExpectedActivationId $ExpectedActivationId
+    if ($receipt.phase -cne 'Ready') { throw 'CCOD_ACTIVATION_RECEIPT_NOT_READY' }
     return $receipt
 }
 
@@ -58,7 +100,24 @@ function Show-CcodActivationFailure {
     } catch { }
 }
 
-if ([string]::IsNullOrWhiteSpace($ActivationId)) { $ActivationId = [guid]::NewGuid().ToString('D') }
+if ([string]::IsNullOrWhiteSpace($ActivationId)) {
+    if ($ValidateReceiptOnly) { Write-Error 'CCOD_ACTIVATION_ID_INVALID' -ErrorAction Continue; exit 3 }
+    $ActivationId = [guid]::NewGuid().ToString('D')
+}
+if (-not (Test-CcodCanonicalGuid $ActivationId)) { Write-Error 'CCOD_ACTIVATION_ID_INVALID' -ErrorAction Continue; exit 3 }
+if ($ValidateReceiptOnly) {
+    try {
+        $terminalReceipt = Read-CcodTerminalActivationReceipt -Root ([IO.Path]::GetFullPath($InstallRoot)) -ExpectedActivationId $ActivationId
+        if ($terminalReceipt.phase -ceq 'Ready') { exit 0 }
+        if ($terminalReceipt.phase -ceq 'Failed') { exit 2 }
+        throw 'CCOD_ACTIVATION_RECEIPT_NOT_READY'
+    } catch {
+        $candidate = ([string]$_.FullyQualifiedErrorId -split ',')[0]
+        $code = if ($candidate -cmatch '^CCOD_[A-Z0-9_]{1,96}$') { $candidate } elseif ($_.Exception.Message -cmatch '^CCOD_[A-Z0-9_]{1,96}$') { $Matches[0] } else { 'CCOD_ACTIVATION_RECEIPT_INVALID' }
+        Write-Error $code -ErrorAction Continue
+        exit 3
+    }
+}
 $clock = [Diagnostics.Stopwatch]::StartNew()
 try {
     $root = [IO.Path]::GetFullPath($AppRoot)

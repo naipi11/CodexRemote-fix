@@ -10,6 +10,36 @@ $ErrorActionPreference='Stop'
 $runtimeManifestModule=Join-Path $PSScriptRoot 'src\persistence\modules\RuntimeManifest.psm1'
 if(-not (Test-Path -LiteralPath $runtimeManifestModule -PathType Leaf)){throw 'CodexRemote-fix support files are incomplete. Run the installer from a complete checkout.'}
 Import-Module $runtimeManifestModule -Force
+$script:CcodRestartSubmissionReceiptFields=@('schemaVersion','submissionId','accepted','transactionId','errorCode','completedAtUtc')
+
+function Test-CcodRestartCanonicalGuid {
+    param($Value)
+    $parsed=[guid]::Empty
+    return $Value-is[string] -and [guid]::TryParseExact($Value,'D',[ref]$parsed) -and $parsed.ToString('D')-ceq$Value
+}
+
+function Test-CcodRestartCanonicalUtc {
+    param($Value)
+    $parsed=[DateTime]::MinValue
+    return $Value-is[string] -and [DateTime]::TryParseExact($Value,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$parsed) -and
+        $parsed.Kind-eq[DateTimeKind]::Utc -and $parsed.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)-ceq$Value
+}
+
+function Assert-CcodRestartSubmissionReceipt {
+    param($Receipt)
+    if($Receipt-isnot[pscustomobject]){throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('Lifecycle submission receipt is invalid.'),'CCOD_RESTART_RECEIPT_INVALID',[Management.Automation.ErrorCategory]::InvalidData,$null)}
+    $actual=@($Receipt.PSObject.Properties.Name)
+    if(($actual-join"`0")-cne($script:CcodRestartSubmissionReceiptFields-join"`0") -or
+        @($Receipt.PSObject.Properties|Where-Object{$_.MemberType-notin@('NoteProperty','Property')}).Count-ne0 -or
+        $Receipt.schemaVersion-isnot[int] -or $Receipt.schemaVersion-ne 1 -or
+        -not(Test-CcodRestartCanonicalGuid $Receipt.submissionId) -or $Receipt.accepted-isnot[bool] -or
+        -not(Test-CcodRestartCanonicalUtc $Receipt.completedAtUtc) -or
+        ($Receipt.accepted -and (-not(Test-CcodRestartCanonicalGuid $Receipt.transactionId) -or $null-ne$Receipt.errorCode)) -or
+        (-not$Receipt.accepted -and ($null-ne$Receipt.transactionId -or $Receipt.errorCode-isnot[string] -or $Receipt.errorCode-cnotmatch'^CCOD_[A-Z0-9_]{1,96}$'))){
+        throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('Lifecycle submission receipt is invalid.'),'CCOD_RESTART_RECEIPT_INVALID',[Management.Automation.ErrorCategory]::InvalidData,$null)
+    }
+    return $Receipt
+}
 
 function Resolve-CcodStartInstalledController {
     param([Parameter(Mandatory)][string]$InstallRoot)
@@ -72,7 +102,8 @@ function Invoke-CcodStartInstalledController {
 function Submit-CcodStartRestart {
     param($Resolved,[Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][int]$TimeoutMilliseconds)
     Import-Module $Resolved.LifecycleRequestModule -Force
-    Submit-CcodLifecycleRequest -InstallRoot $InstallRoot -Kind RestartAndRepair -Origin ExplicitStart -RuntimeId $Resolved.RuntimeId -RuntimeGeneration ([UInt64]$Resolved.Generation) -TimeoutMilliseconds $TimeoutMilliseconds
+    $untrustedReceipt=Submit-CcodLifecycleRequest -InstallRoot $InstallRoot -Kind RestartAndRepair -Origin ExplicitStart -RuntimeId $Resolved.RuntimeId -RuntimeGeneration ([UInt64]$Resolved.Generation) -TimeoutMilliseconds $TimeoutMilliseconds
+    Assert-CcodRestartSubmissionReceipt -Receipt $untrustedReceipt
 }
 
 if($MyInvocation.InvocationName -ne '.'){

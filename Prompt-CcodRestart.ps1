@@ -9,6 +9,38 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$script:CcodRestartSubmissionReceiptFields = @('schemaVersion','submissionId','accepted','transactionId','errorCode','completedAtUtc')
+
+function Test-CcodRestartCanonicalGuid {
+    param($Value)
+    $parsed = [guid]::Empty
+    return $Value -is [string] -and [guid]::TryParseExact($Value,'D',[ref]$parsed) -and $parsed.ToString('D') -ceq $Value
+}
+
+function Test-CcodRestartCanonicalUtc {
+    param($Value)
+    $parsed = [DateTime]::MinValue
+    return $Value -is [string] -and
+        [DateTime]::TryParseExact($Value,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$parsed) -and
+        $parsed.Kind -eq [DateTimeKind]::Utc -and
+        $parsed.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture) -ceq $Value
+}
+
+function Assert-CcodRestartSubmissionReceipt {
+    param($Receipt)
+    if ($Receipt -isnot [pscustomobject]) { throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('Lifecycle submission receipt is invalid.'),'CCOD_RESTART_RECEIPT_INVALID',[Management.Automation.ErrorCategory]::InvalidData,$null) }
+    $actual = @($Receipt.PSObject.Properties.Name)
+    if (($actual -join "`0") -cne ($script:CcodRestartSubmissionReceiptFields -join "`0") -or
+        @($Receipt.PSObject.Properties | Where-Object { $_.MemberType -notin @('NoteProperty','Property') }).Count -ne 0 -or
+        $Receipt.schemaVersion -isnot [int] -or $Receipt.schemaVersion -ne 1 -or
+        -not (Test-CcodRestartCanonicalGuid $Receipt.submissionId) -or $Receipt.accepted -isnot [bool] -or
+        -not (Test-CcodRestartCanonicalUtc $Receipt.completedAtUtc) -or
+        ($Receipt.accepted -and (-not (Test-CcodRestartCanonicalGuid $Receipt.transactionId) -or $null -ne $Receipt.errorCode)) -or
+        (-not $Receipt.accepted -and ($null -ne $Receipt.transactionId -or $Receipt.errorCode -isnot [string] -or $Receipt.errorCode -cnotmatch '^CCOD_[A-Z0-9_]{1,96}$'))) {
+        throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('Lifecycle submission receipt is invalid.'),'CCOD_RESTART_RECEIPT_INVALID',[Management.Automation.ErrorCategory]::InvalidData,$null)
+    }
+    return $Receipt
+}
 
 function Get-CcodRestartPromptText {
     [pscustomobject][ordered]@{
@@ -95,16 +127,16 @@ try {
     $root = [IO.Path]::GetFullPath($InstallRoot)
     $app = [IO.Path]::GetFullPath($AppRoot)
     $resolved = Resolve-CcodRestartLifecycle -CheckoutRoot $app -Root $root
-    $receipt = Submit-CcodRestartLifecycle -Resolved $resolved -Root $root
-    if ($null -eq $receipt -or $receipt.accepted -isnot [bool] -or -not $receipt.accepted) {
-        $code = if ($null -ne $receipt -and $receipt.errorCode -is [string] -and $receipt.errorCode -cmatch '^CCOD_[A-Z0-9_]{1,96}$') { [string]$receipt.errorCode } else { 'CCOD_RESTART_SUBMISSION_REJECTED' }
+    $untrustedReceipt = Submit-CcodRestartLifecycle -Resolved $resolved -Root $root
+    $receipt = Assert-CcodRestartSubmissionReceipt -Receipt $untrustedReceipt
+    if (-not $receipt.accepted) {
+        $code = [string]$receipt.errorCode
         Write-CcodRestartRecord -Root $root -CurrentActivationId $ActivationId -SubmissionId $(if($null-ne$receipt){$receipt.submissionId}else{$null}) -TransactionId $(if($null-ne$receipt){$receipt.transactionId}else{$null}) -Code $code -DurationMilliseconds $clock.ElapsedMilliseconds
         Show-CcodRestartFailure -Code $code
         Write-Error $code -ErrorAction Continue
         exit 1
     }
     Write-CcodRestartRecord -Root $root -CurrentActivationId $ActivationId -SubmissionId $receipt.submissionId -TransactionId $receipt.transactionId -Code 'RESTART_SUBMITTED' -DurationMilliseconds $clock.ElapsedMilliseconds
-    Write-Output ($receipt | ConvertTo-Json -Depth 8 -Compress)
     exit 0
 } catch {
     $candidate = ([string]$_.FullyQualifiedErrorId -split ',')[0]

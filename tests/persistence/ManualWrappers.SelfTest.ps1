@@ -20,6 +20,18 @@ Export-ModuleMember -Function Submit-CcodLifecycleRequest
     [IO.File]::WriteAllText($Path,$source,[Text.UTF8Encoding]::new($false))
 }
 
+function New-CcodFakeLifecycleReceiptModule([string]$Path,$Receipt){
+    $json=($Receipt|ConvertTo-Json -Depth 8 -Compress).Replace("'","''")
+    $source=@"
+function Submit-CcodLifecycleRequest {
+    param(`$InstallRoot,`$Kind,`$Origin,`$RuntimeId,`$RuntimeGeneration,`$TimeoutMilliseconds)
+    '$json'|ConvertFrom-Json
+}
+Export-ModuleMember -Function Submit-CcodLifecycleRequest
+"@
+    [IO.File]::WriteAllText($Path,$source,[Text.UTF8Encoding]::new($false))
+}
+
 Invoke-CcodTest 'Start retains its public contract and a manifest-bound controller boundary' {
     # Production mutation caught: adding hidden public controls or bypassing active-runtime manifest validation.
     $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($startPath,[ref]$tokens,[ref]$errors)
@@ -89,6 +101,31 @@ Invoke-CcodTest 'Start RestartCodex submits one accepted manifest-bound RestartA
     }finally{if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}}
 }
 
+Invoke-CcodTest 'Start RestartCodex rejects every malformed accepted submission receipt' {
+    # Production mutation caught: checking only truthiness/accepted while trusting reordered, extra, noncanonical, or mistyped receipt data.
+    $valid=[ordered]@{schemaVersion=1;submissionId='aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';accepted=$true;transactionId='11111111-2222-3333-4444-555555555555';errorCode=$null;completedAtUtc='2030-02-03T04:05:06.0000000Z'}
+    $cases=@(
+        [pscustomobject]@{Name='truthy accepted';Mutate={param($r)$r.accepted='true'}},
+        [pscustomobject]@{Name='noncanonical submission';Mutate={param($r)$r.submissionId='AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE'}},
+        [pscustomobject]@{Name='untrusted transaction';Mutate={param($r)$r.transactionId='ATTACKER_STDOUT_MARKER'}},
+        [pscustomobject]@{Name='noncanonical completion time';Mutate={param($r)$r.completedAtUtc='2030-02-03T04:05:06Z'}},
+        [pscustomobject]@{Name='extra field';Mutate={param($r)$r.attacker='ATTACKER_STDOUT_MARKER'}}
+    )
+    foreach($case in $cases){
+        $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-start-invalid-receipt-'+[guid]::NewGuid().ToString('N'))
+        try{
+            [IO.Directory]::CreateDirectory($root)|Out-Null;$modulePath=Join-Path $root 'LifecycleRequest.psm1'
+            $receipt=[ordered]@{};foreach($key in $valid.Keys){$receipt[$key]=$valid[$key]};&$case.Mutate $receipt
+            New-CcodFakeLifecycleReceiptModule $modulePath $receipt
+            $resolved=[pscustomobject][ordered]@{RuntimeId='2.5.0-runtime';Generation=[UInt64]11;LifecycleRequestModule=$modulePath}
+            $failure=$null;$observed=@();try{$observed=@(Submit-CcodStartRestart -Resolved $resolved -InstallRoot $root -TimeoutMilliseconds 5000)}catch{$failure=$_}
+            Assert-CcodTrue ($null-ne$failure) "$($case.Name) fails closed"
+            Assert-CcodTrue ($failure.FullyQualifiedErrorId-like'CCOD_RESTART_RECEIPT_INVALID*') "$($case.Name) returns the bounded stable receipt code"
+            Assert-CcodTrue (($observed-join"`n")-cnotmatch'ATTACKER_STDOUT_MARKER') "$($case.Name) emits no untrusted receipt data"
+        }finally{if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}}
+    }
+}
+
 Invoke-CcodTest 'restart prompt submits once through the verified runtime and logs correlated public identifiers' {
     # Production mutation caught: invoking Start/Recover/Apply, skipping manifest validation, submitting more than once, suppressing stderr, or losing activation/submission/transaction correlation.
     $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-prompt-restart-'+[guid]::NewGuid().ToString('N'))
@@ -110,6 +147,7 @@ Export-ModuleMember -Function Read-CcodActiveRuntime,Test-CcodRuntimeManifest
 
         $output=@(& $promptPath -AppRoot $app -InstallRoot $install -Choice Restart -ActivationId $activationId -NoUi 2>&1)
         Assert-CcodEqual 0 $LASTEXITCODE 'accepted restart submission exits successfully'
+        Assert-CcodEqual 0 $output.Count 'accepted prompt emits no lifecycle receipt to stdout'
         Assert-CcodTrue (Test-Path -LiteralPath $capture -PathType Leaf) 'restart creates exactly one durable submission capture'
         $submission=Get-Content -LiteralPath $capture -Raw|ConvertFrom-Json
         Assert-CcodEqual 'RestartAndRepair' $submission.Kind 'prompt submits RestartAndRepair'
@@ -126,6 +164,34 @@ Export-ModuleMember -Function Read-CcodActiveRuntime,Test-CcodRuntimeManifest
         Assert-CcodEqual '11111111-2222-3333-4444-555555555555' $records[0].transactionId 'restart log correlates transaction id'
         Assert-CcodEqual 'RESTART_SUBMITTED' $records[0].code 'restart log uses a stable public code'
         Assert-CcodTrue ($records[0].durationMilliseconds -is [long] -or $records[0].durationMilliseconds -is [int]) 'restart log records bounded duration'
+    }finally{if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}}
+}
+
+Invoke-CcodTest 'restart prompt rejects and never echoes an untrusted accepted receipt' {
+    # Production mutation caught: treating accepted=true as sufficient and serializing attacker-controlled receipt fields to stdout.
+    $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-prompt-invalid-receipt-'+[guid]::NewGuid().ToString('N'))
+    try{
+        $app=Join-Path $root 'app';$install=Join-Path $root 'install';$runtimeId='2.5.0-runtime';$runtime=Join-Path $install "runtime\$runtimeId"
+        [IO.Directory]::CreateDirectory((Join-Path $app 'src\persistence\modules'))|Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $runtime 'src\persistence\modules'))|Out-Null
+        [IO.File]::WriteAllText((Join-Path $install 'active.json'),'{}',[Text.UTF8Encoding]::new($false))
+        $runtimeModule=@"
+function Read-CcodActiveRuntime { param(`$InstallRoot) [pscustomobject][ordered]@{activeRuntime='$runtimeId';generation=[UInt64]7} }
+function Test-CcodRuntimeManifest { param(`$RuntimeDirectory,`$ExpectedRuntimeId) [pscustomobject]@{Valid=`$true;Code='CCOD_RUNTIME_VALID'} }
+Export-ModuleMember -Function Read-CcodActiveRuntime,Test-CcodRuntimeManifest
+"@
+        [IO.File]::WriteAllText((Join-Path $app 'src\persistence\modules\RuntimeManifest.psm1'),$runtimeModule,[Text.UTF8Encoding]::new($false))
+        $malicious=[ordered]@{schemaVersion=1;submissionId='aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';accepted=$true;transactionId='ATTACKER_STDOUT_MARKER';errorCode=$null;completedAtUtc='2030-02-03T04:05:06.0000000Z'}
+        New-CcodFakeLifecycleReceiptModule (Join-Path $runtime 'src\persistence\modules\LifecycleRequest.psm1') $malicious
+        $output=@(& $promptPath -AppRoot $app -InstallRoot $install -Choice Restart -ActivationId '99999999-8888-7777-6666-555555555555' -NoUi 2>&1)
+        Assert-CcodEqual 1 $LASTEXITCODE 'untrusted accepted receipt exits nonzero'
+        $text=$output-join"`n"
+        Assert-CcodTrue ($text-cmatch'CCOD_RESTART_RECEIPT_INVALID') 'untrusted receipt returns the bounded stable code on stderr'
+        Assert-CcodTrue ($text-cnotmatch'ATTACKER_STDOUT_MARKER') 'untrusted transaction data is never echoed'
+        $record=(Get-Content -LiteralPath (Join-Path $install 'logs\post-install-activation.log')|Select-Object -Last 1)|ConvertFrom-Json
+        Assert-CcodEqual 'CCOD_RESTART_RECEIPT_INVALID' $record.code 'invalid receipt support code remains durable'
+        Assert-CcodEqual $null $record.submissionId 'invalid receipt does not persist an untrusted submission id'
+        Assert-CcodEqual $null $record.transactionId 'invalid receipt does not persist an untrusted transaction id'
     }finally{if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}}
 }
 

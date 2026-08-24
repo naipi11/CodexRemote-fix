@@ -601,6 +601,53 @@ $results += Invoke-CcodTest 'upgrade boundaries fail closed with phase receipts 
     }
 }
 
+# Production mutation caught: reporting a pre-generation upgrade failure after stopping the old runtime without first restarting and proving the still-active generation.
+$results += Invoke-CcodTest 'pre-generation upgrade failure restores and proves previous runtime protection before Failed' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.0-rollback-a'|Out-Null
+        $nodePath=New-CcodLifecycleFakeNode -Root $nodeRoot
+        $first=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
+        Set-CcodLifecycleTestStatus -InstallRoot $install -RuntimeId $first.RuntimeId
+        [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'),"module.exports='rollback-b';`n",[Text.UTF8Encoding]::new($false))
+        $fake=New-CcodLifecycleFake -NodePath $nodePath
+        $fake.World.CopyOverride=[pscustomobject]@{Match='*Supervisor.ps1';Action={param($SourcePath,$DestinationPath)throw 'PRIVATE_PREGENERATION_COPY_FAILURE'}}
+        $originalWriter=$fake.Adapters.WriteActivationReceipt
+        $fake.Adapters.WriteActivationReceipt={param($Root,$Receipt)$fake.World.Calls.Add("Receipt:$($Receipt.phase)");&$originalWriter $Root $Receipt}.GetNewClosure()
+        $fake.Adapters.WaitNewRuntimeReady={param($Root,$Runtime,$Generation,$Identity,$Started,$Timeout)$fake.World.Calls.Add("WaitRollbackReady:${Runtime}:${Generation}:${Timeout}");[pscustomobject][ordered]@{SupervisorReady=$true;TrayReady=$true}}.GetNewClosure()
+
+        Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters|Out-Null} 'CCOD_INSTALL_STAGING_FAILED'
+        [string[]]$calls=@($fake.World.Calls)
+        $close=[Array]::IndexOf($calls,'CloseShutdownGate');$lease=[Array]::IndexOf($calls,'ExitInstallLease');$start=[Array]::IndexOf($calls,'StartTask')
+        $wait=@($calls|Where-Object{$_-like"WaitRollbackReady:$($first.RuntimeId):1:*"})[0];$waitIndex=[Array]::IndexOf($calls,$wait);$failed=[Array]::IndexOf($calls,'Receipt:Failed')
+        Assert-CcodTrue ($close-ge0-and$lease-gt$close-and$start-gt$lease-and$waitIndex-gt$start-and$failed-gt$waitIndex) 'shutdown gate and install ownership release before old task restart, readiness proof, and Failed receipt'
+        Assert-CcodEqual 1 $fake.World.TaskStarted 'previous protection is restarted exactly once'
+        $pointer=Read-CcodLifecycleActivePointer -Root $install
+        Assert-CcodEqual $first.RuntimeId $pointer.activeRuntime 'rollback proof remains bound to the previous active runtime'
+        Assert-CcodEqual 1 ([UInt64]$pointer.generation) 'rollback proof remains bound to the previous active generation'
+    } finally {foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}}
+}
+
+$results += Invoke-CcodTest 'pre-generation rollback proof failure reports a bounded rollback code and preserves the old generation' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.0-rollback-proof-a'|Out-Null;$nodePath=New-CcodLifecycleFakeNode -Root $nodeRoot
+        $first=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
+        Set-CcodLifecycleTestStatus -InstallRoot $install -RuntimeId $first.RuntimeId
+        [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'),"module.exports='rollback-proof-b';`n",[Text.UTF8Encoding]::new($false))
+        $fake=New-CcodLifecycleFake -NodePath $nodePath;$fake.World.StartTaskFailure=$true
+        $fake.World.CopyOverride=[pscustomobject]@{Match='*Supervisor.ps1';Action={param($SourcePath,$DestinationPath)throw 'PRIVATE_PREGENERATION_COPY_FAILURE'}}
+
+        Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters|Out-Null} 'CCOD_INSTALL_ROLLBACK_FAILED'
+        $activation=Get-Content -LiteralPath (Join-Path $install 'state\post-install-activation.json') -Raw -Encoding UTF8|ConvertFrom-Json
+        Assert-CcodEqual 'Failed' $activation.phase 'unproven rollback remains terminally Failed'
+        Assert-CcodEqual 'CCOD_INSTALL_ROLLBACK_FAILED' $activation.errorCode 'unproven rollback exposes only the bounded support code'
+        $pointer=Read-CcodLifecycleActivePointer -Root $install
+        Assert-CcodEqual $first.RuntimeId $pointer.activeRuntime 'unproven rollback never mutates the previous active pointer'
+        Assert-CcodEqual 1 ([UInt64]$pointer.generation) 'unproven rollback never regresses or advances generation'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}}
+}
+
 # Production mutation caught: removing superseded runtime directories before readiness or retaining them after a verified Ready transition.
 $results += Invoke-CcodTest 'old runtime cleanup occurs only after combined readiness succeeds' {
     $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
@@ -623,6 +670,31 @@ $results += Invoke-CcodTest 'old runtime cleanup occurs only after combined read
         Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $blocked.Adapters|Out-Null} 'CCOD_INSTALL_NEW_RUNTIME_NOT_READY'
         Assert-CcodTrue (Test-Path -LiteralPath $orphanAfterFailure -PathType Container) 'readiness failure never performs old-runtime cleanup'
     }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}}
+}
+
+# Production mutation caught: allowing a best-effort post-Ready cleanup exception to enter activation failure handling and overwrite the terminal Ready receipt.
+$results += Invoke-CcodTest 'post-Ready cleanup failure retains Ready and the undeleted old runtime' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot;$lock=$null
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.0-cleanup-failure-a'|Out-Null;$nodePath=New-CcodLifecycleFakeNode -Root $nodeRoot
+        $first=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
+        Set-CcodLifecycleTestStatus -InstallRoot $install -RuntimeId $first.RuntimeId
+        $orphan=Join-Path $install 'runtime\superseded-locked';[IO.Directory]::CreateDirectory($orphan)|Out-Null
+        $lockedPath=Join-Path $orphan 'locked.bin';$lock=[IO.File]::Open($lockedPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+        [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'),"module.exports='cleanup-failure-b';`n",[Text.UTF8Encoding]::new($false))
+        $fake=New-CcodLifecycleFake -NodePath $nodePath
+
+        $second=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters
+        Assert-CcodEqual 'Upgraded' $second.Outcome 'cleanup failure does not invalidate the verified upgrade'
+        $activation=Get-Content -LiteralPath (Join-Path $install 'state\post-install-activation.json') -Raw -Encoding UTF8|ConvertFrom-Json
+        Assert-CcodEqual 'Ready' $activation.phase 'cleanup failure cannot overwrite Ready with Failed'
+        Assert-CcodEqual $true $activation.ready 'terminal readiness remains successful'
+        Assert-CcodTrue (Test-Path -LiteralPath $orphan -PathType Container) 'cleanup failure retains the undeleted old runtime'
+        Assert-CcodEqual 1 @($fake.World.LogRecords|Where-Object{$_.code-ceq'CCOD_INSTALL_OLD_RUNTIME_CLEANUP_FAILED'}).Count 'cleanup failure leaves one safe diagnostic record'
+    }finally{
+        if($null-ne$lock){$lock.Dispose()}
+        foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+    }
 }
 
 # Production mutation caught: waiting for the task-created Supervisor while retaining install/lifecycle mutex ownership that blocks bootstrap launch.
@@ -1511,14 +1583,60 @@ $results += Invoke-CcodTest 'installer pumps bounded activation progress and pro
     Assert-CcodTrue ($installerScript -cmatch '(?m)^CloseApplications=no\r?$') 'installer never lets Restart Manager close Codex'
     Assert-CcodTrue ($installerScript -cmatch 'Activate-CcodRemoteFix\.ps1') 'installer bundles the activation worker'
     Assert-CcodTrue ($installerScript -cmatch 'OpenProcess@kernel32\.dll' -and $installerScript -cmatch 'WaitForSingleObject@kernel32\.dll' -and $installerScript -cmatch 'CloseHandle@kernel32\.dll') 'installer owns a bounded synchronize handle for the activation process'
-    Assert-CcodTrue ($installerScript -cmatch '(?s)Activate-CcodRemoteFix\.ps1.*ewNoWait.*OpenProcess.*while WaitForSingleObject\(ProcessHandle, 50\) = WAIT_TIMEOUT.*WizardForm\.Update.*Sleep\(50\)') 'installer polls in bounded intervals while pumping the wizard UI'
+    Assert-CcodTrue ($installerScript -cmatch '(?s)Activate-CcodRemoteFix\.ps1.*ewNoWait.*OpenProcess.*WaitResult\s*:=\s*WaitForSingleObject\(ProcessHandle, 50\).*while WaitResult = WAIT_TIMEOUT.*WizardForm\.Update.*Sleep\(50\)') 'installer polls in bounded intervals while pumping the wizard UI'
     Assert-CcodTrue ($installerScript -cmatch 'UpdateActivationPresentation' -and $installerScript -cmatch 'ProgressGauge\.Position') 'installer maps durable phases to visible status and progress'
-    Assert-CcodTrue ($installerScript -cmatch 'ReadActivationTerminal' -and $installerScript -cmatch "'Ready'" -and $installerScript -cmatch "'Failed'") 'installer reads only terminal Ready or Failed after process exit'
+    Assert-CcodTrue ($installerScript -cmatch 'ValidateActivationReceipt' -and $installerScript -cmatch 'ReceiptValidationExitCode = 0' -and $installerScript -cmatch 'ReceiptValidationExitCode = 2') 'installer accepts only strictly validated terminal Ready or Failed after process exit'
     Assert-CcodTrue ($installerScript -cnotmatch '(?s)Activate-CcodRemoteFix\.ps1[^;]*-Prompt') 'background activation worker never owns the prompt'
-    Assert-CcodTrue ($installerScript -cmatch '(?s)if TerminalPhase = apReady then\s+begin.*Prompt-CcodRestart\.ps1') 'restart prompt runs only inside the Ready branch'
+    Assert-CcodTrue ($installerScript -cmatch '(?s)if \(WorkerExitCode = 0\) and \(TerminalPhase = apReady\) then\s+begin.*Prompt-CcodRestart\.ps1') 'restart prompt runs only after zero worker exit and strict Ready'
     Assert-CcodTrue ($installerScript -cnotmatch '(?s)ewNoWait, ResultCode\);\s*end;') 'launch is never treated as unconditional completion'
     Assert-CcodTrue ($installerScript -cnotmatch 'Prepare-CcodRemoteUpgrade\.ps1') 'installer does not pre-stop the supervisor outside the gated runtime activation transaction'
     Assert-CcodTrue ($installerScript -cnotmatch '(?ms)^\[Run\]\s*\r?\nFilename: "powershell\.exe"; Parameters: ".*Install-CodexControlOtherDevices\.ps1') 'installer does not silently ignore its runtime installer exit code through a Run entry'
+}
+
+# Production mutation caught: reusing a stale receipt, allowing the worker to choose an uncorrelated id, treating WAIT_FAILED/nonzero exit as completion, or trusting Inno substring parsing as terminal proof.
+$results += Invoke-CcodTest 'installer owns one strict activation correlation and fails closed on every process-monitor boundary' {
+    $installerScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
+    Assert-CcodTrue ($installerScript -cmatch 'CoCreateGuid@ole32\.dll' -and $installerScript -cmatch 'StringFromGUID2@ole32\.dll') 'installer generates a canonical activation GUID before worker launch'
+    Assert-CcodTrue ($installerScript -cmatch '(?s)ActivationId\s*:=\s*NewActivationId\(\).*ReceiptPath\s*:=.*RefuseStaleActivationReceipt\(ReceiptPath\).*Activate-CcodRemoteFix\.ps1.*-ActivationId\s+"' ) 'installer removes or refuses the stale receipt and passes its own activation id to the worker'
+    Assert-CcodTrue ($installerScript -cmatch 'PROCESS_QUERY_INFORMATION' -and $installerScript -cmatch 'GetExitCodeProcess@kernel32\.dll' -and $installerScript -cmatch 'WAIT_FAILED') 'installer can distinguish exact process termination, monitoring failure, and worker exit status'
+    Assert-CcodTrue ($installerScript -cmatch '(?s)WaitResult\s*:=\s*WaitForSingleObject\(ProcessHandle, 50\).*if WaitResult = WAIT_FAILED then.*GetExitCodeProcess\(ProcessHandle, WorkerExitCode\).*WorkerExitCode <> 0') 'WAIT_FAILED and nonzero worker exit fail closed before success'
+    Assert-CcodTrue ($installerScript -cmatch '(?s)ValidateActivationReceipt.*-ValidateReceiptOnly.*-ActivationId.*ActivationId.*ReceiptValidationExitCode') 'installer delegates bounded strict terminal receipt validation with the exact activation id'
+    Assert-CcodTrue ($installerScript -cmatch '(?s)ReceiptValidationExitCode = 0.*TerminalPhase := apReady.*ReceiptValidationExitCode = 2.*TerminalPhase := apFailed') 'only strict Ready and Failed validator statuses become terminal phases'
+    Assert-CcodTrue ($installerScript -cmatch '(?s)if \(WorkerExitCode = 0\) and \(TerminalPhase = apReady\) then.*Prompt-CcodRestart\.ps1') 'only a zero-exit worker with the strictly correlated Ready receipt reaches the restart prompt'
+}
+
+$results += Invoke-CcodTest 'activation terminal validator enforces the complete bounded correlated receipt contract' {
+    # Production mutation caught: accepting reordered/extra fields, truthy booleans, stale ids, malformed runtime/error semantics, noncanonical times, or oversized JSON.
+    $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-validator-'+[guid]::NewGuid().ToString('N'))
+    try{
+        [IO.Directory]::CreateDirectory((Join-Path $root 'state'))|Out-Null
+        $activationId='77777777-6666-5555-4444-333333333333';$receiptPath=Join-Path $root 'state\post-install-activation.json';$stderrPath=Join-Path $root 'validator.err'
+        $valid=[ordered]@{schemaVersion=1;activationId=$activationId;phase='Ready';runtimeId='runtime-new';previousRuntimeId='runtime-old';startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=$true;errorCode=$null}
+        $cases=@(
+            [pscustomobject]@{Name='Ready';Exit=0;Mutate={param($r)}},
+            [pscustomobject]@{Name='Failed';Exit=2;Mutate={param($r)$r.phase='Failed';$r.ready=$false;$r.errorCode='CCOD_INSTALL_FAILED'}},
+            [pscustomobject]@{Name='stale id';Exit=3;Mutate={param($r)$r.activationId='aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'}},
+            [pscustomobject]@{Name='truthy ready';Exit=3;Mutate={param($r)$r.ready='true'}},
+            [pscustomobject]@{Name='invalid runtime';Exit=3;Mutate={param($r)$r.runtimeId='..\ATTACKER_STDOUT_MARKER'}},
+            [pscustomobject]@{Name='Ready with error';Exit=3;Mutate={param($r)$r.errorCode='CCOD_ATTACKER_STDOUT_MARKER'}},
+            [pscustomobject]@{Name='nonterminal phase';Exit=3;Mutate={param($r)$r.phase='StartingProtection';$r.ready=$false}},
+            [pscustomobject]@{Name='noncanonical time';Exit=3;Mutate={param($r)$r.updatedAtUtc='2030-02-03T04:05:07Z'}},
+            [pscustomobject]@{Name='extra field';Exit=3;Mutate={param($r)$r.attacker='ATTACKER_STDOUT_MARKER'}}
+        )
+        foreach($case in $cases){
+            $receipt=[ordered]@{};foreach($key in $valid.Keys){$receipt[$key]=$valid[$key]};&$case.Mutate $receipt
+            [IO.File]::WriteAllText($receiptPath,($receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+            if(Test-Path -LiteralPath $stderrPath){Remove-Item -LiteralPath $stderrPath -Force}
+            $stdout=@(& (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -AppRoot $repositoryRoot -InstallRoot $root -ActivationId $activationId -ValidateReceiptOnly 2>$stderrPath)
+            Assert-CcodEqual $case.Exit $LASTEXITCODE "$($case.Name) maps to the strict validator exit contract"
+            Assert-CcodEqual 0 $stdout.Count "$($case.Name) emits no receipt data to stdout"
+            if($case.Exit-ne0-and$case.Exit-ne2){Assert-CcodTrue ((Get-Content -LiteralPath $stderrPath -Raw)-cmatch'CCOD_ACTIVATION_RECEIPT_') "$($case.Name) retains a bounded support code on stderr"}
+        }
+        [IO.File]::WriteAllText($receiptPath,('{'+'"padding":"'+('x'*17000)+'"}'),[Text.UTF8Encoding]::new($false))
+        $stdout=@(& (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -AppRoot $repositoryRoot -InstallRoot $root -ActivationId $activationId -ValidateReceiptOnly 2>$stderrPath)
+        Assert-CcodEqual 3 $LASTEXITCODE 'oversized receipt is refused before JSON parsing'
+        Assert-CcodEqual 0 $stdout.Count 'oversized receipt emits no data to stdout'
+    }finally{if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}}
 }
 
 $results += Invoke-CcodTest 'pre-upgrade supervisor stopper exits cleanly when no old runtime is present' {

@@ -86,8 +86,10 @@ Name: "{userdesktop}\CodexRemote-fix"; Filename: "{sys}\WindowsPowerShell\v1.0\p
 [Code]
 const
   PROCESS_SYNCHRONIZE = $00100000;
+  PROCESS_QUERY_INFORMATION = $00000400;
   WAIT_OBJECT_0 = $00000000;
   WAIT_TIMEOUT = $00000102;
+  WAIT_FAILED = $FFFFFFFF;
 
 type
   TActivationPhase = (apNone, apStoppingPreviousRuntime, apInstallingRuntime,
@@ -100,39 +102,53 @@ function WaitForSingleObject(hHandle: THandle; dwMilliseconds: LongWord): LongWo
   external 'WaitForSingleObject@kernel32.dll stdcall';
 function CloseHandle(hObject: THandle): Boolean;
   external 'CloseHandle@kernel32.dll stdcall';
+function GetExitCodeProcess(hProcess: THandle; var lpExitCode: LongWord): Boolean;
+  external 'GetExitCodeProcess@kernel32.dll stdcall';
+function CoCreateGuid(var Guid: TGUID): HResult;
+  external 'CoCreateGuid@ole32.dll stdcall';
+function StringFromGUID2(var Guid: TGUID; GuidString: String; MaxCharacters: Integer): Integer;
+  external 'StringFromGUID2@ole32.dll stdcall';
+
+function NewActivationId(): String;
+var
+  Guid: TGUID;
+  GuidString: String;
+  GuidLength: Integer;
+begin
+  if CoCreateGuid(Guid) <> 0 then
+    RaiseException('CodexRemote-fix activation correlation could not be created.');
+  SetLength(GuidString, 39);
+  GuidLength := StringFromGUID2(Guid, GuidString, 39);
+  if GuidLength <> 39 then
+    RaiseException('CodexRemote-fix activation correlation could not be formatted.');
+  SetLength(GuidString, 38);
+  Result := LowerCase(Copy(GuidString, 2, 36));
+  if Length(Result) <> 36 then
+    RaiseException('CodexRemote-fix activation correlation is invalid.');
+end;
+
+procedure RefuseStaleActivationReceipt(const ReceiptPath: String);
+begin
+  if FileExists(ReceiptPath) and (not DeleteFile(ReceiptPath)) then
+    RaiseException('CodexRemote-fix could not remove a stale activation receipt.');
+  if FileExists(ReceiptPath) then
+    RaiseException('CodexRemote-fix refused a stale activation receipt.');
+end;
+
+function LoadBoundedActivationReceipt(const ReceiptPath: String; var Content: AnsiString): Boolean;
+var
+  ReceiptSize: Int64;
+begin
+  Result := False;
+  if not FileSize64(ReceiptPath, ReceiptSize) then Exit;
+  if (ReceiptSize <= 0) or (ReceiptSize > 16384) then Exit;
+  Result := LoadStringFromFile(ReceiptPath, Content);
+end;
 
 function HasJsonStringValue(const Content, FieldName, FieldValue: String): Boolean;
 begin
   Result := (Pos('"' + FieldName + '": "' + FieldValue + '"', Content) > 0) or
     (Pos('"' + FieldName + '":"' + FieldValue + '"', Content) > 0);
-end;
-
-function HasJsonLiteralValue(const Content, FieldName, FieldValue: String): Boolean;
-begin
-  Result := (Pos('"' + FieldName + '": ' + FieldValue, Content) > 0) or
-    (Pos('"' + FieldName + '":' + FieldValue, Content) > 0);
-end;
-
-function ReadJsonStringField(const Content, FieldName: String; var Value: String): Boolean;
-var
-  Marker, Tail: String;
-  StartAt, EndAt: Integer;
-begin
-  Result := False;
-  Value := '';
-  Marker := '"' + FieldName + '": "';
-  StartAt := Pos(Marker, Content);
-  if StartAt = 0 then
-  begin
-    Marker := '"' + FieldName + '":"';
-    StartAt := Pos(Marker, Content);
-  end;
-  if StartAt = 0 then Exit;
-  Tail := Copy(Content, StartAt + Length(Marker), Length(Content));
-  EndAt := Pos('"', Tail);
-  if EndAt <= 1 then Exit;
-  Value := Copy(Tail, 1, EndAt - 1);
-  Result := True;
 end;
 
 function DetectActivationPhase(const Content: String): TActivationPhase;
@@ -152,12 +168,13 @@ begin
     Result := apFailed;
 end;
 
-procedure UpdateActivationPresentation(const ReceiptPath: String);
+procedure UpdateActivationPresentation(const ReceiptPath, ExpectedActivationId: String);
 var
   Content: AnsiString;
   Phase: TActivationPhase;
 begin
-  if not LoadStringFromFile(ReceiptPath, Content) then Exit;
+  if not LoadBoundedActivationReceipt(ReceiptPath, Content) then Exit;
+  if not HasJsonStringValue(String(Content), 'activationId', ExpectedActivationId) then Exit;
   Phase := DetectActivationPhase(String(Content));
   case Phase of
     apStoppingPreviousRuntime:
@@ -175,34 +192,34 @@ begin
   end;
 end;
 
-function ReadActivationTerminal(const ReceiptPath: String;
-  var TerminalPhase: TActivationPhase; var ActivationId: String): Boolean;
+function ValidateActivationReceipt(const ReceiptPath, ActivationId: String;
+  var TerminalPhase: TActivationPhase; var ReceiptValidationExitCode: Integer): Boolean;
 var
-  Content: AnsiString;
-  Text, RuntimeId, ErrorCode: String;
+  Parameters: String;
 begin
   Result := False;
   TerminalPhase := apNone;
-  ActivationId := '';
-  if not LoadStringFromFile(ReceiptPath, Content) then Exit;
-  Text := String(Content);
-  TerminalPhase := DetectActivationPhase(Text);
-  if not ReadJsonStringField(Text, 'activationId', ActivationId) or
-    (Length(ActivationId) <> 36) then Exit;
-  if TerminalPhase = apReady then
+  ReceiptValidationExitCode := -1;
+  Parameters := '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
+    ExpandConstant('{app}\Activate-CcodRemoteFix.ps1') + '" -AppRoot "' + ExpandConstant('{app}') +
+    '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') +
+    '" -ValidateReceiptOnly -ActivationId "' + ActivationId + '"';
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE,
+    ewWaitUntilTerminated, ReceiptValidationExitCode) then
   begin
-    if not ReadJsonStringField(Text, 'runtimeId', RuntimeId) or (RuntimeId = '') or
-      not HasJsonLiteralValue(Text, 'ready', 'true') or
-      not HasJsonLiteralValue(Text, 'errorCode', 'null') then Exit;
-    Result := True;
-  end
-  else if TerminalPhase = apFailed then
-  begin
-    if not ReadJsonStringField(Text, 'errorCode', ErrorCode) or
-      (Pos('CCOD_', ErrorCode) <> 1) or
-      not HasJsonLiteralValue(Text, 'ready', 'false') then Exit;
-    Result := True;
+    Log('CodexRemote-fix activation receipt validator could not be started.');
+    Exit;
   end;
+  if ReceiptValidationExitCode = 0 then
+    TerminalPhase := apReady
+  else if ReceiptValidationExitCode = 2 then
+    TerminalPhase := apFailed
+  else
+  begin
+    Log('CodexRemote-fix activation receipt validator rejected the receipt with exit code ' + IntToStr(ReceiptValidationExitCode) + '.');
+    Exit;
+  end;
+  Result := True;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -212,34 +229,68 @@ var
   Parameters, ReceiptPath, ActivationId: String;
   ProcessHandle: THandle;
   TerminalPhase: TActivationPhase;
+  WaitResult, WorkerExitCode: LongWord;
+  ReceiptValidationExitCode: Integer;
 begin
   if CurStep <> ssPostInstall then
     Exit;
+  ActivationId := NewActivationId();
   ReceiptPath := ExpandConstant('{localappdata}\CodexControlOtherDevices\state\post-install-activation.json');
-  Parameters := '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ExpandConstant('{app}\Activate-CcodRemoteFix.ps1') + '" -AppRoot "' + ExpandConstant('{app}') + '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') + '"';
+  RefuseStaleActivationReceipt(ReceiptPath);
+  Parameters := '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ExpandConstant('{app}\Activate-CcodRemoteFix.ps1') + '" -AppRoot "' + ExpandConstant('{app}') + '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') + '" -ActivationId "' + ActivationId + '"';
   if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE, ewNoWait, ResultCode) then
+  begin
+    Log('CodexRemote-fix activation worker could not be started.');
     RaiseException('CodexRemote-fix activation process could not be started.');
-  ProcessHandle := OpenProcess(PROCESS_SYNCHRONIZE, False, LongWord(ResultCode));
+  end;
+  ProcessHandle := OpenProcess(PROCESS_SYNCHRONIZE or PROCESS_QUERY_INFORMATION, False, LongWord(ResultCode));
   if ProcessHandle = 0 then
+  begin
+    Log('CodexRemote-fix activation worker process handle could not be opened for PID ' + IntToStr(ResultCode) + '.');
     RaiseException('CodexRemote-fix activation process could not be monitored.');
+  end;
   try
-    while WaitForSingleObject(ProcessHandle, 50) = WAIT_TIMEOUT do
+    WaitResult := WaitForSingleObject(ProcessHandle, 50);
+    while WaitResult = WAIT_TIMEOUT do
     begin
-      UpdateActivationPresentation(ReceiptPath);
+      UpdateActivationPresentation(ReceiptPath, ActivationId);
       WizardForm.Update;
       Sleep(50);
+      WaitResult := WaitForSingleObject(ProcessHandle, 50);
+    end;
+    if WaitResult = WAIT_FAILED then
+    begin
+      Log('CodexRemote-fix activation process wait failed.');
+      RaiseException('CodexRemote-fix activation process monitoring failed.');
+    end;
+    if WaitResult <> WAIT_OBJECT_0 then
+    begin
+      Log('CodexRemote-fix activation process wait returned unexpected status ' + IntToStr(WaitResult) + '.');
+      RaiseException('CodexRemote-fix activation process monitoring returned an unexpected status.');
+    end;
+    if not GetExitCodeProcess(ProcessHandle, WorkerExitCode) then
+    begin
+      Log('CodexRemote-fix activation process exit status could not be read.');
+      RaiseException('CodexRemote-fix activation process exit status is unavailable.');
     end;
   finally
     CloseHandle(ProcessHandle);
   end;
-  if not ReadActivationTerminal(ReceiptPath, TerminalPhase, ActivationId) then
+  if not ValidateActivationReceipt(ReceiptPath, ActivationId, TerminalPhase, ReceiptValidationExitCode) then
     RaiseException('CodexRemote-fix activation ended without a valid Ready or Failed receipt.');
+  if WorkerExitCode <> 0 then
+  begin
+    Log('CodexRemote-fix activation worker exited with code ' + IntToStr(WorkerExitCode) + '.');
+    if TerminalPhase = apFailed then
+      SuppressibleMsgBox('CodexRemote-fix activation failed safely. Use the support code in post-install-activation.log.', mbError, MB_OK, IDOK);
+    RaiseException('CodexRemote-fix activation worker failed.');
+  end;
   if TerminalPhase = apFailed then
   begin
     SuppressibleMsgBox('CodexRemote-fix activation failed safely. Use the support code in post-install-activation.log.', mbError, MB_OK, IDOK);
     RaiseException('CodexRemote-fix activation reported Failed.');
   end;
-  if TerminalPhase = apReady then
+  if (WorkerExitCode = 0) and (TerminalPhase = apReady) then
   begin
     WizardForm.StatusLabel.Caption := 'CodexRemote-fix activation is ready.';
     WizardForm.ProgressGauge.Position := 100;
