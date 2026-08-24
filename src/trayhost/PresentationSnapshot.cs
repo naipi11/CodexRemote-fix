@@ -3,41 +3,37 @@ using System.Collections.Generic;
 
 public enum TrayColor : byte { Gray = 0, Green = 1, Yellow = 2, Red = 3 }
 public enum LanguageMode : byte { System = 0, Chinese = 1, English = 2 }
-public enum TrayState : byte { Waiting, Inspecting, Transitioning, Active, ActivePaused, RendererHandoff, Suppressed, Recovered, Error }
+public enum ConnectionState : byte { WaitingForCodex = 0, Checking = 1, Connected = 2, RepairNeeded = 3, Error = 4 }
+public enum ProtectionState : byte { Running = 0, Reconnecting = 1, Stopping = 2 }
 
 [Flags]
 public enum PresentationFlags : uint
 {
     None = 0,
-    SessionReadyVisible = 1u << 0,
-    ApplyNowVisible = 1u << 1,
-    ApplyNowEnabled = 1u << 2,
-    ManualRetryVisible = 1u << 3,
-    ManualRetryEnabled = 1u << 4,
-    AutomationToggleEnabled = 1u << 5,
-    AutomationChecked = 1u << 6,
-    CandidateOptInToggleEnabled = 1u << 7,
-    CandidateOptInChecked = 1u << 8,
-    OpenLogsEnabled = 1u << 9,
-    UninstallEnabled = 1u << 10,
-    Busy = 1u << 11
+    RepairEnabled = 1u << 0,
+    LanguageEnabled = 1u << 1,
+    OpenLogsEnabled = 1u << 2,
+    AboutEnabled = 1u << 3,
+    ExitEnabled = 1u << 4,
+    Busy = 1u << 5
 }
 
 public sealed class PresentationSnapshot
 {
     public ulong Revision { get; private set; }
     public TrayColor Color { get; private set; }
-    public TrayState State { get; private set; }
+    public ConnectionState Connection { get; private set; }
+    public ProtectionState Protection { get; private set; }
     public LanguageMode Language { get; private set; }
     public PresentationFlags Flags { get; private set; }
     public IReadOnlyList<string> Strings { get; private set; }
 
-    public PresentationSnapshot(ulong revision, TrayColor color, TrayState state, LanguageMode language, PresentationFlags flags, string[] strings)
+    public PresentationSnapshot(ulong revision, TrayColor color, ConnectionState connection, ProtectionState protection, LanguageMode language, PresentationFlags flags, string[] strings)
     {
         if (revision == 0UL) { throw new ArgumentException("revision must be positive", "revision"); }
-        if (!Enum.IsDefined(typeof(TrayColor), color) || !Enum.IsDefined(typeof(TrayState), state) || !Enum.IsDefined(typeof(LanguageMode), language)) { throw new ArgumentException("presentation enum is invalid"); }
-        if ((((uint)flags) & ~0x00000fffu) != 0u) { throw new ArgumentException("presentation flags are invalid", "flags"); }
-        if (strings == null || strings.Length != 20) { throw new ArgumentException("presentation string count is invalid", "strings"); }
+        if (!Enum.IsDefined(typeof(TrayColor), color) || !Enum.IsDefined(typeof(ConnectionState), connection) || !Enum.IsDefined(typeof(ProtectionState), protection) || !Enum.IsDefined(typeof(LanguageMode), language)) { throw new ArgumentException("presentation enum is invalid"); }
+        if ((((uint)flags) & ~0x0000003fu) != 0u) { throw new ArgumentException("presentation flags are invalid", "flags"); }
+        if (strings == null || strings.Length != 16) { throw new ArgumentException("presentation string count is invalid", "strings"); }
         string[] copy = (string[])strings.Clone();
         for (int i = 0; i < copy.Length; i++)
         {
@@ -46,7 +42,8 @@ public sealed class PresentationSnapshot
         }
         Revision = revision;
         Color = color;
-        State = state;
+        Connection = connection;
+        Protection = protection;
         Language = language;
         Flags = flags;
         Strings = Array.AsReadOnly(copy);

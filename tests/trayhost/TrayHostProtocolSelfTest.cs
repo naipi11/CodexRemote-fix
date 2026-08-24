@@ -142,7 +142,7 @@ internal static class TrayHostProtocolSelfTest
 
     private static string[] ValidStrings()
     {
-        string[] values = new string[20];
+        string[] values = new string[16];
         for (int i = 0; i < values.Length; i++) { values[i] = "string-" + i; }
         return values;
     }
@@ -152,15 +152,16 @@ internal static class TrayHostProtocolSelfTest
         PresentationSnapshot snapshot = new PresentationSnapshot(
             1UL,
             TrayColor.Green,
-            TrayState.Active,
+            ConnectionState.Connected,
+            ProtectionState.Running,
             LanguageMode.Chinese,
-            PresentationFlags.AutomationToggleEnabled | PresentationFlags.AutomationChecked,
+            PresentationFlags.LanguageEnabled | PresentationFlags.OpenLogsEnabled,
             ValidStrings());
-        AssertTrue(snapshot.Revision == 1UL && snapshot.Strings.Count == 20, "presentation snapshot retains its validated fields");
+        AssertTrue(snapshot.Revision == 1UL && snapshot.Connection == ConnectionState.Connected && snapshot.Protection == ProtectionState.Running && snapshot.Strings.Count == 16, "presentation snapshot retains its validated fields");
         bool threw = false;
         string[] invalid = ValidStrings();
         invalid[3] = "bad\rtext";
-        try { new PresentationSnapshot(2UL, TrayColor.Green, TrayState.Active, LanguageMode.Chinese, PresentationFlags.None, invalid); } catch (ArgumentException) { threw = true; }
+        try { new PresentationSnapshot(2UL, TrayColor.Green, ConnectionState.Connected, ProtectionState.Running, LanguageMode.Chinese, PresentationFlags.None, invalid); } catch (ArgumentException) { threw = true; }
         AssertTrue(threw, "presentation control characters are rejected");
     }
 

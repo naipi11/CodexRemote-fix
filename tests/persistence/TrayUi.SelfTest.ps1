@@ -302,15 +302,15 @@ $results.Add((Invoke-CcodTest 'prebuilds one bilingual ContextMenu graph, defers
 
         $active=New-CcodValidPresentation
         Set-CcodTrayPresentation -Context $context -Presentation $active
-        Assert-CcodEqual 'Codex Device Connection' $context.Items.Title.Properties.Text 'English title is rendered in the persistent menu'
-        Assert-CcodEqual ([char]0x201c+'Control other devices'+[char]0x201d+' is active for this session') $context.Items.Status.Properties.Text 'English status is rendered in the persistent menu'
+        Assert-CcodEqual 'CodexRemote-fix' $context.Items.Title.Properties.Text 'legacy diagnostic tray renders the current product title'
+        Assert-CcodEqual 'Connection: Connected' $context.Items.Status.Properties.Text 'legacy diagnostic tray maps current connected evidence'
         & $context.Menu.Events.Popup $context.Menu $null
         Assert-CcodEqual $true $context.MenuOpen 'Popup begins the menu-open window'
         Set-CcodTrayPresentation -Context $context -Presentation $active -Catalog $script:TestSystemCatalog -LanguageMode System -SystemCultureName zh-CN
-        Assert-CcodEqual 'Codex Device Connection' $context.Items.Title.Properties.Text 'open menu keeps its current presentation until Collapse'
+        Assert-CcodEqual 'CodexRemote-fix' $context.Items.Title.Properties.Text 'open menu keeps its current presentation until Collapse'
         Assert-CcodTrue ($null -ne $context.PendingRender) 'open menu coalesces the next render'
         & $context.Menu.Events.Collapse $context.Menu $null
-        $zhTitle='Codex '+[string]::Concat([char[]]@(0x8bbe,0x5907,0x8fde,0x63a5))
+        $zhTitle='CodexRemote-fix'
         Assert-CcodEqual $false $context.MenuOpen 'Collapse clears menu-open state'
         Assert-CcodEqual $zhTitle $context.Items.Title.Properties.Text 'Collapse flushes the newest bilingual render in place'
         Assert-CcodEqual $null $context.PendingRender 'Collapse clears the rendered pending snapshot'
@@ -345,9 +345,9 @@ $results.Add((Invoke-CcodTest 'renders the optional External renderer handoff wa
         $presentation.Color='Yellow'
         $presentation.StateKey='RendererHandoff'
         Set-CcodTrayPresentation -Context $context -Presentation $presentation -Catalog $script:TestEnglishCatalog -LanguageMode en-US -SystemCultureName en-US
-        Assert-CcodEqual 'Codex device connection: working' $context.NotifyIcon.Properties.Text 'External renderer warning keeps the active tooltip'
-        Assert-CcodEqual 'Yellow' $context.NotifyIcon.Properties.Icon.Color 'External renderer warning uses the yellow icon'
-        Assert-CcodEqual 'External renderer handoff was not completed; Codex remains active' $context.Items.Status.Properties.Text 'warning text is rendered in the persistent ContextMenu'
+        Assert-CcodEqual 'Connection: Connected' $context.NotifyIcon.Properties.Text 'legacy diagnostic tray maps the active tooltip to current connected evidence'
+        Assert-CcodEqual 'Yellow' $context.NotifyIcon.Properties.Icon.Color 'legacy diagnostic renderer warning keeps its warning icon'
+        Assert-CcodEqual 'Connection: Error' $context.Items.Status.Properties.Text 'legacy diagnostic renderer warning maps to the v2 error connection text'
     }finally{if($null -ne $context -and $context.State -cne 'Closed'){Close-CcodTrayContext -Context $context|Out-Null}}
 }))
 
@@ -898,9 +898,9 @@ $results += Invoke-CcodTest 'production AttachUiCallback handlers capture the ca
     Assert-CcodTrue ($tail.StartsWith('.GetNewClosure()')) 'every event handler needle is immediately closed over'
 }
 
-$results += Invoke-CcodTest 'accepts the External renderer handoff status key from the validated UI catalog' {
+$results += Invoke-CcodTest 'maps the legacy renderer handoff label through the validated v2 catalog' {
     $localized=& (Get-Module TrayUi) {param($Catalog)Resolve-CcodTrayLocalizedStrings -Catalog $Catalog -LanguageMode en-US -SystemCultureName en-US} $script:TestEnglishCatalog
-    Assert-CcodEqual 'External renderer handoff was not completed; Codex remains active' $localized['Status.RendererHandoff'] 'tray resolves the validated optional handoff status key'
+    Assert-CcodEqual 'Connection: Error' $localized['Status.RendererHandoff'] 'legacy diagnostic tray maps renderer handoff to the v2 error connection key'
 }
 
 $results|ForEach-Object{"PASS $($_.Name)"}

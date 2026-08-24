@@ -20,10 +20,11 @@ $script:CcodSupervisorAdapterNames=@(
 )
 $script:CcodSupervisorUiLanguageModes=@('System','zh-CN','en-US')
 $script:CcodSupervisorUiKeys=@(
-    'Tray.Title','Status.Waiting','Status.Inspecting','Status.Transitioning','Status.Active','Status.ActivePaused','Status.Suppressed','Status.Recovered','Status.Error','Status.RendererHandoff',
-    'Tooltip.Waiting','Tooltip.Inspecting','Tooltip.Transitioning','Tooltip.Active','Tooltip.ActivePaused','Tooltip.Suppressed','Tooltip.Recovered','Tooltip.Error',
-    'Menu.SessionReady','Menu.ApplyNow','Menu.ManualRetry','Menu.Automation','Menu.CandidateOptIn','Menu.Language','Menu.FollowSystem','Menu.Chinese','Menu.English','Menu.OpenLogs','Menu.About','Menu.AboutVersion','Menu.Uninstall',
-    'Dialog.UninstallTitle','Dialog.UninstallMessage','Error.UninstallStart','Error.LanguageChange'
+    'Tray.Title',
+    'Connection.WaitingForCodex','Connection.Checking','Connection.Connected','Connection.RepairNeeded','Connection.Error',
+    'Protection.Running','Protection.Reconnecting','Protection.Stopping',
+    'Menu.CheckAndRepair','Menu.Language','Menu.FollowSystem','Menu.Chinese','Menu.English','Menu.OpenLogs','Menu.About','Menu.AboutVersion','Menu.Exit',
+    'Dialog.ExitTitle','Dialog.ExitMessage','Error.ActionFailed','Error.LanguageChange'
 )
 $script:CcodSupervisorCleanupAllowlist=@(
     'CCOD_SUPERVISOR_LOG_FAILED','CCOD_SUPERVISOR_TIMER_STOP_FAILED','CCOD_SUPERVISOR_WORKER_WAIT_FAILED',
@@ -534,11 +535,11 @@ function ConvertTo-CcodSupervisorLifecycleObservation {
     param([string]$Observation)
     switch($Observation){
         'RemoteVerified'{return 'Connected'}
-        'Special'{return 'Connecting'}
-        'Ordinary'{return 'Ordinary'}
-        'NoCodex'{return 'Disconnected'}
-        'Closed'{return 'Disconnected'}
-        'LaunchRequested'{return 'Disconnected'}
+        'Special'{return 'Checking'}
+        'Ordinary'{return 'RepairNeeded'}
+        'NoCodex'{return 'WaitingForCodex'}
+        'Closed'{return 'WaitingForCodex'}
+        'LaunchRequested'{return 'WaitingForCodex'}
         default{return 'Error'}
     }
 }
@@ -982,11 +983,13 @@ function Set-CcodSupervisorCurrentTrayPresentation {
     if([string]::IsNullOrEmpty($culture)){$culture=Invoke-CcodSupervisorAdapter $Adapters.GetSystemCultureName @() 1}
     if(-not (Test-CcodSupervisorCultureName $culture)){throw 'UI culture is invalid'}
     $engine=New-CcodSupervisorEngineContext $HostState
-    $sessionState=if(@('Waiting','Inspecting','Transitioning','Active','Suppressed','Recovered','Error') -ccontains $HostState.SessionState){$HostState.SessionState}else{'Waiting'}
+    $connection=if(@('WaitingForCodex','Checking','Connected','RepairNeeded','Error') -ccontains $HostState.ConnectionState){$HostState.ConnectionState}else{'WaitingForCodex'}
+    $lifecycleBusy=[bool]($null-ne$HostState.LifecycleWorkerSlot-or$null-ne$HostState.LifecycleRequest)
+    $protection=if($HostState.ProtectionState-ceq'Stopping'){'Stopping'}elseif($lifecycleBusy){'Reconnecting'}elseif(@('Running','Reconnecting')-ccontains$HostState.ProtectionState){$HostState.ProtectionState}else{'Running'}
     $arguments=@{
-        SessionState=$sessionState;AutomationEnabled=[bool]$engine.AutomationEnabled;CandidateCompatibleOptIn=[bool]$engine.CandidateCompatibleOptIn
-        HasOrdinary=[bool](@($HostState.Ordinary).Count -gt 0);ControllerRunning=[bool]($null -ne $HostState.WorkerSlot)
-        StateDamageBlocksActions=[bool]$engine.StateDamageBlocksActions;HasActiveTransaction=[bool]($null -ne $HostState.Journal);Reason=$HostState.Reason
+        ConnectionState=$connection;ProtectionState=$protection
+        Busy=[bool]($null-ne$HostState.WorkerSlot-or$lifecycleBusy-or$null-ne$HostState.Journal)
+        StateDamageBlocksActions=[bool]$engine.StateDamageBlocksActions
     }
     $presentation=Invoke-CcodSupervisorAdapter $Adapters.GetTrayPresentation @($arguments) 1
     if($null -eq $presentation){throw 'tray presentation is invalid'}

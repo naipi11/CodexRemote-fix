@@ -34,15 +34,7 @@ public enum TrayCommand : ushort
     SetLanguageEnglish = 2004,
     OpenLogs = 2005,
     ShowAbout = 2006,
-    Exit = 2007,
-
-    // Task 8 still compiles the pre-v2 native menu. These aliases are never
-    // accepted by TrayHostAction or decoded from the authenticated wire.
-    ApplyNow = 1001,
-    ManualRetry = 1002,
-    SetAutomation = 1003,
-    SetCandidateOptIn = 1004,
-    ConfirmUninstall = 1009
+    Exit = 2007
 }
 
 internal sealed class ProtocolViolationException : IOException

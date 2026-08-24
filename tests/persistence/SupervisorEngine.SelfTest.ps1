@@ -615,86 +615,37 @@ $results += Invoke-CcodTest 'reduces explicit null and empty completion inputs w
     }
 }
 
-$results += Invoke-CcodTest 'projects the complete semantic tray state matrix with a closed typed schema' {
-    $fields=@('Color','StateKey','SessionReadyVisible','ApplyNowVisible','ApplyNowEnabled','ManualRetryVisible','ManualRetryEnabled','AutomationToggleEnabled','AutomationChecked','CandidateOptInToggleEnabled','CandidateOptInChecked','OpenLogsEnabled','UninstallEnabled','Busy')
+$results += Invoke-CcodTest 'projects the truthful v2 connection and protection truth table' {
+    $fields=@('Color','ConnectionState','ProtectionState','RepairEnabled','LanguageEnabled','OpenLogsEnabled','AboutEnabled','ExitEnabled','Busy')
     $matrix=@(
-        @{State='Waiting';Color='Gray';StateKey='Waiting';Ready=$false;Apply=$true;Retry=$false;Busy=$false},
-        @{State='Inspecting';Color='Gray';StateKey='Inspecting';Ready=$false;Apply=$true;Retry=$false;Busy=$true},
-        @{State='Transitioning';Color='Gray';StateKey='Transitioning';Ready=$false;Apply=$true;Retry=$false;Busy=$true},
-        @{State='Active';Color='Green';StateKey='Active';Ready=$true;Apply=$false;Retry=$false;Busy=$false},
-        @{State='Suppressed';Color='Yellow';StateKey='Suppressed';Ready=$false;Apply=$true;Retry=$true;Busy=$false},
-        @{State='Recovered';Color='Red';StateKey='Recovered';Ready=$false;Apply=$true;Retry=$true;Busy=$false},
-        @{State='Error';Color='Red';StateKey='Error';Ready=$false;Apply=$true;Retry=$true;Busy=$false}
+        @{Connection='WaitingForCodex';Color='Gray';Repair=$false},
+        @{Connection='Checking';Color='Yellow';Repair=$false},
+        @{Connection='Connected';Color='Green';Repair=$false},
+        @{Connection='RepairNeeded';Color='Yellow';Repair=$true},
+        @{Connection='Error';Color='Red';Repair=$false}
     )
     foreach($case in $matrix){
-        $view=Get-CcodTrayPresentation -SessionState $case.State -AutomationEnabled $true -CandidateCompatibleOptIn $false -HasOrdinary $case.Apply -ControllerRunning $false -StateDamageBlocksActions $false -HasActiveTransaction $false
-        Assert-CcodPropertyOrder $view $fields "$($case.State) semantic tray schema order"
-        Assert-CcodExactEqual $case.Color $view.Color "$($case.State) color"
-        Assert-CcodExactEqual $case.StateKey $view.StateKey "$($case.State) localization key suffix"
-        Assert-CcodExactEqual $case.Ready $view.SessionReadyVisible "$($case.State) ready row visibility"
-        Assert-CcodExactEqual $case.Apply $view.ApplyNowVisible "$($case.State) apply visibility"
-        Assert-CcodExactEqual $case.Retry $view.ManualRetryVisible "$($case.State) retry visibility"
-        Assert-CcodExactEqual $case.Busy $view.Busy "$($case.State) busy state"
-        Assert-CcodTrue (@('Waiting','Inspecting','Transitioning','Active','ActivePaused','Suppressed','Recovered','Error') -ccontains $view.StateKey) "$($case.State) StateKey is closed"
-        Assert-CcodTrue (@('Gray','Green','Yellow','Red') -ccontains $view.Color) "$($case.State) Color is closed"
-        foreach($field in $fields | Where-Object { $_ -notin @('Color','StateKey') }) { Assert-CcodTrue ($view.$field -is [bool]) "$($case.State) $field is Boolean" }
+        $view=Get-CcodTrayPresentation -ConnectionState $case.Connection -ProtectionState Running -Busy:$false -StateDamageBlocksActions:$false
+        Assert-CcodPropertyOrder $view $fields "$($case.Connection) v2 presentation has the exact ordered contract"
+        Assert-CcodExactEqual $case.Connection $view.ConnectionState "$($case.Connection) remains a direct current-evidence projection"
+        Assert-CcodExactEqual 'Running' $view.ProtectionState "$($case.Connection) preserves current protection state"
+        Assert-CcodExactEqual $case.Color $view.Color "$($case.Connection) color"
+        Assert-CcodExactEqual $case.Repair $view.RepairEnabled "$($case.Connection) repair eligibility"
+        Assert-CcodExactEqual $true $view.OpenLogsEnabled "$($case.Connection) retains logs"
+        Assert-CcodExactEqual $true $view.AboutEnabled "$($case.Connection) retains About"
     }
-
-    $paused=Get-CcodTrayPresentation -SessionState Active -AutomationEnabled $false -CandidateCompatibleOptIn $true -HasOrdinary $false -ControllerRunning $false -StateDamageBlocksActions $false -HasActiveTransaction $false
-    Assert-CcodExactEqual 'Green' $paused.Color 'paused active color'
-    Assert-CcodExactEqual 'ActivePaused' $paused.StateKey 'paused active localization key suffix'
-    Assert-CcodExactEqual $true $paused.SessionReadyVisible 'paused active keeps ready row shown'
-    Assert-CcodExactEqual $false $paused.ApplyNowVisible 'paused active hides irrelevant apply action'
-    Assert-CcodExactEqual $false $paused.AutomationChecked 'paused active mirrors automation input'
-    Assert-CcodExactEqual $true $paused.CandidateOptInChecked 'paused active keeps candidate opt-in independent'
-
-    $handoff=Get-CcodTrayPresentation -SessionState Active -AutomationEnabled $true -CandidateCompatibleOptIn $false -HasOrdinary $false -ControllerRunning $false -StateDamageBlocksActions $false -HasActiveTransaction $false -Reason 'RendererHandoff'
-    Assert-CcodExactEqual 'Yellow' $handoff.Color 'failed optional External renderer handoff uses a warning color'
-    Assert-CcodExactEqual 'RendererHandoff' $handoff.StateKey 'failed optional External renderer handoff exposes its localized status key'
-    Assert-CcodExactEqual $true $handoff.SessionReadyVisible 'failed optional External renderer handoff keeps the session ready'
-    Assert-CcodExactEqual $false $handoff.Busy 'failed optional External renderer handoff is not a controller busy state'
-
-    $waiting=Get-CcodTrayPresentation -SessionState Waiting -AutomationEnabled $true -CandidateCompatibleOptIn $false -HasOrdinary $true -ControllerRunning $false -StateDamageBlocksActions $false -HasActiveTransaction $false
-    Assert-CcodExactEqual $true $waiting.ApplyNowEnabled 'waiting enables an available explicit check'
-
-    foreach($state in @('Suppressed','Recovered','Error')){
-        $retry=Get-CcodTrayPresentation -SessionState $state -AutomationEnabled $true -CandidateCompatibleOptIn $false -HasOrdinary $true -ControllerRunning $false -StateDamageBlocksActions $false -HasActiveTransaction $false
-        Assert-CcodExactEqual $true $retry.ManualRetryEnabled "$state enables an available manual retry"
+    foreach($protection in @('Running','Reconnecting','Stopping')){
+        $view=Get-CcodTrayPresentation -ConnectionState RepairNeeded -ProtectionState $protection -Busy:$false -StateDamageBlocksActions:$false
+        Assert-CcodExactEqual $protection $view.ProtectionState "$protection is independently truthful"
     }
-}
-
-$results += Invoke-CcodTest 'keeps tray action presentation safe through busy transitions and suppression' {
-    $busy=Get-CcodTrayPresentation -SessionState Recovered -AutomationEnabled $true -CandidateCompatibleOptIn $true -HasOrdinary $true -ControllerRunning $true -StateDamageBlocksActions $false -HasActiveTransaction $false
-    Assert-CcodExactEqual $false $busy.ApplyNowEnabled 'busy worker disables apply now'
-    Assert-CcodExactEqual $true $busy.ManualRetryVisible 'failed repair remains represented while busy'
-    Assert-CcodExactEqual $false $busy.ManualRetryEnabled 'busy worker disables manual retry'
-    Assert-CcodExactEqual $false $busy.UninstallEnabled 'busy worker disables uninstall'
-    Assert-CcodExactEqual $true $busy.Busy 'busy mirrors worker activity'
-    Assert-CcodExactEqual $true $busy.AutomationToggleEnabled 'automation toggle remains independently enabled'
-    Assert-CcodExactEqual $true $busy.CandidateOptInToggleEnabled 'candidate toggle remains independently enabled'
-    Assert-CcodExactEqual $true $busy.OpenLogsEnabled 'logs remain available'
-
-    $transition=Get-CcodTrayPresentation -SessionState Transitioning -AutomationEnabled $true -CandidateCompatibleOptIn $true -HasOrdinary $true -ControllerRunning $false -StateDamageBlocksActions $false -HasActiveTransaction $false
-    Assert-CcodExactEqual $true $transition.Busy 'transition state is busy without a worker race'
-    Assert-CcodExactEqual $false $transition.ApplyNowEnabled 'transition state disables apply now'
-    Assert-CcodExactEqual $false $transition.ManualRetryEnabled 'transition state disables manual retry'
-    Assert-CcodExactEqual $false $transition.UninstallEnabled 'transition state disables uninstall'
-
-    $transaction=Get-CcodTrayPresentation -SessionState Suppressed -AutomationEnabled $false -CandidateCompatibleOptIn $true -HasOrdinary $true -ControllerRunning $false -StateDamageBlocksActions $false -HasActiveTransaction $true
-    Assert-CcodExactEqual $true $transaction.Busy 'active transaction is busy'
-    Assert-CcodExactEqual $false $transaction.ApplyNowEnabled 'active transaction disables apply now'
-    Assert-CcodExactEqual $false $transaction.ManualRetryEnabled 'active transaction disables retry'
-    Assert-CcodExactEqual $false $transaction.UninstallEnabled 'active transaction disables uninstall'
-
-    $damaged=Get-CcodTrayPresentation -SessionState Error -AutomationEnabled $true -CandidateCompatibleOptIn $false -HasOrdinary $true -ControllerRunning $false -StateDamageBlocksActions $true -HasActiveTransaction $false -Reason 'StateDamaged'
-    Assert-CcodExactEqual $false $damaged.ApplyNowEnabled 'state damage disables apply now'
-    Assert-CcodExactEqual $false $damaged.ManualRetryEnabled 'safety suppression does not become retryable through presentation'
-}
-
-$results += Invoke-CcodTest 'rejects case-variant tray states coercive flags and unsafe reasons' {
-    Assert-CcodThrows { Get-CcodTrayPresentation -SessionState active -AutomationEnabled $true -CandidateCompatibleOptIn $true -HasOrdinary $false -ControllerRunning $false -StateDamageBlocksActions $false -HasActiveTransaction $false | Out-Null } 'CCOD_TRAY_INPUT_INVALID'
-    Assert-CcodThrows { Get-CcodTrayPresentation -SessionState Active -AutomationEnabled 'true' -CandidateCompatibleOptIn $true -HasOrdinary $false -ControllerRunning $false -StateDamageBlocksActions $false -HasActiveTransaction $false | Out-Null } 'CCOD_TRAY_INPUT_INVALID'
-    Assert-CcodThrows { Get-CcodTrayPresentation -SessionState Error -AutomationEnabled $true -CandidateCompatibleOptIn $true -HasOrdinary $false -ControllerRunning $false -StateDamageBlocksActions $false -HasActiveTransaction $false -Reason "raw`nsecret" | Out-Null } 'CCOD_TRAY_INPUT_INVALID'
+    $busy=Get-CcodTrayPresentation -ConnectionState RepairNeeded -ProtectionState Reconnecting -Busy:$true -StateDamageBlocksActions:$false
+    Assert-CcodExactEqual $false $busy.RepairEnabled 'busy lifecycle disables repair'
+    Assert-CcodExactEqual $false $busy.LanguageEnabled 'busy lifecycle disables language changes'
+    Assert-CcodExactEqual $false $busy.ExitEnabled 'busy lifecycle disables exit'
+    $damaged=Get-CcodTrayPresentation -ConnectionState RepairNeeded -ProtectionState Running -Busy:$false -StateDamageBlocksActions:$true
+    Assert-CcodExactEqual $false $damaged.RepairEnabled 'state damage disables repair'
+    Assert-CcodExactEqual $false $damaged.LanguageEnabled 'state damage disables language changes'
+    Assert-CcodExactEqual $false $damaged.ExitEnabled 'state damage disables exit'
 }
 
 $results += Invoke-CcodTest 'contains no reachable process package registry WMI task UI port Node or file command' {

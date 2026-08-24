@@ -13,9 +13,9 @@ internal static class TrayHostParentClientSelfTest
 
     private static PresentationSnapshot Snapshot(ulong revision)
     {
-        string[] strings = new string[20];
+        string[] strings = new string[16];
         for (int i = 0; i < strings.Length; i++) { strings[i] = "string-" + i; }
-        return new PresentationSnapshot(revision, TrayColor.Green, TrayState.Active, LanguageMode.Chinese, PresentationFlags.OpenLogsEnabled, strings);
+        return new PresentationSnapshot(revision, TrayColor.Green, ConnectionState.Connected, ProtectionState.Running, LanguageMode.Chinese, PresentationFlags.OpenLogsEnabled, strings);
     }
 
     private static Process StartPeer(ProcessStartInfo requested)

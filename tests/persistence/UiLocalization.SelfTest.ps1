@@ -36,8 +36,8 @@ function Write-CcodUiFixtureJson {
 
 function New-CcodUiReorderedStrings {
     param($Strings)
-    $reordered=[ordered]@{'Status.Waiting'=$Strings.'Status.Waiting';'Tray.Title'=$Strings.'Tray.Title'}
-    foreach($property in $Strings.PSObject.Properties){if($property.Name -cne 'Status.Waiting' -and $property.Name -cne 'Tray.Title'){$reordered[$property.Name]=$property.Value}}
+    $reordered=[ordered]@{'Connection.WaitingForCodex'=$Strings.'Connection.WaitingForCodex';'Tray.Title'=$Strings.'Tray.Title'}
+    foreach($property in $Strings.PSObject.Properties){if($property.Name -cne 'Connection.WaitingForCodex' -and $property.Name -cne 'Tray.Title'){$reordered[$property.Name]=$property.Value}}
     return [pscustomobject]$reordered
 }
 
@@ -63,6 +63,17 @@ $results.Add((Invoke-CcodTest 'resolves exact locales and exposes a fixed catalo
     Assert-CcodEqual 'Follow system (zh-CN)' (Get-CcodUiString -Catalog $en -Key 'Menu.FollowSystem' -Arguments @('zh-CN')) 'formats bounded catalog string'
 }))
 
+$results.Add((Invoke-CcodTest 'requires the v2 connection protection and exit catalog surface' {
+    $resources=Join-Path $repositoryRoot 'src\persistence\resources'
+    $catalog=Get-CcodUiCatalog -ResourcesRoot $resources -LanguageMode en-US -SystemCultureName en-US
+    foreach($key in @('Connection.WaitingForCodex','Connection.Checking','Connection.Connected','Connection.RepairNeeded','Connection.Error','Protection.Running','Protection.Reconnecting','Protection.Stopping','Menu.CheckAndRepair','Menu.Exit','Dialog.ExitTitle','Dialog.ExitMessage','Error.ActionFailed')){
+        Assert-CcodTrue ($null-ne$catalog.Strings.PSObject.Properties[$key]) "catalog has $key"
+    }
+    foreach($removed in @('Menu.Automation','Menu.CandidateOptIn','Menu.ManualRetry','Menu.Uninstall','Dialog.UninstallTitle','Dialog.UninstallMessage')){
+        Assert-CcodTrue ($null-eq$catalog.Strings.PSObject.Properties[$removed]) "catalog removes $removed"
+    }
+}))
+
 $results.Add((Invoke-CcodTest 'rejects malformed catalog fixtures and falls back only through validated English' {
     $resources=New-CcodUiFixture
     try {
@@ -84,7 +95,7 @@ $results.Add((Invoke-CcodTest 'rejects malformed catalog fixtures and falls back
             Reset-CcodUiFixture $resources
             $pristineEnglish=Get-CcodUiCatalog -ResourcesRoot $resources -LanguageMode en-US -SystemCultureName en-US
             Assert-CcodEqual 'en-US' $pristineEnglish.EffectiveLocale "$($case.Name) starts with a valid English fallback fixture"
-            Assert-CcodEqual 'Codex Device Connection' (Get-CcodUiString -Catalog $pristineEnglish -Key 'Tray.Title') "$($case.Name) English fixture uses the hand-derived title"
+            Assert-CcodEqual 'CodexRemote-fix' (Get-CcodUiString -Catalog $pristineEnglish -Key 'Tray.Title') "$($case.Name) English fixture uses the hand-derived title"
             $pristineChinese=Get-CcodUiCatalog -ResourcesRoot $resources -LanguageMode zh-CN -SystemCultureName en-US
             Assert-CcodEqual 'zh-CN' $pristineChinese.EffectiveLocale "$($case.Name) starts with a valid selected Chinese fixture"
             if($case.ContainsKey('Text')){Set-CcodUiFixtureText $resources 'ui.zh-CN.json' $case.Text}
@@ -93,7 +104,7 @@ $results.Add((Invoke-CcodTest 'rejects malformed catalog fixtures and falls back
             $catalog=Get-CcodUiCatalog -ResourcesRoot $resources -LanguageMode zh-CN -SystemCultureName en-US
             Assert-CcodEqual 'en-US' $catalog.EffectiveLocale "$($case.Name) selected Chinese falls back to English"
             Assert-CcodEqual $false $catalog.UsedEmergencyCatalog "$($case.Name) uses validated English"
-            Assert-CcodEqual 'Codex Device Connection' (Get-CcodUiString -Catalog $catalog -Key 'Tray.Title') "$($case.Name) returns the hand-derived English fallback title"
+            Assert-CcodEqual 'CodexRemote-fix' (Get-CcodUiString -Catalog $catalog -Key 'Tray.Title') "$($case.Name) returns the hand-derived English fallback title"
         }
         Reset-CcodUiFixture $resources
         $valid=[IO.File]::ReadAllText((Join-Path $resources 'ui.zh-CN.json'),[Text.UTF8Encoding]::new($false))

@@ -34,4 +34,12 @@ Invoke-CcodTest 'TrayHost client maps only v2 actions and returns correlated act
     Assert-CcodTrue ($receive -cnotmatch 'ConfirmUninstall|SetCandidateOptIn|SetAutomation|ApplyNow|ManualRetry') 'receive path does not expose legacy wire actions'
 }
 
+Invoke-CcodTest 'TrayHost client emits the fixed v2 connection protection snapshot fields' {
+    $source = Get-Content -LiteralPath $modulePath -Raw -Encoding UTF8
+    Assert-CcodTrue ($source -cmatch 'Convert-CcodTrayHostConnection') 'snapshot converts the v2 connection state'
+    Assert-CcodTrue ($source -cmatch 'Convert-CcodTrayHostProtection') 'snapshot converts the v2 protection state'
+    Assert-CcodTrue ($source -cmatch 'ConnectionState') 'snapshot carries the current connection state'
+    Assert-CcodTrue ($source -cmatch 'ProtectionState') 'snapshot carries the current protection state'
+}
+
 Write-Host 'TrayHost client self-tests passed.'

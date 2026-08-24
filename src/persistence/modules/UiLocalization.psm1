@@ -2,35 +2,23 @@ Set-StrictMode -Version Latest
 
 $script:CcodUiModes=@('System','zh-CN','en-US')
 $script:CcodUiKeys=@(
-  'Tray.Title','Status.Waiting','Status.Inspecting','Status.Transitioning','Status.Active','Status.ActivePaused','Status.Suppressed','Status.Recovered','Status.Error','Status.RendererHandoff',
-  'Tooltip.Waiting','Tooltip.Inspecting','Tooltip.Transitioning','Tooltip.Active','Tooltip.ActivePaused','Tooltip.Suppressed','Tooltip.Recovered','Tooltip.Error',
-  'Menu.SessionReady','Menu.ApplyNow','Menu.ManualRetry','Menu.Automation','Menu.CandidateOptIn','Menu.Language','Menu.FollowSystem','Menu.Chinese','Menu.English','Menu.OpenLogs','Menu.About','Menu.AboutVersion','Menu.Uninstall',
-  'Dialog.UninstallTitle','Dialog.UninstallMessage','Error.UninstallStart','Error.LanguageChange'
+  'Tray.Title',
+  'Connection.WaitingForCodex','Connection.Checking','Connection.Connected','Connection.RepairNeeded','Connection.Error',
+  'Protection.Running','Protection.Reconnecting','Protection.Stopping',
+  'Menu.CheckAndRepair','Menu.Language','Menu.FollowSystem','Menu.Chinese','Menu.English','Menu.OpenLogs','Menu.About','Menu.AboutVersion','Menu.Exit',
+  'Dialog.ExitTitle','Dialog.ExitMessage','Error.ActionFailed','Error.LanguageChange'
 )
 $script:CcodUiEmergencyEnglish=[ordered]@{
-  'Tray.Title'='Codex Device Connection'
-  'Status.Waiting'='Waiting for Codex'
-  'Status.Inspecting'='Inspecting current Codex'
-  'Status.Transitioning'='Applying compatibility bridge'
-  'Status.Active'=(([char]0x201c)+'Control other devices'+([char]0x201d)+' is active for this session')
-  'Status.ActivePaused'='Current session is active; automatic repair is paused'
-  'Status.Suppressed'='Compatibility action is suppressed'
-  'Status.Recovered'='Ordinary Codex restored after safe recovery'
-  'Status.Error'='Automatic actions blocked; review logs'
-  'Status.RendererHandoff'='External renderer handoff was not completed; Codex remains active'
-  'Tooltip.Waiting'='Codex device connection: waiting'
-  'Tooltip.Inspecting'='Codex device connection: inspecting'
-  'Tooltip.Transitioning'='Codex device connection: applying bridge'
-  'Tooltip.Active'='Codex device connection: working'
-  'Tooltip.ActivePaused'='Codex connection active; automation paused'
-  'Tooltip.Suppressed'='Codex connection action suppressed'
-  'Tooltip.Recovered'='Codex restored after safe recovery'
-  'Tooltip.Error'='Codex connection actions blocked'
-  'Menu.SessionReady'='Current session is ready'
-  'Menu.ApplyNow'='Check and repair now'
-  'Menu.ManualRetry'='Retry last repair'
-  'Menu.Automation'='Repair new sessions automatically'
-  'Menu.CandidateOptIn'='Allow compatible update trials'
+  'Tray.Title'='CodexRemote-fix'
+  'Connection.WaitingForCodex'='Connection: Waiting for Codex'
+  'Connection.Checking'='Connection: Checking'
+  'Connection.Connected'='Connection: Connected'
+  'Connection.RepairNeeded'='Connection: Repair needed'
+  'Connection.Error'='Connection: Error'
+  'Protection.Running'='Protection: Running'
+  'Protection.Reconnecting'='Protection: Reconnecting'
+  'Protection.Stopping'='Protection: Stopping'
+  'Menu.CheckAndRepair'='Check and repair remote connection'
   'Menu.Language'=('Language / '+[char]0x8bed+[char]0x8a00)
   'Menu.FollowSystem'='Follow system ({0})'
   'Menu.Chinese'=([char]0x4e2d+[char]0x6587)
@@ -38,10 +26,10 @@ $script:CcodUiEmergencyEnglish=[ordered]@{
   'Menu.OpenLogs'='Open logs'
   'Menu.About'='About'
   'Menu.AboutVersion'='CodexRemote-fix | Version {0}'
-  'Menu.Uninstall'=('Uninstall supervisor'+[char]0x2026)
-  'Dialog.UninstallTitle'='Uninstall Codex connection supervisor?'
-  'Dialog.UninstallMessage'='This stops the supervisor. A managed Codex session will restart normally. Device keys are kept by default.'
-  'Error.UninstallStart'='Could not start the uninstaller. Review logs.'
+  'Menu.Exit'='Exit'
+  'Dialog.ExitTitle'='Exit CodexRemote-fix?'
+  'Dialog.ExitMessage'='Remote control will stop and Codex may restart in normal mode before CodexRemote-fix exits.'
+  'Error.ActionFailed'='The requested action could not be completed.'
   'Error.LanguageChange'='Could not change language. The previous language remains active.'
 }
 

@@ -173,7 +173,7 @@ function New-CcodSupervisorFake {
     $adapters.GetSupervisorDecision={param($Context)$world.Calls.Add('Decision');$world.Decision}.GetNewClosure()
     $adapters.AddObservedEvent={param($Observed,$Pid,$Created)$world.Calls.Add("Observed:$Pid");$true}.GetNewClosure()
     $adapters.CompleteControllerRun={param($Result,$TransactionId,$Action,$RuntimeId)$world.Calls.Add("Reduce:$Action");[pscustomobject][ordered]@{SessionState='Idle';BlockAutomaticActions=$false;AttemptKey=$null;RecoveryIgnoreKey=$null;SuppressionKey=$null;ErrorCode=$null;Reason='Reduced'}}.GetNewClosure()
-    $adapters.GetTrayPresentation={param($Arguments)$world.PresentationInputs.Add($Arguments);[pscustomobject][ordered]@{Color='Gray';StateKey='Waiting';SessionReadyVisible=$false;ApplyNowVisible=$true;ApplyNowEnabled=$true;ManualRetryVisible=$false;ManualRetryEnabled=$false;AutomationToggleEnabled=$true;AutomationChecked=[bool]$Arguments.AutomationEnabled;CandidateOptInToggleEnabled=$true;CandidateOptInChecked=[bool]$Arguments.CandidateCompatibleOptIn;OpenLogsEnabled=$true;UninstallEnabled=$false;Busy=$false}}.GetNewClosure()
+    $adapters.GetTrayPresentation={param($Arguments)$world.PresentationInputs.Add($Arguments);[pscustomobject][ordered]@{Color='Gray';ConnectionState=$Arguments.ConnectionState;ProtectionState=$Arguments.ProtectionState;RepairEnabled=$false;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true;Busy=[bool]$Arguments.Busy}}.GetNewClosure()
     $adapters.NewQueue={param($Kind)$world.Calls.Add("Queue:$Kind");if($Kind -ceq 'Command'){Write-Output -NoEnumerate $world.CommandQueue}else{Write-Output -NoEnumerate $world.EventQueue}}.GetNewClosure()
     $adapters.GetQueueCount={param($Queue)[int]$Queue.Count}.GetNewClosure()
     $adapters.TryDequeue={param($Queue)$world.TryDequeueSawRealQueue=[object]::ReferenceEquals($Queue,$world.CommandQueue);if($Queue.Count){[pscustomobject][ordered]@{Succeeded=$true;Value=$Queue.Dequeue()}}else{[pscustomobject][ordered]@{Succeeded=$false;Value=$null}}}.GetNewClosure()
@@ -623,8 +623,8 @@ Invoke-CcodTest 'reclaims exact stale lifecycle worker framing left by a killed 
 Invoke-CcodTest 'treats error-free CancelledBeforeClose as successful already-satisfied completion without mutation' {
     foreach($case in @(
         [pscustomobject]@{Kind='CheckAndRepair';Observation='RemoteVerified';Connection='Connected';Id='40000000-0000-0000-0000-000000000001'},
-        [pscustomobject]@{Kind='SafeExit';Observation='Ordinary';Connection='Ordinary';Id='40000000-0000-0000-0000-000000000002'},
-        [pscustomobject]@{Kind='SafeExit';Observation='NoCodex';Connection='Disconnected';Id='40000000-0000-0000-0000-000000000003'}
+        [pscustomobject]@{Kind='SafeExit';Observation='Ordinary';Connection='RepairNeeded';Id='40000000-0000-0000-0000-000000000002'},
+        [pscustomobject]@{Kind='SafeExit';Observation='NoCodex';Connection='WaitingForCodex';Id='40000000-0000-0000-0000-000000000003'}
     )){
         $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
         $request=New-CcodPersistedLifecycleRequest -Kind $case.Kind -TransactionId $case.Id
@@ -1118,7 +1118,7 @@ Invoke-CcodTest 'routes repair and apply decisions into durable lifecycle while 
     }
 }
 
-Invoke-CcodTest 'false migration preferences remain truthful in presentation while guardian Apply proceeds' {
+Invoke-CcodTest 'false migration preferences do not become tray presentation authority while guardian Apply proceeds' {
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
     $hostState.State.AutomationEnabled=$false;$hostState.State.AutomaticCandidateTrialsAllowed=$false
     $hostState.State.Settings.candidateCompatibleOptIn=$false
@@ -1130,8 +1130,18 @@ Invoke-CcodTest 'false migration preferences remain truthful in presentation whi
     Assert-CcodTrue ($null-ne$hostState.LifecycleRequest -and $hostState.LifecycleRequest.kind-ceq'CheckAndRepair') 'guardian creates the durable Apply lifecycle despite false migration values'
     Assert-CcodTrue ($world.PresentationInputs.Count-gt0) 'one truthful presentation input is projected'
     $presentationInput=$world.PresentationInputs[$world.PresentationInputs.Count-1]
-    Assert-CcodEqual $false $presentationInput.AutomationEnabled 'presentation preserves persisted false automation migration value'
-    Assert-CcodEqual $false $presentationInput.CandidateCompatibleOptIn 'presentation preserves persisted false candidate migration value'
+    Assert-CcodEqual 'RepairNeeded' $presentationInput.ConnectionState 'current ordinary evidence projects repair-needed independently of migration flags'
+    Assert-CcodTrue ($null-eq$presentationInput.PSObject.Properties['AutomationEnabled'] -and $null-eq$presentationInput.PSObject.Properties['CandidateCompatibleOptIn']) 'presentation excludes migration-only preference authority'
+}
+
+Invoke-CcodTest 'projects a durable lifecycle as reconnecting protection' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $hostState.ConnectionState='RepairNeeded';$hostState.LifecycleRequest=New-CcodPersistedLifecycleRequest -Kind CheckAndRepair
+    Set-CcodSupervisorCurrentTrayPresentation $hostState $fixture.Fake.Adapters
+    $input=$world.PresentationInputs[$world.PresentationInputs.Count-1]
+    Assert-CcodEqual 'RepairNeeded' $input.ConnectionState 'presentation keeps the current connection evidence'
+    Assert-CcodEqual 'Reconnecting' $input.ProtectionState 'active durable lifecycle is presented as reconnecting protection'
+    Assert-CcodEqual $true $input.Busy 'active durable lifecycle is presented as busy'
 }
 
 Invoke-CcodTest 'Apply controller request carries the full process snapshot source' {
@@ -1471,15 +1481,16 @@ Invoke-CcodTest 'keeps the External renderer handoff warning visible across ordi
     $hostState.SessionState='Active';$hostState.Reason='RendererHandoff';$hostState.ForceReconcile=$false;$hostState.NextReconcileMilliseconds=[long]3000
     $world.Elapsed.Enqueue([long]0)
     $world.Decision=[pscustomobject][ordered]@{Action='KeepSpecial';Reason='SpecialActive';Target=$null;AttemptKey=$null;SuppressionKey=$null;EffectiveClassification='Verified';RequiresController=$false}
-    $seen=[pscustomobject]@{Reason=$null}
+    $hostState.ConnectionState='WaitingForCodex'
+    $seen=[pscustomobject]@{Connection=$null}
     $fixture.Fake.Adapters.GetTrayPresentation={
         param($Arguments)
-        $seen.Reason=$Arguments.Reason
-        [pscustomobject][ordered]@{Color='Yellow';StateKey='RendererHandoff';SessionReadyVisible=$true;ApplyNowVisible=$false;ApplyNowEnabled=$false;ManualRetryVisible=$false;ManualRetryEnabled=$false;AutomationToggleEnabled=$true;AutomationChecked=$true;CandidateOptInToggleEnabled=$true;CandidateOptInChecked=$false;OpenLogsEnabled=$true;UninstallEnabled=$true;Busy=$false}
+        $seen.Connection=$Arguments.ConnectionState
+        [pscustomobject][ordered]@{Color='Gray';ConnectionState=$Arguments.ConnectionState;ProtectionState=$Arguments.ProtectionState;RepairEnabled=$false;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true;Busy=$false}
     }.GetNewClosure()
     Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
     Assert-CcodEqual 'RendererHandoff' $hostState.Reason 'ordinary active reconciliation does not erase the handoff warning'
-    Assert-CcodEqual 'RendererHandoff' $seen.Reason 'tray projection receives the persisted handoff warning'
+    Assert-CcodEqual 'WaitingForCodex' $seen.Connection 'tray projection uses current connection evidence rather than a historical handoff reason'
 }
 
 Write-Output "Supervisor self-tests passed: $($results.Count)"

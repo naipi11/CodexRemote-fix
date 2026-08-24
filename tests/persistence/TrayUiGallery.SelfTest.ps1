@@ -18,7 +18,7 @@ $results.Add((Invoke-CcodTest 'gallery script exists and parses as PowerShell' {
 $results.Add((Invoke-CcodTest 'gallery exposes strict locale and state choices' {
     $source = [IO.File]::ReadAllText($galleryPath, [Text.UTF8Encoding]::new($false))
     Assert-CcodTrue ($source -match "\[ValidateSet\('All','zh-CN','en-US'\)\]\s*\[string\]\s*\`$Locale") 'locale uses the exact gallery choices'
-    Assert-CcodTrue ($source -match "\[ValidateSet\('All','Waiting','Active','Suppressed','Error'\)\]\s*\[string\]\s*\`$State") 'state uses the exact gallery choices'
+    Assert-CcodTrue ($source -match "\[ValidateSet\('All','WaitingForCodex','Checking','Connected','RepairNeeded','Error'\)\]\s*\[string\]\s*\`$State") 'state uses the exact v2 gallery choices'
     Assert-CcodTrue ($source -match '\[ValidateRange\(1,600\)\]\s*\[int\]\s*\$DurationSeconds') 'duration has a bounded range'
     Assert-CcodTrue ($source -match '\[switch\]\s*\$OpenMenu') 'optional screenshot menu switch is explicit'
 }))
@@ -30,7 +30,9 @@ $results.Add((Invoke-CcodTest 'gallery owns tray lifetime and declares its visua
         'New-CcodTrayContext',
         'Set-CcodTrayPresentation',
         'Close-CcodTrayContext',
-        'Visual-only'
+        'Visual-only legacy diagnostic',
+        'ConnectionState',
+        'ProtectionState'
     )) {
         Assert-CcodTrue ($source.Contains($required)) "gallery contains $required"
     }

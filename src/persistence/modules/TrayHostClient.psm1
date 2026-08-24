@@ -18,65 +18,56 @@ function Import-CcodTrayHostAssembly {
 function Convert-CcodTrayHostColor([string]$Value) {
     switch($Value){'Green'{return [TrayColor]::Green}'Yellow'{return [TrayColor]::Yellow}'Red'{return [TrayColor]::Red}default{return [TrayColor]::Gray}}
 }
-function Convert-CcodTrayHostState([string]$Value) {
-    switch($Value){'Inspecting'{return [TrayState]::Inspecting}'Transitioning'{return [TrayState]::Transitioning}'Active'{return [TrayState]::Active}'ActivePaused'{return [TrayState]::ActivePaused}'RendererHandoff'{return [TrayState]::RendererHandoff}'Suppressed'{return [TrayState]::Suppressed}'Recovered'{return [TrayState]::Recovered}'Error'{return [TrayState]::Error}default{return [TrayState]::Waiting}}
+function Convert-CcodTrayHostConnection([string]$Value) {
+    switch($Value){'WaitingForCodex'{return [ConnectionState]::WaitingForCodex}'Checking'{return [ConnectionState]::Checking}'Connected'{return [ConnectionState]::Connected}'RepairNeeded'{return [ConnectionState]::RepairNeeded}'Error'{return [ConnectionState]::Error}default{return [ConnectionState]::WaitingForCodex}}
+}
+function Convert-CcodTrayHostProtection([string]$Value) {
+    switch($Value){'Running'{return [ProtectionState]::Running}'Reconnecting'{return [ProtectionState]::Reconnecting}'Stopping'{return [ProtectionState]::Stopping}default{return [ProtectionState]::Running}}
 }
 
 function New-CcodTrayHostSnapshot {
     param($Presentation,$Catalog,[string]$LanguageMode,[string]$SystemCultureName,[UInt64]$Revision,[string]$RuntimeId)
     $flags=[PresentationFlags]::None
     $flagMap=@{
-        SessionReadyVisible=[PresentationFlags]::SessionReadyVisible;ApplyNowVisible=[PresentationFlags]::ApplyNowVisible;ApplyNowEnabled=[PresentationFlags]::ApplyNowEnabled
-        ManualRetryVisible=[PresentationFlags]::ManualRetryVisible;ManualRetryEnabled=[PresentationFlags]::ManualRetryEnabled;AutomationToggleEnabled=[PresentationFlags]::AutomationToggleEnabled
-        AutomationChecked=[PresentationFlags]::AutomationChecked;CandidateOptInToggleEnabled=[PresentationFlags]::CandidateOptInToggleEnabled;CandidateOptInChecked=[PresentationFlags]::CandidateOptInChecked
-        OpenLogsEnabled=[PresentationFlags]::OpenLogsEnabled;UninstallEnabled=[PresentationFlags]::UninstallEnabled;Busy=[PresentationFlags]::Busy
+        RepairEnabled=[PresentationFlags]::RepairEnabled;LanguageEnabled=[PresentationFlags]::LanguageEnabled;OpenLogsEnabled=[PresentationFlags]::OpenLogsEnabled
+        AboutEnabled=[PresentationFlags]::AboutEnabled;ExitEnabled=[PresentationFlags]::ExitEnabled;Busy=[PresentationFlags]::Busy
     }
-    foreach($pair in @(
-        @('SessionReadyVisible','SessionReadyVisible'),@('ApplyNowVisible','ApplyNowVisible'),@('ApplyNowEnabled','ApplyNowEnabled'),
-        @('ManualRetryVisible','ManualRetryVisible'),@('ManualRetryEnabled','ManualRetryEnabled'),@('AutomationToggleEnabled','AutomationToggleEnabled'),
-        @('AutomationChecked','AutomationChecked'),@('CandidateOptInToggleEnabled','CandidateOptInToggleEnabled'),@('CandidateOptInChecked','CandidateOptInChecked'),
-        @('OpenLogsEnabled','OpenLogsEnabled'),@('UninstallEnabled','UninstallEnabled'),@('Busy','Busy'))){
+    foreach($pair in @(@('RepairEnabled','RepairEnabled'),@('LanguageEnabled','LanguageEnabled'),@('OpenLogsEnabled','OpenLogsEnabled'),@('AboutEnabled','AboutEnabled'),@('ExitEnabled','ExitEnabled'),@('Busy','Busy'))){
         if($Presentation.($pair[0]) -is [bool] -and $Presentation.($pair[0])){$flags=[PresentationFlags]([int]$flags -bor [int]$flagMap[$pair[1]])}
     }
-    $stateKey=[string]$Presentation.StateKey
+    $connection=[string]$Presentation.ConnectionState;$protection=[string]$Presentation.ProtectionState
     $systemLanguage=if([string]$SystemCultureName -cmatch '^zh(?:-|$)'){$Catalog.Strings.'Menu.Chinese'}else{$Catalog.Strings.'Menu.English'}
     $follow=Get-CcodUiString -Catalog $Catalog -Key 'Menu.FollowSystem' -Arguments @($systemLanguage)
-    $tooltipKey='Tooltip.'+$stateKey
-    $tooltip=if($null -ne $Catalog.Strings.PSObject.Properties[$tooltipKey]){$Catalog.Strings.$tooltipKey}else{$Catalog.Strings.'Tooltip.Waiting'}
     $projectVersion='unknown'
     if($RuntimeId -is [string] -and $RuntimeId -cmatch '^(?<version>\d+\.\d+\.\d+)-'){$projectVersion=$Matches['version']}
     $aboutVersion=Get-CcodUiString -Catalog $Catalog -Key 'Menu.AboutVersion' -Arguments @($projectVersion)
     $strings=[string[]]@(
         $Catalog.Strings.'Tray.Title',
-        $Catalog.Strings.('Status.'+$stateKey),
-        $Catalog.Strings.'Menu.SessionReady',
-        $Catalog.Strings.'Menu.ApplyNow',
-        $Catalog.Strings.'Menu.ManualRetry',
-        $Catalog.Strings.'Menu.Automation',
-        $Catalog.Strings.'Menu.CandidateOptIn',
+        $Catalog.Strings.('Connection.'+$connection),
+        $Catalog.Strings.('Protection.'+$protection),
+        $Catalog.Strings.'Menu.CheckAndRepair',
         $Catalog.Strings.'Menu.Language',
         $follow,
         $Catalog.Strings.'Menu.Chinese',
         $Catalog.Strings.'Menu.English',
         $Catalog.Strings.'Menu.OpenLogs',
         $Catalog.Strings.'Menu.About',
-        $Catalog.Strings.'Menu.Uninstall',
-        $Catalog.Strings.'Error.UninstallStart',
-        $Catalog.Strings.'Menu.Uninstall',
-        $tooltip,
-        $Catalog.Strings.'Dialog.UninstallTitle',
-        $Catalog.Strings.'Dialog.UninstallMessage',
-        $aboutVersion
+        $Catalog.Strings.'Menu.Exit',
+        $Catalog.Strings.'Menu.About',
+        $aboutVersion,
+        $Catalog.Strings.'Dialog.ExitTitle',
+        $Catalog.Strings.'Dialog.ExitMessage',
+        $Catalog.Strings.'Error.ActionFailed'
     )
     $mode=if($LanguageMode -ceq 'zh-CN'){[LanguageMode]::Chinese}elseif($LanguageMode -ceq 'en-US'){[LanguageMode]::English}else{[LanguageMode]::System}
-    return [PresentationSnapshot]::new($Revision,(Convert-CcodTrayHostColor $Presentation.Color),(Convert-CcodTrayHostState $stateKey),$mode,$flags,$strings)
+    return [PresentationSnapshot]::new($Revision,(Convert-CcodTrayHostColor $Presentation.Color),(Convert-CcodTrayHostConnection $connection),(Convert-CcodTrayHostProtection $protection),$mode,$flags,$strings)
 }
 
 function New-CcodTrayHostContext {
     param($CommandQueue,$OnTick,$Catalog,[string]$LanguageMode,[string]$SystemCultureName)
     Import-CcodTrayHostAssembly
     $runtimeRoot=Get-CcodTrayHostRuntimeRoot;$runtimeId=Split-Path $runtimeRoot -Leaf;$exe=Join-Path $runtimeRoot 'bin\CodexRemote.TrayHost.exe'
-    $initialPresentation=[pscustomobject][ordered]@{Color='Gray';StateKey='Waiting';SessionReadyVisible=$false;ApplyNowVisible=$false;ApplyNowEnabled=$false;ManualRetryVisible=$false;ManualRetryEnabled=$false;AutomationToggleEnabled=$true;AutomationChecked=$false;CandidateOptInToggleEnabled=$true;CandidateOptInChecked=$false;OpenLogsEnabled=$true;UninstallEnabled=$true;Busy=$false}
+    $initialPresentation=[pscustomobject][ordered]@{Color='Gray';ConnectionState='WaitingForCodex';ProtectionState='Running';RepairEnabled=$false;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true;Busy=$false}
     $initial=New-CcodTrayHostSnapshot $initialPresentation $Catalog $LanguageMode $SystemCultureName ([UInt64]1) $runtimeId
     $process=[Diagnostics.Process]::GetCurrentProcess()
     try{

@@ -90,16 +90,35 @@ function Test-CcodTrayCatalog {
     }catch{return $false}
 }
 
+function ConvertTo-CcodTrayLegacyCatalog {
+    param($Catalog)
+    try{
+        if(-not(Test-CcodExactProperties $Catalog @('LanguageMode','EffectiveLocale','Strings','UsedEmergencyCatalog','ErrorCode')) -or $null-eq$Catalog.Strings){return $Catalog}
+        $required=@('Tray.Title','Connection.WaitingForCodex','Connection.Checking','Connection.Connected','Connection.RepairNeeded','Connection.Error','Menu.CheckAndRepair','Menu.Language','Menu.FollowSystem','Menu.Chinese','Menu.English','Menu.OpenLogs','Menu.About','Menu.AboutVersion','Menu.Exit','Dialog.ExitTitle','Dialog.ExitMessage','Error.ActionFailed','Error.LanguageChange')
+        foreach($key in $required){$property=$Catalog.Strings.PSObject.Properties[$key];if($null-eq$property-or$property.Value-isnot[string]){return $Catalog}}
+        $source=$Catalog.Strings
+        $legacy=[ordered]@{
+            'Tray.Title'=$source.'Tray.Title'
+            'Status.Waiting'=$source.'Connection.WaitingForCodex';'Status.Inspecting'=$source.'Connection.Checking';'Status.Transitioning'=$source.'Connection.Checking';'Status.Active'=$source.'Connection.Connected';'Status.ActivePaused'=$source.'Connection.Connected';'Status.Suppressed'=$source.'Connection.RepairNeeded';'Status.Recovered'=$source.'Connection.RepairNeeded';'Status.Error'=$source.'Connection.Error';'Status.RendererHandoff'=$source.'Connection.Error'
+            'Tooltip.Waiting'=$source.'Connection.WaitingForCodex';'Tooltip.Inspecting'=$source.'Connection.Checking';'Tooltip.Transitioning'=$source.'Connection.Checking';'Tooltip.Active'=$source.'Connection.Connected';'Tooltip.ActivePaused'=$source.'Connection.Connected';'Tooltip.Suppressed'=$source.'Connection.RepairNeeded';'Tooltip.Recovered'=$source.'Connection.RepairNeeded';'Tooltip.Error'=$source.'Connection.Error'
+            'Menu.SessionReady'=$source.'Connection.Connected';'Menu.ApplyNow'=$source.'Menu.CheckAndRepair';'Menu.ManualRetry'=$source.'Menu.CheckAndRepair';'Menu.Automation'='Retired';'Menu.CandidateOptIn'='Retired';'Menu.Language'=$source.'Menu.Language';'Menu.FollowSystem'=$source.'Menu.FollowSystem';'Menu.Chinese'=$source.'Menu.Chinese';'Menu.English'=$source.'Menu.English';'Menu.OpenLogs'=$source.'Menu.OpenLogs';'Menu.About'=$source.'Menu.About';'Menu.AboutVersion'=$source.'Menu.AboutVersion';'Menu.Uninstall'=$source.'Menu.Exit'
+            'Dialog.UninstallTitle'=$source.'Dialog.ExitTitle';'Dialog.UninstallMessage'=$source.'Dialog.ExitMessage';'Error.UninstallStart'=$source.'Error.ActionFailed';'Error.LanguageChange'=$source.'Error.LanguageChange'
+        }
+        return [pscustomobject][ordered]@{LanguageMode=$Catalog.LanguageMode;EffectiveLocale=$Catalog.EffectiveLocale;Strings=[pscustomobject]$legacy;UsedEmergencyCatalog=$Catalog.UsedEmergencyCatalog;ErrorCode=$Catalog.ErrorCode}
+    }catch{return $Catalog}
+}
+
 function Resolve-CcodTrayLocalizedStrings {
     param($Catalog,[string]$LanguageMode,[string]$SystemCultureName)
+    $Catalog=ConvertTo-CcodTrayLegacyCatalog $Catalog
     if($script:TrayUiLanguageModes -cnotcontains $LanguageMode -or $SystemCultureName -isnot [string] -or
        $SystemCultureName.Length -lt 1 -or $SystemCultureName.Length -gt 85 -or (Test-CcodControlCharacter $SystemCultureName) -or
        -not (Test-CcodTrayCatalog $Catalog $LanguageMode)){Throw-CcodTrayError 'CCOD_TRAY_INPUT_INVALID' 'Tray'}
     $strings=[ordered]@{}
     try{
-        foreach($key in $script:TrayUiCatalogKeys){$strings[$key]=Get-CcodUiString -Catalog $Catalog -Key $key}
+        foreach($key in $script:TrayUiCatalogKeys){$strings[$key]=[string]$Catalog.Strings.PSObject.Properties[$key].Value}
         $systemLanguage=if($SystemCultureName -cmatch '^zh(?:-|$)'){$strings['Menu.Chinese']}else{$strings['Menu.English']}
-        $strings['Menu.FollowSystem']=Get-CcodUiString -Catalog $Catalog -Key 'Menu.FollowSystem' -Arguments @($systemLanguage)
+        $strings['Menu.FollowSystem']=[string]::Format([Globalization.CultureInfo]::InvariantCulture,$strings['Menu.FollowSystem'],$systemLanguage)
     }catch{Throw-CcodTrayError 'CCOD_TRAY_INPUT_INVALID' 'Tray'}
     Write-Output -NoEnumerate $strings
 }
@@ -1044,6 +1063,21 @@ function Assert-CcodTrayPresentation {
     foreach($name in $names[2..13]){if($Presentation.$name -isnot [bool]){Throw-CcodTrayError 'CCOD_TRAY_INPUT_INVALID' 'Tray'}}
 }
 
+function ConvertTo-CcodTrayLegacyPresentation {
+    param($Presentation)
+    try{
+        $names=@('Color','ConnectionState','ProtectionState','RepairEnabled','LanguageEnabled','OpenLogsEnabled','AboutEnabled','ExitEnabled','Busy')
+        if(-not(Test-CcodExactProperties $Presentation $names)){return $Presentation}
+        if($Presentation.Color-isnot[string]-or@('Gray','Green','Yellow','Red')-cnotcontains$Presentation.Color-or@('WaitingForCodex','Checking','Connected','RepairNeeded','Error')-cnotcontains$Presentation.ConnectionState-or@('Running','Reconnecting','Stopping')-cnotcontains$Presentation.ProtectionState){return $Presentation}
+        foreach($name in $names[3..8]){if($Presentation.$name-isnot[bool]){return $Presentation}}
+        $state=switch($Presentation.ConnectionState){'WaitingForCodex'{'Waiting'}'Checking'{'Inspecting'}'Connected'{'Active'}'RepairNeeded'{'Suppressed'}default{'Error'}}
+        return [pscustomobject][ordered]@{
+            Color=$Presentation.Color;StateKey=$state;SessionReadyVisible=[bool]($Presentation.ConnectionState-ceq'Connected');ApplyNowVisible=[bool]($Presentation.ConnectionState-ceq'RepairNeeded');ApplyNowEnabled=[bool]$Presentation.RepairEnabled;ManualRetryVisible=[bool]($Presentation.ConnectionState-in@('RepairNeeded','Error'));ManualRetryEnabled=[bool]$Presentation.RepairEnabled
+            AutomationToggleEnabled=$false;AutomationChecked=$false;CandidateOptInToggleEnabled=$false;CandidateOptInChecked=$false;OpenLogsEnabled=[bool]$Presentation.OpenLogsEnabled;UninstallEnabled=[bool]$Presentation.ExitEnabled;Busy=[bool]$Presentation.Busy
+        }
+    }catch{return $Presentation}
+}
+
 function Set-CcodTrayPresentation {
     [CmdletBinding()]
     param(
@@ -1056,6 +1090,7 @@ function Set-CcodTrayPresentation {
     try{[Threading.Monitor]::Enter($queueGate)}catch{Throw-CcodTrayError 'CCOD_TRAY_INPUT_INVALID' 'Tray'}
     try{
     if($Context.State -cne 'Open'){Throw-CcodTrayError 'CCOD_TRAY_CONTEXT_CLOSED' 'Tray'}
+    $Presentation=ConvertTo-CcodTrayLegacyPresentation $Presentation
     Assert-CcodTrayPresentation $Presentation
     $localized=Resolve-CcodTrayLocalizedStrings $Catalog $LanguageMode $SystemCultureName
     $current=Invoke-CcodTrayAdapter $Context.Adapters.GetManagedThreadId @() 1 'CCOD_TRAY_THREAD_INVALID' 'Tray'

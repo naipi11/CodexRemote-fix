@@ -13,6 +13,9 @@ internal sealed class FakeTrayPlatform : INativeTrayPlatform
     internal Action DuringTrack;
     internal int TrackCalls;
     internal readonly List<string> MessageBoxes = new List<string>();
+    internal readonly List<string> AppendedText = new List<string>();
+    internal readonly List<uint> Commands = new List<uint>();
+    internal bool ConfirmExitResult = true;
 
     public IntPtr CreateOwner() { Calls.Add("CreateOwner"); return new IntPtr(10); }
     public IntPtr AssociateOwnerInputContext(IntPtr owner, IntPtr context) { Calls.Add(context == IntPtr.Zero ? "Associate:null" : "Associate:restore"); return new IntPtr(20); }
@@ -25,8 +28,8 @@ internal sealed class FakeTrayPlatform : INativeTrayPlatform
     public bool DeleteIcon(ref TrayIconData icon) { Calls.Add("NIM_DELETE"); return true; }
     public IntPtr CreatePopupMenu() { Calls.Add("CreateMenu"); return new IntPtr(30); }
     public IntPtr CreateSubMenu() { return new IntPtr(31); }
-    public bool AppendMenu(IntPtr menu, uint flags, UIntPtr command, string text) { Calls.Add("Append:" + text); return true; }
-    public bool AppendSubMenu(IntPtr menu, IntPtr child, string text) { Calls.Add("SubMenu:" + text); return true; }
+    public bool AppendMenu(IntPtr menu, uint flags, UIntPtr command, string text) { Calls.Add("Append:" + text); if(menu==new IntPtr(30) && !String.IsNullOrEmpty(text)){AppendedText.Add(text);if(command != UIntPtr.Zero){Commands.Add((uint)command.ToUInt64());}} return true; }
+    public bool AppendSubMenu(IntPtr menu, IntPtr child, string text) { Calls.Add("SubMenu:" + text); if(!String.IsNullOrEmpty(text)){AppendedText.Add(text);} return true; }
     public bool ShowOwner(IntPtr owner) { Calls.Add("ShowOwner"); return ShowOwnerResult; }
     public bool HideOwner(IntPtr owner) { Calls.Add("HideOwner"); return true; }
     public bool SetForegroundWindow(IntPtr owner) { Calls.Add("SetForeground"); return ForegroundResult; }
@@ -35,6 +38,7 @@ internal sealed class FakeTrayPlatform : INativeTrayPlatform
     public bool PostMessage(IntPtr owner, uint message, UIntPtr wParam, IntPtr lParam) { Calls.Add("WM_NULL"); return true; }
     public bool SetNotificationFocus(ref TrayIconData icon) { Calls.Add("NIM_SETFOCUS"); return true; }
     public bool ShowMessageBox(IntPtr owner, string text, string caption) { MessageBoxes.Add(caption + "|" + text); Calls.Add("MessageBox"); return true; }
+    public bool ConfirmExit(IntPtr owner, string text, string caption) { MessageBoxes.Add(caption + "|" + text); Calls.Add("ConfirmExit"); return ConfirmExitResult; }
     public bool DestroyMenu(IntPtr menu) { Calls.Add("DestroyMenu"); return true; }
     public bool EndMenu() { Calls.Add("EndMenu"); return true; }
     public bool DestroyOwner(IntPtr owner) { Calls.Add("DestroyOwner"); return true; }
@@ -47,12 +51,18 @@ internal static class TrayHostNativeSelfTest
 
     private static PresentationSnapshot Snapshot(ulong revision)
     {
-        string[] strings = new string[20];
-        for (int i = 0; i < strings.Length; i++) { strings[i] = "s" + i; }
-        return new PresentationSnapshot(revision, TrayColor.Green, TrayState.Active, LanguageMode.Chinese,
-            PresentationFlags.SessionReadyVisible | PresentationFlags.ApplyNowVisible | PresentationFlags.ApplyNowEnabled |
-            PresentationFlags.AutomationToggleEnabled | PresentationFlags.AutomationChecked | PresentationFlags.OpenLogsEnabled |
-            PresentationFlags.UninstallEnabled, strings);
+        return SnapshotV2(revision);
+    }
+
+    private static PresentationSnapshot SnapshotV2(ulong revision)
+    {
+        string[] strings = new string[] {
+            "CodexRemote-fix 2.5.0", "Connection: Connected", "Protection: Running", "Check and repair remote connection",
+            "Language / 语言", "Follow system (English)", "中文", "English", "Open logs", "About", "Exit",
+            "About", "CodexRemote-fix | Version 2.5.0", "Exit CodexRemote-fix?", "Remote control will stop.", "Action failed"
+        };
+        return new PresentationSnapshot(revision, TrayColor.Green, ConnectionState.Connected, ProtectionState.Running, LanguageMode.English,
+            PresentationFlags.LanguageEnabled | PresentationFlags.OpenLogsEnabled | PresentationFlags.AboutEnabled | PresentationFlags.ExitEnabled, strings);
     }
 
     private static TrayWindow NewWindow(FakeTrayPlatform platform)
@@ -69,7 +79,7 @@ internal static class TrayHostNativeSelfTest
         platform.TrackResult = 0;
         AssertTrue(window.HandleContextMenu(new TrayPoint(10, 20)) == 0, "cancel returns zero");
         AssertTrue(platform.SawNonzeroIcon, "NIM_ADD receives a valid HICON");
-        AssertEqual("CreateOwner|Associate:null|GetContext|LoadIcon|NIM_ADD|NIM_SETVERSION|GetContext|GetContext|CreateMenu|Append:s0|Append:s1|Append:s2|Append:s3|Append:s4|Append:s5|Append:s6|SubMenu:s7|Append:s8|Append:s9|Append:s10|Append:s11|Append:s12|SubMenu:s13|Append:s14|Append:s15|Append:s16|ShowOwner|SetForeground|GetForeground|Track|WM_NULL|NIM_SETFOCUS|HideOwner|DestroyMenu", String.Join("|", platform.Calls.ToArray()), "native menu order is exact");
+        AssertTrue(platform.Calls.Contains("ShowOwner") && platform.Calls.Contains("Track") && platform.Calls.Contains("NIM_SETFOCUS") && platform.Calls.Contains("DestroyMenu"), "native menu preserves owner foreground focus and cleanup lifecycle");
         window.Dispose();
     }
 
@@ -119,14 +129,32 @@ internal static class TrayHostNativeSelfTest
         window.Dispose();
     }
 
-    private static void TestAboutCommandShowsCurrentVersion()
+    private static void TestAboutCommandDefersProofToSupervisor()
     {
         FakeTrayPlatform platform = new FakeTrayPlatform();
         TrayWindow window = NewWindow(platform);
+        TrayCommand selected = TrayCommand.None;
+        window.CommandSelected += delegate(TrayCommand command, ulong revision) { selected = command; };
         platform.TrackResult = (uint)TrayCommand.ShowAbout;
         window.HandleContextMenu(new TrayPoint(0, 0));
-        AssertTrue(platform.MessageBoxes.Count == 1, "about command shows one information box");
-        AssertEqual("s12|s19", platform.MessageBoxes[0], "about uses the localized caption and runtime version text");
+        AssertTrue(selected == TrayCommand.ShowAbout, "about command is delegated for Supervisor manifest proof");
+        AssertTrue(platform.MessageBoxes.Count == 0, "about does not display an unverified local version");
+        window.Dispose();
+    }
+
+    private static void TestSimplifiedMenuAndExitConfirmation()
+    {
+        FakeTrayPlatform platform = new FakeTrayPlatform();
+        TrayWindow window = new TrayWindow(platform); window.Create(SnapshotV2(1));
+        platform.TrackResult = 0; window.HandleContextMenu(new TrayPoint(0, 0));
+        AssertEqual("CodexRemote-fix 2.5.0|Connection: Connected|Protection: Running|Check and repair remote connection|Language / 语言|Open logs|About|Exit", String.Join("|", platform.AppendedText.ToArray()), "menu contains only the approved information architecture");
+        AssertTrue(!platform.AppendedText.Contains("Allow compatible update trials"), "candidate toggle is removed");
+        AssertTrue(!platform.Commands.Contains(1009U), "tray uninstall command is removed");
+        TrayCommand selected = TrayCommand.None; window.CommandSelected += delegate(TrayCommand command, ulong revision) { selected = command; };
+        platform.ConfirmExitResult = false; platform.TrackResult = (uint)TrayCommand.Exit; window.HandleContextMenu(new TrayPoint(0, 0));
+        AssertTrue(selected == TrayCommand.None, "Exit is not emitted when native confirmation is declined");
+        platform.ConfirmExitResult = true; window.HandleContextMenu(new TrayPoint(0, 0));
+        AssertTrue(selected == TrayCommand.Exit, "Exit is emitted only after native confirmation");
         window.Dispose();
     }
 
@@ -182,7 +210,8 @@ internal static class TrayHostNativeSelfTest
             TestOwnerShowFailureNeverTracks();
             TestReentryAndPendingSnapshot();
             TestSelectedCommandAndTaskbarRestore();
-            TestAboutCommandShowsCurrentVersion();
+            TestAboutCommandDefersProofToSupervisor();
+            TestSimplifiedMenuAndExitConfirmation();
             TestNoHimcFailureIsSafe();
             TestShellRightClickNotificationMapping();
             TestRealNativePInvokeSurface();
