@@ -132,7 +132,7 @@ function Add-CcodTestRuntime {
     $kernelPath = Join-Path $kernelDirectory 'KernelObjects.psm1'
     [IO.File]::Copy($kernelObjectsModule, $kernelPath, $true)
     if ($IncludeFenceModules) {
-        foreach ($moduleName in @('PersistenceIO.psm1','LifecycleEpoch.psm1','RuntimeManifest.psm1','TrustedLogonIdentity.psm1')) {
+        foreach ($moduleName in @('PersistenceIO.psm1','LifecycleEpoch.psm1','LifecycleTransaction.psm1','RuntimeManifest.psm1','TrustedLogonIdentity.psm1')) {
             [IO.File]::Copy((Join-Path $repositoryRoot ('src\persistence\modules\' + $moduleName)), (Join-Path $kernelDirectory $moduleName), $true)
         }
         if ($FailLifecycleRelease) {

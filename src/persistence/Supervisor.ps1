@@ -710,27 +710,25 @@ function Complete-CcodSupervisorLifecycleTerminal {
             $HostState.ProtectionState='Stopping'
             Set-CcodSupervisorCurrentTrayPresentation $HostState $Adapters -WaitForAcknowledgement
             if(-not(Complete-CcodSupervisorLifecycleTrayAction $HostState $Adapters $request $true)){
-                Invoke-CcodSupervisorAdapter $Adapters.ClearSafeExitIntent @($HostState.Layout.StateRoot) 0|Out-Null
                 $HostState.ProtectionState='Running';$request.error='SAFE_EXIT_RECOVERY_FAILED'
                 Invoke-CcodSupervisorAdapter $Adapters.WriteLifecycleRequest @($HostState.Layout.StateRoot,$request) 0
                 return
             }
+            Invoke-CcodSupervisorAdapter $Adapters.RequestUiExit @($HostState.Tray) 0
             Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
             Invoke-CcodSupervisorAdapter $Adapters.CompleteLifecycleRequest @($HostState.Layout.StateRoot,$request) 0
-            Invoke-CcodSupervisorAdapter $Adapters.RequestUiExit @($HostState.Tray) 0
             $HostState.ShutdownRequested=$true;$HostState.LifecycleRequest=$null
             return
         }catch{
-            if($markerWritten){Invoke-CcodSupervisorAdapter $Adapters.ClearSafeExitIntent @($HostState.Layout.StateRoot) 0|Out-Null}
-            $HostState.ProtectionState='Running';$request.error='SAFE_EXIT_RECOVERY_FAILED'
+            $HostState.ProtectionState='Running'
+            $request.error='SAFE_EXIT_RECOVERY_FAILED'
             try{Invoke-CcodSupervisorAdapter $Adapters.WriteLifecycleRequest @($HostState.Layout.StateRoot,$request) 0}catch{}
-            [void](Complete-CcodSupervisorLifecycleTrayAction $HostState $Adapters $request $false 'SAFE_EXIT_RECOVERY_FAILED')
             return
         }
     }
     Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
     Invoke-CcodSupervisorAdapter $Adapters.CompleteLifecycleRequest @($HostState.Layout.StateRoot,$request) 0
-    Complete-CcodSupervisorLifecycleTrayAction $HostState $Adapters $request $successful
+    [void](Complete-CcodSupervisorLifecycleTrayAction $HostState $Adapters $request $successful)
     if(-not$successful){$HostState.ConnectionState='Error'}
     $HostState.ProtectionState='Running';$HostState.LifecycleRequest=$null
 }

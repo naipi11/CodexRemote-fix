@@ -376,7 +376,14 @@ function Invoke-CcodBootstrapSafeExitMarkerPolicy {
         try{&$Adapters.ClearCorruptIntent}finally{&$Adapters.ExitOwnership $ownership|Out-Null}
         return [pscustomobject]@{Suppressed=$false;Cleared=$true}
     }
-    $identity=$null;try{$identity=&$Adapters.GetIdentity}catch{if($EntryMode-ceq'Task'){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Task startup requires a trusted logon identity' $null};Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_CONFIRMATION_REQUIRED' 'Explicit startup requires local confirmation before marker replacement' $null}
+    if($null-eq$intent){return [pscustomobject]@{Suppressed=$false;Cleared=$false}}
+    $identity=$null;try{$identity=&$Adapters.GetIdentity}catch{
+        if($EntryMode-ceq'Task'){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Task startup requires a trusted logon identity' $null}
+        if(-not(&$Adapters.ConfirmReplacement)){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_CONFIRMATION_REQUIRED' 'Explicit startup requires local confirmation before marker replacement' $null}
+        $ownership=&$Adapters.EnterOwnership
+        try{&$Adapters.ClearCorruptIntent}finally{&$Adapters.ExitOwnership $ownership|Out-Null}
+        return [pscustomobject]@{Suppressed=$false;Cleared=$true}
+    }
     $same=&$Adapters.TestSameLogon $intent $identity
     if($same-and$EntryMode-ceq'Task'){
         $active=&$Adapters.ReadActiveRequest
@@ -393,7 +400,9 @@ function Invoke-CcodBootstrapSafeExitMarkerPolicy {
 function Test-CcodBootstrapSafeExitSuppression {
     param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$Pointer,[Parameter(Mandatory)][string]$UserSid,[Parameter(Mandatory)][int]$SessionId,[Parameter(Mandatory)][ValidateSet('Task','Explicit')][string]$EntryMode)
     $marker=Join-Path $InstallRoot 'state\lifecycle\safe-exit-intent.json'
-    if(-not[IO.File]::Exists($marker)){return $false}
+    $markerItem=Get-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+    if($null-eq$markerItem){return $false}
+    if($markerItem-isnot[IO.FileInfo]-or($markerItem.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Safe-exit marker path is not a regular file' $marker}
     $validation=Test-CcodBootstrapRuntime -InstallRoot $InstallRoot -RuntimeId $Pointer.ActiveRuntime
     if(-not$validation.Valid){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_INTENT_INVALID' 'Safe-exit marker cannot be verified against the active runtime' $marker}
     $modulePath=Join-Path $validation.RuntimeDirectory 'src\persistence\modules\TrustedLogonIdentity.psm1'

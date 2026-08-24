@@ -540,7 +540,7 @@ Invoke-CcodTest 'SafeExit marker clear failure is not swallowed or converted int
     $request=& (Get-Module LifecycleTransaction | Select-Object -First 1) {param($RuntimeId,$Generation,$Epoch,$Owner,$Logon)$value=New-CcodLifecycleRequest -Kind SafeExit -Origin Tray -RuntimeId $RuntimeId -RuntimeGeneration $Generation -LeaseEpoch $Epoch -OwnerIdentity $Owner -LogonIdentity $Logon -NowUtc '2030-02-03T03:04:05.0000000Z';Move-CcodLifecyclePhase -Request $value -NextPhase CancelledBeforeClose -NowUtc '2030-02-03T03:04:06.0000000Z'} $hostState.Layout.RuntimeId ([UInt64]$hostState.LifecycleOwnership.runtimeGeneration) ([UInt64]$hostState.LifecycleOwnership.epoch) $hostState.LifecycleOwnership.ownerIdentity $hostState.LogonIdentity
     $hostState.LifecycleRequest=$request;$action=[pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command='Exit';Revision=[UInt64]1};$hostState.TrayActionIds[$action.ActionId.ToString('D')]=[pscustomobject][ordered]@{Action=$action;TransactionId=$request.transactionId;TerminalSent=$false}
     $fixture.Fake.Adapters.SendTrayActionResult={param($a,$b,$c,$d,$e,$f)throw 'delivery'}.GetNewClosure();$fixture.Fake.Adapters.ClearSafeExitIntent={param($Root)throw 'clear'}.GetNewClosure()
-    $threw=$false;try{Complete-CcodSupervisorLifecycleTerminal $hostState $fixture.Fake.Adapters}catch{$threw=$true};Assert-CcodTrue $threw 'clear failure remains visible to the caller'
+    $threw=$false;try{Complete-CcodSupervisorLifecycleTerminal $hostState $fixture.Fake.Adapters}catch{$threw=$true};Assert-CcodEqual $false $threw 'undelivered action never invokes or leaks ClearSafeExitIntent'
     Assert-CcodEqual 0 @($world.Calls|Where-Object{$_-ceq'Exit:UI'}).Count 'clear failure never exits UI'
     Assert-CcodEqual $request.transactionId $hostState.LifecycleRequest.transactionId 'clear failure preserves active request for resume'
 }
@@ -558,7 +558,8 @@ Invoke-CcodTest 'SafeExit acknowledges Stopping before terminal completion and U
     $hostState.TrayActionIds[$action.ActionId.ToString('D')]=[pscustomobject][ordered]@{Action=$action;TransactionId=$request.transactionId;TerminalSent=$false}
     Complete-CcodSupervisorLifecycleTerminal $hostState $fixture.Fake.Adapters
     $calls=@($world.Calls);$presentation=[Array]::IndexOf($calls,'Set:Presentation');$actionResult=[Array]::IndexOf($calls,'ActionResult:Completed');$uiExit=[Array]::IndexOf($calls,'Exit:UI')
-    Assert-CcodTrue ($presentation -ge 0 -and $actionResult -gt $presentation -and $uiExit -gt $actionResult) 'acknowledged Stopping presentation precedes terminal action completion and UI exit'
+    $completion=[Array]::IndexOf($calls,'Complete:Lifecycle:CancelledBeforeClose')
+    Assert-CcodTrue ($presentation -ge 0 -and $actionResult -gt $presentation -and $uiExit -gt $actionResult -and $completion -gt $uiExit) 'acknowledged Stopping then action then UI exit precede completion receipt'
     Assert-CcodEqual $true $world.PresentationArguments[$world.PresentationArguments.Count-1].WaitForAcknowledgement 'Stopping waits for native acknowledgement'
 }
 
@@ -594,7 +595,7 @@ Invoke-CcodTest 'SafeExit marker presentation and completion failures are durabl
         Complete-CcodSupervisorLifecycleTerminal $hostState $fixture.Fake.Adapters
         Assert-CcodEqual 'Running' $hostState.ProtectionState "$failure keeps protection running"
         Assert-CcodEqual 'SAFE_EXIT_RECOVERY_FAILED' $hostState.LifecycleRequest.error "$failure stores a stable disarmed SafeExit error"
-        Assert-CcodEqual 0 @($world.Calls|Where-Object{$_-ceq'Exit:UI'}).Count "$failure never exits the UI"
+        Assert-CcodEqual $(if($failure-ceq'CompleteLifecycleRequest'){1}else{0}) @($world.Calls|Where-Object{$_-ceq'Exit:UI'}).Count "$failure has the expected pre-completion UI boundary"
     }
 }
 
