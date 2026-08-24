@@ -89,6 +89,31 @@ try {
         Assert-CcodEqual 'controller-result.json' $siblings[0].Name 'replacement leaves only the controller result file'
     }
 
+    Invoke-CcodTest 'atomically replaces a durable nonempty controller result placeholder accepted by a legacy writer' {
+        $path = Join-Path $root 'replace-nonempty\controller-result.json'
+        [IO.Directory]::CreateDirectory((Split-Path $path -Parent)) | Out-Null
+        $placeholder = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $placeholderBytes = [Text.UTF8Encoding]::new($false).GetBytes("{}`n")
+            $placeholder.Write($placeholderBytes, 0, $placeholderBytes.Length)
+            $placeholder.Flush($true)
+        } finally {
+            $placeholder.Dispose()
+        }
+
+        $legacyWriterBinding = {
+            param([Parameter(Mandatory)][byte[]]$Bytes)
+            return $Bytes.LongLength
+        }
+        Assert-CcodTrue ((Get-Item -LiteralPath $path).Length -gt 0) 'durable controller result placeholder is nonempty'
+        Assert-CcodEqual ([int64]3) (& $legacyWriterBinding ([IO.File]::ReadAllBytes($path))) 'legacy strict byte-array binding accepts the durable placeholder'
+        Write-CcodAtomicJson -Path $path -Value ([ordered]@{ schemaVersion = 1; action = 'Recover'; ok = $true })
+
+        $value = Read-CcodStrictJson -Path $path -ExpectedSchema 1 -Kind 'controller result'
+        Assert-CcodEqual 'Recover' $value.action 'replacement exposes the controller recovery action'
+        Assert-CcodEqual $true ([bool]$value.ok) 'replacement exposes the controller recovery result'
+    }
+
 
     Invoke-CcodTest 'uses the native handle commit without leftover siblings' {
         $path = Join-Path $root 'replace-native\settings.json'
