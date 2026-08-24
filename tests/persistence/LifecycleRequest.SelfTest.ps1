@@ -119,7 +119,7 @@ $results.Add((Invoke-CcodTest 'submits one durable request and returns only its 
         }.GetNewClosure()
         $submitted=Submit-CcodLifecycleRequest -InstallRoot $root -Kind RestartAndRepair -Origin Installer -RuntimeId '2.5.0-a' -RuntimeGeneration 7 -TimeoutMilliseconds 5000 -Adapters (New-CcodSubmissionAdapters $submissionId $onSignal)
         if ($submitted.errorCode -ceq 'CCOD_LIFECYCLE_PATH_INVALID') {
-            Write-Output ('CCOD_LIFECYCLE_TEST_DIAGNOSTIC: ' + (Get-CcodLifecycleSubmissionFailureDiagnostic -Root $root -SubmissionId $submissionId))
+            throw ('CCOD_LIFECYCLE_TEST_DIAGNOSTIC: ' + (Get-CcodLifecycleSubmissionFailureDiagnostic -Root $root -SubmissionId $submissionId))
         }
         Assert-CcodSubmissionReceipt $submitted $submissionId $true $transactionId $null
         Assert-CcodEqual 0 $controllerCalls 'submitter never runs controller recovery or apply'
