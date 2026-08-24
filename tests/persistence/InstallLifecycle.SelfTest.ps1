@@ -126,6 +126,10 @@ function New-CcodLifecycleFake {
         SupervisorAbsenceChecks = 0
         NormalizeReceipt = New-CcodLifecycleNormalizeReceipt -SpecialPresent $false -Normalized $false
         NormalizeCalls = 0
+        LegacyCompatibilityReceipt = New-CcodLifecycleNormalizeReceipt -SpecialPresent $false -Normalized $true -Outcome 'LegacyNoSpecialCompatibility'
+        LegacyCompatibilityCalls = 0
+        LegacyCompatibilityVerifyCalls = 0
+        LegacyCompatibilityVerified = $true
         KeyPath = $null
         BackupCalls = 0
         RemoveKeyCalls = 0
@@ -226,6 +230,8 @@ function New-CcodLifecycleFake {
         $world.ShutdownGateClosed++
     }.GetNewClosure()
     $adapters.NormalizeSpecialSession = { param($InstallRoot, $RuntimeId, $Identity) $world.Calls.Add("Normalize:$RuntimeId"); $world.NormalizeCalls++; $world.NormalizeReceipt }.GetNewClosure()
+    $adapters.NormalizeLegacyControllerCompatibility = { param($InstallRoot, $RuntimeId, $Identity, $Transaction) $world.Calls.Add("LegacyCompatibility:$RuntimeId"); $world.LegacyCompatibilityCalls++; $world.LegacyCompatibilityReceipt }.GetNewClosure()
+    $adapters.VerifyLegacyControllerCompatibility = { param($InstallRoot, $RuntimeId, $Identity, $Transaction) $world.Calls.Add("VerifyLegacyCompatibility:$RuntimeId"); $world.LegacyCompatibilityVerifyCalls++; [bool]$world.LegacyCompatibilityVerified }.GetNewClosure()
     $adapters.SetAutomationEnabled = { param($StateRoot, $Enabled) $world.Calls.Add("Automation:$Enabled"); $world.AutomationPaused++ }.GetNewClosure()
     $adapters.EnterTransitionLease = { param($UserSid, $SessionId) $world.Calls.Add("EnterTransitionLease"); $world.TransitionLeaseCalls++; [pscustomobject][ordered]@{ SchemaVersion = 1; Name = "Fake-Transition"; Kind = 'Transition'; Outcome = 'Acquired'; CreatedNew = $false; Abandoned = $false; Handle = [pscustomobject]@{ Kind = 'Mutex' }; OwnerManagedThreadId = [Threading.Thread]::CurrentThread.ManagedThreadId; Released = $false } }.GetNewClosure()
     $adapters.ExitTransitionLease = { param($Lease) $world.Calls.Add('ExitTransitionLease'); $true }.GetNewClosure()
@@ -1289,6 +1295,134 @@ $results += Invoke-CcodTest 'transactional uninstall reaches ReadyForInno only a
     }
 }
 
+$results += Invoke-CcodTest 'legacy controller compatibility recognizes only the sealed missing-ProcessControl input-validation signature' {
+    $controller = Join-Path (New-CcodLifecycleTempRoot) 'SessionController.ps1'
+    try {
+        [IO.Directory]::CreateDirectory((Split-Path $controller -Parent)) | Out-Null
+        [IO.File]::WriteAllText($controller, @'
+$module = Get-Module ProcessControl -ErrorAction Stop
+'@, [Text.UTF8Encoding]::new($false))
+        $request = [pscustomobject][ordered]@{
+            schemaVersion = 1; action = 'Recover'; transactionId = '33333333-4444-4555-8666-777777777777'; runtimeId = 'runtime-legacy'
+        }
+        $result = [pscustomobject][ordered]@{
+            schemaVersion = 1; action = 'Recover'; ok = $false; outcome = 'Error'; safeState = 'Error'; stage = 'InputValidation'
+            transactionId = $request.transactionId; package = $null; source = $null; special = $null; probes = $null; recovery = $null
+            error = [pscustomobject][ordered]@{ code = 'CCOD_REQUEST_INVALID'; stage = 'InputValidation'; message = 'The session controller failed safely. See the session log for details.' }
+            logFile = $null
+        }
+        $module = Get-Module InstallLifecycle -ErrorAction Stop
+        $recognized = & $module { param($Value,$RequestValue,$Path) Test-CcodLifecycleLegacyControllerProcessControlFailure -Result $Value -Request $RequestValue -ExitCode 1 -ControllerPath $Path } $result $request $controller
+        Assert-CcodEqual $true $recognized 'only the known sealed missing-import controller shape enters compatibility'
+        Add-Content -LiteralPath $controller -Value "Import-Module (Join-Path `$controllerModuleRoot 'ProcessControl.psm1') -Force -Global" -Encoding utf8
+        $recognizedWithImport = & $module { param($Value,$RequestValue,$Path) Test-CcodLifecycleLegacyControllerProcessControlFailure -Result $Value -Request $RequestValue -ExitCode 1 -ControllerPath $Path } $result $request $controller
+        Assert-CcodEqual $false $recognizedWithImport 'a controller that imports ProcessControl cannot take the compatibility branch'
+        $result.error.code = 'CCOD_CONTROLLER_ENGINE_RESULT_INVALID'
+        $wrongError = & $module { param($Value,$RequestValue,$Path) Test-CcodLifecycleLegacyControllerProcessControlFailure -Result $Value -Request $RequestValue -ExitCode 1 -ControllerPath $Path } $result $request $controller
+        Assert-CcodEqual $false $wrongError 'other controller failures cannot masquerade as legacy compatibility'
+    } finally {
+        $root = Split-Path $controller -Parent
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+$results += Invoke-CcodTest 'legacy controller compatibility keeps strict recovery, supervisor, tray, and task proofs before deletion' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source | Out-Null
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters | Out-Null
+        $fake = New-CcodLifecycleFake -NodePath $nodePath
+        $fake.Adapters.NormalizeSpecialSession = {
+            param($InstallRoot,$RuntimeId,$Identity)
+            $exception = [InvalidOperationException]::new('legacy ProcessControl import is absent')
+            throw [Management.Automation.ErrorRecord]::new($exception, 'CCOD_UNINSTALL_LEGACY_CONTROLLER_PROCESSCONTROL_COMPATIBILITY', [Management.Automation.ErrorCategory]::InvalidData, $RuntimeId)
+        }
+        $transaction = New-CcodLifecycleUninstallTransaction -InstallRoot $install -Fake $fake
+        $receipt = Invoke-CcodLifecycleUninstallCleanupTest -InstallRoot $install -Transaction $transaction -Adapters $fake.Adapters
+        Assert-CcodEqual 'ReadyForInno' $receipt.Result.phase 'the independently inspected ordinary state may reach the native Inno handoff'
+        Assert-CcodEqual 1 $fake.World.LegacyCompatibilityCalls 'compatibility inspection is entered only after the exact legacy failure'
+        Assert-CcodEqual 2 $fake.World.LegacyCompatibilityVerifyCalls 'ordinary state is rechecked before both protected deletion boundaries'
+        Assert-CcodEqual 2 $fake.World.SupervisorAbsenceChecks 'compatibility never bypasses the strict Supervisor-absence proof'
+        Assert-CcodEqual 1 $fake.World.TaskRemoved 'task deletion still follows the compatibility verification'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath $install)) 'application deletion remains downstream of every proof'
+    } finally {
+        foreach ($path in @($source,$install,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+$results += Invoke-CcodTest 'legacy compatibility fails closed for every non-matching controller error or changed ordinary-state proof' {
+    foreach ($case in @(
+        [pscustomobject]@{ Name='nonmatching controller failure'; Code='CCOD_UNINSTALL_NORMALIZATION_FAILED'; Verify=$true; Expected='CCOD_UNINSTALL_RECOVERY_FAILED'; CompatibilityCalls=0; VerifyCalls=0 },
+        [pscustomobject]@{ Name='pre-task ordinary-state proof changed'; Code='CCOD_UNINSTALL_LEGACY_CONTROLLER_PROCESSCONTROL_COMPATIBILITY'; Verify=$false; Expected='CCOD_UNINSTALL_TASK_REMOVAL_FAILED'; CompatibilityCalls=1; VerifyCalls=1 }
+    )) {
+        $source = New-CcodLifecycleTempRoot
+        $install = New-CcodLifecycleTempRoot
+        $nodeRoot = New-CcodLifecycleTempRoot
+        try {
+            New-CcodLifecycleSourceFixture -Root $source | Out-Null
+            $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+            Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters | Out-Null
+            $fake = New-CcodLifecycleFake -NodePath $nodePath
+            $fake.World.LegacyCompatibilityVerified = [bool]$case.Verify
+            $fake.Adapters.NormalizeSpecialSession = {
+                param($InstallRoot,$RuntimeId,$Identity)
+                $exception = [InvalidOperationException]::new('controller recovery failed')
+                throw [Management.Automation.ErrorRecord]::new($exception, $case.Code, [Management.Automation.ErrorCategory]::InvalidData, $RuntimeId)
+            }.GetNewClosure()
+            $transaction = New-CcodLifecycleUninstallTransaction -InstallRoot $install -Fake $fake
+            Assert-CcodThrows { Invoke-CcodLifecycleUninstallCleanupTest -InstallRoot $install -Transaction $transaction -Adapters $fake.Adapters } $case.Expected
+            Assert-CcodEqual $case.CompatibilityCalls $fake.World.LegacyCompatibilityCalls "$($case.Name) has the exact compatibility entry count"
+            Assert-CcodEqual $case.VerifyCalls $fake.World.LegacyCompatibilityVerifyCalls "$($case.Name) has the exact compatibility recheck count"
+            Assert-CcodEqual 0 $fake.World.TaskRemoved "$($case.Name) cannot delete the scheduled task"
+            Assert-CcodTrue (Test-Path -LiteralPath $install) "$($case.Name) keeps the application tree intact"
+        } finally {
+            foreach ($path in @($source,$install,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+        }
+    }
+}
+
+$results += Invoke-CcodTest 'legacy compatibility rechecks a resumed transaction before every remaining deletion boundary' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source | Out-Null
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters | Out-Null
+        $fake = New-CcodLifecycleFake -NodePath $nodePath
+        $fake.Adapters.NormalizeSpecialSession = {
+            param($InstallRoot,$RuntimeId,$Identity)
+            $exception = [InvalidOperationException]::new('legacy ProcessControl import is absent')
+            throw [Management.Automation.ErrorRecord]::new($exception, 'CCOD_UNINSTALL_LEGACY_CONTROLLER_PROCESSCONTROL_COMPATIBILITY', [Management.Automation.ErrorCategory]::InvalidData, $RuntimeId)
+        }
+        $proof = [pscustomobject]@{ Calls = 0 }
+        $fake.Adapters.VerifyLegacyControllerCompatibility = {
+            param($InstallRoot,$RuntimeId,$Identity,$Transaction)
+            $proof.Calls++
+            $fake.World.LegacyCompatibilityVerifyCalls++
+            return ($proof.Calls -gt 1)
+        }.GetNewClosure()
+        $transaction = New-CcodLifecycleUninstallTransaction -InstallRoot $install -Fake $fake
+        Assert-CcodThrows { Invoke-CcodLifecycleUninstallCleanupTest -InstallRoot $install -Transaction $transaction -Adapters $fake.Adapters } 'CCOD_UNINSTALL_TASK_REMOVAL_FAILED'
+        Assert-CcodEqual 'ProtectionStopped' $transaction.phase 'failed pre-task proof leaves the transaction before task deletion'
+        Assert-CcodEqual 0 $fake.World.TaskRemoved 'failed pre-task proof does not remove the scheduled task'
+        $transaction.phase = 'Failed'
+        $transaction.resumePhase = 'ProtectionStopped'
+        $transaction.errorCode = 'CCOD_UNINSTALL_TASK_REMOVAL_FAILED'
+        $receipt = Invoke-CcodLifecycleUninstallCleanupTest -InstallRoot $install -Transaction $transaction -Adapters $fake.Adapters
+        Assert-CcodEqual 'ReadyForInno' $receipt.Result.phase 'the resumed transaction reaches the native Inno handoff only after fresh proofs'
+        Assert-CcodEqual 1 $fake.World.LegacyCompatibilityCalls 'resume does not rerun the legacy fallback normalization'
+        Assert-CcodEqual 3 $fake.World.LegacyCompatibilityVerifyCalls 'failed then resumed cleanup proves state before both remaining deletion boundaries'
+        Assert-CcodEqual 1 $fake.World.TaskRemoved 'the task is removed only after the resumed fresh proof'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath $install)) 'the application tree is removed only after the resumed fresh proof'
+    } finally {
+        foreach ($path in @($source,$install,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
 $results += Invoke-CcodTest 'transactional uninstall fails closed before recovery when the transition lease is unavailable' {
     $source = New-CcodLifecycleTempRoot
     $install = New-CcodLifecycleTempRoot
@@ -1486,7 +1620,7 @@ $results += Invoke-CcodTest 'transactional uninstall refuses application deletio
     }
 }
 
-$results += Invoke-CcodTest 'transactional uninstall resumes partial application deletion after the active pointer is already gone' {
+$results += Invoke-CcodTest 'transactional uninstall refuses partial application deletion when the active pointer is already gone' {
     $source = New-CcodLifecycleTempRoot
     $install = New-CcodLifecycleTempRoot
     $nodeRoot = New-CcodLifecycleTempRoot
@@ -1499,12 +1633,12 @@ $results += Invoke-CcodTest 'transactional uninstall resumes partial application
         $fake2 = New-CcodLifecycleFake -NodePath $nodePath
         $transaction = New-CcodLifecycleUninstallTransaction -InstallRoot $install -Fake $fake2 -Phase 'TaskRemoved'
         [IO.File]::Delete((Join-Path $install 'active.json'))
-        $receipt = Invoke-CcodLifecycleUninstallCleanupTest -InstallRoot $install -Transaction $transaction -Adapters $fake2.Adapters
-        Assert-CcodEqual 'ReadyForInno' $receipt.Result.phase 'partial deletion retry reaches the Inno handoff phase'
-        Assert-CcodEqual 'ApplicationStateRemoved,ReadyForInno' ($receipt.WrittenPhases -join ',') 'partial deletion retry only repeats application deletion phases'
+        $fake2.World.LegacyCompatibilityVerified = $false
+        Assert-CcodThrows { Invoke-CcodLifecycleUninstallCleanupTest -InstallRoot $install -Transaction $transaction -Adapters $fake2.Adapters } 'CCOD_UNINSTALL_APPLICATION_STATE_REMOVAL_FAILED'
         Assert-CcodEqual 0 $fake2.World.TaskRemoved 'partial deletion retry never repeats task removal'
         Assert-CcodEqual 0 $fake2.World.AutomationPaused 'partial deletion retry does not touch deleted state files'
-        Assert-CcodTrue (-not (Test-Path -LiteralPath $install)) 'partial deletion retry removes the remaining application tree'
+        Assert-CcodEqual 1 $fake2.World.LegacyCompatibilityVerifyCalls 'partial deletion retry requires a fresh ordinary-state proof'
+        Assert-CcodTrue (Test-Path -LiteralPath $install) 'missing active-runtime evidence blocks further application deletion'
     } finally {
         foreach ($path in @($source, $install, $nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
     }
@@ -1834,19 +1968,19 @@ $results += Invoke-CcodTest 'installer exposes CodexRemote-fix as the searchable
     Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-setup\.exe\.sha256\.txt') 'build script writes a hash beside the public setup filename'
 }
 
-$results += Invoke-CcodTest 'installer publishes the exact CodexRemote-fix 2.5.4 release artifacts' {
+$results += Invoke-CcodTest 'installer publishes the exact CodexRemote-fix 2.5.5 release artifacts' {
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
-    Assert-CcodEqual '2.5.4' ([string]$package.version) 'package version is exactly 2.5.4'
+    Assert-CcodEqual '2.5.5' ([string]$package.version) 'package version is exactly 2.5.5'
 
     $installerScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw
     $outputBase = [regex]::Match($installerScript, '(?m)^OutputBaseFilename=(.+)$').Groups[1].Value.Trim()
     $setupName = ($outputBase -replace '\{#ProjectVersion\}', [string]$package.version) + '.exe'
-    Assert-CcodEqual 'CodexRemote-fix-2.5.4-setup.exe' $setupName 'Inno output resolves to the exact public setup filename'
+    Assert-CcodEqual 'CodexRemote-fix-2.5.5-setup.exe' $setupName 'Inno output resolves to the exact public setup filename'
 
     $buildScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
     $checksumTemplate = [regex]::Match($buildScript, 'Join-Path \$dist \("([^"]+\.sha256\.txt)"\)').Groups[1].Value
     $checksumName = $checksumTemplate.Replace('$Version', [string]$package.version)
-    Assert-CcodEqual 'CodexRemote-fix-2.5.4-setup.exe.sha256.txt' $checksumName 'build script resolves to the exact public checksum filename'
+    Assert-CcodEqual 'CodexRemote-fix-2.5.5-setup.exe.sha256.txt' $checksumName 'build script resolves to the exact public checksum filename'
 }
 
 # Production mutation caught: allowing raw activation JSON to authorize Ready/Failed, checking the deadline after terminal processing, prompting without a strict validator child exit, or synchronously waiting on an unbounded validator.
@@ -2198,16 +2332,16 @@ $results += Invoke-CcodTest 'README and release workflow publish current install
     Assert-CcodTrue ($readmeChinese -cmatch '\A(?s:<div align="center">.*?<h1>CodexRemote-fix</h1>)') 'Chinese README uses the centered public product heading'
 
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start[^\r\n]*\r?\n(.*?)(?=^## )').Groups[1].Value
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.4-setup\.exe') 'English Quick Start names the exact setup artifact'
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.4-setup\.exe\.sha256\.txt') 'English Quick Start names the exact checksum artifact'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.5-setup\.exe') 'English Quick Start names the exact setup artifact'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.5-setup\.exe\.sha256\.txt') 'English Quick Start names the exact checksum artifact'
     Assert-CcodTrue ($quickStart -cnotmatch '(?i)powershell|Install-CodexControlOtherDevices') 'English Quick Start does not teach PowerShell installation'
     Assert-CcodTrue ($quickStart -cmatch '\*\*CodexRemote-fix\*\*') 'English Quick Start names the public desktop shortcut'
 
     $quickStartChineseMatch = [regex]::Match($readmeChinese, '(?ms)^## [^\r\n]+\r?\n(?:\r?\n)?(?=1\.[^\r\n]*\[Releases\])(.*?)(?=^## |\z)')
     Assert-CcodTrue $quickStartChineseMatch.Success 'Chinese README exposes a Quick Start section'
     $quickStartChinese = $quickStartChineseMatch.Groups[1].Value
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.4-setup\.exe') 'Chinese Quick Start names the exact setup artifact'
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.4-setup\.exe\.sha256\.txt') 'Chinese Quick Start names the exact checksum artifact'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.5-setup\.exe') 'Chinese Quick Start names the exact setup artifact'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.5-setup\.exe\.sha256\.txt') 'Chinese Quick Start names the exact checksum artifact'
     Assert-CcodTrue ($quickStartChinese -cnotmatch '(?i)powershell|Install-CodexControlOtherDevices') 'Chinese Quick Start does not teach PowerShell installation'
     Assert-CcodTrue ($quickStartChinese -cmatch '\*\*CodexRemote-fix\*\*') 'Chinese Quick Start names the public desktop shortcut'
 

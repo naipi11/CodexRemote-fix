@@ -52,6 +52,18 @@ function Test-CcodLifecycleCanonicalGuid {
     return $Value -is [string] -and [guid]::TryParseExact($Value, 'D', [ref]$parsed) -and $parsed.ToString('D') -ceq $Value
 }
 
+function Test-CcodLifecycleExactProperties {
+    param($Value, [string[]]$Expected)
+
+    if ($null -eq $Value -or ($Value -isnot [pscustomobject] -and $Value -isnot [Collections.IDictionary])) { return $false }
+    $actual = if ($Value -is [Collections.IDictionary]) { @($Value.Keys) } else { @($Value.PSObject.Properties.Name) }
+    if ($actual.Count -ne $Expected.Count) { return $false }
+    foreach ($name in $Expected) {
+        if ($actual -cnotcontains $name) { return $false }
+    }
+    return $true
+}
+
 function Assert-CcodActivationReceipt {
     param($Receipt)
     if (-not (Test-CcodActivationExactProperties $Receipt) -or
@@ -730,6 +742,42 @@ function Stop-CcodLifecycleExactProcess {
     return ($forcedExit -is [bool] -and $forcedExit)
 }
 
+function Test-CcodLifecycleLegacyControllerProcessControlFailure {
+    param(
+        [Parameter(Mandatory)]$Result,
+        [Parameter(Mandatory)]$Request,
+        [Parameter(Mandatory)][int]$ExitCode,
+        [Parameter(Mandatory)][string]$ControllerPath
+    )
+
+    try {
+        $resultFields = @('schemaVersion','action','ok','outcome','safeState','stage','transactionId','package','source','special','probes','recovery','error','logFile')
+        $errorFields = @('code','stage','message')
+        if ($ExitCode -ne 1 -or
+            -not (Test-CcodLifecycleExactProperties $Result $resultFields) -or
+            ($Result.schemaVersion -isnot [int] -and $Result.schemaVersion -isnot [long]) -or $Result.schemaVersion -ne 1 -or
+            $Result.action -cne 'Recover' -or $Result.ok -isnot [bool] -or $Result.ok -or
+            $Result.outcome -cne 'Error' -or $Result.safeState -cne 'Error' -or $Result.stage -cne 'InputValidation' -or
+            $Result.transactionId -cne $Request.transactionId -or $Result.package -ne $null -or $Result.source -ne $null -or
+            $Result.special -ne $null -or $Result.probes -ne $null -or $Result.recovery -ne $null -or $Result.logFile -ne $null -or
+            -not (Test-CcodLifecycleExactProperties $Result.error $errorFields) -or
+            $Result.error.code -cne 'CCOD_REQUEST_INVALID' -or $Result.error.stage -cne 'InputValidation' -or
+            $Result.error.message -cne 'The session controller failed safely. See the session log for details.' -or
+            $Request.schemaVersion -ne 1 -or $Request.action -cne 'Recover' -or
+            -not (Test-CcodLifecycleCanonicalGuid $Request.transactionId) -or
+            $ControllerPath -isnot [string] -or -not [IO.File]::Exists($ControllerPath)) {
+            return $false
+        }
+
+        $controllerText = [IO.File]::ReadAllText($ControllerPath, [Text.UTF8Encoding]::new($false))
+        $legacyLookup = $controllerText -match '(?im)^\s*\$module\s*=\s*Get-Module\s+ProcessControl\s+-ErrorAction\s+Stop\s*$'
+        $processControlImport = $controllerText -match '(?im)^\s*Import-Module\s+.*ProcessControl\.psm1'
+        return [bool]($legacyLookup -and -not $processControlImport)
+    } catch {
+        return $false
+    }
+}
+
 function Invoke-CcodLifecycleControllerRecover {
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
@@ -798,8 +846,13 @@ function Invoke-CcodLifecycleControllerRecover {
             Throw-CcodLifecycleError 'CCOD_UNINSTALL_NORMALIZATION_FAILED' 'The controller returned invalid JSON' $resultPath
         }
         if (($fromStdout | ConvertTo-Json -Depth 16 -Compress) -cne ($result | ConvertTo-Json -Depth 16 -Compress) -or
-            $result.transactionId -cne $request.transactionId -or $result.action -cne 'Recover' -or
-            $exitCode -ne 0 -or $result.ok -ne $true -or $null -ne $result.error) {
+            $result.transactionId -cne $request.transactionId -or $result.action -cne 'Recover') {
+            Throw-CcodLifecycleError 'CCOD_UNINSTALL_NORMALIZATION_FAILED' 'The controller could not normalize the session safely' $result
+        }
+        if ($exitCode -ne 0 -or $result.ok -ne $true -or $null -ne $result.error) {
+            if (Test-CcodLifecycleLegacyControllerProcessControlFailure -Result $result -Request $request -ExitCode $exitCode -ControllerPath $controller) {
+                Throw-CcodLifecycleError 'CCOD_UNINSTALL_LEGACY_CONTROLLER_PROCESSCONTROL_COMPATIBILITY' 'The active legacy controller requires an authenticated compatibility inspection' $result
+            }
             Throw-CcodLifecycleError 'CCOD_UNINSTALL_NORMALIZATION_FAILED' 'The controller could not normalize the session safely' $result
         }
         $specialPresent = $null -ne $result.special -and
@@ -816,6 +869,116 @@ function Invoke-CcodLifecycleControllerRecover {
         foreach ($path in @($requestPath, $resultPath, $stderrPath)) {
             if ([IO.File]::Exists($path)) { try { [IO.File]::Delete($path) } catch { } }
         }
+    }
+}
+
+function Assert-CcodLifecycleLegacyNoSpecialState {
+    param([Parameter(Mandatory)][string]$InstallRoot)
+
+    $stateRoot = [IO.Path]::GetFullPath((Join-Path $InstallRoot 'state'))
+    $status = Read-CcodStatus -StateRoot $stateRoot
+    if (-not (Test-CcodLifecycleExactProperties $status @('schemaVersion','session')) -or
+        ($status.schemaVersion -isnot [int] -and $status.schemaVersion -isnot [long]) -or
+        $status.schemaVersion -ne 1 -or $null -ne $status.session) {
+        Throw-CcodLifecycleError 'CCOD_UNINSTALL_LEGACY_COMPATIBILITY_STATE_INVALID' 'Legacy compatibility requires a strict no-session status state' $status
+    }
+
+    $transitionPath = [IO.Path]::GetFullPath((Join-Path $stateRoot 'transition.json'))
+    $transition = Read-CcodStrictJson -Path $transitionPath -ExpectedSchema 1 -Kind 'transition'
+    if (-not (Test-CcodLifecycleExactProperties $transition @('schemaVersion','activeTransaction')) -or
+        ($transition.schemaVersion -isnot [int] -and $transition.schemaVersion -isnot [long]) -or
+        $transition.schemaVersion -ne 1 -or $null -ne $transition.activeTransaction) {
+        Throw-CcodLifecycleError 'CCOD_UNINSTALL_LEGACY_COMPATIBILITY_STATE_INVALID' 'Legacy compatibility requires an empty transition journal' $transition
+    }
+
+    if ($null -ne (Read-CcodLifecycleRequest -StateRoot $stateRoot)) {
+        Throw-CcodLifecycleError 'CCOD_UNINSTALL_LEGACY_COMPATIBILITY_STATE_INVALID' 'Legacy compatibility refuses a pending lifecycle request' $stateRoot
+    }
+}
+
+function Test-CcodLifecycleLegacyInspectionResult {
+    param(
+        [Parameter(Mandatory)]$Result,
+        [Parameter(Mandatory)][string]$TransactionId
+    )
+
+    $fields = @('schemaVersion','action','ok','outcome','safeState','stage','transactionId','package','source','special','probes','recovery','error','logFile')
+    return (Test-CcodLifecycleExactProperties $Result $fields) -and
+        ($Result.schemaVersion -is [int] -or $Result.schemaVersion -is [long]) -and $Result.schemaVersion -eq 1 -and
+        $Result.action -ceq 'Inspect' -and $Result.ok -is [bool] -and $Result.ok -and
+        $Result.outcome -ceq 'Inspected' -and @('NoCodex','OrdinaryRunning') -ccontains $Result.safeState -and
+        $Result.stage -ceq 'Inspected' -and $Result.transactionId -ceq $TransactionId -and
+        $null -eq $Result.special -and $null -eq $Result.error
+}
+
+function Invoke-CcodLifecycleLegacyControllerCompatibilityInspection {
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$RuntimeId,
+        [Parameter(Mandatory)]$Identity,
+        [Parameter(Mandatory)]$Transaction
+    )
+
+    try {
+        if ($Identity.UserSid -isnot [string] -or [string]::IsNullOrWhiteSpace($Identity.UserSid) -or
+            $Identity.SessionId -isnot [int] -or $Identity.SessionId -lt 0 -or
+            $Transaction.runtimeGeneration -isnot [ValueType] -or $Transaction.leaseEpoch -isnot [ValueType]) {
+            throw 'identity or transaction context is invalid'
+        }
+        [uint64]$runtimeGeneration = $Transaction.runtimeGeneration
+        [uint64]$leaseEpoch = $Transaction.leaseEpoch
+        $root = Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
+        $runtimeRoot = [IO.Path]::GetFullPath((Join-Path (Join-Path $root 'runtime') $RuntimeId))
+        $validation = Test-CcodRuntimeManifest -RuntimeDirectory $runtimeRoot -ExpectedRuntimeId $RuntimeId
+        if (-not $validation.Valid) { throw 'active runtime manifest is invalid' }
+        $controller = [IO.Path]::GetFullPath((Join-Path $runtimeRoot 'src\persistence\SessionController.ps1'))
+        if (-not [IO.File]::Exists($controller)) { throw 'active controller is missing' }
+
+        Assert-CcodLifecycleLegacyNoSpecialState -InstallRoot $root
+        $inspectionId = [guid]::NewGuid().ToString('D')
+        $controllerLiteral = "'" + $controller.Replace("'", "''") + "'"
+        $rootLiteral = "'" + $root.Replace("'", "''") + "'"
+        $runtimeLiteral = "'" + $RuntimeId.Replace("'", "''") + "'"
+        $inspectionLiteral = "'" + $inspectionId + "'"
+        $probeScript = @"
+`$ErrorActionPreference = 'Stop'
+`$WarningPreference = 'SilentlyContinue'
+`$InformationPreference = 'SilentlyContinue'
+`$ProgressPreference = 'SilentlyContinue'
+`$controller = [IO.Path]::GetFullPath($controllerLiteral)
+. `$controller
+`$current = [Diagnostics.Process]::GetCurrentProcess()
+try {
+    `$created = `$current.StartTime.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    `$identity = [pscustomobject][ordered]@{ pid = [int]`$current.Id; creationTimeUtc = `$created; sessionId = [string]`$current.SessionId }
+} finally {
+    `$current.Dispose()
+}
+`$context = Resolve-CcodControllerRuntime -InstallRoot $rootLiteral -ControllerPath `$controller
+`$request = New-CcodManualControllerRequest -Action 'Inspect' -RuntimeId $runtimeLiteral -RuntimeGeneration ([UInt64]$runtimeGeneration) -LeaseEpoch ([UInt64]$leaseEpoch) -OwnerIdentity ([pscustomobject][ordered]@{ pid = `$identity.pid; creationTimeUtc = `$identity.creationTimeUtc }) -SupervisorIdentity `$identity -ExistingOnly `$true -RendererPort `$null -MainPort `$null -TimeoutMilliseconds 5000 -RestartOrdinary `$true -TransactionId $inspectionLiteral
+`$paths = Get-CcodInstalledControllerPaths -RuntimeContext `$context
+`$result = Invoke-CcodInspectSession -Request `$request -Paths `$paths -Adapters @{}
+[Console]::Out.WriteLine((`$result | ConvertTo-Json -Depth 16 -Compress))
+"@
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probeScript))
+        $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+        $output = @(& $powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded 2>&1)
+        $exitCode = $LASTEXITCODE
+        $lines = @($output | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($exitCode -ne 0 -or $lines.Count -ne 1) { throw 'compatibility inspection did not return one successful result' }
+        $inspection = $lines[0] | ConvertFrom-Json -ErrorAction Stop
+        if (-not (Test-CcodLifecycleLegacyInspectionResult -Result $inspection -TransactionId $inspectionId)) {
+            throw 'compatibility inspection result is invalid or unsafe'
+        }
+        Assert-CcodLifecycleLegacyNoSpecialState -InstallRoot $root
+        return [pscustomobject][ordered]@{
+            SchemaVersion = 1
+            SpecialPresent = $false
+            Normalized = $true
+            Outcome = 'LegacyNoSpecialCompatibility'
+        }
+    } catch {
+        Throw-CcodLifecycleError 'CCOD_UNINSTALL_LEGACY_COMPATIBILITY_FAILED' 'The legacy controller compatibility inspection could not prove an ordinary session' $InstallRoot
     }
 }
 
@@ -1081,6 +1244,16 @@ function Get-CcodLifecycleAdapters {
         NormalizeSpecialSession = {
             param($InstallRoot, $RuntimeId, $Identity)
             Invoke-CcodLifecycleControllerRecover -InstallRoot $InstallRoot -RuntimeId $RuntimeId -Identity $Identity
+        }
+        NormalizeLegacyControllerCompatibility = {
+            param($InstallRoot, $RuntimeId, $Identity, $Transaction)
+            Invoke-CcodLifecycleLegacyControllerCompatibilityInspection -InstallRoot $InstallRoot -RuntimeId $RuntimeId -Identity $Identity -Transaction $Transaction
+        }
+        VerifyLegacyControllerCompatibility = {
+            param($InstallRoot, $RuntimeId, $Identity, $Transaction)
+            $receipt = Invoke-CcodLifecycleLegacyControllerCompatibilityInspection -InstallRoot $InstallRoot -RuntimeId $RuntimeId -Identity $Identity -Transaction $Transaction
+            return $receipt.SpecialPresent -is [bool] -and -not $receipt.SpecialPresent -and
+                $receipt.Normalized -is [bool] -and $receipt.Normalized -and $receipt.Outcome -ceq 'LegacyNoSpecialCompatibility'
         }
         SetAutomationEnabled = {
             param($StateRoot, $Enabled)
@@ -1748,6 +1921,19 @@ function Invoke-CcodUninstallCleanup {
             Set-CcodUninstallTransactionPhase -Transaction $Transaction -Phase 'Recovering' -WriteTransaction $WriteTransaction -Adapters $adapters
             try {
                 $recovery = & $adapters.NormalizeSpecialSession $root $pointer.activeRuntime $identity
+            } catch {
+                $normalizationFailure = $_
+                if ((Get-CcodLifecycleErrorId $normalizationFailure) -ceq 'CCOD_UNINSTALL_LEGACY_CONTROLLER_PROCESSCONTROL_COMPATIBILITY') {
+                    try {
+                        $recovery = & $adapters.NormalizeLegacyControllerCompatibility $root $pointer.activeRuntime $identity $Transaction
+                    } catch {
+                        Throw-CcodLifecycleError 'CCOD_UNINSTALL_RECOVERY_FAILED' 'A special Codex session could not be recovered before uninstall' $Transaction
+                    }
+                } else {
+                    Throw-CcodLifecycleError 'CCOD_UNINSTALL_RECOVERY_FAILED' 'A special Codex session could not be recovered before uninstall' $Transaction
+                }
+            }
+            try {
                 if ($null -eq $recovery -or $null -eq $recovery.PSObject.Properties['SpecialPresent'] -or $recovery.SpecialPresent -isnot [bool] -or
                     $null -eq $recovery.PSObject.Properties['Normalized'] -or $recovery.Normalized -isnot [bool] -or
                     ([bool]$recovery.SpecialPresent -and -not [bool]$recovery.Normalized)) {
@@ -1782,6 +1968,8 @@ function Invoke-CcodUninstallCleanup {
 
         if ($phase -eq 'ProtectionStopped') {
             try {
+                $compatibilityVerified = & $adapters.VerifyLegacyControllerCompatibility $root $pointer.activeRuntime $identity $Transaction
+                if ($compatibilityVerified -isnot [bool] -or -not $compatibilityVerified) { throw 'manifest-verified no-special proof changed before task removal' }
                 & $adapters.RemoveSupervisorTask
                 $absent = & $adapters.TestSupervisorTaskAbsent
                 if ($absent -isnot [bool] -or -not $absent) { throw 'scheduled task deletion was not proven' }
@@ -1795,7 +1983,13 @@ function Invoke-CcodUninstallCleanup {
         }
 
         if ($phase -eq 'TaskRemoved') {
-            try { Remove-CcodLifecycleInstallTree -InstallRoot $root -Adapters $adapters }
+            try {
+                if ([IO.Directory]::Exists($root)) {
+                    $compatibilityVerified = & $adapters.VerifyLegacyControllerCompatibility $root $Transaction.runtimeId $identity $Transaction
+                    if ($compatibilityVerified -isnot [bool] -or -not $compatibilityVerified) { throw 'manifest-verified no-special proof changed before application removal' }
+                }
+                Remove-CcodLifecycleInstallTree -InstallRoot $root -Adapters $adapters
+            }
             catch { Throw-CcodLifecycleError 'CCOD_UNINSTALL_APPLICATION_STATE_REMOVAL_FAILED' 'The application runtime and state could not be removed safely' $Transaction }
             Set-CcodUninstallTransactionPhase -Transaction $Transaction -Phase 'ApplicationStateRemoved' -WriteTransaction $WriteTransaction -Adapters $adapters
             Set-CcodUninstallTransactionPhase -Transaction $Transaction -Phase 'ReadyForInno' -WriteTransaction $WriteTransaction -Adapters $adapters
