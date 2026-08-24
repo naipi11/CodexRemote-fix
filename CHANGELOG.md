@@ -6,6 +6,18 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.4
+
+### English
+
+- Made fail-closed uninstall recovery preclaim a durable nonempty controller result placeholder so it works with a still-manifest-sealed older controller runtime.
+- Added regression coverage for the legacy strict byte-array writer and the prelaunch placeholder ordering.
+
+### 简体中文
+
+- 调整失败即停止的卸载恢复：预占并认证的 controller 结果文件现在会持久写入非空占位内容，因此仍可由清单封存的旧 controller runtime 安全替换。
+- 新增旧版严格字节数组写入器及控制器启动前占位写入顺序的回归覆盖。
+
 ## v2.5.3
 
 ### English

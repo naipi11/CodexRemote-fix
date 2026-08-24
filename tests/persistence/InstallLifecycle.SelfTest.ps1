@@ -1592,6 +1592,20 @@ $results += Invoke-CcodTest 'default adapters keep module session state for priv
     Assert-CcodTrue ($commandNames -contains 'Get-CcodLifecycleProjectVersion') 'default GetProjectVersion still targets the private helper'
 }
 
+$results += Invoke-CcodTest 'uninstall recovery preclaims a durable nonempty controller result before launching a legacy runtime controller' {
+    $source = Get-Content -LiteralPath $installLifecycleModule -Raw -Encoding UTF8
+    $recover = [regex]::Match($source, '(?ms)^function Invoke-CcodLifecycleControllerRecover\s*\{(?<body>.*?)(?=^function Get-CcodLifecycleAdapters\s*\{)')
+    Assert-CcodTrue $recover.Success 'controller recovery implementation exists as one bounded function'
+    $body = $recover.Groups['body'].Value
+    $open = $body.IndexOf('$resultPlaceholder = [IO.File]::Open($resultPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)')
+    $bytes = $body.IndexOf('$resultPlaceholderBytes = [Text.UTF8Encoding]::new($false).GetBytes("{}`n")')
+    $write = $body.IndexOf('$resultPlaceholder.Write($resultPlaceholderBytes, 0, $resultPlaceholderBytes.Length)')
+    $flush = $body.IndexOf('$resultPlaceholder.Flush($true)')
+    $dispose = $body.IndexOf('$resultPlaceholder.Dispose()')
+    $launch = $body.IndexOf('$powershell = (Get-Command powershell.exe -ErrorAction Stop).Source')
+    Assert-CcodTrue ($open -ge 0 -and $bytes -gt $open -and $write -gt $bytes -and $flush -gt $write -and $dispose -gt $flush -and $launch -gt $dispose) 'owned nonempty result placeholder is written and flushed before the controller launch'
+}
+
 $results += Invoke-CcodTest 'timed out supervisor shutdown never terminates a reused PID' {
     $fake = New-CcodLifecycleFake
     $fake.World.WaitSupervisorExit = $false
@@ -1820,19 +1834,19 @@ $results += Invoke-CcodTest 'installer exposes CodexRemote-fix as the searchable
     Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-setup\.exe\.sha256\.txt') 'build script writes a hash beside the public setup filename'
 }
 
-$results += Invoke-CcodTest 'installer publishes the exact CodexRemote-fix 2.5.3 release artifacts' {
+$results += Invoke-CcodTest 'installer publishes the exact CodexRemote-fix 2.5.4 release artifacts' {
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
-    Assert-CcodEqual '2.5.3' ([string]$package.version) 'package version is exactly 2.5.3'
+    Assert-CcodEqual '2.5.4' ([string]$package.version) 'package version is exactly 2.5.4'
 
     $installerScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw
     $outputBase = [regex]::Match($installerScript, '(?m)^OutputBaseFilename=(.+)$').Groups[1].Value.Trim()
     $setupName = ($outputBase -replace '\{#ProjectVersion\}', [string]$package.version) + '.exe'
-    Assert-CcodEqual 'CodexRemote-fix-2.5.3-setup.exe' $setupName 'Inno output resolves to the exact public setup filename'
+    Assert-CcodEqual 'CodexRemote-fix-2.5.4-setup.exe' $setupName 'Inno output resolves to the exact public setup filename'
 
     $buildScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
     $checksumTemplate = [regex]::Match($buildScript, 'Join-Path \$dist \("([^"]+\.sha256\.txt)"\)').Groups[1].Value
     $checksumName = $checksumTemplate.Replace('$Version', [string]$package.version)
-    Assert-CcodEqual 'CodexRemote-fix-2.5.3-setup.exe.sha256.txt' $checksumName 'build script resolves to the exact public checksum filename'
+    Assert-CcodEqual 'CodexRemote-fix-2.5.4-setup.exe.sha256.txt' $checksumName 'build script resolves to the exact public checksum filename'
 }
 
 # Production mutation caught: allowing raw activation JSON to authorize Ready/Failed, checking the deadline after terminal processing, prompting without a strict validator child exit, or synchronously waiting on an unbounded validator.
@@ -2184,16 +2198,16 @@ $results += Invoke-CcodTest 'README and release workflow publish current install
     Assert-CcodTrue ($readmeChinese -cmatch '\A(?s:<div align="center">.*?<h1>CodexRemote-fix</h1>)') 'Chinese README uses the centered public product heading'
 
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start[^\r\n]*\r?\n(.*?)(?=^## )').Groups[1].Value
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.3-setup\.exe') 'English Quick Start names the exact setup artifact'
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.3-setup\.exe\.sha256\.txt') 'English Quick Start names the exact checksum artifact'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.4-setup\.exe') 'English Quick Start names the exact setup artifact'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.4-setup\.exe\.sha256\.txt') 'English Quick Start names the exact checksum artifact'
     Assert-CcodTrue ($quickStart -cnotmatch '(?i)powershell|Install-CodexControlOtherDevices') 'English Quick Start does not teach PowerShell installation'
     Assert-CcodTrue ($quickStart -cmatch '\*\*CodexRemote-fix\*\*') 'English Quick Start names the public desktop shortcut'
 
     $quickStartChineseMatch = [regex]::Match($readmeChinese, '(?ms)^## [^\r\n]+\r?\n(?:\r?\n)?(?=1\.[^\r\n]*\[Releases\])(.*?)(?=^## |\z)')
     Assert-CcodTrue $quickStartChineseMatch.Success 'Chinese README exposes a Quick Start section'
     $quickStartChinese = $quickStartChineseMatch.Groups[1].Value
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.3-setup\.exe') 'Chinese Quick Start names the exact setup artifact'
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.3-setup\.exe\.sha256\.txt') 'Chinese Quick Start names the exact checksum artifact'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.4-setup\.exe') 'Chinese Quick Start names the exact setup artifact'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.4-setup\.exe\.sha256\.txt') 'Chinese Quick Start names the exact checksum artifact'
     Assert-CcodTrue ($quickStartChinese -cnotmatch '(?i)powershell|Install-CodexControlOtherDevices') 'Chinese Quick Start does not teach PowerShell installation'
     Assert-CcodTrue ($quickStartChinese -cmatch '\*\*CodexRemote-fix\*\*') 'Chinese Quick Start names the public desktop shortcut'
 
