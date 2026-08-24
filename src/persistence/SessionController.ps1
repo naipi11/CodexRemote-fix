@@ -33,6 +33,7 @@ Import-Module (Join-Path $controllerModuleRoot 'LifecycleEpoch.psm1') -Force
 Import-Module (Join-Path $controllerModuleRoot 'TransitionJournal.psm1') -Force
 Import-Module (Join-Path $controllerModuleRoot 'KernelObjects.psm1') -Force
 Import-Module (Join-Path $controllerModuleRoot 'PersistenceIO.psm1') -Force -Global
+Import-Module (Join-Path $controllerModuleRoot 'ProcessControl.psm1') -Force -Global
 
 function Test-CcodControllerCanonicalGuid([object]$Value){
     if($Value -isnot [string]){return $false}

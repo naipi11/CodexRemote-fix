@@ -6,6 +6,18 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.5
+
+### English
+
+- Added a tightly scoped compatibility inspection for an older manifest-sealed controller that omitted its `ProcessControl` import. It accepts only the exact correlated legacy failure and requires a manifest-verified read-only ordinary-session recheck immediately before each protected uninstall deletion boundary.
+- New `SessionController` runtimes now load `ProcessControl` globally, and regression coverage rejects every other controller failure or changed compatibility proof.
+
+### 简体中文
+
+- 为遗漏 `ProcessControl` 导入的旧版清单封存 controller 增加了严格限定的兼容探测。它只接受精确关联的旧版失败特征，并在每个受保护卸载删除边界之前重新执行经清单验证的只读普通会话检查。
+- 新版 `SessionController` runtime 现会全局加载 `ProcessControl`；回归覆盖会拒绝其他任何 controller 失败或已变化的兼容性证明。
+
 ## v2.5.4
 
 ### English

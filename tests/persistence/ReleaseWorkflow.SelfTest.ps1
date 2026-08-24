@@ -188,20 +188,21 @@ Invoke-CcodTest 'package scripts build provenance and workflows retain the relea
     Assert-CcodTrue ($release -cmatch '(?ms)^  publish:\r?\n    needs: build\r?\n    runs-on: windows-latest\r?\n    permissions:\r?\n      contents: write\s*$') 'only the publish job receives release-write permission'
 }
 
-Invoke-CcodTest '2.5.4 current documentation matches the lifecycle tray and uninstall contract' {
+Invoke-CcodTest '2.5.5 current documentation matches the lifecycle tray and uninstall contract' {
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
-    Assert-CcodEqual '2.5.4' ([string]$package.version) 'package metadata is the 2.5.4 release'
+    Assert-CcodEqual '2.5.5' ([string]$package.version) 'package metadata is the 2.5.5 release'
 
     $changelog = Get-Content -LiteralPath (Join-Path $repositoryRoot 'CHANGELOG.md') -Raw
-    $releaseSection = [regex]::Match($changelog, '(?ms)^## v2\.5\.4\s*\r?\n(?<body>.*?)(?=^## |\z)')
-    Assert-CcodTrue $releaseSection.Success 'v2.5.4 release section exists'
+    $releaseSection = [regex]::Match($changelog, '(?ms)^## v2\.5\.5\s*\r?\n(?<body>.*?)(?=^## |\z)')
+    Assert-CcodTrue $releaseSection.Success 'v2.5.5 release section exists'
     $releaseBody = $releaseSection.Groups['body'].Value
-    Assert-CcodTrue ($releaseBody -match '(?m)^### English\s*$') 'v2.5.4 release section is English'
-    Assert-CcodTrue ($releaseBody.Contains('Made fail-closed uninstall recovery preclaim a durable nonempty controller result placeholder so it works with a still-manifest-sealed older controller runtime.')) 'v2.5.4 legacy controller compatibility release bullet is exact'
-    Assert-CcodTrue ($releaseBody.Contains('Added regression coverage for the legacy strict byte-array writer and the prelaunch placeholder ordering.')) 'v2.5.4 regression release bullet is exact'
+    Assert-CcodTrue ($releaseBody -match '(?m)^### English\s*$') 'v2.5.5 release section is English'
+    Assert-CcodTrue ($releaseBody.Contains('Added a tightly scoped compatibility inspection for an older manifest-sealed controller that omitted its `ProcessControl` import. It accepts only the exact correlated legacy failure and requires a manifest-verified read-only ordinary-session recheck immediately before each protected uninstall deletion boundary.')) 'v2.5.5 legacy controller compatibility release bullet is exact'
+    Assert-CcodTrue ($releaseBody.Contains('New `SessionController` runtimes now load `ProcessControl` globally, and regression coverage rejects every other controller failure or changed compatibility proof.')) 'v2.5.5 regression release bullet is exact'
 
     $readme = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.md') -Raw
-    Assert-CcodTrue ($readme.Contains('CodexRemote-fix-2.5.4-setup.exe')) 'English Quick Start names the 2.5.4 installer'
+    $quickStart = [regex]::Match($readme, '(?ms)^## Quick start\s*\r?\n(?<body>.*?)(?=^## |\z)').Groups['body'].Value
+    Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.5-setup.exe')) 'English Quick Start names the 2.5.5 installer'
     Assert-CcodTrue ($readme.Contains('## Connection and protection status')) 'English README documents the current status contract'
     foreach ($state in @('Waiting for Codex', 'Checking', 'Connected', 'Repair needed', 'Error', 'Running', 'Reconnecting', 'Stopping')) {
         Assert-CcodTrue ($readme.Contains($state)) "English README documents state: $state"
@@ -215,7 +216,8 @@ Invoke-CcodTest '2.5.4 current documentation matches the lifecycle tray and unin
     Assert-CcodTrue (-not $readme.Contains('Automation, Candidate-compatible trial, Logs, and Uninstall')) 'English README no longer describes removed tray toggles'
 
     $readmeZh = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.zh-CN.md') -Raw -Encoding UTF8
-    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.4-setup.exe')) 'Chinese Quick Start names the 2.5.4 installer'
+    $quickStartZh = [regex]::Match($readmeZh, '(?ms)^## \u5FEB\u901F\u5F00\u59CB\s*\r?\n(?<body>.*?)(?=^## |\z)').Groups['body'].Value
+    Assert-CcodTrue ($quickStartZh.Contains('CodexRemote-fix-2.5.5-setup.exe')) 'Chinese Quick Start names the 2.5.5 installer'
     Assert-CcodTrue ($readmeZh -match '## \u8FDE\u63A5\u4E0E\u5B88\u62A4\u72B6\u6001') 'Chinese README documents the current status contract'
     foreach ($statePattern in @('\u7B49\u5F85 Codex', '\u6B63\u5728\u68C0\u67E5', '\u5DF2\u8FDE\u63A5', '\u9700\u8981\u4FEE\u590D', '\u9519\u8BEF', '\u8FD0\u884C\u4E2D', '\u6B63\u5728\u91CD\u8FDE', '\u6B63\u5728\u505C\u6B62')) {
         Assert-CcodTrue ($readmeZh -match $statePattern) "Chinese README documents state pattern: $statePattern"

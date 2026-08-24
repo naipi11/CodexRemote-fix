@@ -117,6 +117,14 @@ function Invoke-CcodLeasedTestController {
 $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-controller-selftest-'+[guid]::NewGuid().ToString('N'))
 try{
     $paths=New-CcodControllerPaths $root;$resultPath=Join-Path $root 'result.json'
+    Invoke-CcodTest 'controller exposes ProcessControl globally so legacy provenance parses the exact child command line' {
+        $processControl=Get-Module -Name ProcessControl -ErrorAction SilentlyContinue
+        Assert-CcodTrue ($null -ne $processControl) 'SessionController imports ProcessControl into the controller-visible module table'
+        $adapter=Get-CcodControllerAdapters $null
+        $commandLine='powershell.exe -NoProfile -File "C:\work\child.ps1" -RequestPath "C:\Temp\request.json"'
+        $tokens=@(& $adapter.ParseProcessCommandLine $commandLine)
+        Assert-CcodEqual 'powershell.exe,-NoProfile,-File,C:\work\child.ps1,-RequestPath,C:\Temp\request.json' ($tokens -join ',') 'legacy provenance receives the native parsed process command-line tokens instead of an empty array'
+    }
     Invoke-CcodTest 'schema-v2 controller dispatches only the fenced Inspect Close Apply and RepairRenderer allow-list' {
         foreach($action in @('Inspect','Close','Apply','RepairRenderer')){
             $events=[Collections.Generic.List[string]]::new();$request=New-CcodControllerV2Request -Action $action

@@ -4,14 +4,14 @@ $ErrorActionPreference='Stop'
 $repositoryRoot=Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $lockPath=Join-Path $repositoryRoot 'build\trayhost-packages.lock.json'
 
-Invoke-CcodTest '2.5.4 source metadata binds the package and TrayHost assembly identities' {
+Invoke-CcodTest '2.5.5 source metadata binds the package and TrayHost assembly identities' {
     $package=Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw|ConvertFrom-Json
-    Assert-CcodEqual '2.5.4' ([string]$package.version) 'package version is the 2.5.4 release version'
+    Assert-CcodEqual '2.5.5' ([string]$package.version) 'package version is the 2.5.5 release version'
     $assemblyInfo=Get-Content -LiteralPath (Join-Path $repositoryRoot 'src\trayhost\AssemblyInfo.cs') -Raw
-    Assert-CcodTrue ($assemblyInfo -match 'AssemblyVersion\("2\.5\.4\.0"\)') 'TrayHost assembly version is 2.5.4.0'
-    Assert-CcodTrue ($assemblyInfo -match 'AssemblyFileVersion\("2\.5\.4\.0"\)') 'TrayHost file version is 2.5.4.0'
+    Assert-CcodTrue ($assemblyInfo -match 'AssemblyVersion\("2\.5\.5\.0"\)') 'TrayHost assembly version is 2.5.5.0'
+    Assert-CcodTrue ($assemblyInfo -match 'AssemblyFileVersion\("2\.5\.5\.0"\)') 'TrayHost file version is 2.5.5.0'
     $manifest=Get-Content -LiteralPath (Join-Path $repositoryRoot 'src\trayhost\CodexRemote.TrayHost.manifest') -Raw
-    Assert-CcodTrue ($manifest -match '<assemblyIdentity version="2\.5\.4\.0"') 'TrayHost manifest identity is 2.5.4.0'
+    Assert-CcodTrue ($manifest -match '<assemblyIdentity version="2\.5\.5\.0"') 'TrayHost manifest identity is 2.5.5.0'
 }
 
 Invoke-CcodTest 'TrayHost build lock pins the Microsoft net48 reference package' {
@@ -48,14 +48,14 @@ Invoke-CcodTest 'TrayHost build emits one source-auditable artifact and rejects 
     Import-Module $modulePath -Force
     $artifact=Join-Path $env:TEMP ('ccod-trayhost-artifact-'+[Guid]::NewGuid().ToString('N'))
     try{
-        $result=Invoke-CcodTrayHostBuild -RepositoryRoot $repositoryRoot -Version '2.5.4' -OutputDirectory $artifact
+        $result=Invoke-CcodTrayHostBuild -RepositoryRoot $repositoryRoot -Version '2.5.5' -OutputDirectory $artifact
         Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $artifact 'CodexRemote.TrayHost.exe') -PathType Leaf) 'TrayHost executable exists'
         Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $artifact 'CodexRemote.TrayHost.exe.config') -PathType Leaf) 'TrayHost config exists'
         Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $artifact 'trayhost-build-provenance.json') -PathType Leaf) 'TrayHost provenance exists'
         $provenance=Get-Content -LiteralPath (Join-Path $artifact 'trayhost-build-provenance.json') -Raw|ConvertFrom-Json
-        Assert-CcodEqual '2.5.4' ([string]$provenance.version) 'provenance version is exact'
+        Assert-CcodEqual '2.5.5' ([string]$provenance.version) 'provenance version is exact'
         $fileVersion=[Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $artifact 'CodexRemote.TrayHost.exe')).FileVersion
-        Assert-CcodEqual '2.5.4.0' ([string]$fileVersion) 'built TrayHost file version is release-aligned'
+        Assert-CcodEqual '2.5.5.0' ([string]$fileVersion) 'built TrayHost file version is release-aligned'
         Assert-CcodTrue ([string]$provenance.gitCommit -cmatch '^[0-9a-f]{40}$') 'provenance records one canonical source commit'
         $provenanceTimestamp=[datetime]::MinValue
         Assert-CcodTrue ([datetime]::TryParse([string]$provenance.buildTimestampUtc,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$provenanceTimestamp)) 'provenance records a parseable build timestamp'
@@ -67,10 +67,10 @@ Invoke-CcodTest 'TrayHost build emits one source-auditable artifact and rejects 
         Assert-CcodTrue (@($provenance.sourceFiles).Count -ge 10) 'provenance includes every TrayHost source'
         Assert-CcodTrue (-not ([string]$provenance|Select-String -Pattern '[A-Za-z]:\\|\\\\' -Quiet)) 'provenance does not leak absolute paths'
         $currentCommit=(& git -C $repositoryRoot rev-parse HEAD).Trim().ToLowerInvariant()
-        $validated=Test-CcodTrayHostArtifact -RepositoryRoot $repositoryRoot -Version '2.5.4' -ArtifactDirectory $artifact -ExpectedGitCommit $currentCommit
+        $validated=Test-CcodTrayHostArtifact -RepositoryRoot $repositoryRoot -Version '2.5.5' -ArtifactDirectory $artifact -ExpectedGitCommit $currentCommit
         Assert-CcodEqual $currentCommit ([string]$validated.GitCommit) 'artifact validation binds the current source commit when requested'
         $tampered=Join-Path $artifact 'CodexRemote.TrayHost.exe.config'; Add-Content -LiteralPath $tampered -Value 'x'
-        $threw=$false; try{Test-CcodTrayHostArtifact -RepositoryRoot $repositoryRoot -Version '2.5.4' -ArtifactDirectory $artifact|Out-Null}catch{$threw=$true}
+        $threw=$false; try{Test-CcodTrayHostArtifact -RepositoryRoot $repositoryRoot -Version '2.5.5' -ArtifactDirectory $artifact|Out-Null}catch{$threw=$true}
         Assert-CcodTrue $threw 'tampered artifact is rejected'
     }finally{if(Test-Path -LiteralPath $artifact){Remove-Item -LiteralPath $artifact -Recurse -Force -ErrorAction SilentlyContinue}}
 }
