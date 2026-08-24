@@ -85,6 +85,10 @@ if ($failures.Count -eq 0) {
     $powershellExecutable = (Get-Command powershell.exe -ErrorAction Stop).Source
     $persistenceOutput = & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $persistenceSelfTest 2>&1
     if ($LASTEXITCODE -ne 0) {
+        foreach ($line in @($persistenceOutput)) {
+            $text = [string]$line
+            if ($text -match 'CCOD_LIFECYCLE_TEST_DIAG_') { Write-Host $text }
+        }
         $failures.Add("Persistence self-test failed: $($persistenceOutput -join ' ')")
     }
 }
