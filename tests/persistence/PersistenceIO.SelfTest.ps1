@@ -72,6 +72,23 @@ try {
         Assert-CcodEqual 'settings.json' $siblings[0].Name 'replacement must leave only the target file'
     }
 
+    Invoke-CcodTest 'atomically replaces a preclaimed empty controller result file' {
+        $path = Join-Path $root 'replace-empty\controller-result.json'
+        [IO.Directory]::CreateDirectory((Split-Path $path -Parent)) | Out-Null
+        $placeholder = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $placeholder.Dispose()
+
+        Assert-CcodEqual 0 ([IO.FileInfo]$path).Length 'preclaimed controller result starts empty'
+        Write-CcodAtomicJson -Path $path -Value ([ordered]@{ schemaVersion = 1; action = 'Recover'; ok = $true })
+
+        $value = Read-CcodStrictJson -Path $path -ExpectedSchema 1 -Kind 'controller result'
+        $siblings = @(Get-ChildItem -LiteralPath (Split-Path $path -Parent) -Force)
+        Assert-CcodEqual 'Recover' $value.action 'replacement exposes the controller recovery action'
+        Assert-CcodEqual $true ([bool]$value.ok) 'replacement exposes the controller recovery result'
+        Assert-CcodEqual 1 $siblings.Count 'replacement leaves no temporary or backup siblings'
+        Assert-CcodEqual 'controller-result.json' $siblings[0].Name 'replacement leaves only the controller result file'
+    }
+
 
     Invoke-CcodTest 'uses the native handle commit without leftover siblings' {
         $path = Join-Path $root 'replace-native\settings.json'
@@ -187,6 +204,24 @@ try {
         Assert-CcodEqual 'before' (Read-CcodStrictJson -Path $path -ExpectedSchema 1 -Kind 'settings').value '1176 recovery must recreate the old target JSON'
     }
 
+    Invoke-CcodTest 'restores an empty preclaimed controller result when a simulated 1176 leaves it missing' {
+        $path = Join-Path $root 'replace-empty-1176\controller-result.json'
+        [IO.Directory]::CreateDirectory((Split-Path $path -Parent)) | Out-Null
+        $placeholder = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $placeholder.Dispose()
+        $adapters = @{
+            CommitFileByHandle = {
+                param([IO.FileStream]$Source, [string]$Destination)
+                [IO.File]::Delete($Destination)
+                return [pscustomobject]@{ Success = $false; ErrorCode = 1176 }
+            }
+        }
+
+        Assert-CcodThrows { Write-CcodAtomicJson -Path $path -Value ([ordered]@{ schemaVersion = 1; action = 'Recover'; ok = $true }) -Adapters $adapters } 'CCOD_ATOMIC_REPLACE_FAILED'
+        Assert-CcodTrue ([IO.File]::Exists($path)) '1176 recovery must recreate the empty controller result file'
+        Assert-CcodEqual 0 ([IO.FileInfo]$path).Length '1176 recovery must preserve the empty old bytes'
+    }
+
     Invoke-CcodTest 'retains foreign path objects and writes a recovery artifact for a simulated 1177' {
         $path = Join-Path $root 'replace-1177\settings.json'
         $directory = Split-Path $path -Parent
@@ -211,6 +246,34 @@ try {
         Assert-CcodEqual 'foreign path object' ([IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false))) '1177 recovery must not overwrite the foreign target object'
         Assert-CcodEqual 'before' (Read-CcodStrictJson -Path $displaced -ExpectedSchema 1 -Kind 'settings').value '1177 recovery must not delete or move the displaced old target object'
         Assert-CcodEqual 'before' (Read-CcodStrictJson -Path $artifact -ExpectedSchema 1 -Kind 'settings').value '1177 recovery artifact must retain old JSON bytes'
+    }
+
+    Invoke-CcodTest 'retains a foreign path object and writes an empty controller recovery artifact for a simulated 1177' {
+        $path = Join-Path $root 'replace-empty-1177\controller-result.json'
+        $directory = Split-Path $path -Parent
+        $displaced = Join-Path $directory 'displaced-empty-controller-result.json'
+        $artifact = Join-Path $directory 'empty-controller-recovery.json'
+        [IO.Directory]::CreateDirectory($directory) | Out-Null
+        $placeholder = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $placeholder.Dispose()
+        $adapters = @{
+            GetRandomFileName = {
+                param([string]$Purpose)
+                if ($Purpose -eq 'replacement') { return 'new-controller-replacement.json' }
+                return 'empty-controller-recovery.json'
+            }
+            CommitFileByHandle = {
+                param([IO.FileStream]$Source, [string]$Destination)
+                [IO.File]::Move($Destination, $displaced)
+                [IO.File]::WriteAllText($Destination, 'foreign path object', [Text.UTF8Encoding]::new($false))
+                return [pscustomobject]@{ Success = $false; ErrorCode = 1177 }
+            }
+        }
+
+        Assert-CcodThrows { Write-CcodAtomicJson -Path $path -Value ([ordered]@{ schemaVersion = 1; action = 'Recover'; ok = $true }) -Adapters $adapters } 'CCOD_ATOMIC_RECOVERY_FAILED'
+        Assert-CcodEqual 'foreign path object' ([IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false))) '1177 recovery must not overwrite the foreign controller result object'
+        Assert-CcodEqual 0 ([IO.FileInfo]$displaced).Length '1177 recovery must not modify the displaced empty controller result'
+        Assert-CcodEqual 0 ([IO.FileInfo]$artifact).Length '1177 recovery artifact must retain the empty old bytes'
     }
 
     Invoke-CcodTest 'rejects malformed state and quarantines it beside the source' {

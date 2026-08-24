@@ -6,6 +6,18 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.3
+
+### English
+
+- Fixed fail-closed uninstall recovery when its authenticated controller result placeholder is initially empty.
+- Added regression coverage for atomically replacing the empty preclaimed controller result file.
+
+### 简体中文
+
+- 修复失败即停止的卸载恢复：已认证的 controller 结果占位文件为空时，恢复结果可安全原子写入。
+- 新增回归覆盖，可原子替换预先创建的空 controller 结果文件。
+
 ## v2.5.2
 
 ### English
