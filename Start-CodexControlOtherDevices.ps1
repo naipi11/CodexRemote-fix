@@ -21,7 +21,9 @@ function Resolve-CcodStartInstalledController {
     if(-not $validation.Valid){throw "Installed runtime validation failed: $($validation.Code). Repair or reinstall CodexRemote-fix."}
     $controller=Join-Path $runtime 'src\persistence\SessionController.ps1'
     if(-not (Test-Path -LiteralPath $controller -PathType Leaf)){throw 'The verified active runtime does not contain the required restart files. Repair or reinstall.'}
-    [pscustomobject]@{RuntimeId=$active.activeRuntime;RuntimeRoot=$runtime;Controller=[IO.Path]::GetFullPath($controller)}
+    $lifecycleRequestModule=Join-Path $runtime 'src\persistence\modules\LifecycleRequest.psm1'
+    if(-not(Test-Path -LiteralPath $lifecycleRequestModule -PathType Leaf)){throw 'The verified active runtime lacks lifecycle submission support. Repair or reinstall.'}
+    [pscustomobject]@{RuntimeId=$active.activeRuntime;Generation=[UInt64]$active.generation;RuntimeRoot=$runtime;Controller=[IO.Path]::GetFullPath($controller);LifecycleRequestModule=[IO.Path]::GetFullPath($lifecycleRequestModule)}
 }
 
 function Get-CcodStartSupervisorIdentity {
@@ -36,14 +38,6 @@ function New-CcodStartControllerRequest {
         schemaVersion=1;action='Apply';transactionId=$TransactionId;runtimeId=$RuntimeId;supervisorIdentity=$SupervisorIdentity;source=$null;existingOnly=$false
         rendererPort=if($RendererDebugPort -eq 0){$null}else{$RendererDebugPort};mainPort=if($MainInspectorPort -eq 0){$null}else{$MainInspectorPort}
         timeoutMilliseconds=[int]($TimeoutSeconds*1000);restartOrdinary=$true
-    }
-}
-
-function New-CcodRestartControllerRequest {
-    param([string]$RuntimeId,[int]$TimeoutSeconds,$SupervisorIdentity=(Get-CcodStartSupervisorIdentity),[string]$TransactionId=([guid]::NewGuid().ToString('D')))
-    [pscustomobject][ordered]@{
-        schemaVersion=1;action='Recover';transactionId=$TransactionId;runtimeId=$RuntimeId;supervisorIdentity=$SupervisorIdentity;source=$null;existingOnly=$true
-        rendererPort=$null;mainPort=$null;timeoutMilliseconds=[int]($TimeoutSeconds*1000);restartOrdinary=$true
     }
 }
 
@@ -75,30 +69,30 @@ function Invoke-CcodStartInstalledController {
     }
 }
 
-function Invoke-CcodRestartInstalledWorkflow {
-    param($Resolved,$RestartRequest,$ApplyRequest)
-    $recovery=Invoke-CcodStartInstalledController -Resolved $Resolved -Request $RestartRequest
-    if($recovery.outcome -notin @('Recovered','NoAction','Closed')){throw "Codex restart could not safely recover the current session: $($recovery.outcome)"}
-    $apply=Invoke-CcodStartInstalledController -Resolved $Resolved -Request $ApplyRequest
-    if($apply.outcome -notin @('Activated','NoAction')){throw "Codex restart did not activate the controlled session: $($apply.outcome)"}
-    return [pscustomobject][ordered]@{Recovery=$recovery;Apply=$apply}
+function Submit-CcodStartRestart {
+    param($Resolved,[Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][int]$TimeoutMilliseconds)
+    Import-Module $Resolved.LifecycleRequestModule -Force
+    Submit-CcodLifecycleRequest -InstallRoot $InstallRoot -Kind RestartAndRepair -Origin ExplicitStart -RuntimeId $Resolved.RuntimeId -RuntimeGeneration ([UInt64]$Resolved.Generation) -TimeoutMilliseconds $TimeoutMilliseconds
 }
 
 if($MyInvocation.InvocationName -ne '.'){
     $installRoot=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'CodexControlOtherDevices'))
     $resolved=Resolve-CcodStartInstalledController -InstallRoot $installRoot
-    $request=New-CcodStartControllerRequest -RuntimeId $resolved.RuntimeId -RendererDebugPort $RendererDebugPort -MainInspectorPort $MainInspectorPort -TimeoutSeconds $TimeoutSeconds
     if($RestartCodex){
-        $restart=New-CcodRestartControllerRequest -RuntimeId $resolved.RuntimeId -TimeoutSeconds $TimeoutSeconds
-        $workflow=Invoke-CcodRestartInstalledWorkflow -Resolved $resolved -RestartRequest $restart -ApplyRequest $request
-        $result=$workflow.Apply
+        $receipt=Submit-CcodStartRestart -Resolved $resolved -InstallRoot $installRoot -TimeoutMilliseconds ([int]($TimeoutSeconds*1000))
+        if(-not$receipt.accepted){throw "CCOD_RESTART_SUBMISSION_REJECTED: $($receipt.errorCode)"}
+        Write-Host ''
+        Write-Host 'Codex restart and repair was submitted to the persistent Supervisor.' -ForegroundColor Green
+        Write-Host ("Transaction: {0}" -f $receipt.transactionId)
+        Write-Host ''
     }else{
+        $request=New-CcodStartControllerRequest -RuntimeId $resolved.RuntimeId -RendererDebugPort $RendererDebugPort -MainInspectorPort $MainInspectorPort -TimeoutSeconds $TimeoutSeconds
         $result=Invoke-CcodStartInstalledController -Resolved $resolved -Request $request
+        Write-Host ''
+        Write-Host 'CodexRemote-fix is enabled for this app session.' -ForegroundColor Green
+        Write-Host 'Open Settings > Connections > Control other devices.'
+        if($null -ne $result.logFile){Write-Host "Diagnostics: $($result.logFile)"}
+        Write-Host 'Launch Codex normally or run Reset-CodexControlOtherDevices.ps1 to disable the runtime fix.'
+        Write-Host ''
     }
-    Write-Host ''
-    Write-Host 'CodexRemote-fix is enabled for this app session.' -ForegroundColor Green
-    Write-Host 'Open Settings > Connections > Control other devices.'
-    if($null -ne $result.logFile){Write-Host "Diagnostics: $($result.logFile)"}
-    Write-Host 'Launch Codex normally or run Reset-CodexControlOtherDevices.ps1 to disable the runtime fix.'
-    Write-Host ''
 }

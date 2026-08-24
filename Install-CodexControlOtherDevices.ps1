@@ -3,7 +3,8 @@ param(
     [string]$InstallRoot,
     [switch]$EnableCandidateCompatibleUpdates,
     [switch]$RepairState,
-    [switch]$DoNotStart
+    [switch]$DoNotStart,
+    [string]$ActivationId
 )
 
 $ErrorActionPreference = 'Stop'
@@ -35,7 +36,8 @@ $receipt = Invoke-CcodInstall `
     -InstallRoot $InstallRoot `
     -EnableCandidateCompatibleUpdates:([bool]$EnableCandidateCompatibleUpdates) `
     -RepairState:([bool]$RepairState) `
-    -DoNotStart:([bool]$DoNotStart)
+    -DoNotStart:([bool]$DoNotStart) `
+    -ActivationId $ActivationId
 
 Write-Host ''
 Write-Host 'CodexRemote-fix - install result' -ForegroundColor Cyan

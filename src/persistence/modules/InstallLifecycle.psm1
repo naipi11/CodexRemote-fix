@@ -8,9 +8,12 @@ Import-Module (Join-Path $PSScriptRoot 'ScheduledTask.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'KernelObjects.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'CompatibilityProbe.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'UiPreferences.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'LifecycleTransaction.psm1') -Force
 
 $script:CcodLifecycleTaskName = 'Codex Control Other Devices Supervisor'
 $script:CcodLifecycleDefaultInstallRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'CodexControlOtherDevices'
+$script:CcodActivationReceiptFields = @('schemaVersion','activationId','phase','runtimeId','previousRuntimeId','startedAtUtc','updatedAtUtc','ready','errorCode')
+$script:CcodActivationPhases = @('StoppingPreviousRuntime','InstallingRuntime','ActivatingRuntime','StartingProtection','Ready','Failed')
 
 function Throw-CcodLifecycleError {
     param(
@@ -25,6 +28,85 @@ function Throw-CcodLifecycleError {
         [Management.Automation.ErrorCategory]::InvalidData,
         $Target
     )
+}
+
+function Get-CcodLifecycleErrorId {
+    param($ErrorRecord)
+    return ([string]$ErrorRecord.FullyQualifiedErrorId -split ',')[0]
+}
+
+function Test-CcodActivationExactProperties {
+    param($Value)
+    if ($null -eq $Value -or $Value -isnot [pscustomobject]) { return $false }
+    $actual = @($Value.PSObject.Properties.Name)
+    if ($actual.Count -ne $script:CcodActivationReceiptFields.Count) { return $false }
+    for ($index = 0; $index -lt $actual.Count; $index++) {
+        if ($actual[$index] -cne $script:CcodActivationReceiptFields[$index]) { return $false }
+    }
+    return $true
+}
+
+function Assert-CcodActivationReceipt {
+    param($Receipt)
+    if (-not (Test-CcodActivationExactProperties $Receipt) -or
+        $Receipt.schemaVersion -isnot [int] -or $Receipt.schemaVersion -ne 1 -or
+        $Receipt.activationId -isnot [string] -or $Receipt.activationId -cnotmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or
+        $Receipt.phase -isnot [string] -or $script:CcodActivationPhases -cnotcontains $Receipt.phase -or
+        ($null -ne $Receipt.runtimeId -and ($Receipt.runtimeId -isnot [string] -or $Receipt.runtimeId -cnotmatch '^[A-Za-z0-9._-]{1,96}$')) -or
+        ($null -ne $Receipt.previousRuntimeId -and ($Receipt.previousRuntimeId -isnot [string] -or $Receipt.previousRuntimeId -cnotmatch '^[A-Za-z0-9._-]{1,96}$')) -or
+        $Receipt.startedAtUtc -isnot [string] -or $Receipt.updatedAtUtc -isnot [string] -or
+        $Receipt.ready -isnot [bool] -or
+        (($Receipt.phase -ceq 'Ready') -ne [bool]$Receipt.ready) -or
+        (($Receipt.phase -ceq 'Failed') -and ($Receipt.errorCode -isnot [string] -or $Receipt.errorCode -cnotmatch '^CCOD_[A-Z0-9_]{1,96}$')) -or
+        (($Receipt.phase -cne 'Failed') -and $null -ne $Receipt.errorCode)) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_ACTIVATION_RECEIPT_INVALID' 'Activation receipt contract is invalid' $null
+    }
+    try {
+        $started = [DateTime]::ParseExact($Receipt.startedAtUtc, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+        $updated = [DateTime]::ParseExact($Receipt.updatedAtUtc, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+        if ($updated -lt $started) { throw 'timestamp order' }
+    } catch {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_ACTIVATION_RECEIPT_INVALID' 'Activation receipt timestamps are invalid' $null
+    }
+    return $true
+}
+
+function Write-CcodActivationReceiptFile {
+    param([Parameter(Mandatory)][string]$InstallRoot, [Parameter(Mandatory)]$Receipt)
+    [void](Assert-CcodActivationReceipt $Receipt)
+    $stateRoot = Join-Path $InstallRoot 'state'
+    [IO.Directory]::CreateDirectory($stateRoot) | Out-Null
+    Write-CcodAtomicJson -Path (Join-Path $stateRoot 'post-install-activation.json') -Value $Receipt
+}
+
+function Write-CcodInstallActivationPhase {
+    param(
+        [Parameter(Mandatory)]$Activation,
+        [Parameter(Mandatory)][string]$Phase,
+        [AllowNull()]$RuntimeId,
+        [AllowNull()]$PreviousRuntimeId,
+        [AllowNull()]$ErrorCode,
+        [Parameter(Mandatory)][hashtable]$Adapters,
+        [Parameter(Mandatory)][string]$InstallRoot
+    )
+    $now = & $Adapters.UtcNow
+    if ($now -isnot [DateTime]) { Throw-CcodLifecycleError 'CCOD_INSTALL_CLOCK_INVALID' 'Activation clock must return DateTime' $null }
+    $receipt = [pscustomobject][ordered]@{
+        schemaVersion = 1
+        activationId = [string]$Activation.ActivationId
+        phase = $Phase
+        runtimeId = $RuntimeId
+        previousRuntimeId = $PreviousRuntimeId
+        startedAtUtc = [string]$Activation.StartedAtUtc
+        updatedAtUtc = $now.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+        ready = [bool]($Phase -ceq 'Ready')
+        errorCode = $ErrorCode
+    }
+    [void](Assert-CcodActivationReceipt $receipt)
+    try { & $Adapters.WriteActivationReceipt $InstallRoot $receipt }
+    catch { Throw-CcodLifecycleError 'CCOD_INSTALL_ACTIVATION_RECEIPT_FAILED' 'Activation receipt could not be persisted' $null }
+    $Activation.LastPhase = $Phase
+    return $receipt
 }
 
 function Get-CcodLifecycleCanonicalRoot {
@@ -509,7 +591,10 @@ function Stop-CcodLifecycleSupervisor {
     if (-not (& $Adapters.IsSupervisorIdentityCurrent $Identity)) {
         return $true
     }
-    return [bool](& $Adapters.TerminateSupervisor $Identity)
+    $terminated = & $Adapters.TerminateSupervisor $Identity
+    if ($terminated -isnot [bool] -or -not $terminated) { return $false }
+    $forcedExit = & $Adapters.WaitSupervisorExit $Identity 5000
+    return ($forcedExit -is [bool] -and $forcedExit)
 }
 
 function Invoke-CcodLifecycleControllerRecover {
@@ -658,6 +743,19 @@ function Get-CcodLifecycleAdapters {
             } catch { return $false }
         }
         UtcNow = { [DateTime]::UtcNow }
+        NewActivationId = { [guid]::NewGuid().ToString('D') }
+        WriteActivationReceipt = {
+            param($InstallRoot, $Receipt)
+            Write-CcodActivationReceiptFile -InstallRoot $InstallRoot -Receipt $Receipt
+        }
+        ReadActiveLifecycleRequest = {
+            param($StateRoot)
+            Read-CcodLifecycleRequest -StateRoot $StateRoot
+        }
+        WaitNewRuntimeReady = {
+            param($InstallRoot, $RuntimeId, $RuntimeGeneration, $Identity, $TaskStartedAtUtc, $TimeoutMilliseconds)
+            Wait-CcodLifecycleNewRuntimeReady -InstallRoot $InstallRoot -RuntimeId $RuntimeId -RuntimeGeneration $RuntimeGeneration -Identity $Identity -TaskStartedAtUtc $TaskStartedAtUtc -TimeoutMilliseconds $TimeoutMilliseconds
+        }
         InstallSupervisorTask = {
             param($InstallRoot, $UserSid)
             $spec = Get-CcodSupervisorTaskSpec -InstallRoot $InstallRoot -UserSid $UserSid
@@ -817,6 +915,162 @@ function Start-CcodLifecycleTask {
     & $Adapters.StartSupervisorTask
 }
 
+function Get-CcodLifecycleReadinessAdapters {
+    param([hashtable]$Adapters)
+    $defaults = @{
+        EnumerateProcesses = { Get-CimInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction Stop }
+        GetProcessOwnerSid = {
+            param($Process)
+            $owner = Invoke-CimMethod -InputObject $Process -MethodName GetOwnerSid -ErrorAction Stop
+            if ($null -eq $owner -or [int]$owner.ReturnValue -ne 0) { return $null }
+            return [string]$owner.Sid
+        }
+        OpenReadyEvent = { param($UserSid,$SessionId,$ReadyToken) Open-CcodEvent -Kind Ready -UserSid $UserSid -SessionId $SessionId -ReadyToken $ReadyToken }
+        WaitReadyEvent = { param($Event,$TimeoutMilliseconds) [bool]$Event.Handle.WaitOne($TimeoutMilliseconds) }
+        IsSupervisorIdentityCurrent = {
+            param($SupervisorIdentity)
+            $process = $null
+            try {
+                $process = Get-Process -Id $SupervisorIdentity.Pid -ErrorAction SilentlyContinue
+                if ($null -eq $process) { return $false }
+                return $process.StartTime.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture) -ceq $SupervisorIdentity.CreationTimeUtc
+            } catch { return $false }
+            finally { if ($null -ne $process) { $process.Dispose() } }
+        }
+        CloseReadyEvent = { param($Event) $Event.Handle.Dispose() }
+        StartClock = { [Diagnostics.Stopwatch]::StartNew() }
+        GetElapsedMilliseconds = { param($Clock) [long]$Clock.ElapsedMilliseconds }
+        Sleep = { param($Milliseconds) Start-Sleep -Milliseconds $Milliseconds }
+    }
+    if ($null -eq $Adapters) { return $defaults }
+    if ($Adapters -isnot [hashtable]) { Throw-CcodLifecycleError 'CCOD_INSTALL_ADAPTER_INVALID' 'Readiness adapters must be a hashtable' $null }
+    $resolved = @{}
+    foreach ($name in $defaults.Keys) { $resolved[$name] = $defaults[$name] }
+    foreach ($key in $Adapters.Keys) {
+        if ($key -isnot [string] -or -not $resolved.ContainsKey($key) -or $Adapters[$key] -isnot [scriptblock]) {
+            Throw-CcodLifecycleError 'CCOD_INSTALL_ADAPTER_INVALID' 'Readiness adapter contract is invalid' $key
+        }
+        $resolved[$key] = $Adapters[$key]
+    }
+    return $resolved
+}
+
+function New-CcodLifecycleNotReadyProof {
+    return [pscustomobject][ordered]@{ SupervisorReady=$false; TrayReady=$false }
+}
+
+function Wait-CcodLifecycleNewRuntimeReady {
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$RuntimeId,
+        [Parameter(Mandatory)][UInt64]$RuntimeGeneration,
+        [Parameter(Mandatory)]$Identity,
+        [Parameter(Mandatory)][DateTime]$TaskStartedAtUtc,
+        [Parameter(Mandatory)][ValidateRange(1,120000)][int]$TimeoutMilliseconds,
+        [hashtable]$Adapters
+    )
+    $adapter = Get-CcodLifecycleReadinessAdapters -Adapters $Adapters
+    $readyEvent = $null
+    $readyToken = $null
+    try {
+        $root = Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
+        $pointer = Read-CcodActiveRuntime -InstallRoot $root
+        if ($pointer.activeRuntime -cne $RuntimeId -or [UInt64]$pointer.generation -ne $RuntimeGeneration) { return New-CcodLifecycleNotReadyProof }
+        $runtimeRoot = [IO.Path]::GetFullPath((Join-Path (Join-Path $root 'runtime') $RuntimeId))
+        $validation = Test-CcodRuntimeManifest -RuntimeDirectory $runtimeRoot -ExpectedRuntimeId $RuntimeId
+        if (-not $validation.Valid) { return New-CcodLifecycleNotReadyProof }
+        if ($null -eq $Identity -or $Identity.UserSid -isnot [string] -or $Identity.SessionId -isnot [int]) { return New-CcodLifecycleNotReadyProof }
+        $supervisorPath = [IO.Path]::GetFullPath((Join-Path $runtimeRoot 'src\persistence\Supervisor.ps1'))
+        $bootstrapPath = [IO.Path]::GetFullPath((Join-Path $root 'bootstrap.ps1'))
+        $hostPrefix = '^\s*(?:"[^"]*powershell\.exe"|[^\s"]*powershell\.exe)'
+        $supervisorPattern = $hostPrefix + '\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-STA\s+-File\s+"(?<path>[^"]+)"\s+-ReadyToken\s+(?<token>[0-9a-f]{64})\s*$'
+        $bootstrapPattern = $hostPrefix + '\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-STA\s+-WindowStyle\s+Hidden\s+-File\s+"(?<path>[^"]+)"\s+-InstallRoot\s+"(?<root>[^"]+)"\s+-EntryMode\s+Task\s*$'
+        $started = $TaskStartedAtUtc.ToUniversalTime()
+        $clock = & $adapter.StartClock
+        while ([long](& $adapter.GetElapsedMilliseconds $clock) -lt $TimeoutMilliseconds) {
+            $snapshots = @(& $adapter.EnumerateProcesses)
+            $byPid = @{}
+            $duplicatePid = $false
+            foreach ($snapshot in $snapshots) {
+                if ($null -eq $snapshot -or $null -eq $snapshot.PSObject.Properties['ProcessId']) { continue }
+                $snapshotPid = 0
+                if (-not [int]::TryParse([string]$snapshot.ProcessId, [ref]$snapshotPid) -or $snapshotPid -lt 1) { continue }
+                if ($byPid.ContainsKey($snapshotPid)) { $duplicatePid = $true; break }
+                $byPid[$snapshotPid] = $snapshot
+            }
+            if ($duplicatePid) { return New-CcodLifecycleNotReadyProof }
+            $matches = [Collections.Generic.List[object]]::new()
+            foreach ($snapshot in $byPid.Values) {
+                if ($null -eq $snapshot.PSObject.Properties['Name'] -or [string]$snapshot.Name -ine 'powershell.exe' -or
+                    $null -eq $snapshot.PSObject.Properties['SessionId'] -or [int]$snapshot.SessionId -ne $Identity.SessionId -or
+                    $null -eq $snapshot.PSObject.Properties['ParentProcessId'] -or $null -eq $snapshot.PSObject.Properties['CreationDate'] -or
+                    $null -eq $snapshot.PSObject.Properties['CommandLine'] -or [string]::IsNullOrWhiteSpace([string]$snapshot.CommandLine)) { continue }
+                $created = ([DateTime]$snapshot.CreationDate).ToUniversalTime()
+                if ($created -lt $started) { continue }
+                $match = [regex]::Match([string]$snapshot.CommandLine, $supervisorPattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                if (-not $match.Success) { continue }
+                try { $candidatePath = [IO.Path]::GetFullPath($match.Groups['path'].Value) } catch { continue }
+                if ($candidatePath -cne $supervisorPath) { continue }
+                $parentPid = [int]$snapshot.ParentProcessId
+                if ($parentPid -lt 1 -or -not $byPid.ContainsKey($parentPid)) { continue }
+                $parent = $byPid[$parentPid]
+                if ($null -eq $parent.PSObject.Properties['SessionId'] -or [int]$parent.SessionId -ne $Identity.SessionId -or
+                    $null -eq $parent.PSObject.Properties['CreationDate'] -or ([DateTime]$parent.CreationDate).ToUniversalTime() -lt $started -or
+                    $null -eq $parent.PSObject.Properties['CommandLine']) { continue }
+                $parentMatch = [regex]::Match([string]$parent.CommandLine, $bootstrapPattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                if (-not $parentMatch.Success) { continue }
+                try {
+                    $candidateBootstrap = [IO.Path]::GetFullPath($parentMatch.Groups['path'].Value)
+                    $candidateRoot = [IO.Path]::GetFullPath($parentMatch.Groups['root'].Value)
+                } catch { continue }
+                if ($candidateBootstrap -cne $bootstrapPath -or $candidateRoot -cne $root) { continue }
+                if ((& $adapter.GetProcessOwnerSid $snapshot) -cne $Identity.UserSid -or (& $adapter.GetProcessOwnerSid $parent) -cne $Identity.UserSid) { continue }
+                $matches.Add([pscustomobject][ordered]@{
+                    Identity = [pscustomobject][ordered]@{ Pid=[int]$snapshot.ProcessId; CreationTimeUtc=$created.ToString('o', [Globalization.CultureInfo]::InvariantCulture); SessionId=[int]$snapshot.SessionId; UserSid=[string]$Identity.UserSid }
+                    Token = [string]$match.Groups['token'].Value
+                })
+            }
+            if ($matches.Count -gt 1) { return New-CcodLifecycleNotReadyProof }
+            if ($matches.Count -eq 1) {
+                $candidate = $matches[0]
+                if (-not (& $adapter.IsSupervisorIdentityCurrent $candidate.Identity)) { return New-CcodLifecycleNotReadyProof }
+                $readyToken = [string]$candidate.Token
+                try { $readyEvent = & $adapter.OpenReadyEvent $Identity.UserSid $Identity.SessionId $readyToken }
+                catch { return New-CcodLifecycleNotReadyProof }
+                while ([long](& $adapter.GetElapsedMilliseconds $clock) -lt $TimeoutMilliseconds) {
+                    if (-not (& $adapter.IsSupervisorIdentityCurrent $candidate.Identity)) { return New-CcodLifecycleNotReadyProof }
+                    $remaining = $TimeoutMilliseconds - [long](& $adapter.GetElapsedMilliseconds $clock)
+                    $slice = [int][Math]::Min(100, [Math]::Max(1, $remaining))
+                    $signaled = $false
+                    try { $signaled = & $adapter.WaitReadyEvent $readyEvent $slice } catch { return New-CcodLifecycleNotReadyProof }
+                    if ($signaled -isnot [bool]) { return New-CcodLifecycleNotReadyProof }
+                    if ($signaled) {
+                        if (-not (& $adapter.IsSupervisorIdentityCurrent $candidate.Identity)) { return New-CcodLifecycleNotReadyProof }
+                        return [pscustomobject][ordered]@{ SupervisorReady=$true; TrayReady=$true }
+                    }
+                }
+                return New-CcodLifecycleNotReadyProof
+            }
+            & $adapter.Sleep 20
+        }
+        return New-CcodLifecycleNotReadyProof
+    } catch {
+        return New-CcodLifecycleNotReadyProof
+    } finally {
+        $readyToken = $null
+        if ($null -ne $readyEvent) { try { & $adapter.CloseReadyEvent $readyEvent } catch { } }
+    }
+}
+
+function Assert-CcodLifecycleTaskIdle {
+    param([Parameter(Mandatory)][hashtable]$Adapters)
+    $idle = & $Adapters.WaitSupervisorTaskIdle 10000
+    if ($idle -isnot [bool] -or -not $idle) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_SUPERVISOR_TASK_BUSY' 'The previous IgnoreNew supervisor task instance did not exit before activation' $script:CcodLifecycleTaskName
+    }
+    return $true
+}
+
 function Remove-CcodLifecycleInstallTree {
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
@@ -893,6 +1147,7 @@ function Invoke-CcodInstall {
         [switch]$EnableCandidateCompatibleUpdates,
         [switch]$RepairState,
         [switch]$DoNotStart,
+        [string]$ActivationId,
         [hashtable]$Adapters
     )
 
@@ -934,13 +1189,54 @@ function Invoke-CcodInstall {
         $existingPointer = Read-CcodActiveRuntime -InstallRoot $root
     }
 
+    if ([string]::IsNullOrWhiteSpace($ActivationId)) { $ActivationId = & $adapters.NewActivationId }
+    $startedAt = & $adapters.UtcNow
+    if ($startedAt -isnot [DateTime]) { Throw-CcodLifecycleError 'CCOD_INSTALL_CLOCK_INVALID' 'Activation clock must return DateTime' $null }
+    $activation = [pscustomobject]@{
+        ActivationId = [string]$ActivationId
+        StartedAtUtc = $startedAt.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+        LastPhase = $null
+    }
     $stagingDirectory = $null
     $runtimeId = $null
-    $upgrade = $false
+    $runtimeRoot = $null
+    $runtimeCreated = $false
+    $pointerCommitted = $false
+    $pointer = $existingPointer
+    $upgrade = $null -ne $existingPointer
     $installLease = $null
     $shutdownGate = $null
     $lifecycleOwnership = $null
     try {
+        if ($upgrade) {
+            $pending = & $adapters.ReadActiveLifecycleRequest (Join-Path $root 'state')
+            if ($null -ne $pending) {
+                Throw-CcodLifecycleError 'CCOD_INSTALL_LIFECYCLE_BUSY' 'A nonterminal lifecycle transaction must complete before upgrade' $null
+            }
+            Write-CcodInstallActivationPhase -Activation $activation -Phase 'StoppingPreviousRuntime' -RuntimeId $null -PreviousRuntimeId ([string]$existingPointer.activeRuntime) -ErrorCode $null -Adapters $adapters -InstallRoot $root | Out-Null
+            $shutdownGate = & $adapters.CreateSupervisorShutdownGate $identity.UserSid $identity.SessionId
+            if ($null -eq $shutdownGate) {
+                Throw-CcodLifecycleError 'CCOD_INSTALL_SHUTDOWN_GATE_FAILED' 'The upgrade shutdown gate could not be created' $root
+            }
+            $oldSupervisor = Get-CcodLifecycleSupervisorIdentity -InstallRoot $root -Identity $identity -Adapters $adapters
+            if ($null -ne $oldSupervisor -and -not (Stop-CcodLifecycleSupervisor -InstallRoot $root -Adapters $adapters -Identity $oldSupervisor)) {
+                Throw-CcodLifecycleError 'CCOD_INSTALL_PREVIOUS_RUNTIME_BUSY' 'The verified previous Supervisor did not exit exactly' $null
+            }
+            [void](Assert-CcodLifecycleTaskIdle -Adapters $adapters)
+            $installLease = & $adapters.EnterInstallLease $identity.UserSid
+            if ($null -eq $installLease -or $installLease.Outcome -isnot [string] -or @('Acquired', 'TimedOut') -cnotcontains $installLease.Outcome) {
+                Throw-CcodLifecycleError 'CCOD_INSTALL_LEASE_INVALID' 'The installation lease contract is invalid' $installLease
+            }
+            if ($installLease.Outcome -ceq 'TimedOut') {
+                Throw-CcodLifecycleError 'CCOD_INSTALL_BUSY' 'Another transition or bootstrap launch is in progress; retry the upgrade shortly' $root
+            }
+            $pending = & $adapters.ReadActiveLifecycleRequest (Join-Path $root 'state')
+            if ($null -ne $pending) {
+                Throw-CcodLifecycleError 'CCOD_INSTALL_LIFECYCLE_BUSY' 'A nonterminal lifecycle transaction appeared during upgrade shutdown' $null
+            }
+        }
+
+        Write-CcodInstallActivationPhase -Activation $activation -Phase 'InstallingRuntime' -RuntimeId $null -PreviousRuntimeId $(if ($upgrade) { [string]$existingPointer.activeRuntime } else { $null }) -ErrorCode $null -Adapters $adapters -InstallRoot $root | Out-Null
         $stagingDirectory = Copy-CcodLifecycleStaging -SourceRoot $sourceRoot -InstallRoot $root -Adapters $adapters -Files $files
         $manifest = New-CcodRuntimeManifest -RuntimeDirectory $stagingDirectory -ProjectVersion $projectVersion
         [IO.File]::WriteAllText(
@@ -965,33 +1261,15 @@ function Invoke-CcodInstall {
         } else {
             [IO.Directory]::CreateDirectory((Split-Path $runtimeRoot -Parent)) | Out-Null
             [IO.Directory]::Move($stagingDirectory, $runtimeRoot)
+            $runtimeCreated = $true
         }
         $stagingDirectory = $null
-        $upgrade = $null -ne $existingPointer
         if (-not $upgrade) {
             $stateRoot = Join-Path $root 'state'
             Initialize-CcodState -StateRoot $stateRoot -NodeCandidates $nodeCandidates -CandidateCompatibleOptIn ([bool]$EnableCandidateCompatibleUpdates)
             Initialize-CcodUiPreference -StateRoot $stateRoot | Out-Null
         }
-        if ($upgrade) {
-            $installLease = & $adapters.EnterInstallLease $identity.UserSid
-            if ($null -eq $installLease -or $installLease.Outcome -isnot [string] -or @('Acquired', 'TimedOut') -cnotcontains $installLease.Outcome) {
-                Throw-CcodLifecycleError 'CCOD_INSTALL_LEASE_INVALID' 'The installation lease contract is invalid' $installLease
-            }
-            if ($installLease.Outcome -ceq 'TimedOut') {
-                Throw-CcodLifecycleError 'CCOD_INSTALL_BUSY' 'Another transition or bootstrap launch is in progress; retry the upgrade shortly' $root
-            }
-            $shutdownGate = & $adapters.CreateSupervisorShutdownGate $identity.UserSid $identity.SessionId
-            if ($null -eq $shutdownGate) {
-                Throw-CcodLifecycleError 'CCOD_INSTALL_SHUTDOWN_GATE_FAILED' 'The upgrade shutdown gate could not be created' $root
-            }
-            $oldSupervisor = Get-CcodLifecycleSupervisorIdentity -InstallRoot $root -Identity $identity -Adapters $adapters
-            if ($null -ne $oldSupervisor) {
-                if (-not (Stop-CcodLifecycleSupervisor -InstallRoot $root -Adapters $adapters -Identity $oldSupervisor)) {
-                    Throw-CcodLifecycleError 'CCOD_INSTALL_SUPERVISOR_STOP_FAILED' 'The verified legacy supervisor did not stop safely' $oldSupervisor
-                }
-            }
-        }
+        Write-CcodInstallActivationPhase -Activation $activation -Phase 'ActivatingRuntime' -RuntimeId $runtimeId -PreviousRuntimeId $(if ($upgrade) { [string]$existingPointer.activeRuntime } else { $null }) -ErrorCode $null -Adapters $adapters -InstallRoot $root | Out-Null
         $process = [Diagnostics.Process]::GetCurrentProcess()
         try {
             $ownerIdentity = [pscustomobject][ordered]@{ pid=[int]$process.Id; creationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o') }
@@ -1000,18 +1278,72 @@ function Invoke-CcodInstall {
             $lifecycleOwnership = & $adapters.EnterLifecycleOwnership $root $ownershipRuntimeId $ownershipGeneration $ownerIdentity $identity.UserSid $identity.SessionId
             $pointer = & $adapters.SetActiveRuntime $root $runtimeId $lifecycleOwnership
         } finally { $process.Dispose() }
+        [UInt64]$expectedGeneration = if ($null -ne $existingPointer) { [UInt64]$existingPointer.generation + 1 } else { 1 }
+        if ($null -eq $pointer -or $pointer.activeRuntime -cne $runtimeId -or [UInt64]$pointer.generation -ne $expectedGeneration) {
+            Throw-CcodLifecycleError 'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN' 'The active runtime generation commit could not be proven' $null
+        }
+        $pointerCommitted = $true
         if ($null -ne $shutdownGate) {
             & $adapters.CloseSupervisorShutdownGate $shutdownGate
             $shutdownGate = $null
         }
+        Write-CcodInstallActivationPhase -Activation $activation -Phase 'StartingProtection' -RuntimeId $runtimeId -PreviousRuntimeId $pointer.previousRuntime -ErrorCode $null -Adapters $adapters -InstallRoot $root | Out-Null
         Install-CcodLifecycleTask -InstallRoot $root -Adapters $adapters -Identity $identity
-        if (-not $DoNotStart) {
-            Start-CcodLifecycleTask -Adapters $adapters
+        if ($DoNotStart) {
+            Throw-CcodLifecycleError 'CCOD_INSTALL_NEW_RUNTIME_NOT_READY' 'Activation cannot succeed without starting and proving the new runtime' $null
         }
-        if ($upgrade) {
-            Remove-CcodLifecycleOldRuntimes -InstallRoot $root -ActiveRuntimeId $runtimeId -PreviousRuntimeId $pointer.previousRuntime
+        $taskStartedAt = & $adapters.UtcNow
+        try { & $adapters.StartSupervisorTask }
+        catch { Throw-CcodLifecycleError 'CCOD_INSTALL_SUPERVISOR_START_FAILED' 'The existing scheduled task could not start the new runtime' $null }
+        $ownershipReleased = & $adapters.ExitLifecycleOwnership $lifecycleOwnership
+        if ($ownershipReleased -isnot [bool] -or -not $ownershipReleased -or -not $lifecycleOwnership.released) {
+            Throw-CcodLifecycleError 'CCOD_INSTALL_LIFECYCLE_RELEASE_FAILED' 'Generation ownership could not be released for scheduled-task bootstrap' $null
         }
+        if ($null -ne $installLease -and $installLease.Outcome -ceq 'Acquired') {
+            $installReleased = & $adapters.ExitInstallLease $installLease
+            if ($installReleased -isnot [bool] -or -not $installReleased) {
+                Throw-CcodLifecycleError 'CCOD_INSTALL_LIFECYCLE_RELEASE_FAILED' 'Installation lease could not be released for scheduled-task bootstrap' $null
+            }
+            $installLease = $null
+        }
+        $readyProof = & $adapters.WaitNewRuntimeReady $root $runtimeId ([UInt64]$pointer.generation) $identity $taskStartedAt 15000
+        if ($null -eq $readyProof -or $readyProof.SupervisorReady -isnot [bool] -or $readyProof.TrayReady -isnot [bool] -or
+            -not $readyProof.SupervisorReady -or -not $readyProof.TrayReady) {
+            Throw-CcodLifecycleError 'CCOD_INSTALL_NEW_RUNTIME_NOT_READY' 'The new Supervisor and authenticated TrayHost readiness were not proven' $null
+        }
+        Write-CcodInstallActivationPhase -Activation $activation -Phase 'Ready' -RuntimeId $runtimeId -PreviousRuntimeId $pointer.previousRuntime -ErrorCode $null -Adapters $adapters -InstallRoot $root | Out-Null
+        if ($upgrade) { Remove-CcodLifecycleOldRuntimes -InstallRoot $root -ActiveRuntimeId $runtimeId -PreviousRuntimeId $pointer.previousRuntime }
         Write-CcodLifecycleLog -InstallRoot $root -Adapters $adapters -Stage $(if ($upgrade) { 'Upgrade' } else { 'Install' }) -Code 'CCOD_INSTALL_COMPLETED' -Outcome $(if ($upgrade) { 'Upgraded' } else { 'Installed' })
+    } catch {
+        $caught = $_
+        $errorCode = Get-CcodLifecycleErrorId $caught
+        if ($errorCode -notmatch '^CCOD_[A-Z0-9_]+$') {
+            $errorCode = switch ([string]$activation.LastPhase) {
+                'StoppingPreviousRuntime' { 'CCOD_INSTALL_PREVIOUS_RUNTIME_BUSY' }
+                'InstallingRuntime' { 'CCOD_INSTALL_STAGING_FAILED' }
+                'ActivatingRuntime' { 'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN' }
+                'StartingProtection' { 'CCOD_INSTALL_NEW_RUNTIME_NOT_READY' }
+                default { 'CCOD_INSTALL_FAILED' }
+            }
+        }
+        if (-not $pointerCommitted -and $null -ne $runtimeId -and [IO.File]::Exists($activePath)) {
+            try {
+                $observedPointer = Read-CcodActiveRuntime -InstallRoot $root
+                if ($observedPointer.activeRuntime -ceq $runtimeId -and ($null -eq $existingPointer -or [UInt64]$observedPointer.generation -gt [UInt64]$existingPointer.generation)) {
+                    $pointerCommitted = $true
+                }
+            } catch { }
+        }
+        if (-not $pointerCommitted -and $runtimeCreated -and $null -ne $runtimeRoot -and [IO.Directory]::Exists($runtimeRoot)) {
+            try { Remove-Item -LiteralPath $runtimeRoot -Recurse -Force -ErrorAction Stop } catch { }
+        }
+        if ($errorCode -cne 'CCOD_INSTALL_ACTIVATION_RECEIPT_FAILED') {
+            try {
+                Write-CcodInstallActivationPhase -Activation $activation -Phase 'Failed' -RuntimeId $runtimeId -PreviousRuntimeId $(if ($null -ne $existingPointer) { [string]$existingPointer.activeRuntime } else { $null }) -ErrorCode $errorCode -Adapters $adapters -InstallRoot $root | Out-Null
+            } catch { }
+        }
+        if ((Get-CcodLifecycleErrorId $caught) -match '^CCOD_[A-Z0-9_]+$') { throw $caught }
+        Throw-CcodLifecycleError $errorCode 'Installation failed at a protected activation boundary' $null
     } finally {
         if ($null -ne $shutdownGate) {
             try { & $adapters.CloseSupervisorShutdownGate $shutdownGate } catch { }
