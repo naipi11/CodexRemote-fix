@@ -43,21 +43,16 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 ## 快速开始
 
-1. 从 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 下载 `CodexRemote-fix-2.5.7-windows-x64.zip`、对应 `.sha256.txt`、release manifest 和 payload manifest；打开前先核对 ZIP 的 SHA-256。
-2. 将已验证的 ZIP 解压到一个新的空目录。如果 Windows 标记了下载脚本，只对已验证的入口脚本解除阻止，然后在 Windows PowerShell 中运行：
+1. 从 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 下载 `CodexRemote-fix-2.5.8-setup.exe`（推荐安装包）或便携 ZIP `CodexRemote-fix-2.5.8-windows-x64.zip`；下载并核对对应的 `.sha256.txt`。
+2. 选择安装包时直接运行并跟随向导；选择便携 ZIP 时解压到新空目录，然后双击 `CodexRemote-fix.exe`。
 
-       Unblock-File .\Install-CodexRemote-fix.ps1
-       .\Install-CodexRemote-fix.ps1
-
-   入口会先校验全部载荷文件、再执行 Microsoft Defender 自定义扫描，之后才复制到当前用户的应用目录；它不会关闭 Defender，也不会添加排除项。
+   两条路径都会校验载荷、执行 Microsoft Defender 自定义扫描，并保留 DPAPI 设备密钥。
 3. 托盘守护程序会自动启动。连接状态显示 **已连接** 后，打开 **设置 → 连接 → 控制其他设备** 即可注册或使用。Windows 10 用户请确认已安装 .NET Framework 4.8，原生 TrayHost 需要该组件。
 
 当前便携 ZIP、SHA-256、release manifest 与 payload manifest 始终发布在
 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 页面。
 
-便携发布会有意拒绝覆盖已有便携载荷。替换便携版本前，请先运行已安装的
-`Uninstall-CodexControlOtherDevices.ps1`；设置和 DPAPI 设备密钥会保留。由旧 Inno
-安装包迁移时，请先卸载旧版本。
+替换便携版本前，请先运行已安装的 `Uninstall-CodexControlOtherDevices.ps1`；设置和 DPAPI 设备密钥会保留。
 
 已验证：Windows 11 · Codex Desktop `26.818.2441.0` · Node.js `22.23.1`；
 隐藏的控制器标签、原生托盘菜单、双语菜单切换和常驻守护程序均可用。
@@ -83,12 +78,12 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 ## 发布（Releases）
 
-每个带 tag 的发布都会附带 Windows 便携 ZIP、SHA-256 校验文件、release manifest 和
-payload manifest。`.github/workflows/release.yml` 会在 tag 上自动构建，因此 v2.5.7
-发布提供 `CodexRemote-fix-2.5.7-windows-x64.zip`、
-`CodexRemote-fix-2.5.7-windows-x64.zip.sha256.txt`、
-`CodexRemote-fix-2.5.7-release-manifest.json` 和
-`CodexRemote-fix-2.5.7-payload-manifest.json`。
+每个带 tag 的发布都会附带 Windows 安装包和便携 ZIP，各自带 SHA-256 校验文件、release manifest，并共享 payload manifest。`.github/workflows/release.yml` 会在 tag 上自动构建两者，因此 v2.5.8 提供：
+
+- `CodexRemote-fix-2.5.8-setup.exe` 及其校验文件
+- `CodexRemote-fix-2.5.8-windows-x64.zip` 及其校验文件
+- `CodexRemote-fix-2.5.8-payload-manifest.json`
+- `CodexRemote-fix-2.5.8-release-manifest.json` 和 `CodexRemote-fix-2.5.8-setup-release-manifest.json`
 
 GitHub Release 正文只发布英文更新说明；本 README 继续保留中英文使用说明。
 完整历史见 [CHANGELOG.md](CHANGELOG.md)。

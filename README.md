@@ -46,21 +46,17 @@ that existing page and leaves the Codex UI, account authorization, and enrollmen
 
 ## Quick start
 
-1. Download `CodexRemote-fix-2.5.7-windows-x64.zip`, its `.sha256.txt`, the release manifest, and the payload manifest from [Releases](https://github.com/naipi11/CodexRemote-fix/releases). Verify the ZIP SHA-256 before opening it.
-2. Extract the verified ZIP into a new empty folder. If Windows marked the downloaded script, unblock only the verified entrypoint, then run it in Windows PowerShell:
 
-       Unblock-File .\Install-CodexRemote-fix.ps1
-       .\Install-CodexRemote-fix.ps1
+1. Download either `CodexRemote-fix-2.5.8-setup.exe` (recommended installer) or `CodexRemote-fix-2.5.8-windows-x64.zip` from [Releases](https://github.com/naipi11/CodexRemote-fix/releases). Download and verify the matching `.sha256.txt` before continuing.
+2. If you chose the setup installer, run it and follow the wizard. If you chose the portable ZIP, extract it into a new empty folder and double-click `CodexRemote-fix.exe`.
 
-   The entrypoint validates every payload file and runs a Microsoft Defender custom scan before it copies anything to the current-user application directory. It neither disables Defender nor adds an exclusion.
+   Both paths validate the payload, run a Microsoft Defender custom scan, and preserve the DPAPI device-key store.
 3. The tray supervisor starts automatically. When the connection reports **Connected**, open **Settings → Connections → Control other devices** to enroll or use the device. Windows 10 users should ensure that .NET Framework 4.8 is installed for the native TrayHost.
 
 The current portable bundle, checksum, release manifest, and payload manifest are always published on the
 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) page.
 
-The portable release intentionally refuses to overwrite an existing portable payload. Before replacing a
-portable build, use its installed `Uninstall-CodexControlOtherDevices.ps1`; settings and the DPAPI
-device-key store stay in place. To transition from an older Inno build, uninstall that older build first.
+Before replacing a portable build, use its installed `Uninstall-CodexControlOtherDevices.ps1`; settings and the DPAPI\r\ndevice-key store stay in place.
 
 Verified on Windows 11 · Codex Desktop `26.818.2441.0` · Node.js `22.23.1`:
 the hidden controller tab, native tray menu, bilingual menu switching, and persistent
@@ -87,12 +83,12 @@ The tray reports two independent, truthful status lines instead of inferring rea
 
 ## Releases
 
-Every tagged release ships a Windows portable ZIP, its SHA-256 checksum, a release manifest, and a
-payload manifest. The `.github/workflows/release.yml` workflow builds the bundle from the tag
-automatically, so v2.5.7 includes `CodexRemote-fix-2.5.7-windows-x64.zip`,
-`CodexRemote-fix-2.5.7-windows-x64.zip.sha256.txt`,
-`CodexRemote-fix-2.5.7-release-manifest.json`, and
-`CodexRemote-fix-2.5.7-payload-manifest.json`.
+Every tagged release ships a Windows setup installer and a portable ZIP, each with its SHA-256 checksum, release manifest, and the shared payload manifest. The `.github/workflows/release.yml` workflow builds both from the tag automatically, so v2.5.8 includes:
+
+- `CodexRemote-fix-2.5.8-setup.exe` and its checksum
+- `CodexRemote-fix-2.5.8-windows-x64.zip` and its checksum
+- `CodexRemote-fix-2.5.8-payload-manifest.json`
+- `CodexRemote-fix-2.5.8-release-manifest.json` and `CodexRemote-fix-2.5.8-setup-release-manifest.json`
 
 Each release appends a short English change summary to the GitHub release body. The bilingual release history is kept in [CHANGELOG.md](CHANGELOG.md).
 

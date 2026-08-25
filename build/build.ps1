@@ -131,7 +131,9 @@ $checksum = "$bundle.sha256.txt"
 $provenance = Join-Path $dist "CodexRemote-fix-$Version-trayhost-provenance.json"
 $payloadManifestAsset = Join-Path $dist "CodexRemote-fix-$Version-payload-manifest.json"
 $releaseManifest = Join-Path $dist "CodexRemote-fix-$Version-release-manifest.json"
-foreach ($path in @($bundle,$checksum,$provenance,$payloadManifestAsset,$releaseManifest)) {
+$setupExe = Join-Path $dist "CodexRemote-fix-$Version-setup.exe"
+$setupChecksum = "$setupExe.sha256.txt"
+foreach ($path in @($bundle,$checksum,$provenance,$payloadManifestAsset,$releaseManifest,$setupExe,$setupChecksum)) {
     if ([IO.File]::Exists($path) -or [IO.Directory]::Exists($path)) { throw "Refusing to overwrite immutable release output: $path" }
 }
 
@@ -170,10 +172,13 @@ try {
         $relative = $runtimeFile.FullName.Substring($runtimeRoot.TrimEnd('\').Length + 1).Replace('\','/')
         Copy-CcodBuildPayloadFile -Source $runtimeFile.FullName -PayloadRoot $payloadRoot -Relative ('src/runtime/' + $relative)
     }
+    Invoke-CcodPortableLauncherBuild -RepositoryRoot $repoRoot -Version $Version -OutputDirectory (Join-Path $PSScriptRoot 'generated\portable') -GitCommit $gitCommit -BuildTimestampUtc $buildTimestampUtc | Out-Null
     foreach ($trayHostFile in @('CodexRemote.TrayHost.exe','CodexRemote.TrayHost.exe.config','trayhost-build-provenance.json')) {
         Copy-CcodBuildPayloadFile -Source (Join-Path $trayHostArtifact $trayHostFile) -PayloadRoot $payloadRoot -Relative ('bin/' + $trayHostFile)
     }
-
+    foreach ($portableFile in @('CodexRemote.Portable.exe','CodexRemote.Portable.exe.config','portable-launcher-provenance.json')) {
+        Copy-CcodBuildPayloadFile -Source (Join-Path $PSScriptRoot ('generated\portable\' + $portableFile)) -PayloadRoot $payloadRoot -Relative ('bin/' + $portableFile)
+    }
     $lifecycleModule = Import-Module (Join-Path $payloadRoot 'src\persistence\modules\InstallLifecycle.psm1') -Force -PassThru
     try {
         & $lifecycleModule { param($Root) Get-CcodLifecycleSourceFiles -SourceRoot $Root -RequireTrayHost | Out-Null } $payloadRoot
@@ -192,6 +197,8 @@ try {
     }
     Write-CcodBuildUtf8 -Path $payloadManifestPath -Text (($payloadManifest | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
     [IO.File]::Copy((Assert-CcodBuildRegularFile -Path (Join-Path $repoRoot 'Install-CodexRemote-fix.ps1') -Kind 'Portable bundle entrypoint'),(Join-Path $stageRoot 'Install-CodexRemote-fix.ps1'),$false)
+    [IO.File]::Copy((Assert-CcodBuildRegularFile -Path (Join-Path $PSScriptRoot 'generated\portable\CodexRemote.Portable.exe') -Kind 'Portable launcher'),(Join-Path $stageRoot 'CodexRemote-fix.exe'),$false)
+    [IO.File]::Copy((Assert-CcodBuildRegularFile -Path (Join-Path $PSScriptRoot 'generated\portable\CodexRemote.Portable.exe.config') -Kind 'Portable launcher config'),(Join-Path $stageRoot 'CodexRemote-fix.exe.config'),$false)
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
     [IO.Compression.ZipFile]::CreateFromDirectory($stageRoot,$bundle,[IO.Compression.CompressionLevel]::Optimal,$false)
@@ -210,7 +217,9 @@ try {
             [ordered]@{ name = [IO.Path]::GetFileName($bundle); sha256 = $bundleHash },
             [ordered]@{ name = [IO.Path]::GetFileName($checksum); sha256 = Get-CcodBuildFileSha256 -Path $checksum },
             [ordered]@{ name = [IO.Path]::GetFileName($provenance); sha256 = Get-CcodBuildFileSha256 -Path $provenance },
-            [ordered]@{ name = [IO.Path]::GetFileName($payloadManifestAsset); sha256 = Get-CcodBuildFileSha256 -Path $payloadManifestAsset }
+            [ordered]@{ name = [IO.Path]::GetFileName($payloadManifestAsset); sha256 = Get-CcodBuildFileSha256 -Path $payloadManifestAsset },
+            [ordered]@{ name = 'CodexRemote-fix.exe'; sha256 = Get-CcodBuildFileSha256 -Path (Join-Path $stageRoot 'CodexRemote-fix.exe') },
+            [ordered]@{ name = 'CodexRemote-fix.exe.config'; sha256 = Get-CcodBuildFileSha256 -Path (Join-Path $stageRoot 'CodexRemote-fix.exe.config') }
         )
     }
     Write-CcodBuildUtf8 -Path $releaseManifest -Text (($releaseRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
@@ -236,4 +245,42 @@ Write-Host ("  Hash:     {0}" -f (Get-CcodBuildFileSha256 -Path $bundle))
 Write-Host ("  TrayHost: {0}" -f $provenance)
 Write-Host ("  Payload:  {0}" -f $payloadManifestAsset)
 Write-Host ("  Manifest: {0}" -f $releaseManifest)
+Write-Host ''
+
+# Build the Inno Setup installer from the same verified source tree.
+$isccCandidates = @(
+    (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+    (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+    (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+)
+$iscc = $isccCandidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and [IO.File]::Exists($_) } | Select-Object -First 1
+if (-not $iscc) { throw 'Inno Setup 6 (ISCC.exe) was not found. Install it with: winget install --id JRSoftware.InnoSetup --exact' }
+$issPath = Join-Path $PSScriptRoot 'CodexControlOtherDevices.iss'
+& $iscc "/DProjectVersion=$Version" "/DTrayHostArtifactDirectory=$trayHostArtifact" "/O$dist\." $issPath
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $setupExe -PathType Leaf)) {
+    throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
+}
+$setupHash = Get-CcodBuildFileSha256 -Path $setupExe
+Write-CcodBuildUtf8 -Path $setupChecksum -Text ("{0} *{1}" -f $setupHash,[IO.Path]::GetFileName($setupExe))
+$setupReleaseManifest = Join-Path $dist "CodexRemote-fix-$Version-setup-release-manifest.json"
+$setupRecord = [ordered]@{
+    schemaVersion = 1
+    product = 'CodexRemote-fix'
+    version = $Version
+    gitCommit = $gitCommit
+    buildTimestampUtc = $buildTimestampUtc
+    assets = @(
+        [ordered]@{ name = [IO.Path]::GetFileName($setupExe); sha256 = $setupHash },
+        [ordered]@{ name = [IO.Path]::GetFileName($setupChecksum); sha256 = Get-CcodBuildFileSha256 -Path $setupChecksum },
+        [ordered]@{ name = [IO.Path]::GetFileName($provenance); sha256 = Get-CcodBuildFileSha256 -Path $provenance }
+    )
+}
+Write-CcodBuildUtf8 -Path $setupReleaseManifest -Text (($setupRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
+Test-CcodReleaseAssetManifest -ManifestPath $setupReleaseManifest -AssetDirectory $dist -ExpectedVersion $Version | Out-Null
+
+Write-Host ''
+Write-Host 'Installer build completed:' -ForegroundColor Green
+Write-Host ("  Setup:    {0}" -f $setupExe)
+Write-Host ("  SHA-256:  {0}" -f $setupChecksum)
+Write-Host ("  Manifest: {0}" -f $setupReleaseManifest)
 Write-Host ''

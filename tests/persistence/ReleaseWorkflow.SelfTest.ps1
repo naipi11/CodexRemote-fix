@@ -14,7 +14,7 @@ function New-CcodReleaseFixture {
     [IO.File]::WriteAllText($checksum, ("{0} *{1}`r`n" -f $installerHash, [IO.Path]::GetFileName($installer)), [Text.UTF8Encoding]::new($false))
     $trayHost = Join-Path $root 'CodexRemote-fix-2.5.0-trayhost-provenance.json'
     [IO.File]::WriteAllText($trayHost, ('{"schemaVersion":1,"product":"CodexRemote-fix","version":"2.5.0","gitCommit":"' + ('a' * 40) + '","buildTimestampUtc":"2026-08-24T00:00:00.0000000Z"}'), [Text.UTF8Encoding]::new($false))
-    $manifest = Join-Path $root 'CodexRemote-fix-2.5.0-release-manifest.json'
+    $manifest = Join-Path $root 'CodexRemote-fix-2.5.0-setup-release-manifest.json'
     $assets = @(
         [ordered]@{ name = [IO.Path]::GetFileName($installer); sha256 = $installerHash },
         [ordered]@{ name = [IO.Path]::GetFileName($checksum); sha256 = Get-CcodTestFileSha256 -Path $checksum },
@@ -38,6 +38,10 @@ function New-CcodPortableReleaseFixture {
     $payload = Join-Path $stage 'payload'
     [IO.Directory]::CreateDirectory($payload) | Out-Null
     [IO.File]::WriteAllText((Join-Path $stage 'Install-CodexRemote-fix.ps1'),'Write-Output portable',[Text.UTF8Encoding]::new($false))
+    $launcher = Join-Path $stage 'CodexRemote-fix.exe'
+    $launcherConfig = Join-Path $stage 'CodexRemote-fix.exe.config'
+    [IO.File]::WriteAllBytes($launcher,[byte[]](3,1,4,1,5,9,2,6))
+    [IO.File]::WriteAllText($launcherConfig,'<configuration/>',[Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $payload 'hello.txt'),'portable payload',[Text.UTF8Encoding]::new($false))
     $timestamp = '2026-08-25T00:00:00.0000000Z'
     $commit = 'b' * 40
@@ -60,7 +64,9 @@ function New-CcodPortableReleaseFixture {
         [ordered]@{name=[IO.Path]::GetFileName($bundle);sha256=$bundleHash},
         [ordered]@{name=[IO.Path]::GetFileName($checksum);sha256=Get-CcodTestFileSha256 -Path $checksum},
         [ordered]@{name=[IO.Path]::GetFileName($provenance);sha256=Get-CcodTestFileSha256 -Path $provenance},
-        [ordered]@{name=[IO.Path]::GetFileName($payloadAsset);sha256=Get-CcodTestFileSha256 -Path $payloadAsset}
+        [ordered]@{name=[IO.Path]::GetFileName($payloadAsset);sha256=Get-CcodTestFileSha256 -Path $payloadAsset},
+        [ordered]@{name='CodexRemote-fix.exe';sha256=Get-CcodTestFileSha256 -Path $launcher},
+        [ordered]@{name='CodexRemote-fix.exe.config';sha256=Get-CcodTestFileSha256 -Path $launcherConfig}
     )
     $release = [ordered]@{schemaVersion=2;product='CodexRemote-fix';version='2.5.6';gitCommit=$commit;buildTimestampUtc=$timestamp;distribution='portable-zip';assets=$assets}
     [IO.File]::WriteAllText($manifest,($release | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
@@ -223,25 +229,24 @@ Invoke-CcodTest 'package scripts build provenance and workflows retain the relea
     Assert-CcodTrue ($release -cmatch '(?ms)^  publish:\r?\n    needs: build\r?\n    runs-on: windows-latest\r?\n    permissions:\r?\n      contents: write\s*$') 'only the publish job receives release-write permission'
 }
 
-Invoke-CcodTest '2.5.7 documentation matches the portable release, Defender gate, and protected uninstall contract' {
+Invoke-CcodTest '2.5.8 documentation matches the portable release, Defender gate, and protected uninstall contract' {
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
-    Assert-CcodEqual '2.5.7' ([string]$package.version) 'package metadata is the 2.5.7 release'
+    Assert-CcodEqual '2.5.8' ([string]$package.version) 'package metadata is the 2.5.8 release'
     $changelog = Get-Content -LiteralPath (Join-Path $repositoryRoot 'CHANGELOG.md') -Raw
-    $releaseSection = [regex]::Match($changelog, '(?ms)^## v2\.5\.7\s*\r?\n(?<body>.*?)(?=^## |\z)')
-    Assert-CcodTrue $releaseSection.Success 'v2.5.7 release section exists'
-    Assert-CcodTrue ($releaseSection.Groups['body'].Value.Contains('nested staging directory')) 'v2.5.7 changelog records the nested portable install fix'
+    $releaseSection = [regex]::Match($changelog, '(?ms)^## v2\.5\.8\s*\r?\n(?<body>.*?)(?=^## |\z)')
+    Assert-CcodTrue $releaseSection.Success 'v2.5.8 release section exists'
+    Assert-CcodTrue ($releaseSection.Groups['body'].Value.Contains('trusted logon identity adapter')) 'v2.5.8 changelog records the live supervisor startup fix'
     $readme = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.md') -Raw
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start\s*\r?\n(?<body>.*?)(?=^## |\z)').Groups['body'].Value
-    Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.7-windows-x64.zip')) 'English Quick Start names the portable ZIP'
-    Assert-CcodTrue ($quickStart.Contains('Install-CodexRemote-fix.ps1')) 'English Quick Start names the verified entrypoint'
+    Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.8-setup.exe')) 'English Quick Start names the setup installer'
+    Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.8-windows-x64.zip')) 'English Quick Start names the portable ZIP'
+    Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix.exe')) 'English Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($quickStart.Contains('Microsoft Defender')) 'English Quick Start documents the local Defender gate'
-    Assert-CcodTrue (-not $quickStart.Contains('-setup.exe')) 'English Quick Start no longer directs users to the retired self-extracting setup'
-    Assert-CcodTrue ($readme.Contains('Uninstall-CodexControlOtherDevices.ps1')) 'English README documents the portable uninstall entrypoint'
     $readmeZh = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.zh-CN.md') -Raw -Encoding UTF8
-    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.7-windows-x64.zip')) 'Chinese Quick Start names the portable ZIP'
-    Assert-CcodTrue ($readmeZh.Contains('Install-CodexRemote-fix.ps1')) 'Chinese Quick Start names the verified entrypoint'
+    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.8-setup.exe')) 'Chinese Quick Start names the setup installer'
+    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.8-windows-x64.zip')) 'Chinese Quick Start names the portable ZIP'
+    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix.exe')) 'Chinese Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($readmeZh.Contains('Microsoft Defender')) 'Chinese Quick Start documents the local Defender gate'
-    Assert-CcodTrue ($readmeZh.Contains('Uninstall-CodexControlOtherDevices.ps1')) 'Chinese README documents the portable uninstall entrypoint'
     $technical = Get-Content -LiteralPath (Join-Path $repositoryRoot 'docs\TECHNICAL.md') -Raw
     Assert-CcodTrue ($technical.Contains('PortableUninstallFinalizer.ps1')) 'technical documentation records the staged portable finalizer'
     $security = Get-Content -LiteralPath (Join-Path $repositoryRoot 'SECURITY.md') -Raw

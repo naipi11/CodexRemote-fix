@@ -303,7 +303,7 @@ function Test-CcodReleasePortablePayloadManifest {
     $checksumName = "$bundleName.sha256.txt"
     $provenanceName = "CodexRemote-fix-$ExpectedVersion-trayhost-provenance.json"
     $payloadManifestName = "CodexRemote-fix-$ExpectedVersion-payload-manifest.json"
-    $expectedNames = @($bundleName,$checksumName,$provenanceName,$payloadManifestName)
+    $expectedNames = @($bundleName,$checksumName,$provenanceName,$payloadManifestName,'CodexRemote-fix.exe','CodexRemote-fix.exe.config')
     $assetHashes = @{}
     foreach ($asset in @($ReleaseManifest.assets)) {
         if ($null -eq $asset -or (($asset.PSObject.Properties.Name | Sort-Object) -join '|') -cne 'name|sha256' -or
@@ -317,6 +317,7 @@ function Test-CcodReleasePortablePayloadManifest {
         Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Portable release manifest does not bind the exact final asset set' $ReleaseManifestFile
     }
     foreach ($name in $expectedNames) {
+        if ($name -ceq 'CodexRemote-fix.exe' -or $name -ceq 'CodexRemote-fix.exe.config') { continue }
         $assetPath = Assert-CcodReleaseDefenderRegularFile -Path (Join-Path $Directory $name) -Kind 'Portable release asset'
         if ((Get-CcodReleaseDefenderHash -Path $assetPath) -cne $assetHashes[$name]) {
             Throw-CcodReleaseDefenderError 'CCOD_RELEASE_ASSET_HASH_MISMATCH' 'Portable release asset bytes do not match the release manifest' $name
@@ -351,7 +352,12 @@ function Test-CcodReleasePortablePayloadManifest {
         -not (Test-CcodReleaseDefenderCanonicalUtc $payloadTimestamp) -or $payloadTimestamp -cne $manifestTimestamp) {
         Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Portable payload manifest metadata is not release-bound' $payloadManifestName
     }
-    $expectedZipFiles = @{'Install-CodexRemote-fix.ps1'=$null;'payload-manifest.json'=$null}
+    $expectedZipFiles = @{
+        'CodexRemote-fix.exe'=$null
+        'CodexRemote-fix.exe.config'=$null
+        'Install-CodexRemote-fix.ps1'=$null
+        'payload-manifest.json'=$null
+    }
     $previousPath = $null
     foreach ($record in @($payloadManifest.files)) {
         if ($null -eq $record -or (($record.PSObject.Properties.Name | Sort-Object) -join '|') -cne 'length|path|sha256' -or
@@ -369,7 +375,7 @@ function Test-CcodReleasePortablePayloadManifest {
         }
         $expectedZipFiles[$entryName] = $record
     }
-    if ($expectedZipFiles.Count -le 2) {
+    if ($expectedZipFiles.Count -le 4) {
         Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Portable payload manifest is empty' $payloadManifestName
     }
 
@@ -407,6 +413,18 @@ function Test-CcodReleasePortablePayloadManifest {
             }
         } finally {
             if ($null -ne $manifestStream) { $manifestStream.Dispose() }
+        }
+        foreach ($rootEntryName in @('CodexRemote-fix.exe','CodexRemote-fix.exe.config')) {
+            $rootEntry = $seen[$rootEntryName]
+            $rootStream = $null
+            try {
+                $rootStream = $rootEntry.Open()
+                if ((Get-CcodReleaseDefenderStreamHash -Stream $rootStream) -cne $assetHashes[$rootEntryName]) {
+                    Throw-CcodReleaseDefenderError 'CCOD_RELEASE_ASSET_HASH_MISMATCH' 'Portable ZIP root launcher differs from the release manifest.' $rootEntryName
+                }
+            } finally {
+                if ($null -ne $rootStream) { $rootStream.Dispose() }
+            }
         }
         foreach ($entryName in @($expectedZipFiles.Keys | Where-Object { $_.StartsWith('payload/',[StringComparison]::Ordinal) })) {
             $record = $expectedZipFiles[$entryName]
@@ -551,7 +569,12 @@ function Invoke-CcodReleaseDefenderCheck {
     $versionMatch = [regex]::Match($installerLeaf, '^CodexRemote-fix-(\d+\.\d+\.\d+)-(?:setup\.exe|windows-x64\.zip)$')
     if (-not $versionMatch.Success) { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Release candidate name cannot bind a release manifest version' $installerLeaf }
     $version = $versionMatch.Groups[1].Value
-    $manifestPath = Join-Path (Split-Path $candidate.InstallerPath -Parent) "CodexRemote-fix-$version-release-manifest.json"
+    $manifestName = if ($installerLeaf.EndsWith('-setup.exe',[StringComparison]::Ordinal)) {
+        "CodexRemote-fix-$version-setup-release-manifest.json"
+    } else {
+        "CodexRemote-fix-$version-release-manifest.json"
+    }
+    $manifestPath = Join-Path (Split-Path $candidate.InstallerPath -Parent) $manifestName
     $manifest = Test-CcodReleaseAssetManifest -ManifestPath $manifestPath -AssetDirectory (Split-Path $candidate.InstallerPath -Parent) -ExpectedVersion $version
     if ($manifest.InstallerSha256 -cne $candidate.Sha256) { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_ASSET_HASH_MISMATCH' 'Release manifest and checksum bind different installer bytes' $installerLeaf }
     $zone = & $adapters.GetZoneId $candidate.InstallerPath

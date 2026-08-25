@@ -250,7 +250,7 @@ function Get-CcodSupervisorDefaultAdapters {
     $defaults.SignalEvent={param($Event)[void]$Event.Handle.Set()}
     $defaults.CloseEvent={param($Event)$Event.Handle.Dispose();$Event.Disposed=$true}
     $defaults.ReadActiveRuntime={param($InstallRoot)Read-CcodActiveRuntime -InstallRoot $InstallRoot}
-    $defaults.GetTrustedLogonIdentity={param($ExpectedUserSid,$ExpectedSessionId)Get-CcodTrustedLogonIdentity -ExpectedUserSid $ExpectedUserSid -ExpectedSessionId $ExpectedSessionId}
+    $defaults.GetTrustedLogonIdentity={param($ExpectedUserSid,$ExpectedSessionId)Get-CcodTrustedLogonIdentity -Adapters $null}
     $defaults.WriteSafeExitIntent={param($StateRoot,$LogonIdentity,$RuntimeId,$RecoveryTransactionId,$NowUtc)Write-CcodSafeExitIntent -StateRoot $StateRoot -LogonIdentity $LogonIdentity -RuntimeId $RuntimeId -RecoveryTransactionId $RecoveryTransactionId -NowUtc $NowUtc}
     $defaults.ClearSafeExitIntent={param($StateRoot)Clear-CcodSafeExitIntent -StateRoot $StateRoot|Out-Null}
     $defaults.EnterLifecycleOwnership={param($InstallRoot,$RuntimeId,$RuntimeGeneration,$OwnerIdentity,$UserSid,$SessionId,$TimeoutMilliseconds)Enter-CcodLifecycleOwnership -InstallRoot $InstallRoot -RuntimeId $RuntimeId -RuntimeGeneration $RuntimeGeneration -OwnerIdentity $OwnerIdentity -UserSid $UserSid -SessionId $SessionId -TimeoutMilliseconds $TimeoutMilliseconds}

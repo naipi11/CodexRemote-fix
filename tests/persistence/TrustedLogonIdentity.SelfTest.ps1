@@ -69,6 +69,14 @@ try {
         }
     }
 
+    Invoke-CcodTest 'default adapters return an object the strict live contract accepts' {
+        $module = Get-Module TrustedLogonIdentity | Select-Object -First 1
+        $identity = & $module { param($Value) Get-CcodTrustedLogonIdentity -Adapters $Value } $null
+        Assert-CcodEqual 'authenticationId,userSid,sessionId' (($identity.PSObject.Properties.Name) -join ',') 'default token facts are bound as an exact ordered object'
+        Assert-CcodTrue ($identity.authenticationId -cmatch '^[0-9A-F]{8}:[0-9A-F]{8}$') 'default token facts produce a canonical AuthenticationId'
+        Assert-CcodTrue ($identity.userSid -match '^S-1-(?:0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*))+$') 'default token facts produce the current process user SID'
+    }
+
     Invoke-CcodTest 'persists and reads an exact safe-exit intent through the atomic state path' {
         $state = New-CcodSafeExitFixtureRoot -Root $root -Name 'round-trip'
         $identity = New-CcodTrustedIdentity
