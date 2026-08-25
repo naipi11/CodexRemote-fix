@@ -459,8 +459,8 @@ function Get-CcodSupervisorRemainingBudget {
     param($Clock,[hashtable]$Adapters)
     $elapsed=Invoke-CcodSupervisorAdapter $Adapters.GetElapsedMilliseconds @($Clock) 1
     if(($elapsed -isnot [int] -and $elapsed -isnot [long]) -or $elapsed -lt 0){throw 'monotonic clock is invalid'}
-    if([long]$elapsed -ge 5000){return [int]0}
-    return [int](5000-[long]$elapsed)
+    if([long]$elapsed -ge 30000){return [int]0}
+    return [int](30000-[long]$elapsed)
 }
 
 function Invoke-CcodSupervisorDrainQueue {
