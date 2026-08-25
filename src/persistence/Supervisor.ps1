@@ -150,7 +150,7 @@ function Invoke-CcodSupervisorAdapterCapture {
             if($items.Count -ge 16){throw 'adapter output limit exceeded'}
             $items.Add($_)
         }
-    }catch{$threw=$true;try{[IO.File]::AppendAllText("C:\Users\33384\AppData\Local\Temp\ccod-adapter-raw.txt",("RAW="+$_.Exception.GetType().FullName+"|"+$_.Exception.Message+[Environment]::NewLine+"FQEID="+$_.FullyQualifiedErrorId+[Environment]::NewLine+"STACK="+$_.ScriptStackTrace+[Environment]::NewLine),[Text.UTF8Encoding]::new($false))}catch{}}
+    }catch{$threw=$true}
     finally{
         # WinForms/WMI adapters can append non-terminating records to $Error without failing.
         # Preserve caller history; only stream items and terminating throws count as adapter failure.
@@ -242,7 +242,7 @@ function Get-CcodSupervisorDefaultAdapters {
     $defaults.GetUtcNow={[DateTime]::UtcNow}
     $defaults.EnterLease={param($Kind,$UserSid,$SessionId,$TimeoutMilliseconds)if($Kind -ceq 'AccountSupervisor'){Enter-CcodMutex -Kind $Kind -UserSid $UserSid -TimeoutMilliseconds $TimeoutMilliseconds}else{Enter-CcodMutex -Kind $Kind -UserSid $UserSid -SessionId $SessionId -TimeoutMilliseconds $TimeoutMilliseconds}}
     $defaults.ExitLease={param($Lease)Exit-CcodMutex -Lease $Lease}
-    $defaults.OpenReadyEvent={param($UserSid,$SessionId,$Token)Open-CcodEvent -Kind Ready -UserSid ([string]$UserSid) -SessionId ([int]$SessionId) -ReadyToken ([string]$Token)}
+    $defaults.OpenReadyEvent={param($UserSid,$SessionId,$Token) $kernelModule=Get-Module -Name KernelObjects|Select-Object -First 1;if($null -eq $kernelModule){throw 'kernel-object module unavailable'};& $kernelModule {param($Sid,$Sess,$Tok)Open-CcodEvent -Kind Ready -UserSid $Sid -SessionId $Sess -ReadyToken $Tok} ([string]$UserSid) ([int]$SessionId) ([string]$Token)}
     $defaults.OpenShutdownEvent={param($UserSid,$SessionId)New-CcodEvent -Kind Shutdown -UserSid $UserSid -SessionId $SessionId}
     $defaults.OpenLifecycleWakeEvent={param($UserSid,$SessionId)New-CcodSupervisorLifecycleWakeEvent -UserSid $UserSid -SessionId $SessionId}
     $defaults.ResetLifecycleWakeEvent={param($Event)[void]$Event.Handle.Reset()}
