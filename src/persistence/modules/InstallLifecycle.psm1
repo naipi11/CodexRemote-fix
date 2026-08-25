@@ -1697,20 +1697,20 @@ function Invoke-CcodInstall {
         if ($DoNotStart) {
             Throw-CcodLifecycleError 'CCOD_INSTALL_NEW_RUNTIME_NOT_READY' 'Activation cannot succeed without starting and proving the new runtime' $null
         }
-        $taskStartedAt = & $adapters.UtcNow
-        try { & $adapters.StartSupervisorTask }
-        catch { Throw-CcodLifecycleError 'CCOD_INSTALL_SUPERVISOR_START_FAILED' 'The existing scheduled task could not start the new runtime' $null }
         $ownershipReleased = & $adapters.ExitLifecycleOwnership $lifecycleOwnership
         if ($ownershipReleased -isnot [bool] -or -not $ownershipReleased -or -not $lifecycleOwnership.released) {
-            Throw-CcodLifecycleError 'CCOD_INSTALL_LIFECYCLE_RELEASE_FAILED' 'Generation ownership could not be released for scheduled-task bootstrap' $null
+            Throw-CcodLifecycleError 'CCOD_INSTALL_LIFECYCLE_RELEASE_FAILED' 'Generation ownership could not be released before scheduled-task bootstrap' $null
         }
         if ($null -ne $installLease -and $installLease.Outcome -ceq 'Acquired') {
             $installReleased = & $adapters.ExitInstallLease $installLease
             if ($installReleased -isnot [bool] -or -not $installReleased) {
-                Throw-CcodLifecycleError 'CCOD_INSTALL_LIFECYCLE_RELEASE_FAILED' 'Installation lease could not be released for scheduled-task bootstrap' $null
+                Throw-CcodLifecycleError 'CCOD_INSTALL_LIFECYCLE_RELEASE_FAILED' 'Installation lease could not be released before scheduled-task bootstrap' $null
             }
             $installLease = $null
         }
+        $taskStartedAt = & $adapters.UtcNow
+        try { & $adapters.StartSupervisorTask }
+        catch { Throw-CcodLifecycleError 'CCOD_INSTALL_SUPERVISOR_START_FAILED' 'The existing scheduled task could not start the new runtime' $null }
         $readyProof = & $adapters.WaitNewRuntimeReady $root $runtimeId ([UInt64]$pointer.generation) $identity $taskStartedAt 15000
         if ($null -eq $readyProof -or $readyProof.SupervisorReady -isnot [bool] -or $readyProof.TrayReady -isnot [bool] -or
             -not $readyProof.SupervisorReady -or -not $readyProof.TrayReady) {
