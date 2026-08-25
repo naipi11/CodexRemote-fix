@@ -855,8 +855,8 @@ $results += Invoke-CcodTest 'post-Ready completion-log failure stays Ready retai
     } finally {foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}}
 }
 
-# Production mutation caught: waiting for the task-created Supervisor while retaining install/lifecycle mutex ownership that blocks bootstrap launch.
-$results += Invoke-CcodTest 'upgrade releases generation ownership before waiting for task-created readiness' {
+# Production mutation caught: starting the task or waiting for its Supervisor while retaining install/lifecycle mutex ownership that blocks bootstrap launch.
+$results += Invoke-CcodTest 'upgrade releases generation ownership before starting and waiting for task-created readiness' {
     $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
     try{
         New-CcodLifecycleSourceFixture -Root $source -Version '2.5.0-handoff-a'|Out-Null;$nodePath=New-CcodLifecycleFakeNode -Root $nodeRoot
@@ -868,7 +868,7 @@ $results += Invoke-CcodTest 'upgrade releases generation ownership before waitin
         Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters|Out-Null
         [string[]]$calls=@($fake.World.Calls)
         $startIndex=[Array]::IndexOf($calls,'StartTask');$ownershipExit=[Array]::IndexOf($calls,'ExitLifecycleOwnership');$installExit=[Array]::IndexOf($calls,'ExitInstallLease');$readyIndex=[Array]::IndexOf($calls,'WaitNewRuntimeReady')
-        Assert-CcodTrue ($startIndex-ge0-and$ownershipExit-gt$startIndex-and$installExit-gt$ownershipExit-and$readyIndex-gt$installExit) 'task starts, ownership fully releases, then readiness polling begins'
+        Assert-CcodTrue ($ownershipExit-ge0-and$installExit-gt$ownershipExit-and$startIndex-gt$installExit-and$readyIndex-gt$startIndex) 'ownership fully releases before task starts, then readiness polling begins'
         Assert-CcodEqual 1 $fake.World.InstallLeaseReleased 'install lease releases exactly once before readiness'
     }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}}
 }

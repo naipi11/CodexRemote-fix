@@ -602,8 +602,8 @@ $results += Invoke-CcodTest 'bootstrap contains no Codex process, package, or ta
 
 $results += Invoke-CcodTest 'launches the supervisor child with an explicit STA apartment' {
     $source = Get-Content -LiteralPath $bootstrapScript -Raw
-    Assert-CcodTrue ($source.Contains('-STA -File')) 'bootstrap supervisor launch arguments include -STA before -File'
-    Assert-CcodTrue ($source.Contains('-NoProfile -ExecutionPolicy Bypass -STA -File')) 'bootstrap uses the exact STA launch argument prefix'
+    Assert-CcodTrue (($source.Contains('-STA -File') -or $source.Contains("'-STA', '-File'"))) 'bootstrap supervisor launch arguments include -STA before -File'
+    Assert-CcodTrue (($source.Contains('-NoProfile -ExecutionPolicy Bypass -STA -File') -or $source.Contains("'-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File'"))) 'bootstrap uses the exact STA launch argument prefix'
     Assert-CcodTrue (-not $source.Contains('-NoProfile -ExecutionPolicy Bypass -File "')) 'bootstrap no longer launches the supervisor without -STA'
 }
 

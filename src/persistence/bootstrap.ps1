@@ -828,19 +828,13 @@ try {
         }
         AcquireLaunchLease = {
             $module = Import-CcodBootstrapKernelObjects -InstallRoot $root -Pointer $initialPointer
-            $lease = & $module { param($Sid,$Timeout) Enter-CcodMutex -Kind 'AccountTransition' -UserSid $Sid -TimeoutMilliseconds $Timeout } $userSid ([int]($ReadyTimeoutSeconds * 1000))
-            [pscustomobject]@{ KernelModule = $module; LaunchLease = $lease }
+            [pscustomobject]@{ KernelModule = $module; LaunchLease = $null }
         }
     }
     $safeExitSuppressed = $prelaunch.Suppressed
     if($safeExitSuppressed){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_SUPPRESSED' 'Task startup was intentionally suppressed by the same-logon safe-exit marker' $root}
 
     $kernelModule = $prelaunch.KernelModule
-    $launchLease = $prelaunch.LaunchLease
-    if ($launchLease.Outcome -cne 'Acquired') {
-        Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_LAUNCH_BUSY' 'An installation transition is in progress; bootstrap will retry through the scheduled task' $root
-    }
-
     $readyEvent = New-CcodBootstrapReadyEvent -UserSid $userSid -SessionId $sessionId -Token $token
     if (-not $readyEvent.CreatedNew) {
         Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_READY_EVENT_EXISTS' 'A stale ready event already exists; bootstrap refuses to reuse it' $readyEvent.Name
@@ -862,6 +856,10 @@ try {
             Write-CcodBootstrapLog -InstallRoot $root -Message ("Runtime {0} rejected before launch: {1}" -f $runtimeId, $validation.Code)
             continue
         }
+        $launchLease = & $kernelModule { param($Sid,$Timeout) Enter-CcodMutex -Kind 'AccountTransition' -UserSid $Sid -TimeoutMilliseconds $Timeout } $userSid ([int]($ReadyTimeoutSeconds * 1000))
+        if ($launchLease.Outcome -cne 'Acquired') {
+            Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_LAUNCH_BUSY' 'An installation transition is in progress; bootstrap will retry through the scheduled task' $root
+        }
         $child = Start-CcodBootstrapSupervisor -SupervisorPath $validation.SupervisorPath -ReadyToken $token -WorkingDirectory $root
         $released = & $kernelModule { param($Lease) Exit-CcodMutex -Lease $Lease } $launchLease
         if ($released -isnot [bool] -or -not $released) {
@@ -870,9 +868,15 @@ try {
         $launchLease = $null
         $outcome = Wait-CcodBootstrapReady -Event $readyEvent -Process $child -TimeoutSeconds $ReadyTimeoutSeconds
         if ($outcome -ceq 'Ready') {
+            if ($runtimeId -cne $pointer.ActiveRuntime) {
+                $updated = Invoke-CcodBootstrapFencedPointerPromotion -InstallRoot $root -Pointer $pointer -Validation $validation -NewRuntimeId $runtimeId -UserSid $userSid -SessionId $sessionId
+                Write-CcodBootstrapLog -InstallRoot $root -Message ("Runtime {0} signaled ready; active pointer switched from {1}" -f $runtimeId, $pointer.ActiveRuntime)
+            }
+
             $readyConfirmed = $true
-            $exitCode = 0
-            Start-Sleep -Milliseconds 5000
+            if (-not $child.HasExited) { [void]$child.WaitForExit(2000) }
+            if ($child.HasExited) { $exitCode = [int]$child.ExitCode }
+            if ($exitCode -eq 0) { Start-Sleep -Milliseconds 3000 }
             Write-CcodBootstrapLog -InstallRoot $root -Message ("Runtime {0} signaled ready; supervisor retained for installer verification" -f $runtimeId)
             break
         }

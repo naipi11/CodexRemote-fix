@@ -11,10 +11,14 @@ No unreleased changes.
 ### English
 
 - Fixed the Inno Setup installer so it bundles the portable launcher with TrayHost; post-install activation now passes source validation instead of failing closed.
+- Fixed bootstrap fallback sequencing so each verified runtime acquires and releases the transition lease around its launch, allowing the previous runtime to recover cleanly after an early exit.
+- Increased the Supervisor startup proof budget and retained the ready Supervisor long enough for installer verification, while preserving lifecycle fencing and the DPAPI device-key store.
 
 ### 简体中文
 
 - 修复 Inno Setup 安装包：安装时会与 TrayHost 一起安装便携启动器，安装后激活现在能通过源校验，而不再失败关闭。
+- 修复启动回退时序：每个经验证的 runtime 只在启动边界内获取并释放 transition lease，活动 runtime 提前退出时可安全回退到 previous runtime。
+- 增加 Supervisor 启动证明预算，并在安装器验证窗口内保留 ready Supervisor，同时继续保护生命周期围栏和 DPAPI 设备密钥存储。
 
 ## v2.5.9
 

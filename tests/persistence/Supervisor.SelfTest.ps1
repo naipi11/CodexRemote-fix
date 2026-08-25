@@ -359,7 +359,7 @@ Invoke-CcodTest 'acquires both lifetime leases and signals Ready only after all 
     Assert-CcodTrue $fake.World.NewTraySawRealQueue 'tray receives the command queue itself'
     Assert-CcodTrue $fake.World.NewWatcherSawRealQueue 'watcher receives the event queue itself'
     $calls=@($fake.World.Calls)
-    foreach($before in @('Enter:AccountSupervisor:5000','Enter:Supervisor:5000','Read:ActiveRuntime','Read:LogonIdentity','Enter:LifecycleOwnership:7','Open:Ready','Open:Shutdown','Open:LifecycleWake','Read:State','Read:Journal','Read:LifecycleRequest','Read:UiPreference','Get:SystemCulture','Get:UiCatalog:System','Queue:Command','Queue:Event','New:Tray','New:Watcher')){
+    foreach($before in @('Enter:AccountSupervisor:30000','Enter:Supervisor:30000','Read:ActiveRuntime','Read:LogonIdentity','Enter:LifecycleOwnership:7','Open:Ready','Open:Shutdown','Open:LifecycleWake','Read:State','Read:Journal','Read:LifecycleRequest','Read:UiPreference','Get:SystemCulture','Get:UiCatalog:System','Queue:Command','Queue:Event','New:Tray','New:Watcher')){
         Assert-CcodTrue ([Array]::IndexOf($calls,$before) -ge 0) "$before occurs"
         Assert-CcodTrue ([Array]::IndexOf($calls,$before) -lt [Array]::IndexOf($calls,'Signal:Ready')) "$before precedes Ready"
     }
@@ -373,19 +373,19 @@ Invoke-CcodTest 'acquires both lifetime leases and signals Ready only after all 
     Assert-CcodTrue ([Array]::IndexOf($calls,'Exit:Supervisor') -lt [Array]::IndexOf($calls,'Exit:AccountSupervisor')) 'leases release in reverse order'
 }
 
-Invoke-CcodTest 'uses one monotonic 5000ms acquisition budget' {
+Invoke-CcodTest 'uses one monotonic 30000ms acquisition budget' {
     $fake=New-CcodSupervisorFake
     $fake.World.Elapsed.Enqueue([long]0);$fake.World.Elapsed.Enqueue([long]4200)
     $receipt=Invoke-CcodSupervisorHost -ReadyToken $readyToken -Adapters $fake.Adapters
     Assert-CcodReceipt $receipt 'Stopped' 0
-    Assert-CcodTrue ($fake.World.Calls.Contains('Enter:AccountSupervisor:5000')) 'first lease receives full budget'
-    Assert-CcodTrue ($fake.World.Calls.Contains('Enter:Supervisor:800')) 'second lease receives only remainder'
+    Assert-CcodTrue ($fake.World.Calls.Contains('Enter:AccountSupervisor:30000')) 'first lease receives full budget'
+    Assert-CcodTrue ($fake.World.Calls.Contains('Enter:Supervisor:25800')) 'second lease receives only remainder'
 }
 
 Invoke-CcodTest 'does not take over or signal Ready when either lifetime lease times out' {
     foreach($case in @(
-        [pscustomobject]@{First='TimedOut';Second='Acquired';Expected='Enter:AccountSupervisor:5000';Forbidden='Enter:Supervisor:5000'},
-        [pscustomobject]@{First='Acquired';Second='TimedOut';Expected='Enter:Supervisor:5000';Forbidden='Open:Ready'}
+        [pscustomobject]@{First='TimedOut';Second='Acquired';Expected='Enter:AccountSupervisor:30000';Forbidden='Enter:Supervisor:30000'},
+        [pscustomobject]@{First='Acquired';Second='TimedOut';Expected='Enter:Supervisor:30000';Forbidden='Open:Ready'}
     )){
         $fake=New-CcodSupervisorFake -FirstLeaseOutcome $case.First -SecondLeaseOutcome $case.Second
         $receipt=Invoke-CcodSupervisorHost -ReadyToken $readyToken -Adapters $fake.Adapters
