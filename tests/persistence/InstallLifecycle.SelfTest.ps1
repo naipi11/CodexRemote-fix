@@ -2342,7 +2342,7 @@ $results += Invoke-CcodTest 'README and release workflow publish current portabl
     Assert-CcodTrue ($readmeChinese -cmatch '\A(?s:<div align="center">.*?<h1>CodexRemote-fix</h1>)') 'Chinese README uses the centered public product heading'
 
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start[^\r\n]*\r?\n(.*?)(?=^## )').Groups[1].Value
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.6-windows-x64\.zip') 'English Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.7-windows-x64\.zip') 'English Quick Start names the exact portable artifact'
     Assert-CcodTrue ($quickStart -cmatch '\.sha256\.txt') 'English Quick Start names the checksum artifact'
     Assert-CcodTrue ($quickStart -cmatch 'Install-CodexRemote-fix\.ps1') 'English Quick Start teaches the verified portable entrypoint'
     Assert-CcodTrue ($quickStart -cnotmatch 'setup\.exe') 'English Quick Start does not direct users to the retired self-extracting setup'
@@ -2350,7 +2350,7 @@ $results += Invoke-CcodTest 'README and release workflow publish current portabl
     $quickStartChineseMatch = [regex]::Match($readmeChinese, '(?ms)^## [^\r\n]+\r?\n(?:\r?\n)?(?=1\.[^\r\n]*\[Releases\])(.*?)(?=^## |\z)')
     Assert-CcodTrue $quickStartChineseMatch.Success 'Chinese README exposes a Quick Start section'
     $quickStartChinese = $quickStartChineseMatch.Groups[1].Value
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.6-windows-x64\.zip') 'Chinese Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.7-windows-x64\.zip') 'Chinese Quick Start names the exact portable artifact'
     Assert-CcodTrue ($quickStartChinese -cmatch '\.sha256\.txt') 'Chinese Quick Start names the checksum artifact'
     Assert-CcodTrue ($quickStartChinese -cmatch 'Install-CodexRemote-fix\.ps1') 'Chinese Quick Start teaches the verified portable entrypoint'
     Assert-CcodTrue ($quickStartChinese -cnotmatch 'setup\.exe') 'Chinese Quick Start does not direct users to the retired self-extracting setup'
