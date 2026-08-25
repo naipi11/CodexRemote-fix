@@ -54,6 +54,9 @@ function New-CcodLifecycleSourceFixture {
     foreach ($trayHostFile in @('CodexRemote.TrayHost.exe', 'CodexRemote.TrayHost.exe.config', 'trayhost-build-provenance.json')) {
         [IO.File]::WriteAllText((Join-Path $Root "bin\$trayHostFile"), "fixture $trayHostFile`r`n", [Text.UTF8Encoding]::new($false))
     }
+    foreach ($portableFile in @('CodexRemote.Portable.exe', 'CodexRemote.Portable.exe.config', 'portable-launcher-provenance.json')) {
+        [IO.File]::WriteAllText((Join-Path $Root "bin\$portableFile"), "fixture $portableFile`r`n", [Text.UTF8Encoding]::new($false))
+    }
     return $Root
 }
 
