@@ -46,7 +46,7 @@ that existing page and leaves the Codex UI, account authorization, and enrollmen
 
 ## Quick start
 
-1. Download `CodexRemote-fix-2.5.6-windows-x64.zip`, its `.sha256.txt`, the release manifest, and the payload manifest from [Releases](https://github.com/naipi11/CodexRemote-fix/releases). Verify the ZIP SHA-256 before opening it.
+1. Download `CodexRemote-fix-2.5.7-windows-x64.zip`, its `.sha256.txt`, the release manifest, and the payload manifest from [Releases](https://github.com/naipi11/CodexRemote-fix/releases). Verify the ZIP SHA-256 before opening it.
 2. Extract the verified ZIP into a new empty folder. If Windows marked the downloaded script, unblock only the verified entrypoint, then run it in Windows PowerShell:
 
        Unblock-File .\Install-CodexRemote-fix.ps1
@@ -65,97 +65,6 @@ device-key store stay in place. To transition from an older Inno build, uninstal
 Verified on Windows 11 · Codex Desktop `26.818.2441.0` · Node.js `22.23.1`:
 the hidden controller tab, native tray menu, bilingual menu switching, and persistent
 supervisor are working.
-
-## What's new in v2.5.6
-
-- Replaced the unsigned self-extracting installer distribution with a manifest-bound portable ZIP. The release validator checks the ZIP, checksum, TrayHost provenance, external payload manifest, and every archived payload file.
-- The portable entrypoint verifies and Defender-scans the payload before install. Its detached external finalizer removes only a marker-bound current-user payload after the existing fail-closed lifecycle cleanup has proved the runtime/session boundary; the DPAPI device-key store remains untouched.
-
-## What's new in v2.5.5
-
-- Added a tightly scoped compatibility inspection for an older manifest-sealed controller that omitted its `ProcessControl` import. It accepts only the exact correlated legacy failure and requires a manifest-verified read-only ordinary-session recheck immediately before each protected uninstall deletion boundary.
-- New `SessionController` runtimes now load `ProcessControl` globally, and regression coverage rejects every other controller failure or changed compatibility proof.
-
-## What's new in v2.5.4
-
-- Made fail-closed uninstall recovery preclaim a durable nonempty controller result placeholder so it works with a still-manifest-sealed older controller runtime.
-- Added regression coverage for the legacy strict byte-array writer and the prelaunch placeholder ordering.
-
-## What's new in v2.5.3
-
-- Fixed fail-closed uninstall recovery when its authenticated controller result placeholder is initially empty.
-- Added regression coverage for atomically replacing the empty preclaimed controller result file.
-
-## What's new in v2.5.2
-
-- Fixed the fail-closed uninstaller staging payload so `StateStore` can load its required `TrustedLogonIdentity` dependency before cleanup.
-- Added an external-payload import regression that proves the staged cleanup module has its complete dependency closure before any deletion.
-
-## What's new in v2.5.1
-
-- Fixed the new-install Supervisor startup contract so the complete schema-two active runtime pointer is accepted before readiness is signaled.
-- Added a regression test for both fresh-install and upgrade-shaped active runtime pointers.
-
-## What's new in v2.5.0
-
-- Rebuilt restart and repair as a durable Supervisor-owned lifecycle that resumes safely after delayed or manual Codex launches.
-- Simplified the tray to truthful connection/protection status, one repair action, language, logs, About, and safe Exit.
-- Made upgrades wait for the new runtime and tray, preserved authorized devices, and unified Windows Settings and direct uninstall behind a fail-closed cleanup flow.
-
-## What's new in v2.4.23
-
-- Replaced the embedded COM activator with the standard Windows AppsFolder launch route.
-- Preserved reliable **Restart now** behavior while removing the signature that triggered Defender's download heuristic.
-- Added regression coverage for the exact Explorer AppsFolder activation request.
-
-## What's new in v2.4.22
-
-- Fixed **Restart now** closing Codex without reopening it by using Windows' native packaged-app activation API.
-- Ordinary recovery uses the exact Codex AUMID instead of executing the WindowsApps binary directly.
-- Added a regression test that keeps ordinary and controlled launch paths separate.
-
-## What's new in v2.4.21
-
-- Fixed a TrayHost parent-reader disposal race that could make the tray icon disappear while the controlled Codex session remained active.
-- TrayHost shutdown now waits for its background pipe threads before releasing synchronization handles.
-- Added a native regression test for the remote-fault disposal race.
-
-## What's new in v2.4.20
-
-- After installation, show an English prompt: restart Codex now or restart it manually later.
-- The installer never closes or restarts Codex automatically; choosing **Later** leaves the current session untouched.
-- The installer now stops the prior CodexRemote-fix supervisor from its persistent runtime, validates the packaged TrayHost payload, and shows the prompt only after the new runtime is active.
-- Choosing **Restart now** safely closes the current Codex session and launches a fresh controlled session after explicit user confirmation.
-- Runtime activation now continues in a background worker, so the setup window can finish without freezing during the handoff.
-- Tray language changes wait for the native menu host to acknowledge the new presentation before returning.
-- The reissued installer verifies an ordinary Codex recovery before controlled activation, preventing a single-instance launch race.
-- If restart confirmation cannot be completed, the new runtime stays active and the user is asked to restart Codex manually instead of receiving a false activation-failure message.
-
-## What's new in v2.4.19
-
-- Added a native **About** menu item; it opens an information dialog with the active CodexRemote-fix version, such as `2.4.19`.
-- The installer now stops the verified running supervisor before replacing the installed runtime, while preserving device keys and persistent state.
-- The existing atomic runtime upgrade remains in place; old runtime files are retired only after the new runtime is activated successfully.
-
-## What's new in v2.4.18
-
-- Centered the CodexRemote-fix icon, product name, language switch, and verified project badges in both README languages.
-- Enabled repository Dependabot alerts and automatic security updates.
-- Added scheduled and push/PR CodeQL scanning for the JavaScript/TypeScript and C# portions of the project.
-
-## What's new in v2.4.17
-
-- Major fix: authorized remote-control devices now survive Codex updates without re-pairing.
-- Restored the preserved enrollment mapping through Codex's host bridge before refreshing remote connections.
-- Patched an already-cached native device-key addon export in place, so existing Codex consumers use the corrected implementation.
-- Kept the existing device keys, server-side authorization, and normal Codex enrollment flow unchanged.
-
-## What's new in v2.4.16
-
-- Fixed a Windows PowerShell redirected-input UTF-8 preamble that could make TrayHost exit before signaling readiness.
-- Kept strict protocol validation: only the initial bootstrap frame accepts one BOM; authenticated frames remain unchanged.
-- Added Windows GitHub Actions validation for pull requests and pushes to `main`.
-- Preserved the existing native Win32 tray, encrypted device-key store, and server-side authorization.
 
 ## Everyday use
 
@@ -180,13 +89,12 @@ The tray reports two independent, truthful status lines instead of inferring rea
 
 Every tagged release ships a Windows portable ZIP, its SHA-256 checksum, a release manifest, and a
 payload manifest. The `.github/workflows/release.yml` workflow builds the bundle from the tag
-automatically, so v2.5.6 includes `CodexRemote-fix-2.5.6-windows-x64.zip`,
-`CodexRemote-fix-2.5.6-windows-x64.zip.sha256.txt`,
-`CodexRemote-fix-2.5.6-release-manifest.json`, and
-`CodexRemote-fix-2.5.6-payload-manifest.json`.
+automatically, so v2.5.7 includes `CodexRemote-fix-2.5.7-windows-x64.zip`,
+`CodexRemote-fix-2.5.7-windows-x64.zip.sha256.txt`,
+`CodexRemote-fix-2.5.7-release-manifest.json`, and
+`CodexRemote-fix-2.5.7-payload-manifest.json`.
 
-Each release appends a short English change summary to the GitHub release body. The README and
-[CHANGELOG.md](CHANGELOG.md) retain the bilingual documentation history.
+Each release appends a short English change summary to the GitHub release body. The bilingual release history is kept in [CHANGELOG.md](CHANGELOG.md).
 
 After a Codex Desktop update, check the [Releases](https://github.com/naipi11/CodexRemote-fix/releases)
 page for a newer portable bundle, or run the **CodexRemote-fix compatibility check** shortcut from the Start menu
