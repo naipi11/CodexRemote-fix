@@ -6,6 +6,16 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.9
+
+### English
+
+- Fixed release publication so the Inno Setup installer executable is uploaded alongside the portable ZIP and manifests.
+
+### 简体中文
+
+- 修复发布上传：现在 Inno Setup 安装包可执行文件会与便携 ZIP 和清单一起上传。
+
 ## v2.5.8
 
 ### English
