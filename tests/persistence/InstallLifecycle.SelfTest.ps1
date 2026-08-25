@@ -54,6 +54,9 @@ function New-CcodLifecycleSourceFixture {
     foreach ($trayHostFile in @('CodexRemote.TrayHost.exe', 'CodexRemote.TrayHost.exe.config', 'trayhost-build-provenance.json')) {
         [IO.File]::WriteAllText((Join-Path $Root "bin\$trayHostFile"), "fixture $trayHostFile`r`n", [Text.UTF8Encoding]::new($false))
     }
+    foreach ($portableFile in @('CodexRemote.Portable.exe', 'CodexRemote.Portable.exe.config', 'portable-launcher-provenance.json')) {
+        [IO.File]::WriteAllText((Join-Path $Root "bin\$portableFile"), "fixture $portableFile`r`n", [Text.UTF8Encoding]::new($false))
+    }
     return $Root
 }
 
@@ -1976,9 +1979,9 @@ $results += Invoke-CcodTest 'installer exposes CodexRemote-fix as the searchable
     Assert-CcodTrue ($buildScript -cmatch '\$bundle\.sha256\.txt') 'build script writes a hash beside the public portable ZIP filename'
 }
 
-$results += Invoke-CcodTest 'portable builder publishes the exact CodexRemote-fix 2.5.7 release artifact contract' {
+$results += Invoke-CcodTest 'portable builder publishes the exact CodexRemote-fix 2.5.8 release artifact contract' {
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
-    Assert-CcodEqual '2.5.7' ([string]$package.version) 'package version is exactly 2.5.7'
+    Assert-CcodEqual '2.5.8' ([string]$package.version) 'package version is exactly 2.5.8'
 
     $buildScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
     Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-windows-x64\.zip') 'portable build resolves the exact public ZIP filename'
@@ -2040,11 +2043,11 @@ $results += Invoke-CcodTest 'installer uses launch-only ewNoWait and accepts ter
 }
 
 # Production mutation caught: compiling a script with an unrecognized built-in identifier, or leaving the bounded validator route uncompiled.
-$results += Invoke-CcodTest 'portable builder needs no Inno compiler and creates a manifest-bound ZIP release' {
+$results += Invoke-CcodTest 'release builder creates a manifest-bound ZIP and an Inno setup installer' {
     $buildScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
     Assert-CcodTrue ($buildScript -cmatch 'ZipFile\]::CreateFromDirectory') 'portable builder creates a ZIP through the platform archive API'
     Assert-CcodTrue ($buildScript -cmatch 'Test-CcodReleaseAssetManifest') 'portable builder validates its complete release contract before reporting success'
-    Assert-CcodTrue ($buildScript -cnotmatch 'ISCC\.exe|Inno Setup|innosetup') 'portable builder has no Inno compiler dependency'
+    Assert-CcodTrue ($buildScript -cmatch 'ISCC\.exe|Inno Setup|innosetup') 'release builder uses Inno Setup for the installer'
 <#
     $isccCandidates = @(
         (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
@@ -2342,18 +2345,18 @@ $results += Invoke-CcodTest 'README and release workflow publish current portabl
     Assert-CcodTrue ($readmeChinese -cmatch '\A(?s:<div align="center">.*?<h1>CodexRemote-fix</h1>)') 'Chinese README uses the centered public product heading'
 
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start[^\r\n]*\r?\n(.*?)(?=^## )').Groups[1].Value
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.7-windows-x64\.zip') 'English Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.8-setup\.exe') 'English Quick Start names the setup installer'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.8-windows-x64\.zip') 'English Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix\.exe') 'English Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($quickStart -cmatch '\.sha256\.txt') 'English Quick Start names the checksum artifact'
-    Assert-CcodTrue ($quickStart -cmatch 'Install-CodexRemote-fix\.ps1') 'English Quick Start teaches the verified portable entrypoint'
-    Assert-CcodTrue ($quickStart -cnotmatch 'setup\.exe') 'English Quick Start does not direct users to the retired self-extracting setup'
 
     $quickStartChineseMatch = [regex]::Match($readmeChinese, '(?ms)^## [^\r\n]+\r?\n(?:\r?\n)?(?=1\.[^\r\n]*\[Releases\])(.*?)(?=^## |\z)')
     Assert-CcodTrue $quickStartChineseMatch.Success 'Chinese README exposes a Quick Start section'
     $quickStartChinese = $quickStartChineseMatch.Groups[1].Value
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.7-windows-x64\.zip') 'Chinese Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.8-setup\.exe') 'Chinese Quick Start names the setup installer'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.8-windows-x64\.zip') 'Chinese Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix\.exe') 'Chinese Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($quickStartChinese -cmatch '\.sha256\.txt') 'Chinese Quick Start names the checksum artifact'
-    Assert-CcodTrue ($quickStartChinese -cmatch 'Install-CodexRemote-fix\.ps1') 'Chinese Quick Start teaches the verified portable entrypoint'
-    Assert-CcodTrue ($quickStartChinese -cnotmatch 'setup\.exe') 'Chinese Quick Start does not direct users to the retired self-extracting setup'
 
     Assert-CcodTrue ($readme -cmatch 'Uninstall-CodexControlOtherDevices\.ps1') 'English uninstall instructions use the protected portable entrypoint'
     Assert-CcodTrue ($readmeChinese -cmatch 'Uninstall-CodexControlOtherDevices\.ps1') 'Chinese uninstall instructions use the protected portable entrypoint'

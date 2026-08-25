@@ -95,4 +95,45 @@ function Test-CcodTrayHostArtifact {
     return [pscustomobject][ordered]@{Valid=$true;Executable=$exe;Version=$Version;GitCommit=[string]$commit.Value;Sha256=(Get-CcodTrayHostHash $exe)}
 }
 
-Export-ModuleMember -Function Invoke-CcodTrayHostBuild,Test-CcodTrayHostArtifact
+function Invoke-CcodPortableLauncherBuild {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][string]$Version,
+        [Parameter(Mandatory)][string]$OutputDirectory,
+        [string]$GitCommit,
+        [string]$BuildTimestampUtc
+    )
+    if($Version -notmatch '^\d+\.\d+\.\d+$'){throw 'CCOD_PORTABLE_LAUNCHER_VERSION_INVALID'}
+    $repo=[IO.Path]::GetFullPath($RepositoryRoot);$out=[IO.Path]::GetFullPath($OutputDirectory);Test-CcodTrayHostOutputDirectory $out
+    if([string]::IsNullOrWhiteSpace($GitCommit)){$GitCommit=Get-CcodTrayHostGitCommit -RepositoryRoot $repo}else{$GitCommit=$GitCommit.ToLowerInvariant()}
+    if($GitCommit -cnotmatch '^[0-9a-f]{40}$'){throw 'CCOD_PORTABLE_LAUNCHER_PROVENANCE_INVALID'}
+    if([string]::IsNullOrWhiteSpace($BuildTimestampUtc)){$BuildTimestampUtc=[datetime]::UtcNow.ToString('o',[Globalization.CultureInfo]::InvariantCulture)}
+    if(-not (Test-CcodTrayHostCanonicalUtc $BuildTimestampUtc)){throw 'CCOD_PORTABLE_LAUNCHER_PROVENANCE_INVALID'}
+    $sourceRoot=Join-Path $repo 'src\portable';$launcher=Join-Path $sourceRoot 'PortableLauncher.cs';
+    $manifest=Join-Path $sourceRoot 'CodexRemote.Portable.manifest';$config=Join-Path $sourceRoot 'CodexRemote.Portable.exe.config';
+    $icon=Join-Path $repo 'assets\codexremote-fix\codexremote-fix.ico'
+    foreach($required in @($launcher,$manifest,$config,$icon)){if(-not(Test-Path -LiteralPath $required -PathType Leaf)){throw 'CCOD_PORTABLE_LAUNCHER_SOURCE_MISSING'}}
+    Import-Module (Join-Path $repo 'build\TrayHostReferencePack.psm1') -Force
+    $reference=Resolve-CcodTrayHostReferencePack -LockPath (Join-Path $repo 'build\trayhost-packages.lock.json') -CacheRoot (Join-Path $env:TEMP 'ccod-trayhost-reference-pack')
+    $compiler=Get-CcodTrayHostCompiler
+    $work=Join-Path ([IO.Path]::GetDirectoryName($out)) ('.ccod-portable-launcher-'+[Guid]::NewGuid().ToString('N'));New-Item -ItemType Directory -Path $work -Force|Out-Null
+    try{
+        $exe=Join-Path $work 'CodexRemote.Portable.exe';$compilerArgs=@('/nologo','/noconfig','/nostdlib+','/target:winexe','/platform:anycpu','/optimize+','/debug-','/checked+','/warn:4','/warnaserror+',('/out:{0}' -f $exe),('/main:PortableLauncher'),('/win32manifest:{0}' -f $manifest),('/win32icon:{0}' -f $icon))
+        foreach($leaf in @('mscorlib.dll','System.dll','System.Core.dll','System.Drawing.dll')){$compilerArgs+=('/reference:'+ (Join-Path $reference.ReferenceRoot $leaf))}
+        $compilerArgs+=@($launcher)
+        & $compiler @compilerArgs
+        if($LASTEXITCODE -ne 0 -or -not(Test-Path -LiteralPath $exe -PathType Leaf)){throw 'CCOD_PORTABLE_LAUNCHER_COMPILE_FAILED'}
+        $configOut=Join-Path $work 'CodexRemote.Portable.exe.config';Copy-Item -LiteralPath $config -Destination $configOut -Force
+        $provenance=[ordered]@{schemaVersion=1;product='CodexRemote-fix';version=$Version;gitCommit=$GitCommit;buildTimestampUtc=$BuildTimestampUtc;targetFramework='net48';compiler=[ordered]@{name='csc.exe';sha256=(Get-CcodTrayHostHash $compiler)};referenceRoot='locked-net48';sourceFiles=@([ordered]@{name='PortableLauncher.cs';sha256=(Get-CcodTrayHostHash $launcher)});iconSha256=(Get-CcodTrayHostHash $icon);manifestSha256=(Get-CcodTrayHostHash $manifest);configSha256=(Get-CcodTrayHostHash $config);artifactSha256=(Get-CcodTrayHostHash $exe);configArtifactSha256=(Get-CcodTrayHostHash $configOut)}
+        $provenancePath=Join-Path $work 'portable-launcher-provenance.json';$provenance|ConvertTo-Json -Depth 8|Set-Content -LiteralPath $provenancePath -Encoding UTF8
+        if(Test-Path -LiteralPath $out){Remove-Item -LiteralPath $out -Recurse -Force}
+        New-Item -ItemType Directory -Path $out -Force|Out-Null
+        Copy-Item -LiteralPath $exe -Destination (Join-Path $out 'CodexRemote.Portable.exe') -Force
+        Copy-Item -LiteralPath $configOut -Destination (Join-Path $out 'CodexRemote.Portable.exe.config') -Force
+        Copy-Item -LiteralPath $provenancePath -Destination (Join-Path $out 'portable-launcher-provenance.json') -Force
+        return [pscustomobject][ordered]@{ArtifactDirectory=$out;Executable=Join-Path $out 'CodexRemote.Portable.exe';Provenance=Join-Path $out 'portable-launcher-provenance.json';Version=$Version;Sha256=(Get-CcodTrayHostHash (Join-Path $out 'CodexRemote.Portable.exe'))}
+    }finally{if(Test-Path -LiteralPath $work){Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue}}
+}
+
+Export-ModuleMember -Function Invoke-CcodTrayHostBuild,Test-CcodTrayHostArtifact,Invoke-CcodPortableLauncherBuild

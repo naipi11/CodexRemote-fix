@@ -281,7 +281,7 @@ function Get-CcodLifecycleSourceFiles {
     foreach ($leaf in $required) { $relative.Add($leaf) }
     $trayHostRoot = Join-Path $root 'bin'
     if ([IO.Directory]::Exists($trayHostRoot)) {
-        $expectedTrayHost = @('CodexRemote.TrayHost.exe','CodexRemote.TrayHost.exe.config','trayhost-build-provenance.json')
+        $expectedTrayHost = @('CodexRemote.TrayHost.exe','CodexRemote.TrayHost.exe.config','trayhost-build-provenance.json','CodexRemote.Portable.exe','CodexRemote.Portable.exe.config','portable-launcher-provenance.json')
         $actualTrayHost = @(Get-ChildItem -LiteralPath $trayHostRoot -Force -ErrorAction Stop)
         if (@($actualTrayHost | Where-Object { $_.PSIsContainer -or $expectedTrayHost -cnotcontains $_.Name }).Count -gt 0 -or
             (@($actualTrayHost.Name | Sort-Object) -join ',') -cne (@($expectedTrayHost | Sort-Object) -join ',')) {

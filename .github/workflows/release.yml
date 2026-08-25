@@ -116,6 +116,8 @@ jobs:
           . ./tools/Test-ReleaseDefender.ps1 -Library
           $manifestPath = Join-Path $PWD ("build\dist\CodexRemote-fix-$version-release-manifest.json")
           Test-CcodReleaseAssetManifest -ManifestPath $manifestPath -AssetDirectory (Join-Path $PWD 'build\dist') -ExpectedVersion $version | Out-Null
+          $setupManifestPath = Join-Path $PWD ("build\dist\CodexRemote-fix-$version-setup-release-manifest.json")
+          Test-CcodReleaseAssetManifest -ManifestPath $setupManifestPath -AssetDirectory (Join-Path $PWD 'build\dist') -ExpectedVersion $version | Out-Null
 
       - name: Publish GitHub release
         shell: pwsh

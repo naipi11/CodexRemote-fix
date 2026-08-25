@@ -1567,4 +1567,11 @@ Invoke-CcodTest 'keeps the External renderer handoff warning visible across ordi
     Assert-CcodEqual 'WaitingForCodex' $seen.Connection 'tray projection uses current connection evidence rather than a historical handoff reason'
 }
 
+Invoke-CcodTest 'default trusted logon identity adapter satisfies the live supervisor contract' {
+    $defaults = Get-CcodSupervisorDefaultAdapters
+    $identity = & $defaults.GetIdentity
+    $logonIdentity = & $defaults.GetTrustedLogonIdentity $identity.UserSid $identity.SessionId
+    Assert-CcodTrue (Test-CcodSupervisorLogonIdentity $logonIdentity $identity) 'default logon identity adapter binds the current module contract'
+}
+
 Write-Output "Supervisor self-tests passed: $($results.Count)"

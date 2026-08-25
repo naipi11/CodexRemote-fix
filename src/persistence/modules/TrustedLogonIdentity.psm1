@@ -161,7 +161,15 @@ function Get-CcodTrustedLogonAdapters {
     param([hashtable]$Adapters)
 
     $resolved = @{
-        GetProcessTokenFacts = { Initialize-CcodTrustedLogonNative; [CcodTrustedLogonNative]::GetCurrentProcessTokenFacts() }
+        GetProcessTokenFacts = {
+            Initialize-CcodTrustedLogonNative
+            $facts = [CcodTrustedLogonNative]::GetCurrentProcessTokenFacts()
+            [pscustomobject][ordered]@{
+                AuthenticationHighPart = [uint32]$facts.AuthenticationHighPart
+                AuthenticationLowPart = [uint32]$facts.AuthenticationLowPart
+                userSid = [string]$facts.userSid
+            }
+        }
         GetCurrentUserSid = { throw 'Thread identity must not be used for trusted logon facts' }
         GetCurrentSessionId = {
             $process = [Diagnostics.Process]::GetCurrentProcess()

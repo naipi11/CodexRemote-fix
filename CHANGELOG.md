@@ -6,6 +6,16 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.8
+
+### English
+
+- Fixed the live supervisor startup so the default trusted logon identity adapter matches its module contract and returns assertion-ready token facts. Fresh installs now prove supervisor and tray readiness instead of failing closed during activation.
+
+### 简体中文
+
+- 修复守护程序真实启动：默认可信登录身份适配器现与其模块契约一致，并返回可供断言使用的令牌事实。全新安装现在能证明 Supervisor 与托盘已就绪，而不是在激活阶段失败关闭。
+
 ## v2.5.7
 
 ### English
