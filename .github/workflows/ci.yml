@@ -26,10 +26,6 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install Inno Setup
-        shell: pwsh
-        run: choco install innosetup -y --no-progress
-
       - name: Run uninstall bootstrap self-test
         shell: pwsh
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./tests/persistence/UninstallBootstrap.SelfTest.ps1

@@ -54,3 +54,4 @@ if ($receipt.Outcome -eq 'Installed' -or $receipt.Outcome -eq 'Upgraded') {
     Write-Host 'Open Settings > Connections > Control other devices after starting Codex normally.' -ForegroundColor Green
     Write-Host ''
 }
+return $receipt

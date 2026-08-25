@@ -18,7 +18,7 @@ function New-CcodUninstallBootstrapContext {
         leaseEpoch = [uint64]11
         userSid = 'S-1-5-21-111-222-333-1001'
         sessionId = 1
-        payloadEntries = @('src/persistence/UninstallBootstrap.ps1','src/persistence/modules/InstallLifecycle.psm1')
+        payloadRecords = New-CcodUninstallBootstrapPayloadRecords -ResumeOnly
     }
 }
 
@@ -61,7 +61,7 @@ function New-CcodUninstallBootstrapAdapters {
                 leaseEpoch = [uint64]11
                 userSid = 'S-1-5-21-111-222-333-1001'
                 sessionId = 1
-                payloadEntries = @('src/persistence/UninstallBootstrap.ps1','src/persistence/modules/InstallLifecycle.psm1')
+                payloadRecords = New-CcodUninstallBootstrapPayloadRecords -ResumeOnly
             }
         }.GetNewClosure()
         GetTransactionRoot = {
@@ -100,7 +100,7 @@ function New-CcodUninstallBootstrapAdapters {
             if ($World.StageError) {
                 throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('payload hash proof failed'),'CCOD_UNINSTALL_PAYLOAD_HASH_MISMATCH',[Management.Automation.ErrorCategory]::InvalidData,$TransactionRoot)
             }
-            [void]($World.StagedEntries = @($Context.payloadEntries))
+            [void]($World.StagedEntries = @($Context.payloadRecords | ForEach-Object { [string]$_.path }))
         }.GetNewClosure()
         WriteTransaction = {
             param($TransactionRoot,$Transaction)
@@ -160,7 +160,9 @@ function New-CcodVerifiedUninstallRuntimeFixture {
     $runtimeRoot = Join-Path $InstallRoot 'runtime\pending'
     foreach ($entry in @(
         'src/persistence/UninstallBootstrap.ps1',
+        'src/persistence/PortableUninstallFinalizer.ps1',
         'src/persistence/modules/InstallLifecycle.psm1',
+        'src/persistence/modules/PortableRelease.psm1',
         'src/persistence/modules/PersistenceIO.psm1',
         'src/persistence/modules/RuntimeManifest.psm1',
         'src/persistence/modules/LifecycleEpoch.psm1',
@@ -206,7 +208,7 @@ $results += Invoke-CcodTest 'Prepare stages only the manifest-bound cleanup payl
     $receipt = Invoke-CcodUninstallBootstrap -InstallerRoot 'C:\installer' -InstallRoot 'C:\install' -Mode Prepare -Adapters (New-CcodUninstallBootstrapAdapters $world)
     Assert-CcodEqual 'ReadyForInno' $receipt.phase 'verified cleanup reaches the Inno boundary'
     Assert-CcodEqual 'Validate,GetRoot,Read,NewId,Create,Write:Requested,Publish,Stage,Cleanup,Write:ReadyForInno,Receipt:ReadyForInno' ($world.Calls -join ',') 'Prepare publishes a recoverable transaction only after its durable transaction record exists'
-    Assert-CcodEqual 'src/persistence/UninstallBootstrap.ps1,src/persistence/modules/InstallLifecycle.psm1' ($world.StagedEntries -join ',') 'staging has no device-key material'
+    Assert-CcodEqual 'src/persistence/UninstallBootstrap.ps1,src/persistence/PortableUninstallFinalizer.ps1,src/persistence/modules/InstallLifecycle.psm1,src/persistence/modules/PortableRelease.psm1,src/persistence/modules/PersistenceIO.psm1,src/persistence/modules/RuntimeManifest.psm1,src/persistence/modules/LifecycleEpoch.psm1,src/persistence/modules/StateStore.psm1,src/persistence/modules/TrustedLogonIdentity.psm1,src/persistence/modules/ScheduledTask.psm1,src/persistence/modules/KernelObjects.psm1,src/persistence/modules/CompatibilityProbe.psm1,src/persistence/modules/UiPreferences.psm1,src/persistence/modules/LifecycleTransaction.psm1' ($world.StagedEntries -join ',') 'staging has no device-key material'
     Assert-CcodEqual $null $receipt.errorCode 'ReadyForInno carries no failure code'
 }
 
@@ -221,9 +223,31 @@ $results += Invoke-CcodTest 'production runtime verification binds the installed
         Assert-CcodEqual $fixture.RuntimeId $context.runtimeId 'verified context binds the active manifest runtime'
         Assert-CcodEqual ([uint64]7) ([uint64]$context.runtimeGeneration) 'verified context binds active generation'
         Assert-CcodEqual ([uint64]11) ([uint64]$context.leaseEpoch) 'verified context binds lifecycle epoch'
-        Assert-CcodEqual 12 @($context.payloadEntries).Count 'only the cleanup entry and its imported modules are staged'
+        Assert-CcodEqual 14 @($context.payloadRecords).Count 'only the cleanup entry, portable finalizer, and imported modules are staged'
         [IO.File]::AppendAllText((Join-Path $fixture.RuntimeRoot 'src\persistence\modules\InstallLifecycle.psm1'),'# altered',[Text.UTF8Encoding]::new($false))
         Assert-CcodThrows { Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $repositoryRoot -InstallRoot $installRoot | Out-Null } 'CCOD_UNINSTALL_RUNTIME_INVALID'
+    } finally {
+        [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previousLocalAppData,'Process')
+        if (Test-Path -LiteralPath $localAppData) { Remove-Item -LiteralPath $localAppData -Recurse -Force }
+    }
+}
+
+$results += Invoke-CcodTest 'external staging refuses a cleanup source changed after runtime verification' {
+    $localAppData = Join-Path ([IO.Path]::GetTempPath()) ('ccod-uninstall-race-' + [guid]::NewGuid().ToString('N'))
+    $installRoot = Join-Path $localAppData 'CodexControlOtherDevices'
+    $previousLocalAppData = [Environment]::GetEnvironmentVariable('LOCALAPPDATA','Process')
+    try {
+        [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$localAppData,'Process')
+        $fixture = New-CcodVerifiedUninstallRuntimeFixture -InstallRoot $installRoot
+        $context = Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $repositoryRoot -InstallRoot $installRoot
+        [IO.File]::AppendAllText((Join-Path $fixture.RuntimeRoot 'src\persistence\PortableUninstallFinalizer.ps1'),'# changed after verification',[Text.UTF8Encoding]::new($false))
+        $transactionDirectory = Join-Path $localAppData 'staged-transaction'
+        [IO.Directory]::CreateDirectory($transactionDirectory) | Out-Null
+        Assert-CcodThrows {
+            Stage-CcodUninstallBootstrapPayload -InstallRoot $installRoot -Context $context -TransactionDirectory $transactionDirectory
+        } 'CCOD_UNINSTALL_PAYLOAD_HASH_MISMATCH'
+        $payloadRoot = Join-Path $transactionDirectory 'payload'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $payloadRoot 'src\persistence\PortableUninstallFinalizer.ps1'))) 'the changed cleanup source is never staged'
     } finally {
         [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previousLocalAppData,'Process')
         if (Test-Path -LiteralPath $localAppData) { Remove-Item -LiteralPath $localAppData -Recurse -Force }
@@ -257,8 +281,9 @@ $results += Invoke-CcodTest 'real external staging uses a protected current-user
         $payloadRoot = Join-Path $transactionDirectory 'payload'
         Assert-CcodUninstallBootstrapDirectoryAcl -Path $payloadRoot -UserSid $context.userSid
         $payloadFiles = @(Get-ChildItem -LiteralPath $payloadRoot -Recurse -File -Force)
-        Assert-CcodEqual 12 $payloadFiles.Count 'external payload contains the exact cleanup entry and required modules'
-        foreach ($entry in @($context.payloadEntries)) {
+        Assert-CcodEqual 14 $payloadFiles.Count 'external payload contains the exact cleanup entry, portable finalizer, and required modules'
+        foreach ($record in @($context.payloadRecords)) {
+            $entry = [string]$record.path
             $source = Join-Path $fixture.RuntimeRoot ($entry.Replace('/','\'))
             $staged = Join-Path $payloadRoot ($entry.Replace('/','\'))
             Assert-CcodTrue (Test-Path -LiteralPath $staged -PathType Leaf) "manifest-bound payload entry $entry is staged"

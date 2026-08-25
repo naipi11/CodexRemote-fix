@@ -6,6 +6,20 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.6
+
+### English
+
+- Replaced the unsigned self-extracting installer release with a manifest-bound portable ZIP. Release validation now binds the ZIP, checksum, TrayHost provenance, external payload manifest, and every archived payload file.
+- Added a verified portable entrypoint that scans the payload with Microsoft Defender before installation, without disabling protection or adding exclusions.
+- Added a staged portable uninstall finalizer that removes only the marker-bound current-user payload after the existing fail-closed cleanup proves the runtime/session boundary. The DPAPI device-key store remains untouched.
+
+### 简体中文
+
+- 将无签名自解压安装器发布改为带清单绑定的便携 ZIP。发布校验现会绑定 ZIP、校验和、TrayHost provenance、外置 payload manifest 以及归档内的每一个载荷文件。
+- 新增经验证的便携入口：安装前使用 Microsoft Defender 扫描载荷，不关闭防护，也不添加排除项。
+- 新增 staged 便携卸载终结器：只有既有失败即停止清理已经证明 runtime/会话边界后，才删除带标记绑定的当前用户载荷；DPAPI 设备密钥存储保持不变。
+
 ## v2.5.5
 
 ### English

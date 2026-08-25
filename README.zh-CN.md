@@ -43,18 +43,29 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 ## 快速开始
 
-1. 从 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 下载 `CodexRemote-fix-2.5.5-setup.exe` 和 `CodexRemote-fix-2.5.5-setup.exe.sha256.txt`，并核对 SHA-256。
-2. 运行 `CodexRemote-fix-2.5.5-setup.exe`，无需管理员权限。
-   Windows 10 用户请确认已安装 .NET Framework 4.8，原生 TrayHost 需要该组件。
-3. 托盘守护程序会自动启动，并创建桌面快捷方式 **CodexRemote-fix**。安装器会等待新 runtime 与 TrayHost 就绪，再让你选择 **立即重启** 或 **稍后**：仅在可以关闭并重新启动 Codex 时选择 **立即重启**；选择 **稍后** 会保持当前 Codex 会话不受影响，并会在之后手动或正常启动 Codex 时安全恢复。连接状态显示 **已连接** 后，打开 **设置 → 连接 → 控制其他设备** 即可注册或使用。
+1. 从 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 下载 `CodexRemote-fix-2.5.6-windows-x64.zip`、对应 `.sha256.txt`、release manifest 和 payload manifest；打开前先核对 ZIP 的 SHA-256。
+2. 将已验证的 ZIP 解压到一个新的空目录。如果 Windows 标记了下载脚本，只对已验证的入口脚本解除阻止，然后在 Windows PowerShell 中运行：
 
-当前安装包及其 SHA-256 校验值始终发布在
+       Unblock-File .\Install-CodexRemote-fix.ps1
+       .\Install-CodexRemote-fix.ps1
+
+   入口会先校验全部载荷文件、再执行 Microsoft Defender 自定义扫描，之后才复制到当前用户的应用目录；它不会关闭 Defender，也不会添加排除项。
+3. 托盘守护程序会自动启动。连接状态显示 **已连接** 后，打开 **设置 → 连接 → 控制其他设备** 即可注册或使用。Windows 10 用户请确认已安装 .NET Framework 4.8，原生 TrayHost 需要该组件。
+
+当前便携 ZIP、SHA-256、release manifest 与 payload manifest 始终发布在
 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 页面。
 
-升级时直接运行新版安装包即可，现有设置与设备密钥会原地保留。安装器会等待新 runtime 与托盘就绪后才提供重启选择，并且只会安全清理中断升级遗留的已完成恢复工作。
+便携发布会有意拒绝覆盖已有便携载荷。替换便携版本前，请先运行已安装的
+`Uninstall-CodexControlOtherDevices.ps1`；设置和 DPAPI 设备密钥会保留。由旧 Inno
+安装包迁移时，请先卸载旧版本。
 
 已验证：Windows 11 · Codex Desktop `26.818.2441.0` · Node.js `22.23.1`；
 隐藏的控制器标签、原生托盘菜单、双语菜单切换和常驻守护程序均可用。
+
+## v2.5.6 更新内容
+
+- 将无签名自解压安装器改为带清单绑定的便携 ZIP。发布校验会验证 ZIP、校验和、TrayHost provenance、外置 payload manifest 以及归档内的每一个载荷文件。
+- 便携入口会在安装前校验并交给 Defender 扫描。外置终结器只有在既有的失败即停止生命周期清理已经证明 runtime/会话边界后，才删除带标记绑定的当前用户载荷；不会触碰 DPAPI 设备密钥存储。
 
 ## v2.5.5 更新内容
 
@@ -163,16 +174,18 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 ## 发布（Releases）
 
-每个带 tag 的发布都会附带 Windows 安装包及其 SHA-256 校验文件。
-`.github/workflows/release.yml` 会在 tag 上自动构建安装包，因此 2.5.5 发布提供
-可直接运行的 `CodexRemote-fix-2.5.5-setup.exe`
-及 `CodexRemote-fix-2.5.5-setup.exe.sha256.txt`。
+每个带 tag 的发布都会附带 Windows 便携 ZIP、SHA-256 校验文件、release manifest 和
+payload manifest。`.github/workflows/release.yml` 会在 tag 上自动构建，因此 v2.5.6
+发布提供 `CodexRemote-fix-2.5.6-windows-x64.zip`、
+`CodexRemote-fix-2.5.6-windows-x64.zip.sha256.txt`、
+`CodexRemote-fix-2.5.6-release-manifest.json` 和
+`CodexRemote-fix-2.5.6-payload-manifest.json`。
 
 GitHub Release 正文只发布英文更新说明；本 README 继续保留中英文使用说明。
 完整历史见 [CHANGELOG.md](CHANGELOG.md)。
 
 Codex Desktop 更新后，请到 [Releases](https://github.com/naipi11/CodexRemote-fix/releases)
-查看是否有更新安装包；也可以从开始菜单运行 **CodexRemote-fix compatibility check（兼容性检查）**
+查看是否有更新便携包；也可以从开始菜单运行 **CodexRemote-fix compatibility check（兼容性检查）**
 快捷方式，确认当前守护程序仍匹配。
 
 ## Star History
@@ -226,11 +239,11 @@ External renderer 未附加到已经运行的会话？
 
 ## 卸载
 
-托盘中没有卸载命令。请在 **Windows 设置 → 应用 → 已安装的应用** 中卸载
-**CodexRemote-fix**，或直接从应用安装目录运行已安装的 `unins000.exe`。
-两个入口都会使用同一个外部、失败即停止的清理事务；如果它无法证明当前 runtime 与会话身份，
-会保护已安装文件而不会猜测性删除。DPAPI 设备密钥会原地保留，因此已授权设备会被保留。
-本地删除密钥不会撤销服务器授权；如需撤销，请先在 Codex 中撤销设备。
+托盘中没有卸载命令。请运行已安装的
+`%LOCALAPPDATA%\CodexControlOtherDevices-installer\Uninstall-CodexControlOtherDevices.ps1`。
+它会先完成同一个外部、失败即停止的清理事务，再启动 staged finalizer，仅删除带标记绑定的便携
+载荷。如果无法证明当前 runtime 与会话身份，文件会保留而不会猜测性删除。DPAPI 设备密钥会原地
+保留，因此已授权设备会被保留。本地删除密钥不会撤销服务器授权；如需撤销，请先在 Codex 中撤销设备。
 
 ## 它解决了什么
 

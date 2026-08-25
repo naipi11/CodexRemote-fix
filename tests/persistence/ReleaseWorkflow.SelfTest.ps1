@@ -32,6 +32,41 @@ function New-CcodReleaseFixture {
     return [pscustomobject]@{ Root = $root; Installer = $installer; Checksum = $checksum; TrayHost = $trayHost; Manifest = $manifest }
 }
 
+function New-CcodPortableReleaseFixture {
+    $root = Join-Path $env:TEMP ('ccod-portable-release-workflow-' + [guid]::NewGuid().ToString('N'))
+    $stage = Join-Path $root 'stage'
+    $payload = Join-Path $stage 'payload'
+    [IO.Directory]::CreateDirectory($payload) | Out-Null
+    [IO.File]::WriteAllText((Join-Path $stage 'Install-CodexRemote-fix.ps1'),'Write-Output portable',[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $payload 'hello.txt'),'portable payload',[Text.UTF8Encoding]::new($false))
+    $timestamp = '2026-08-25T00:00:00.0000000Z'
+    $commit = 'b' * 40
+    $payloadFile = Join-Path $payload 'hello.txt'
+    $payloadRecord = [ordered]@{path='hello.txt';length=[int64](Get-Item -LiteralPath $payloadFile).Length;sha256=Get-CcodTestFileSha256 -Path $payloadFile}
+    $payloadManifest = [ordered]@{schemaVersion=1;product='CodexRemote-fix';version='2.5.6';gitCommit=$commit;buildTimestampUtc=$timestamp;files=@($payloadRecord)}
+    [IO.File]::WriteAllText((Join-Path $stage 'payload-manifest.json'),($payloadManifest | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    $bundle = Join-Path $root 'CodexRemote-fix-2.5.6-windows-x64.zip'
+    [IO.Compression.ZipFile]::CreateFromDirectory($stage,$bundle,[IO.Compression.CompressionLevel]::Optimal,$false)
+    $checksum = "$bundle.sha256.txt"
+    $bundleHash = Get-CcodTestFileSha256 -Path $bundle
+    [IO.File]::WriteAllText($checksum,("$bundleHash *$([IO.Path]::GetFileName($bundle))"),[Text.UTF8Encoding]::new($false))
+    $provenance = Join-Path $root 'CodexRemote-fix-2.5.6-trayhost-provenance.json'
+    [IO.File]::WriteAllText($provenance,([ordered]@{schemaVersion=1;product='CodexRemote-fix';version='2.5.6';gitCommit=$commit;buildTimestampUtc=$timestamp}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+    $payloadAsset = Join-Path $root 'CodexRemote-fix-2.5.6-payload-manifest.json'
+    [IO.File]::Copy((Join-Path $stage 'payload-manifest.json'),$payloadAsset,$false)
+    $manifest = Join-Path $root 'CodexRemote-fix-2.5.6-release-manifest.json'
+    $assets = @(
+        [ordered]@{name=[IO.Path]::GetFileName($bundle);sha256=$bundleHash},
+        [ordered]@{name=[IO.Path]::GetFileName($checksum);sha256=Get-CcodTestFileSha256 -Path $checksum},
+        [ordered]@{name=[IO.Path]::GetFileName($provenance);sha256=Get-CcodTestFileSha256 -Path $provenance},
+        [ordered]@{name=[IO.Path]::GetFileName($payloadAsset);sha256=Get-CcodTestFileSha256 -Path $payloadAsset}
+    )
+    $release = [ordered]@{schemaVersion=2;product='CodexRemote-fix';version='2.5.6';gitCommit=$commit;buildTimestampUtc=$timestamp;distribution='portable-zip';assets=$assets}
+    [IO.File]::WriteAllText($manifest,($release | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    return [pscustomobject]@{Root=$root;Bundle=$bundle;Checksum=$checksum;PayloadManifest=$payloadAsset;Manifest=$manifest}
+}
+
 Invoke-CcodTest 'release defender tool exposes manifest and scan functions without a live scan' {
     Assert-CcodTrue (Test-Path -LiteralPath $defenderPath -PathType Leaf) 'Defender release gate exists'
     . $defenderPath -Library
@@ -188,7 +223,30 @@ Invoke-CcodTest 'package scripts build provenance and workflows retain the relea
     Assert-CcodTrue ($release -cmatch '(?ms)^  publish:\r?\n    needs: build\r?\n    runs-on: windows-latest\r?\n    permissions:\r?\n      contents: write\s*$') 'only the publish job receives release-write permission'
 }
 
-Invoke-CcodTest '2.5.5 current documentation matches the lifecycle tray and uninstall contract' {
+Invoke-CcodTest '2.5.6 documentation matches the portable release, Defender gate, and protected uninstall contract' {
+    $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
+    Assert-CcodEqual '2.5.6' ([string]$package.version) 'package metadata is the 2.5.6 release'
+    $changelog = Get-Content -LiteralPath (Join-Path $repositoryRoot 'CHANGELOG.md') -Raw
+    $releaseSection = [regex]::Match($changelog, '(?ms)^## v2\.5\.6\s*\r?\n(?<body>.*?)(?=^## |\z)')
+    Assert-CcodTrue $releaseSection.Success 'v2.5.6 release section exists'
+    Assert-CcodTrue ($releaseSection.Groups['body'].Value.Contains('manifest-bound portable ZIP')) 'v2.5.6 changelog records the portable ZIP boundary'
+    $readme = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.md') -Raw
+    $quickStart = [regex]::Match($readme, '(?ms)^## Quick start\s*\r?\n(?<body>.*?)(?=^## |\z)').Groups['body'].Value
+    Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.6-windows-x64.zip')) 'English Quick Start names the portable ZIP'
+    Assert-CcodTrue ($quickStart.Contains('Install-CodexRemote-fix.ps1')) 'English Quick Start names the verified entrypoint'
+    Assert-CcodTrue ($quickStart.Contains('Microsoft Defender')) 'English Quick Start documents the local Defender gate'
+    Assert-CcodTrue (-not $quickStart.Contains('-setup.exe')) 'English Quick Start no longer directs users to the retired self-extracting setup'
+    Assert-CcodTrue ($readme.Contains('Uninstall-CodexControlOtherDevices.ps1')) 'English README documents the portable uninstall entrypoint'
+    $readmeZh = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.zh-CN.md') -Raw -Encoding UTF8
+    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.6-windows-x64.zip')) 'Chinese Quick Start names the portable ZIP'
+    Assert-CcodTrue ($readmeZh.Contains('Install-CodexRemote-fix.ps1')) 'Chinese Quick Start names the verified entrypoint'
+    Assert-CcodTrue ($readmeZh.Contains('Microsoft Defender')) 'Chinese Quick Start documents the local Defender gate'
+    Assert-CcodTrue ($readmeZh.Contains('Uninstall-CodexControlOtherDevices.ps1')) 'Chinese README documents the portable uninstall entrypoint'
+    $technical = Get-Content -LiteralPath (Join-Path $repositoryRoot 'docs\TECHNICAL.md') -Raw
+    Assert-CcodTrue ($technical.Contains('PortableUninstallFinalizer.ps1')) 'technical documentation records the staged portable finalizer'
+    $security = Get-Content -LiteralPath (Join-Path $repositoryRoot 'SECURITY.md') -Raw
+    Assert-CcodTrue ($security.Contains('does not disable Defender or add exclusions')) 'security documentation forbids Defender weakening'
+<#
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
     Assert-CcodEqual '2.5.5' ([string]$package.version) 'package metadata is the 2.5.5 release'
 
@@ -247,6 +305,29 @@ Invoke-CcodTest '2.5.5 current documentation matches the lifecycle tray and unin
     Assert-CcodTrue ($security.Contains('unins000.exe')) 'security documentation identifies the direct uninstaller route'
     Assert-CcodTrue (-not $security.Contains('-BackupDeviceKeyStore')) 'security documentation excludes legacy key backup switch'
     Assert-CcodTrue (-not $security.Contains('-RemoveDeviceKeyStore')) 'security documentation excludes legacy key removal switch'
+#>
+}
+
+Invoke-CcodTest 'portable release manifest binds the ZIP payload manifest and each archived payload file' {
+    . $defenderPath -Library
+    $fixture = New-CcodPortableReleaseFixture
+    try {
+        $validated = Test-CcodReleaseAssetManifest -ManifestPath $fixture.Manifest -AssetDirectory $fixture.Root -ExpectedVersion '2.5.6'
+        Assert-CcodEqual $true ([bool]$validated.Valid) 'valid portable fixture passes the release manifest contract'
+        Assert-CcodEqual 'portable-zip' ([string]$validated.Distribution) 'validator reports the portable release distribution'
+        $payload = Get-Content -LiteralPath $fixture.PayloadManifest -Raw | ConvertFrom-Json
+        $payload.files[0].sha256 = '0' * 64
+        [IO.File]::WriteAllText($fixture.PayloadManifest,($payload | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+        $release = Get-Content -LiteralPath $fixture.Manifest -Raw | ConvertFrom-Json
+        $asset = @($release.assets | Where-Object { $_.name -ceq [IO.Path]::GetFileName($fixture.PayloadManifest) })[0]
+        $asset.sha256 = Get-CcodTestFileSha256 -Path $fixture.PayloadManifest
+        [IO.File]::WriteAllText($fixture.Manifest,($release | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows {
+            Test-CcodReleaseAssetManifest -ManifestPath $fixture.Manifest -AssetDirectory $fixture.Root -ExpectedVersion '2.5.6'
+        } 'CCOD_RELEASE_ASSET_HASH_MISMATCH'
+    } finally {
+        if (Test-Path -LiteralPath $fixture.Root) { Remove-Item -LiteralPath $fixture.Root -Recurse -Force }
+    }
 }
 
 Write-Host 'Release workflow self-tests passed.'

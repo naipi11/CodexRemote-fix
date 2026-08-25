@@ -249,12 +249,17 @@ Export-ModuleMember -Function Submit-CcodLifecycleRequest
     }finally{if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}}
 }
 
-Invoke-CcodTest 'public uninstall wrapper rejects retired direct options and delegates only to the installed Inno executable' {
+Invoke-CcodTest 'public uninstall wrapper rejects retired direct options and delegates portable cleanup to an external verified finalizer' {
     $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($uninstallPath,[ref]$tokens,[ref]$errors)
     Assert-CcodTrue (@($errors).Count -eq 0) 'Uninstall wrapper parses'
     $commands=@($ast.FindAll({param($node)$node -is [Management.Automation.Language.CommandAst]},$true)|ForEach-Object{$_.GetCommandName()}|Where-Object{$_})
-    Assert-CcodTrue ($commands -ccontains 'Start-Process') 'Uninstall wrapper delegates the real operation to Inno'
-    foreach($forbidden in @('Import-Module','Remove-Item','Move-Item','Copy-Item','Invoke-CcodUninstall')){Assert-CcodTrue ($commands -cnotcontains $forbidden) "Uninstall wrapper has no direct $forbidden path"}
+    Assert-CcodTrue ($commands -ccontains 'Start-Process') 'Uninstall wrapper delegates portable finalization to an external process'
+    Assert-CcodTrue ($commands -ccontains 'Import-Module') 'Uninstall wrapper verifies the installed portable marker through its manifest-bound module'
+    foreach($forbidden in @('Remove-Item','Move-Item','Copy-Item','Invoke-CcodUninstall')){Assert-CcodTrue ($commands -cnotcontains $forbidden) "Uninstall wrapper has no direct $forbidden path"}
+    $source=Get-Content -LiteralPath $uninstallPath -Raw -Encoding UTF8
+    foreach($required in @('portable-release.json','Assert-CcodPortableInstalledMarker','-Mode Prepare','PortableUninstallFinalizer.ps1')){
+        Assert-CcodTrue ($source -cmatch [regex]::Escape($required)) "Uninstall wrapper requires $required for the portable finalization boundary"
+    }
     foreach($argument in @(@{Name='KeepCurrentSpecialSession';Value=$true},@{Name='BackupDeviceKeyStore';Value=$true},@{Name='RemoveDeviceKeyStore';Value=$true})){
         $failure=$null
         $parameters=@{};$parameters[[string]$argument.Name]=$argument.Value

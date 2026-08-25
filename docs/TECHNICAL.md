@@ -238,15 +238,23 @@ resource allowlist. They are copied into the staged runtime, hashed in
 supervisor therefore uses the same immutable catalog bytes as the runtime
 manifest; do not manually copy UI files into an active runtime.
 
-The tray has no uninstall command. Windows Settings and the installed `unins000.exe`
-both enter the same Inno-owned, external cleanup path. Before Inno may remove app-owned
-files, `UninstallBootstrap.ps1` verifies the active schema-2 runtime pointer, manifest
-hashes, contained cleanup payload, reparse-point safety, current user/session identity,
-and the lifecycle epoch. It writes a protected external uninstaller receipt bound to the
-runtime ID, runtime generation, lease epoch, SID, and session. Inno accepts only that
-receipt and fails closed on any mismatch. The transaction stops the verified supervisor,
-normalizes the owned session when its identity can be proven, and removes only app-owned
-runtime/state data. It neither copies, moves, nor deletes the DPAPI device-key store.
+The tray has no uninstall command. The portable entry
+`Uninstall-CodexControlOtherDevices.ps1` first enters the same external, fail-closed
+cleanup path. `UninstallBootstrap.ps1` verifies the active schema-2 runtime pointer,
+manifest hashes, contained cleanup payload, reparse-point safety, current user/session identity,
+and lifecycle epoch. It writes a protected external receipt bound to runtime ID, generation,
+epoch, SID, and session. Only then does a staged `PortableUninstallFinalizer.ps1` verify
+the current-user marker and remove the exact portable installer root; it invokes the staged
+bootstrap completion entry only after that root is absent. Any mismatch leaves files in place.
+The transaction stops the verified supervisor, normalizes the owned session when its identity
+can be proven, and removes only app-owned runtime/state data. It neither copies, moves, nor
+deletes the DPAPI device-key store.
+
+The release is a ZIP with an outer `Install-CodexRemote-fix.ps1`, a separately published
+payload manifest, and a manifest-bound runtime payload. The outer entrypoint checks all extracted
+file hashes and runs a Defender custom scan before copying the payload into
+`%LOCALAPPDATA%\CodexControlOtherDevices-installer`; it never changes Defender policy or
+adds an exclusion.
 
 ### Source and installed layouts
 
@@ -480,7 +488,7 @@ The persistent supervisor adds these rules:
   reconciles and adopts it instead of restarting Codex;
 - external uninstall normalizes a special session only after it proves the
   current lifecycle fence and process identity, verifies both debugger ports
-  closed, and receives an Inno-validated cleanup receipt.
+  closed, and receives a staged-finalizer completion receipt.
 
 This is safer than relying only on a static version list, but it is not a
 structured control-flow or binary-integrity check. A future build that retains
