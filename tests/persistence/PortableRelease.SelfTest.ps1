@@ -11,10 +11,13 @@ function Get-CcodPortableReleaseTestHash {
 }
 
 function New-CcodPortableReleaseFixture {
+    param([switch]$Nested)
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-portable-release-' + [guid]::NewGuid().ToString('N'))
     $payload = Join-Path $root 'payload'
     [IO.Directory]::CreateDirectory($payload) | Out-Null
-    $file = Join-Path $payload 'safe.txt'
+    $relative = if ($Nested) { 'bin/safe.txt' } else { 'safe.txt' }
+    $file = Join-Path $payload ($relative.Replace('/',[IO.Path]::DirectorySeparatorChar.ToString()))
+    [IO.Directory]::CreateDirectory((Split-Path $file -Parent)) | Out-Null
     [IO.File]::WriteAllText($file,'portable fixture',[Text.UTF8Encoding]::new($false))
     $manifestPath = Join-Path $root 'payload-manifest.json'
     $manifest = [ordered]@{
@@ -23,10 +26,10 @@ function New-CcodPortableReleaseFixture {
         version = '2.5.6'
         gitCommit = ('a' * 40)
         buildTimestampUtc = '2026-08-25T00:00:00.0000000Z'
-        files = @([ordered]@{path='safe.txt';length=[int64](Get-Item -LiteralPath $file).Length;sha256=Get-CcodPortableReleaseTestHash -Path $file})
+        files = @([ordered]@{path=$relative;length=[int64](Get-Item -LiteralPath $file).Length;sha256=Get-CcodPortableReleaseTestHash -Path $file})
     }
     [IO.File]::WriteAllText($manifestPath,($manifest | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
-    return [pscustomobject]@{Root=$root;Payload=$payload;Manifest=$manifestPath;File=$file}
+    return [pscustomobject]@{Root=$root;Payload=$payload;Manifest=$manifestPath;File=$file;Relative=$relative}
 }
 
 Invoke-CcodTest 'portable payload manifest validates an exact file record set' {
@@ -82,6 +85,25 @@ Invoke-CcodTest 'portable payload copy refuses arbitrary caller-selected install
         Assert-CcodThrows {
             Copy-CcodPortablePayload -PayloadRoot $fixture.Payload -ManifestPath $fixture.Manifest -InstallerRoot (Join-Path $fixture.Root 'arbitrary-root') | Out-Null
         } 'CCOD_PORTABLE_PATH_INVALID'
+    } finally {
+        if (Test-Path -LiteralPath $fixture.Root) { Remove-Item -LiteralPath $fixture.Root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'portable payload copy creates manifest-bound nested directories in a fresh staging root' {
+    $fixture = New-CcodPortableReleaseFixture -Nested
+    $target = Join-Path $fixture.Root 'installer-root'
+    try {
+        $module = Get-Module PortableRelease
+        $receipt = & $module {
+            param($Payload,$Manifest,$InstallerRoot)
+            function Get-CcodPortableReleaseExpectedInstallerRoot { return $InstallerRoot }
+            Copy-CcodPortablePayload -PayloadRoot $Payload -ManifestPath $Manifest -InstallerRoot $InstallerRoot
+        } $fixture.Payload $fixture.Manifest $target
+        Assert-CcodEqual $target $receipt.InstallerRoot 'nested payload copy is bound to the expected installer root'
+        $copied = Join-Path $target ($fixture.Relative.Replace('/',[IO.Path]::DirectorySeparatorChar.ToString()))
+        Assert-CcodTrue ([IO.File]::Exists($copied)) 'nested portable payload file is copied into a newly created plain directory'
+        Assert-CcodEqual (Get-CcodPortableReleaseTestHash -Path $fixture.File) (Get-CcodPortableReleaseTestHash -Path $copied) 'nested portable payload bytes remain manifest-bound after copy'
     } finally {
         if (Test-Path -LiteralPath $fixture.Root) { Remove-Item -LiteralPath $fixture.Root -Recurse -Force }
     }

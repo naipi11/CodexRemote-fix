@@ -43,7 +43,7 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 ## 快速开始
 
-1. 从 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 下载 `CodexRemote-fix-2.5.6-windows-x64.zip`、对应 `.sha256.txt`、release manifest 和 payload manifest；打开前先核对 ZIP 的 SHA-256。
+1. 从 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 下载 `CodexRemote-fix-2.5.7-windows-x64.zip`、对应 `.sha256.txt`、release manifest 和 payload manifest；打开前先核对 ZIP 的 SHA-256。
 2. 将已验证的 ZIP 解压到一个新的空目录。如果 Windows 标记了下载脚本，只对已验证的入口脚本解除阻止，然后在 Windows PowerShell 中运行：
 
        Unblock-File .\Install-CodexRemote-fix.ps1
@@ -61,6 +61,10 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 已验证：Windows 11 · Codex Desktop `26.818.2441.0` · Node.js `22.23.1`；
 隐藏的控制器标签、原生托盘菜单、双语菜单切换和常驻守护程序均可用。
+
+## v2.5.7 更新内容
+
+- 修复首次便携安装：复制载荷文件前会创建并重新验证每个受清单绑定的嵌套 staging 目录；重解析点路径仍会被拒绝。
 
 ## v2.5.6 更新内容
 
@@ -175,11 +179,11 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 ## 发布（Releases）
 
 每个带 tag 的发布都会附带 Windows 便携 ZIP、SHA-256 校验文件、release manifest 和
-payload manifest。`.github/workflows/release.yml` 会在 tag 上自动构建，因此 v2.5.6
-发布提供 `CodexRemote-fix-2.5.6-windows-x64.zip`、
-`CodexRemote-fix-2.5.6-windows-x64.zip.sha256.txt`、
-`CodexRemote-fix-2.5.6-release-manifest.json` 和
-`CodexRemote-fix-2.5.6-payload-manifest.json`。
+payload manifest。`.github/workflows/release.yml` 会在 tag 上自动构建，因此 v2.5.7
+发布提供 `CodexRemote-fix-2.5.7-windows-x64.zip`、
+`CodexRemote-fix-2.5.7-windows-x64.zip.sha256.txt`、
+`CodexRemote-fix-2.5.7-release-manifest.json` 和
+`CodexRemote-fix-2.5.7-payload-manifest.json`。
 
 GitHub Release 正文只发布英文更新说明；本 README 继续保留中英文使用说明。
 完整历史见 [CHANGELOG.md](CHANGELOG.md)。

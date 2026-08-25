@@ -223,22 +223,22 @@ Invoke-CcodTest 'package scripts build provenance and workflows retain the relea
     Assert-CcodTrue ($release -cmatch '(?ms)^  publish:\r?\n    needs: build\r?\n    runs-on: windows-latest\r?\n    permissions:\r?\n      contents: write\s*$') 'only the publish job receives release-write permission'
 }
 
-Invoke-CcodTest '2.5.6 documentation matches the portable release, Defender gate, and protected uninstall contract' {
+Invoke-CcodTest '2.5.7 documentation matches the portable release, Defender gate, and protected uninstall contract' {
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
-    Assert-CcodEqual '2.5.6' ([string]$package.version) 'package metadata is the 2.5.6 release'
+    Assert-CcodEqual '2.5.7' ([string]$package.version) 'package metadata is the 2.5.7 release'
     $changelog = Get-Content -LiteralPath (Join-Path $repositoryRoot 'CHANGELOG.md') -Raw
-    $releaseSection = [regex]::Match($changelog, '(?ms)^## v2\.5\.6\s*\r?\n(?<body>.*?)(?=^## |\z)')
-    Assert-CcodTrue $releaseSection.Success 'v2.5.6 release section exists'
-    Assert-CcodTrue ($releaseSection.Groups['body'].Value.Contains('manifest-bound portable ZIP')) 'v2.5.6 changelog records the portable ZIP boundary'
+    $releaseSection = [regex]::Match($changelog, '(?ms)^## v2\.5\.7\s*\r?\n(?<body>.*?)(?=^## |\z)')
+    Assert-CcodTrue $releaseSection.Success 'v2.5.7 release section exists'
+    Assert-CcodTrue ($releaseSection.Groups['body'].Value.Contains('nested staging directory')) 'v2.5.7 changelog records the nested portable install fix'
     $readme = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.md') -Raw
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start\s*\r?\n(?<body>.*?)(?=^## |\z)').Groups['body'].Value
-    Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.6-windows-x64.zip')) 'English Quick Start names the portable ZIP'
+    Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.7-windows-x64.zip')) 'English Quick Start names the portable ZIP'
     Assert-CcodTrue ($quickStart.Contains('Install-CodexRemote-fix.ps1')) 'English Quick Start names the verified entrypoint'
     Assert-CcodTrue ($quickStart.Contains('Microsoft Defender')) 'English Quick Start documents the local Defender gate'
     Assert-CcodTrue (-not $quickStart.Contains('-setup.exe')) 'English Quick Start no longer directs users to the retired self-extracting setup'
     Assert-CcodTrue ($readme.Contains('Uninstall-CodexControlOtherDevices.ps1')) 'English README documents the portable uninstall entrypoint'
     $readmeZh = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.zh-CN.md') -Raw -Encoding UTF8
-    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.6-windows-x64.zip')) 'Chinese Quick Start names the portable ZIP'
+    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.7-windows-x64.zip')) 'Chinese Quick Start names the portable ZIP'
     Assert-CcodTrue ($readmeZh.Contains('Install-CodexRemote-fix.ps1')) 'Chinese Quick Start names the verified entrypoint'
     Assert-CcodTrue ($readmeZh.Contains('Microsoft Defender')) 'Chinese Quick Start documents the local Defender gate'
     Assert-CcodTrue ($readmeZh.Contains('Uninstall-CodexControlOtherDevices.ps1')) 'Chinese README documents the portable uninstall entrypoint'

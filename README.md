@@ -46,7 +46,7 @@ that existing page and leaves the Codex UI, account authorization, and enrollmen
 
 ## Quick start
 
-1. Download `CodexRemote-fix-2.5.6-windows-x64.zip`, its `.sha256.txt`, the release manifest, and the payload manifest from [Releases](https://github.com/naipi11/CodexRemote-fix/releases). Verify the ZIP SHA-256 before opening it.
+1. Download `CodexRemote-fix-2.5.7-windows-x64.zip`, its `.sha256.txt`, the release manifest, and the payload manifest from [Releases](https://github.com/naipi11/CodexRemote-fix/releases). Verify the ZIP SHA-256 before opening it.
 2. Extract the verified ZIP into a new empty folder. If Windows marked the downloaded script, unblock only the verified entrypoint, then run it in Windows PowerShell:
 
        Unblock-File .\Install-CodexRemote-fix.ps1
@@ -65,6 +65,10 @@ device-key store stay in place. To transition from an older Inno build, uninstal
 Verified on Windows 11 · Codex Desktop `26.818.2441.0` · Node.js `22.23.1`:
 the hidden controller tab, native tray menu, bilingual menu switching, and persistent
 supervisor are working.
+
+## What's new in v2.5.7
+
+- Fixed first-run portable installation by creating and revalidating every manifest-bound nested staging directory before a payload file is copied. Reparse paths remain rejected.
 
 ## What's new in v2.5.6
 
@@ -180,10 +184,10 @@ The tray reports two independent, truthful status lines instead of inferring rea
 
 Every tagged release ships a Windows portable ZIP, its SHA-256 checksum, a release manifest, and a
 payload manifest. The `.github/workflows/release.yml` workflow builds the bundle from the tag
-automatically, so v2.5.6 includes `CodexRemote-fix-2.5.6-windows-x64.zip`,
-`CodexRemote-fix-2.5.6-windows-x64.zip.sha256.txt`,
-`CodexRemote-fix-2.5.6-release-manifest.json`, and
-`CodexRemote-fix-2.5.6-payload-manifest.json`.
+automatically, so v2.5.7 includes `CodexRemote-fix-2.5.7-windows-x64.zip`,
+`CodexRemote-fix-2.5.7-windows-x64.zip.sha256.txt`,
+`CodexRemote-fix-2.5.7-release-manifest.json`, and
+`CodexRemote-fix-2.5.7-payload-manifest.json`.
 
 Each release appends a short English change summary to the GitHub release body. The README and
 [CHANGELOG.md](CHANGELOG.md) retain the bilingual documentation history.

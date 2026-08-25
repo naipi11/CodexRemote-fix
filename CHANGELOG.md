@@ -6,6 +6,16 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.7
+
+### English
+
+- Fixed the verified portable installer to create and revalidate each manifest-bound nested staging directory before copying payload files. This restores first-run portable installation while continuing to reject reparse paths.
+
+### 简体中文
+
+- 修复经验证的便携安装器：复制载荷文件前会创建并重新验证每个受清单绑定的嵌套 staging 目录。在继续拒绝重解析点路径的同时，恢复首次便携安装。
+
 ## v2.5.6
 
 ### English

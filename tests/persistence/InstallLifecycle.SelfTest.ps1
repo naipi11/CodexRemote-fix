@@ -1976,9 +1976,9 @@ $results += Invoke-CcodTest 'installer exposes CodexRemote-fix as the searchable
     Assert-CcodTrue ($buildScript -cmatch '\$bundle\.sha256\.txt') 'build script writes a hash beside the public portable ZIP filename'
 }
 
-$results += Invoke-CcodTest 'portable builder publishes the exact CodexRemote-fix 2.5.6 release artifact contract' {
+$results += Invoke-CcodTest 'portable builder publishes the exact CodexRemote-fix 2.5.7 release artifact contract' {
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
-    Assert-CcodEqual '2.5.6' ([string]$package.version) 'package version is exactly 2.5.6'
+    Assert-CcodEqual '2.5.7' ([string]$package.version) 'package version is exactly 2.5.7'
 
     $buildScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
     Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-windows-x64\.zip') 'portable build resolves the exact public ZIP filename'

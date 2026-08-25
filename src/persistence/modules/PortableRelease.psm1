@@ -288,6 +288,31 @@ function Clear-CcodPortableReleaseZoneIdentifier {
     try { Remove-Item -LiteralPath $Path -Stream Zone.Identifier -Force -ErrorAction SilentlyContinue } catch { }
 }
 
+function New-CcodPortableReleasePlainChildDirectory {
+    param([Parameter(Mandatory)][string]$Root,[Parameter(Mandatory)][string]$Relative)
+    $base = Assert-CcodPortableReleasePlainDirectory -Path $Root -Kind 'Portable staging root'
+    if (-not (Test-CcodPortableReleaseRelativePath $Relative)) {
+        Throw-CcodPortableReleaseError 'CCOD_PORTABLE_PATH_INVALID' 'A portable release destination directory is invalid' $Relative
+    }
+    $cursor = $base
+    foreach ($segment in @($Relative -split '/' | Where-Object { $_.Length -gt 0 })) {
+        $cursor = Join-Path $cursor $segment
+        if ([IO.File]::Exists($cursor)) {
+            Throw-CcodPortableReleaseError 'CCOD_PORTABLE_PATH_INVALID' 'A portable release destination directory is a file' $cursor
+        }
+        if (-not [IO.Directory]::Exists($cursor)) {
+            try { [IO.Directory]::CreateDirectory($cursor) | Out-Null }
+            catch { Throw-CcodPortableReleaseError 'CCOD_PORTABLE_PATH_INVALID' 'A portable release destination directory could not be created' $cursor }
+        }
+        try { $item = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop }
+        catch { Throw-CcodPortableReleaseError 'CCOD_PORTABLE_PATH_INVALID' 'A portable release destination directory is inaccessible' $cursor }
+        if (-not $item.PSIsContainer -or (Test-CcodPortableReleaseReparse -Path $cursor)) {
+            Throw-CcodPortableReleaseError 'CCOD_PORTABLE_REPARSE_PATH' 'A portable release destination directory is not plain' $cursor
+        }
+    }
+    return $cursor
+}
+
 function Copy-CcodPortablePayload {
     [CmdletBinding()]
     param(
@@ -311,9 +336,12 @@ function Copy-CcodPortablePayload {
     try {
         foreach ($entry in @($manifest.Files)) {
             $sourceFile = Resolve-CcodPortableReleaseChildPath -Root $source -Relative $entry.path
+            $separator = ([string]$entry.path).LastIndexOf('/')
+            if ($separator -gt 0) {
+                $relativeDirectory = ([string]$entry.path).Substring(0,$separator)
+                New-CcodPortableReleasePlainChildDirectory -Root $staging -Relative $relativeDirectory | Out-Null
+            }
             $destination = Resolve-CcodPortableReleaseChildPath -Root $staging -Relative $entry.path -AllowMissingLeaf
-            $destinationDirectory = Split-Path $destination -Parent
-            [IO.Directory]::CreateDirectory($destinationDirectory) | Out-Null
             [IO.File]::Copy($sourceFile,$destination,$false)
             if ((Get-CcodPortableReleaseSha256 -Path $destination) -cne $entry.sha256) {
                 Throw-CcodPortableReleaseError 'CCOD_PORTABLE_COPY_HASH_MISMATCH' 'A copied portable payload file did not match its manifest hash' $entry.path
