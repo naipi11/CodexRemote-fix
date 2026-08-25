@@ -862,18 +862,14 @@ try {
             Write-CcodBootstrapLog -InstallRoot $root -Message ("Runtime {0} rejected before launch: {1}" -f $runtimeId, $validation.Code)
             continue
         }
-
         $child = Start-CcodBootstrapSupervisor -SupervisorPath $validation.SupervisorPath -ReadyToken $token -WorkingDirectory $root
+        $released = & $kernelModule { param($Lease) Exit-CcodMutex -Lease $Lease } $launchLease
+        if ($released -isnot [bool] -or -not $released) {
+            Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_LAUNCH_RELEASE_FAILED' 'The launch serialization lease could not be released before Supervisor readiness' $root
+        }
+        $launchLease = $null
         $outcome = Wait-CcodBootstrapReady -Event $readyEvent -Process $child -TimeoutSeconds $ReadyTimeoutSeconds
         if ($outcome -ceq 'Ready') {
-            if ($runtimeId -cne $pointer.ActiveRuntime) {
-                $updated = Invoke-CcodBootstrapFencedPointerPromotion -InstallRoot $root -Pointer $pointer -Validation $validation -NewRuntimeId $runtimeId -UserSid $userSid -SessionId $sessionId
-                Write-CcodBootstrapLog -InstallRoot $root -Message ("Runtime {0} signaled ready; active pointer switched from {1}" -f $runtimeId, $pointer.ActiveRuntime)
-            }
-            $released = & $kernelModule { param($Lease) Exit-CcodMutex -Lease $Lease } $launchLease
-            if ($released -isnot [bool] -or -not $released) {
-                Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_LAUNCH_RELEASE_FAILED' 'The launch serialization lease could not be released after Supervisor readiness' $root
-            }
             $readyConfirmed = $true
             $exitCode = 0
             Start-Sleep -Milliseconds 5000
