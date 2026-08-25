@@ -567,7 +567,7 @@ function Start-CcodBootstrapSupervisor {
     )
 
     $powershell = Get-CcodBootstrapPowerShellPath
-    $arguments = '-NoProfile -ExecutionPolicy Bypass -STA -File "' + $SupervisorPath + '" -ReadyToken ' + $ReadyToken
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', $SupervisorPath, '-ReadyToken', $ReadyToken)
     try {
         return Start-Process -FilePath $powershell -ArgumentList $arguments -WindowStyle Hidden -WorkingDirectory $WorkingDirectory -PassThru
     } catch {
