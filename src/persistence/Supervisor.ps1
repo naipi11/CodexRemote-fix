@@ -150,7 +150,7 @@ function Invoke-CcodSupervisorAdapterCapture {
             if($items.Count -ge 16){throw 'adapter output limit exceeded'}
             $items.Add($_)
         }
-    }catch{$threw=$true}
+    }catch{$threw=$true;try{[IO.File]::AppendAllText("C:\Users\33384\AppData\Local\Temp\ccod-adapter-raw.txt",("RAW="+$_.Exception.GetType().FullName+"|"+$_.Exception.Message+[Environment]::NewLine+"FQEID="+$_.FullyQualifiedErrorId+[Environment]::NewLine+"STACK="+$_.ScriptStackTrace+[Environment]::NewLine),[Text.UTF8Encoding]::new($false))}catch{}}
     finally{
         # WinForms/WMI adapters can append non-terminating records to $Error without failing.
         # Preserve caller history; only stream items and terminating throws count as adapter failure.
