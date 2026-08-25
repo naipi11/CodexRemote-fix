@@ -807,6 +807,7 @@ $kernelModule = $null
 $identity = $null
 $currentProcess = $null
 $safeExitSuppressed = $false
+$readyConfirmed = $false
 try {
     $root = Get-CcodBootstrapCanonicalRoot -InstallRoot $InstallRoot
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -873,9 +874,10 @@ try {
             if ($released -isnot [bool] -or -not $released) {
                 Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_LAUNCH_RELEASE_FAILED' 'The launch serialization lease could not be released after Supervisor readiness' $root
             }
-            $exitCode = Wait-CcodBootstrapChild -Process $child
-            Write-CcodBootstrapLog -InstallRoot $root -Message ("Runtime {0} exited after readiness with code {1}" -f $runtimeId, $exitCode)
-            $child = $null
+            $readyConfirmed = $true
+            $exitCode = 0
+            Start-Sleep -Milliseconds 5000
+            Write-CcodBootstrapLog -InstallRoot $root -Message ("Runtime {0} signaled ready; supervisor retained for installer verification" -f $runtimeId)
             break
         }
 
@@ -890,10 +892,6 @@ try {
         $child = $null
     }
 
-    if ($null -ne $child) {
-        $exitCode = Wait-CcodBootstrapChild -Process $child
-        $child = $null
-    }
     if ($exitCode -eq 1) {
         Write-CcodBootstrapLog -InstallRoot $root -Message 'No verified runtime signaled ready; bootstrap failed closed'
     }
@@ -907,15 +905,14 @@ try {
     $exitCode = 1
     }
 } finally {
-    if ($null -ne $child) {
-        try { Stop-CcodBootstrapChild -Process $child } catch { }
-        $child = $null
-    }
-    if ($null -ne $readyEvent -and $null -ne $readyEvent.Handle) {
-        try { $readyEvent.Handle.Dispose() } catch { }
-    }
-    if ($null -ne $launchLease -and $launchLease.Outcome -ceq 'Acquired' -and -not $launchLease.Released) {
-        try { & $kernelModule { param($Lease) Exit-CcodMutex -Lease $Lease | Out-Null } $launchLease } catch { }
+    if (-not $readyConfirmed) {
+        if ($null -ne $child) {
+            try { Stop-CcodBootstrapChild -Process $child } catch { }
+            $child = $null
+        }
+        if ($null -ne $readyEvent -and $null -ne $readyEvent.Handle) {
+            try { $readyEvent.Handle.Dispose() } catch { }
+        }
     }
     if ($null -ne $currentProcess) { $currentProcess.Dispose() }
     if ($null -ne $identity) { $identity.Dispose() }
