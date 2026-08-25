@@ -1435,7 +1435,8 @@ function Invoke-CcodSupervisorHost {
             if(-not(Test-CcodSupervisorLogonIdentity $logonIdentity $identity)){throw 'trusted logon identity contract is invalid'}
             $remaining=Get-CcodSupervisorRemainingBudget $clock $adapter
             $ownerIdentity=[pscustomobject][ordered]@{pid=[int]$identity.Pid;creationTimeUtc=[string]$identity.CreationTimeUtc}
-            $lifecycleOwnership=Invoke-CcodSupervisorAdapter $adapter.EnterLifecycleOwnership @($layout.InstallRoot,$layout.RuntimeId,[UInt64]$activeRuntime.generation,$ownerIdentity,$identity.UserSid,[int]$identity.SessionId,[int]$remaining) 1
+            $runtimeGeneration=[UInt64][decimal]$activeRuntime.generation
+            $lifecycleOwnership=Invoke-CcodSupervisorAdapter $adapter.EnterLifecycleOwnership @($layout.InstallRoot,$layout.RuntimeId,$runtimeGeneration,$ownerIdentity,$identity.UserSid,[int]$identity.SessionId,[int]$remaining) 1
             if(-not(Test-CcodSupervisorLifecycleOwnership $lifecycleOwnership $identity $activeRuntime)){throw 'lifecycle ownership contract is invalid'}
             $lifecycleOwned=$true
             $readyEvent=Invoke-CcodSupervisorAdapter $adapter.OpenReadyEvent @($identity.UserSid,[int]$identity.SessionId,$ReadyToken) 1
