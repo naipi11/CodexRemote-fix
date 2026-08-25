@@ -242,7 +242,7 @@ function Get-CcodSupervisorDefaultAdapters {
     $defaults.GetUtcNow={[DateTime]::UtcNow}
     $defaults.EnterLease={param($Kind,$UserSid,$SessionId,$TimeoutMilliseconds)if($Kind -ceq 'AccountSupervisor'){Enter-CcodMutex -Kind $Kind -UserSid $UserSid -TimeoutMilliseconds $TimeoutMilliseconds}else{Enter-CcodMutex -Kind $Kind -UserSid $UserSid -SessionId $SessionId -TimeoutMilliseconds $TimeoutMilliseconds}}
     $defaults.ExitLease={param($Lease)Exit-CcodMutex -Lease $Lease}
-    $defaults.OpenReadyEvent={param($UserSid,$SessionId,$Token)Open-CcodEvent -Kind Ready -UserSid $UserSid -SessionId $SessionId -ReadyToken $Token}
+    $defaults.OpenReadyEvent={param($UserSid,$SessionId,$Token)Open-CcodEvent -Kind Ready -UserSid ([string]$UserSid) -SessionId ([int]$SessionId) -ReadyToken ([string]$Token)}
     $defaults.OpenShutdownEvent={param($UserSid,$SessionId)New-CcodEvent -Kind Shutdown -UserSid $UserSid -SessionId $SessionId}
     $defaults.OpenLifecycleWakeEvent={param($UserSid,$SessionId)New-CcodSupervisorLifecycleWakeEvent -UserSid $UserSid -SessionId $SessionId}
     $defaults.ResetLifecycleWakeEvent={param($Event)[void]$Event.Handle.Reset()}
