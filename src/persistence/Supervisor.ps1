@@ -1482,7 +1482,7 @@ function Invoke-CcodSupervisorHost {
             Invoke-CcodSupervisorAdapter $adapter.RunUiContext @($tray) 0
             $outcome='Stopped';$exitCode=0
         }while($false)
-    }catch{$outcome='Failed';$exitCode=1}
+    }catch{$outcome='Failed';$exitCode=1;try{[IO.File]::AppendAllText('C:\Users\33384\AppData\Local\Temp\ccod-final-diagnostic.txt',('FAIL='+$_.Exception.Message+[Environment]::NewLine+'STACK='+$_.ScriptStackTrace+[Environment]::NewLine),[Text.UTF8Encoding]::new($false))}catch{}}
     finally{
         if($null -ne $hostState){$hostState.ShutdownRequested=$true}
         if($null-ne$hostState){if(-not(Stop-CcodSupervisorOwnedWorkerForShutdown $hostState $adapter LifecycleWorkerSlot $codes)){$workerCleanupSafe=$false};if(-not(Stop-CcodSupervisorOwnedWorkerForShutdown $hostState $adapter WorkerSlot $codes)){$workerCleanupSafe=$false}}
