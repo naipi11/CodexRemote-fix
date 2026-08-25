@@ -508,7 +508,7 @@ function Get-CcodSupervisorNowUtc {
 function Test-CcodSupervisorActiveRuntime {
     param($Pointer,[string]$RuntimeId)
     return (Test-CcodSupervisorExactProperties $Pointer @('schemaVersion','activeRuntime','previousRuntime','generation','updatedAtUtc')) -and
-        $Pointer.schemaVersion -is [int] -and $Pointer.schemaVersion -eq 2 -and $Pointer.activeRuntime -is [string] -and $Pointer.activeRuntime -cmatch '^[A-Za-z0-9._-]{1,96}$' -and $Pointer.activeRuntime -ceq $RuntimeId -and
+        ($Pointer.schemaVersion -is [int] -or $Pointer.schemaVersion -is [int64] -or $Pointer.schemaVersion -is [long]) -and [int]$Pointer.schemaVersion -eq 2 -and $Pointer.activeRuntime -is [string] -and $Pointer.activeRuntime -cmatch '^[A-Za-z0-9._-]{1,96}$' -and $Pointer.activeRuntime -ceq $RuntimeId -and
         ($null -eq $Pointer.previousRuntime -or ($Pointer.previousRuntime -is [string] -and $Pointer.previousRuntime -cmatch '^[A-Za-z0-9._-]{1,96}$')) -and
         (Test-CcodSupervisorCanonicalUtc $Pointer.updatedAtUtc) -and
         ($Pointer.generation -is [int] -or $Pointer.generation -is [long] -or $Pointer.generation -is [uint64] -or $Pointer.generation -is [decimal]) -and [decimal]$Pointer.generation -ge 1 -and [decimal]$Pointer.generation -le [decimal][UInt64]::MaxValue -and [decimal]::Truncate([decimal]$Pointer.generation) -eq [decimal]$Pointer.generation
