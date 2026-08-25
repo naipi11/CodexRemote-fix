@@ -280,10 +280,10 @@ function New-CcodEventResult {
 
 function New-CcodEvent {
     [CmdletBinding()]
-    param($Kind,$UserSid,$SessionId,$Adapters)
-    if($Kind -isnot [string] -or $Kind -cne 'Shutdown'){Throw-CcodKernelError 'CCOD_KERNEL_INPUT_INVALID' ([Management.Automation.ErrorCategory]::InvalidArgument)}
-    $hasSession=$PSBoundParameters.ContainsKey('SessionId');$adapter=Get-CcodKernelAdapters $Adapters
-    $name=Resolve-CcodKernelName $Kind $UserSid $SessionId $null $hasSession $false $adapter
+    param($Kind,$UserSid,$SessionId,$ReadyToken,$Adapters)
+    if($Kind -isnot [string] -or @('Shutdown','Ready') -cnotcontains $Kind){Throw-CcodKernelError 'CCOD_KERNEL_INPUT_INVALID' ([Management.Automation.ErrorCategory]::InvalidArgument)}
+    $hasSession=$PSBoundParameters.ContainsKey('SessionId');$hasToken=$PSBoundParameters.ContainsKey('ReadyToken');$adapter=Get-CcodKernelAdapters $Adapters
+    $name=Resolve-CcodKernelName $Kind $UserSid $SessionId $ReadyToken $hasSession $hasToken $adapter
     $security=New-CcodEventSecurity -UserSid $UserSid;$handle=$null
     try{
         try{$opened=& $adapter.CreateEvent $name $security}catch [UnauthorizedAccessException]{Throw-CcodKernelError 'CCOD_KERNEL_ACCESS_DENIED' ([Management.Automation.ErrorCategory]::SecurityError)}catch [Threading.WaitHandleCannotBeOpenedException]{if(& $adapter.TestOtherMutexType $name){Throw-CcodKernelError 'CCOD_KERNEL_OBJECT_TYPE_MISMATCH' ([Management.Automation.ErrorCategory]::InvalidType)};Throw-CcodKernelError 'CCOD_KERNEL_OPEN_FAILED' ([Management.Automation.ErrorCategory]::OpenError)}

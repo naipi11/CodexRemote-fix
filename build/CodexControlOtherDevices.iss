@@ -2,6 +2,9 @@
 #ifndef TrayHostArtifactDirectory
 #define TrayHostArtifactDirectory SourcePath + "\generated\trayhost"
 #endif
+#ifndef PortableArtifactDirectory
+#define PortableArtifactDirectory SourcePath + "\generated\portable"
+#endif
 AppId={{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}
 AppName=CodexRemote-fix
 AppVersion={#ProjectVersion}
@@ -49,6 +52,9 @@ Source: "..\build\trayhost-packages.lock.json"; DestDir: "{app}\build"; Flags: i
 Source: "{#TrayHostArtifactDirectory}\CodexRemote.TrayHost.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#TrayHostArtifactDirectory}\CodexRemote.TrayHost.exe.config"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#TrayHostArtifactDirectory}\trayhost-build-provenance.json"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "{#PortableArtifactDirectory}\CodexRemote.Portable.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "{#PortableArtifactDirectory}\CodexRemote.Portable.exe.config"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "{#PortableArtifactDirectory}\portable-launcher-provenance.json"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "..\.github\workflows\release.yml"; DestDir: "{app}\.github\workflows"; Flags: ignoreversion
 Source: "..\assets\codexremote-fix\codexremote-fix.ico"; DestDir: "{app}\assets"; DestName: "CodexRemote-fix.ico"; Flags: ignoreversion
 Source: "..\assets\codexremote-fix\codexremote-fix.ico"; DestDir: "{app}\assets\codexremote-fix"; Flags: ignoreversion

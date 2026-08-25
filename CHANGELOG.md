@@ -6,6 +6,16 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.10
+
+### English
+
+- Fixed the Inno Setup installer so it bundles the portable launcher with TrayHost; post-install activation now passes source validation instead of failing closed.
+
+### 简体中文
+
+- 修复 Inno Setup 安装包：安装时会与 TrayHost 一起安装便携启动器，安装后激活现在能通过源校验，而不再失败关闭。
+
 ## v2.5.9
 
 ### English

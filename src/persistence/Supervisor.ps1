@@ -181,10 +181,10 @@ function Import-CcodSupervisorModules {
     if($null -eq $script:CcodSupervisorScriptPath){throw 'supervisor script path is unavailable'}
     $moduleRoot=Join-Path (Split-Path $script:CcodSupervisorScriptPath -Parent) 'modules'
     foreach($leaf in @('KernelObjects.psm1','PersistenceIO.psm1','RuntimeManifest.psm1','LifecycleEpoch.psm1','LifecycleTransaction.psm1','LifecycleCoordinator.psm1','LifecycleRequest.psm1','TrustedLogonIdentity.psm1','StateStore.psm1','TransitionJournal.psm1','ProcessControl.psm1','RendererIntegration.psm1','SupervisorEngine.psm1','UiLocalization.psm1','UiPreferences.psm1','TrayUi.psm1','TrayHostClient.psm1','WorkerRuntime.psm1')){
-        Import-Module -Name (Join-Path $moduleRoot $leaf) -Force -ErrorAction Stop
+        Import-Module -Name (Join-Path $moduleRoot $leaf) -Force -ErrorAction Stop -WarningAction SilentlyContinue
     }
     foreach($leaf in @('KernelObjects.psm1','LifecycleTransaction.psm1')){
-        Import-Module -Name (Join-Path $moduleRoot $leaf) -Force -ErrorAction Stop
+        Import-Module -Name (Join-Path $moduleRoot $leaf) -Force -ErrorAction Stop -WarningAction SilentlyContinue
     }
 }
 
