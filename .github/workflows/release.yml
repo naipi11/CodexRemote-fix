@@ -150,7 +150,7 @@ jobs:
               throw "Could not inspect existing release assets for $tag."
             }
           }
-          $assets = @(Get-ChildItem -LiteralPath (Join-Path $PWD 'build\dist') -File | Where-Object { $_.Extension -in @('.zip', '.txt', '.json') })
+          $assets = @(Get-ChildItem -LiteralPath (Join-Path $PWD 'build\dist') -File | Where-Object { $_.Extension -in @('.exe', '.zip', '.txt', '.json') })
           $assetNames = @($assets | ForEach-Object { $_.Name })
           $unexpected = @($existingAssets | Where-Object { $assetNames -cnotcontains $_ })
           if ($unexpected.Count -ne 0) {
@@ -199,7 +199,7 @@ jobs:
           if ($tag -cnotmatch '^v\d+\.\d+\.\d+$') {
             throw "Release tag output is invalid: '$tag'."
           }
-          $assets = @(Get-ChildItem -LiteralPath (Join-Path $PWD 'build\dist') -File | Where-Object { $_.Extension -in @('.zip', '.txt', '.json') })
+          $assets = @(Get-ChildItem -LiteralPath (Join-Path $PWD 'build\dist') -File | Where-Object { $_.Extension -in @('.exe', '.zip', '.txt', '.json') })
           $assetNames = @($assets | ForEach-Object { $_.Name })
           $publishedNames = @(& gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name')
           if ($LASTEXITCODE -ne 0 -or ((@($publishedNames | Sort-Object) -join '|') -cne (@($assetNames | Sort-Object) -join '|'))) {
