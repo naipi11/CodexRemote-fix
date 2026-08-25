@@ -1383,7 +1383,7 @@ function Wait-CcodLifecycleNewRuntimeReady {
         $supervisorPath = [IO.Path]::GetFullPath((Join-Path $runtimeRoot 'src\persistence\Supervisor.ps1'))
         $bootstrapPath = [IO.Path]::GetFullPath((Join-Path $root 'bootstrap.ps1'))
         $hostPrefix = '^\s*(?:"[^"]*powershell\.exe"|[^\s"]*powershell\.exe)'
-        $supervisorPattern = $hostPrefix + '\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-STA\s+-File\s+"(?<path>[^"]+)"\s+-ReadyToken\s+(?<token>[0-9a-f]{64})\s*$'
+        $supervisorPattern = $hostPrefix + '\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-STA\s+-File\s+(?:\"(?<path>[^\"]+)\"|(?<path>[^\s]+))\s+-ReadyToken\s+(?<token>[0-9a-f]{64})\s*$'
         $bootstrapPattern = $hostPrefix + '\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-STA\s+-WindowStyle\s+Hidden\s+-File\s+"(?<path>[^"]+)"\s+-InstallRoot\s+"(?<root>[^"]+)"\s+-EntryMode\s+Task\s*$'
         $started = $TaskStartedAtUtc.ToUniversalTime()
         $clock = & $adapter.StartClock
