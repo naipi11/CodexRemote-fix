@@ -44,7 +44,9 @@ function New-CcodLifecycleSourceFixture {
     [IO.File]::WriteAllText((Join-Path $Root 'src\persistence\StaticProbeWorker.ps1'), "# Worker fixture`r`n", [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $Root 'src\persistence\LifecycleWorker.ps1'), "# Lifecycle worker fixture`r`n", [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $Root 'src\persistence\UninstallBootstrap.ps1'), "# Uninstall bootstrap fixture`r`n", [Text.UTF8Encoding]::new($false))
-    foreach ($module in @('PersistenceIO.psm1', 'RuntimeManifest.psm1', 'CompatibilityProbe.psm1', 'ProcessControl.psm1', 'StateStore.psm1', 'TransitionJournal.psm1', 'SessionEngine.psm1', 'SupervisorEngine.psm1', 'KernelObjects.psm1', 'TrayUi.psm1', 'UiLocalization.psm1', 'UiPreferences.psm1', 'ScheduledTask.psm1')) {
+    [IO.File]::WriteAllText((Join-Path $Root 'src\persistence\bootstrap.ps1'), ("# Stable bootstrap fixture" + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $Root 'src\persistence\PortableUninstallFinalizer.ps1'), ("# Portable finalizer fixture" + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+    foreach ($module in @('PersistenceIO.psm1', 'RuntimeManifest.psm1', 'CompatibilityProbe.psm1', 'ProcessControl.psm1', 'StateStore.psm1', 'TransitionJournal.psm1', 'SessionEngine.psm1', 'SupervisorEngine.psm1', 'KernelObjects.psm1', 'TrayUi.psm1', 'UiLocalization.psm1', 'UiPreferences.psm1', 'ScheduledTask.psm1', 'PortableRelease.psm1')) {
         [IO.File]::WriteAllText((Join-Path $Root "src\persistence\modules\$module"), "# $module`r`n", [Text.UTF8Encoding]::new($false))
     }
     [IO.File]::WriteAllText((Join-Path $Root 'src\persistence\resources\ui.en-US.json'), '{"schemaVersion":1,"language":"en-US"}', [Text.UTF8Encoding]::new($false))
@@ -1676,9 +1678,11 @@ $results += Invoke-CcodTest 'the legacy direct uninstall command and key-managem
     }
 }
 
-$results += Invoke-CcodTest 'Inno owns the fail-closed bootstrap handoff and the public wrapper only delegates to Inno' {
+$results += Invoke-CcodTest 'portable release keeps the fail-closed bootstrap handoff outside the installer root' {
     $innoPath = Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'
     $wrapperPath = Join-Path $repositoryRoot 'Uninstall-CodexControlOtherDevices.ps1'
+    $finalizerPath = Join-Path $repositoryRoot 'src\persistence\PortableUninstallFinalizer.ps1'
+    $portableModulePath = Join-Path $repositoryRoot 'src\persistence\modules\PortableRelease.psm1'
     $inno = Get-Content -LiteralPath $innoPath -Raw
     $wrapper = Get-Content -LiteralPath $wrapperPath -Raw
     Assert-CcodTrue ($inno -notmatch '(?m)^\s*\[UninstallRun\]') 'Inno has no legacy pre-delete UninstallRun route'
@@ -1687,8 +1691,12 @@ $results += Invoke-CcodTest 'Inno owns the fail-closed bootstrap handoff and the
     Assert-CcodTrue ($inno -match 'CurUninstallStepChanged' -and $inno -match '-Mode\s+FinalizeReceipt') 'Inno writes completion only after its file deletion phase'
     Assert-CcodTrue ($inno -match 'CCOD_UNINSTALL_FINALIZATION_MISSING' -and $inno -match 'CCOD_UNINSTALL_FINALIZATION_FAILED') 'Inno propagates a missing or failed post-delete completion receipt instead of reporting a false successful uninstall'
     Assert-CcodTrue ($inno -notmatch 'BackupDeviceKeyStore|RemoveDeviceKeyStore|KeepCurrentSpecialSession') 'Inno exposes no key or special-session uninstall options'
-    Assert-CcodTrue ($wrapper -match 'unins000\.exe') 'public PowerShell wrapper delegates to the generated Inno uninstaller'
-    Assert-CcodTrue ($wrapper -notmatch 'Import-Module|Invoke-CcodUninstall') 'public PowerShell wrapper cannot perform direct lifecycle cleanup'
+    Assert-CcodTrue (Test-Path -LiteralPath $finalizerPath -PathType Leaf) 'portable release includes an external finalizer'
+    Assert-CcodTrue (Test-Path -LiteralPath $portableModulePath -PathType Leaf) 'portable release includes a marker-bound removal module'
+    Assert-CcodTrue ($wrapper -match 'PortableUninstallFinalizer\.ps1' -and $wrapper -match '-Mode\s+Prepare') 'public wrapper prepares protected cleanup before launching the external portable finalizer'
+    Assert-CcodTrue ($wrapper -match 'Start-Process' -and $wrapper -match 'portable-finalizer\.stderr\.log') 'public wrapper delegates final deletion to a detached external process with auditable output'
+    Assert-CcodTrue ($wrapper -notmatch 'Remove-Item') 'public wrapper cannot delete the portable installer root directly'
+    Assert-CcodTrue ((Get-Content -LiteralPath $finalizerPath -Raw) -match 'Remove-CcodPortableInstallerRoot') 'external finalizer owns the bound portable root deletion'
     Assert-CcodTrue ($wrapper -match 'CCOD_UNINSTALL_OPTION_REMOVED') 'deprecated wrapper switches fail closed instead of changing key behavior'
 }
 
@@ -1964,23 +1972,19 @@ $results += Invoke-CcodTest 'installer exposes CodexRemote-fix as the searchable
     }
 
     $buildScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
-    Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-setup\.exe') 'build script locates the public setup filename'
-    Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-setup\.exe\.sha256\.txt') 'build script writes a hash beside the public setup filename'
+    Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-windows-x64\.zip') 'build script locates the public portable ZIP filename'
+    Assert-CcodTrue ($buildScript -cmatch '\$bundle\.sha256\.txt') 'build script writes a hash beside the public portable ZIP filename'
 }
 
-$results += Invoke-CcodTest 'installer publishes the exact CodexRemote-fix 2.5.5 release artifacts' {
+$results += Invoke-CcodTest 'portable builder publishes the exact CodexRemote-fix 2.5.6 release artifact contract' {
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
-    Assert-CcodEqual '2.5.5' ([string]$package.version) 'package version is exactly 2.5.5'
-
-    $installerScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw
-    $outputBase = [regex]::Match($installerScript, '(?m)^OutputBaseFilename=(.+)$').Groups[1].Value.Trim()
-    $setupName = ($outputBase -replace '\{#ProjectVersion\}', [string]$package.version) + '.exe'
-    Assert-CcodEqual 'CodexRemote-fix-2.5.5-setup.exe' $setupName 'Inno output resolves to the exact public setup filename'
+    Assert-CcodEqual '2.5.6' ([string]$package.version) 'package version is exactly 2.5.6'
 
     $buildScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
-    $checksumTemplate = [regex]::Match($buildScript, 'Join-Path \$dist \("([^"]+\.sha256\.txt)"\)').Groups[1].Value
-    $checksumName = $checksumTemplate.Replace('$Version', [string]$package.version)
-    Assert-CcodEqual 'CodexRemote-fix-2.5.5-setup.exe.sha256.txt' $checksumName 'build script resolves to the exact public checksum filename'
+    Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-windows-x64\.zip') 'portable build resolves the exact public ZIP filename'
+    Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-payload-manifest\.json') 'portable build publishes a separately bound payload manifest'
+    Assert-CcodTrue ($buildScript -cmatch 'schemaVersion = 2') 'portable build writes a schema-two release manifest'
+    Assert-CcodTrue ($buildScript -cmatch "distribution = 'portable-zip'") 'portable build labels the release distribution explicitly'
 }
 
 # Production mutation caught: allowing raw activation JSON to authorize Ready/Failed, checking the deadline after terminal processing, prompting without a strict validator child exit, or synchronously waiting on an unbounded validator.
@@ -2036,7 +2040,12 @@ $results += Invoke-CcodTest 'installer uses launch-only ewNoWait and accepts ter
 }
 
 # Production mutation caught: compiling a script with an unrecognized built-in identifier, or leaving the bounded validator route uncompiled.
-$results += Invoke-CcodTest 'installer compiles the bounded activation route with the configured Inno Setup compiler' {
+$results += Invoke-CcodTest 'portable builder needs no Inno compiler and creates a manifest-bound ZIP release' {
+    $buildScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
+    Assert-CcodTrue ($buildScript -cmatch 'ZipFile\]::CreateFromDirectory') 'portable builder creates a ZIP through the platform archive API'
+    Assert-CcodTrue ($buildScript -cmatch 'Test-CcodReleaseAssetManifest') 'portable builder validates its complete release contract before reporting success'
+    Assert-CcodTrue ($buildScript -cnotmatch 'ISCC\.exe|Inno Setup|innosetup') 'portable builder has no Inno compiler dependency'
+<#
     $isccCandidates = @(
         (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
         (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
@@ -2059,6 +2068,7 @@ $results += Invoke-CcodTest 'installer compiles the bounded activation route wit
     } finally {
         if (Test-Path -LiteralPath $outputRoot) { Remove-Item -LiteralPath $outputRoot -Recurse -Force }
     }
+#>
 }
 
 $results += Invoke-CcodTest 'activation terminal validator enforces the complete bounded correlated receipt contract' {
@@ -2325,34 +2335,34 @@ $results += Invoke-CcodTest 'setup uninstall Start menu and desktop use one inst
     }
 }
 
-$results += Invoke-CcodTest 'README and release workflow publish current installer-first branding' {
+$results += Invoke-CcodTest 'README and release workflow publish current portable-release branding' {
     $readme = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.md') -Raw -Encoding UTF8
     $readmeChinese = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.zh-CN.md') -Raw -Encoding UTF8
     Assert-CcodTrue ($readme -cmatch '\A(?s:<div align="center">.*?<h1>CodexRemote-fix</h1>)') 'default README uses the centered public English product heading'
     Assert-CcodTrue ($readmeChinese -cmatch '\A(?s:<div align="center">.*?<h1>CodexRemote-fix</h1>)') 'Chinese README uses the centered public product heading'
 
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start[^\r\n]*\r?\n(.*?)(?=^## )').Groups[1].Value
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.5-setup\.exe') 'English Quick Start names the exact setup artifact'
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.5-setup\.exe\.sha256\.txt') 'English Quick Start names the exact checksum artifact'
-    Assert-CcodTrue ($quickStart -cnotmatch '(?i)powershell|Install-CodexControlOtherDevices') 'English Quick Start does not teach PowerShell installation'
-    Assert-CcodTrue ($quickStart -cmatch '\*\*CodexRemote-fix\*\*') 'English Quick Start names the public desktop shortcut'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.6-windows-x64\.zip') 'English Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStart -cmatch '\.sha256\.txt') 'English Quick Start names the checksum artifact'
+    Assert-CcodTrue ($quickStart -cmatch 'Install-CodexRemote-fix\.ps1') 'English Quick Start teaches the verified portable entrypoint'
+    Assert-CcodTrue ($quickStart -cnotmatch 'setup\.exe') 'English Quick Start does not direct users to the retired self-extracting setup'
 
     $quickStartChineseMatch = [regex]::Match($readmeChinese, '(?ms)^## [^\r\n]+\r?\n(?:\r?\n)?(?=1\.[^\r\n]*\[Releases\])(.*?)(?=^## |\z)')
     Assert-CcodTrue $quickStartChineseMatch.Success 'Chinese README exposes a Quick Start section'
     $quickStartChinese = $quickStartChineseMatch.Groups[1].Value
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.5-setup\.exe') 'Chinese Quick Start names the exact setup artifact'
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.5-setup\.exe\.sha256\.txt') 'Chinese Quick Start names the exact checksum artifact'
-    Assert-CcodTrue ($quickStartChinese -cnotmatch '(?i)powershell|Install-CodexControlOtherDevices') 'Chinese Quick Start does not teach PowerShell installation'
-    Assert-CcodTrue ($quickStartChinese -cmatch '\*\*CodexRemote-fix\*\*') 'Chinese Quick Start names the public desktop shortcut'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.6-windows-x64\.zip') 'Chinese Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStartChinese -cmatch '\.sha256\.txt') 'Chinese Quick Start names the checksum artifact'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'Install-CodexRemote-fix\.ps1') 'Chinese Quick Start teaches the verified portable entrypoint'
+    Assert-CcodTrue ($quickStartChinese -cnotmatch 'setup\.exe') 'Chinese Quick Start does not direct users to the retired self-extracting setup'
 
-    Assert-CcodTrue ($readme -cmatch '(?s)Windows Settings.{0,160}\*\*CodexRemote-fix\*\*') 'English uninstall instructions use the public product name'
-    Assert-CcodTrue ($readmeChinese -cmatch '(?s)Windows .{0,100}\*\*CodexRemote-fix\*\*') 'Chinese uninstall instructions use the public product name'
+    Assert-CcodTrue ($readme -cmatch 'Uninstall-CodexControlOtherDevices\.ps1') 'English uninstall instructions use the protected portable entrypoint'
+    Assert-CcodTrue ($readmeChinese -cmatch 'Uninstall-CodexControlOtherDevices\.ps1') 'Chinese uninstall instructions use the protected portable entrypoint'
     Assert-CcodTrue ($readme -cmatch 'Each release appends a short English change summary to the GitHub release body') 'README documents English-only GitHub release notes'
     Assert-CcodTrue ($readme -cnotmatch 'bilingual change summary to this README and to the GitHub release body') 'README does not promise bilingual GitHub release notes'
 
     $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot '.github\workflows\release.yml') -Raw -Encoding UTF8
     Assert-CcodTrue ($workflow -cmatch '(?m)^name: CodexRemote-fix release\r?$') 'release workflow uses public product branding'
-    Assert-CcodTrue ($workflow -cmatch '(?m)^\s+name: CodexRemote-fix installer\r?$') 'uploaded artifact uses public product branding'
+    Assert-CcodTrue ($workflow -cmatch '(?m)^\s+name: CodexRemote-fix portable bundle\r?$') 'uploaded artifact uses public portable bundle branding'
     Assert-CcodTrue ($workflow -cmatch '--title "CodexRemote-fix \$version"') 'GitHub release title uses public product branding'
     Assert-CcodTrue ($workflow -cmatch 'englishSection = \[regex\]::Match') 'GitHub release notes extract the English changelog section only'
     Assert-CcodTrue ($workflow -cmatch 'has no English release section') 'release fails clearly when the English changelog section is missing'

@@ -273,6 +273,171 @@ function Get-CcodReleaseDefenderChecksum {
     return [pscustomobject][ordered]@{ InstallerPath = $installer; ChecksumPath = $checksum; Sha256 = $actual }
 }
 
+function Get-CcodReleaseDefenderStreamHash {
+    param([Parameter(Mandatory)][IO.Stream]$Stream)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($Stream))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+function Test-CcodReleasePortablePayloadManifest {
+    param(
+        [Parameter(Mandatory)]$ReleaseManifest,
+        [Parameter(Mandatory)][string]$ReleaseManifestRaw,
+        [Parameter(Mandatory)][string]$ReleaseManifestFile,
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$ExpectedVersion
+    )
+    $manifestTimestamp = Get-CcodReleaseDefenderRawJsonString -Json $ReleaseManifestRaw -PropertyName 'buildTimestampUtc'
+    $expectedFields = @('schemaVersion','product','version','gitCommit','buildTimestampUtc','distribution','assets')
+    if (((($ReleaseManifest.PSObject.Properties.Name | Sort-Object) -join '|') -cne (($expectedFields | Sort-Object) -join '|')) -or
+        ($ReleaseManifest.schemaVersion -isnot [int] -and $ReleaseManifest.schemaVersion -isnot [long]) -or [int]$ReleaseManifest.schemaVersion -ne 2 -or
+        $ReleaseManifest.product -isnot [string] -or $ReleaseManifest.product -cne 'CodexRemote-fix' -or
+        $ReleaseManifest.version -isnot [string] -or $ReleaseManifest.version -cne $ExpectedVersion -or
+        $ReleaseManifest.gitCommit -isnot [string] -or $ReleaseManifest.gitCommit -cnotmatch '^[0-9a-f]{40}$' -or
+        $ReleaseManifest.distribution -isnot [string] -or $ReleaseManifest.distribution -cne 'portable-zip' -or
+        -not (Test-CcodReleaseDefenderCanonicalUtc $manifestTimestamp)) {
+        Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Portable release manifest metadata does not have the required canonical shape' $ReleaseManifestFile
+    }
+    $bundleName = "CodexRemote-fix-$ExpectedVersion-windows-x64.zip"
+    $checksumName = "$bundleName.sha256.txt"
+    $provenanceName = "CodexRemote-fix-$ExpectedVersion-trayhost-provenance.json"
+    $payloadManifestName = "CodexRemote-fix-$ExpectedVersion-payload-manifest.json"
+    $expectedNames = @($bundleName,$checksumName,$provenanceName,$payloadManifestName)
+    $assetHashes = @{}
+    foreach ($asset in @($ReleaseManifest.assets)) {
+        if ($null -eq $asset -or (($asset.PSObject.Properties.Name | Sort-Object) -join '|') -cne 'name|sha256' -or
+            $asset.name -isnot [string] -or $asset.sha256 -isnot [string] -or $asset.name -cnotmatch '^[A-Za-z0-9._-]+$' -or
+            $asset.sha256 -cnotmatch '^[0-9a-f]{64}$' -or $assetHashes.ContainsKey([string]$asset.name)) {
+            Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Portable release asset records are malformed or duplicate' $ReleaseManifestFile
+        }
+        $assetHashes[[string]$asset.name] = [string]$asset.sha256
+    }
+    if ($assetHashes.Count -ne $expectedNames.Count -or (($assetHashes.Keys | Sort-Object) -join '|') -cne (($expectedNames | Sort-Object) -join '|')) {
+        Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Portable release manifest does not bind the exact final asset set' $ReleaseManifestFile
+    }
+    foreach ($name in $expectedNames) {
+        $assetPath = Assert-CcodReleaseDefenderRegularFile -Path (Join-Path $Directory $name) -Kind 'Portable release asset'
+        if ((Get-CcodReleaseDefenderHash -Path $assetPath) -cne $assetHashes[$name]) {
+            Throw-CcodReleaseDefenderError 'CCOD_RELEASE_ASSET_HASH_MISMATCH' 'Portable release asset bytes do not match the release manifest' $name
+        }
+    }
+    $checksumText = [IO.File]::ReadAllText((Join-Path $Directory $checksumName)).TrimEnd([char]13,[char]10)
+    if ($checksumText -cne ("{0} *{1}" -f $assetHashes[$bundleName],$bundleName)) {
+        Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Portable release checksum is not bound to the ZIP bytes' $checksumName
+    }
+    $provenanceRaw = [IO.File]::ReadAllText((Join-Path $Directory $provenanceName))
+    try { $provenance = $provenanceRaw | ConvertFrom-Json -ErrorAction Stop }
+    catch { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'TrayHost provenance is not valid JSON' $provenanceName }
+    $provenanceTimestamp = Get-CcodReleaseDefenderRawJsonString -Json $provenanceRaw -PropertyName 'buildTimestampUtc'
+    if ($null -eq $provenance.PSObject.Properties['version'] -or $null -eq $provenance.PSObject.Properties['gitCommit'] -or
+        $provenance.version -isnot [string] -or $provenance.version -cne $ExpectedVersion -or
+        $provenance.gitCommit -isnot [string] -or $provenance.gitCommit -cne $ReleaseManifest.gitCommit -or
+        -not (Test-CcodReleaseDefenderCanonicalUtc $provenanceTimestamp) -or $provenanceTimestamp -cne $manifestTimestamp) {
+        Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'TrayHost provenance is not bound to the portable release version, source commit, and timestamp' $provenanceName
+    }
+
+    $payloadManifestPath = Join-Path $Directory $payloadManifestName
+    $payloadRaw = [IO.File]::ReadAllText($payloadManifestPath)
+    try { $payloadManifest = $payloadRaw | ConvertFrom-Json -ErrorAction Stop }
+    catch { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Portable payload manifest is not valid JSON' $payloadManifestName }
+    $payloadTimestamp = Get-CcodReleaseDefenderRawJsonString -Json $payloadRaw -PropertyName 'buildTimestampUtc'
+    $payloadFields = @('schemaVersion','product','version','gitCommit','buildTimestampUtc','files')
+    if (((($payloadManifest.PSObject.Properties.Name | Sort-Object) -join '|') -cne (($payloadFields | Sort-Object) -join '|')) -or
+        ($payloadManifest.schemaVersion -isnot [int] -and $payloadManifest.schemaVersion -isnot [long]) -or [int]$payloadManifest.schemaVersion -ne 1 -or
+        $payloadManifest.product -isnot [string] -or $payloadManifest.product -cne 'CodexRemote-fix' -or
+        $payloadManifest.version -isnot [string] -or $payloadManifest.version -cne $ExpectedVersion -or
+        $payloadManifest.gitCommit -isnot [string] -or $payloadManifest.gitCommit -cne $ReleaseManifest.gitCommit -or
+        -not (Test-CcodReleaseDefenderCanonicalUtc $payloadTimestamp) -or $payloadTimestamp -cne $manifestTimestamp) {
+        Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Portable payload manifest metadata is not release-bound' $payloadManifestName
+    }
+    $expectedZipFiles = @{'Install-CodexRemote-fix.ps1'=$null;'payload-manifest.json'=$null}
+    $previousPath = $null
+    foreach ($record in @($payloadManifest.files)) {
+        if ($null -eq $record -or (($record.PSObject.Properties.Name | Sort-Object) -join '|') -cne 'length|path|sha256' -or
+            $record.path -isnot [string] -or $record.path -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$' -or
+            $record.path.Contains('//') -or $record.path.Contains('..') -or $record.path.Contains(':') -or
+            ($record.length -isnot [int] -and $record.length -isnot [long]) -or [int64]$record.length -lt 0 -or
+            $record.sha256 -isnot [string] -or $record.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            ($null -ne $previousPath -and [StringComparer]::Ordinal.Compare($previousPath,[string]$record.path) -ge 0)) {
+            Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Portable payload file records are invalid, duplicate, or unordered' $payloadManifestName
+        }
+        $previousPath = [string]$record.path
+        $entryName = 'payload/' + $record.path
+        if ($expectedZipFiles.ContainsKey($entryName)) {
+            Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Portable payload manifest has duplicate ZIP entry names' $entryName
+        }
+        $expectedZipFiles[$entryName] = $record
+    }
+    if ($expectedZipFiles.Count -le 2) {
+        Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Portable payload manifest is empty' $payloadManifestName
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    $archive = $null
+    try {
+        $archive = [IO.Compression.ZipFile]::OpenRead((Join-Path $Directory $bundleName))
+        $seen = @{}
+        foreach ($entry in @($archive.Entries)) {
+            $name = [string]$entry.FullName
+            if ($name.Contains('\')) { $name = $name.Replace('\','/') }
+            if ([string]::IsNullOrWhiteSpace($name) -or $name.Contains(':') -or $name -match '(^|/)\.\.?(?:/|$)') {
+                Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Portable ZIP contains an unsafe entry path' $name
+            }
+            if ($name.EndsWith('/')) {
+                if ($name -cne 'payload/' -and -not $name.StartsWith('payload/',[StringComparison]::Ordinal)) {
+                    Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Portable ZIP contains an unexpected directory entry' $name
+                }
+                continue
+            }
+            if (-not $expectedZipFiles.ContainsKey($name) -or $seen.ContainsKey($name)) {
+                Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Portable ZIP file entries differ from the payload manifest' $name
+            }
+            $seen[$name] = $entry
+        }
+        if ($seen.Count -ne $expectedZipFiles.Count) {
+            Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Portable ZIP is missing an expected payload file' $bundleName
+        }
+        $manifestEntry = $seen['payload-manifest.json']
+        $manifestStream = $null
+        try {
+            $manifestStream = $manifestEntry.Open()
+            if ((Get-CcodReleaseDefenderStreamHash -Stream $manifestStream) -cne (Get-CcodReleaseDefenderHash -Path $payloadManifestPath)) {
+                Throw-CcodReleaseDefenderError 'CCOD_RELEASE_ASSET_HASH_MISMATCH' 'Portable ZIP payload manifest differs from the separately released manifest.' $bundleName
+            }
+        } finally {
+            if ($null -ne $manifestStream) { $manifestStream.Dispose() }
+        }
+        foreach ($entryName in @($expectedZipFiles.Keys | Where-Object { $_.StartsWith('payload/',[StringComparison]::Ordinal) })) {
+            $record = $expectedZipFiles[$entryName]
+            $entry = $seen[$entryName]
+            if ([int64]$entry.Length -ne [int64]$record.length) {
+                Throw-CcodReleaseDefenderError 'CCOD_RELEASE_ASSET_HASH_MISMATCH' 'Portable ZIP payload length differs from its manifest.' $entryName
+            }
+            $entryStream = $null
+            try {
+                $entryStream = $entry.Open()
+                if ((Get-CcodReleaseDefenderStreamHash -Stream $entryStream) -cne [string]$record.sha256) {
+                    Throw-CcodReleaseDefenderError 'CCOD_RELEASE_ASSET_HASH_MISMATCH' 'Portable ZIP payload hash differs from its manifest.' $entryName
+                }
+            } finally {
+                if ($null -ne $entryStream) { $entryStream.Dispose() }
+            }
+        }
+    } finally {
+        if ($null -ne $archive) { $archive.Dispose() }
+    }
+    return [pscustomobject][ordered]@{
+        Valid = $true
+        Version = $ExpectedVersion
+        GitCommit = [string]$ReleaseManifest.gitCommit
+        BuildTimestampUtc = $manifestTimestamp
+        InstallerSha256 = [string]$assetHashes[$bundleName]
+        InstallerName = $bundleName
+        Distribution = 'portable-zip'
+    }
+}
+
 function Test-CcodReleaseAssetManifest {
     [CmdletBinding()]
     param(
@@ -285,6 +450,9 @@ function Test-CcodReleaseAssetManifest {
     $manifestRaw = [IO.File]::ReadAllText($manifestFile)
     try { $manifest = $manifestRaw | ConvertFrom-Json -ErrorAction Stop }
     catch { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Release manifest is not valid JSON' $manifestFile }
+    if (($manifest.schemaVersion -is [int] -or $manifest.schemaVersion -is [long]) -and [int]$manifest.schemaVersion -eq 2) {
+        return Test-CcodReleasePortablePayloadManifest -ReleaseManifest $manifest -ReleaseManifestRaw $manifestRaw -ReleaseManifestFile $manifestFile -Directory $directory -ExpectedVersion $ExpectedVersion
+    }
     $manifestTimestamp = Get-CcodReleaseDefenderRawJsonString -Json $manifestRaw -PropertyName 'buildTimestampUtc'
     $expectedFields = @('schemaVersion','product','version','gitCommit','buildTimestampUtc','assets')
     if ($null -eq $manifest -or (($manifest.PSObject.Properties.Name | Sort-Object) -join '|') -cne (($expectedFields | Sort-Object) -join '|') -or
@@ -380,8 +548,8 @@ function Invoke-CcodReleaseDefenderCheck {
     $adapters = Resolve-CcodReleaseDefenderAdapters -Adapters $Adapters
     $candidate = Get-CcodReleaseDefenderChecksum -InstallerPath $InstallerPath -ChecksumPath $ChecksumPath -Adapters $adapters
     $installerLeaf = [IO.Path]::GetFileName($candidate.InstallerPath)
-    $versionMatch = [regex]::Match($installerLeaf, '^CodexRemote-fix-(\d+\.\d+\.\d+)-setup\.exe$')
-    if (-not $versionMatch.Success) { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Installer name cannot bind a release manifest version' $installerLeaf }
+    $versionMatch = [regex]::Match($installerLeaf, '^CodexRemote-fix-(\d+\.\d+\.\d+)-(?:setup\.exe|windows-x64\.zip)$')
+    if (-not $versionMatch.Success) { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Release candidate name cannot bind a release manifest version' $installerLeaf }
     $version = $versionMatch.Groups[1].Value
     $manifestPath = Join-Path (Split-Path $candidate.InstallerPath -Parent) "CodexRemote-fix-$version-release-manifest.json"
     $manifest = Test-CcodReleaseAssetManifest -ManifestPath $manifestPath -AssetDirectory (Split-Path $candidate.InstallerPath -Parent) -ExpectedVersion $version

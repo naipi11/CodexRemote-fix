@@ -49,10 +49,6 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install Inno Setup
-        shell: pwsh
-        run: choco install innosetup -y --no-progress
-
       - name: Run repository validation
         shell: pwsh
         run: npm test
@@ -69,7 +65,7 @@ jobs:
         shell: pwsh
         run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionOnly
 
-      - name: Build CodexRemote-fix installer
+      - name: Build CodexRemote-fix portable bundle
         shell: pwsh
         env:
           CCOD_RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
@@ -77,10 +73,10 @@ jobs:
           $version = $env:CCOD_RELEASE_TAG.Substring(1)
           ./build/build.ps1 -Version $version
 
-      - name: Upload immutable CodexRemote-fix installer
+      - name: Upload immutable CodexRemote-fix portable bundle
         uses: actions/upload-artifact@v4
         with:
-          name: CodexRemote-fix installer
+          name: CodexRemote-fix portable bundle
           path: build/dist/*
           if-no-files-found: error
 
@@ -100,10 +96,10 @@ jobs:
         with:
           node-version: 22
 
-      - name: Download immutable CodexRemote-fix installer
+      - name: Download immutable CodexRemote-fix portable bundle
         uses: actions/download-artifact@v4
         with:
-          name: CodexRemote-fix installer
+          name: CodexRemote-fix portable bundle
           path: build/dist
 
       - name: Verify downloaded release candidate contract
@@ -152,7 +148,7 @@ jobs:
               throw "Could not inspect existing release assets for $tag."
             }
           }
-          $assets = @(Get-ChildItem -LiteralPath (Join-Path $PWD 'build\dist') -File | Where-Object { $_.Extension -in @('.exe', '.txt', '.json') })
+          $assets = @(Get-ChildItem -LiteralPath (Join-Path $PWD 'build\dist') -File | Where-Object { $_.Extension -in @('.zip', '.txt', '.json') })
           $assetNames = @($assets | ForEach-Object { $_.Name })
           $unexpected = @($existingAssets | Where-Object { $assetNames -cnotcontains $_ })
           if ($unexpected.Count -ne 0) {
@@ -201,7 +197,7 @@ jobs:
           if ($tag -cnotmatch '^v\d+\.\d+\.\d+$') {
             throw "Release tag output is invalid: '$tag'."
           }
-          $assets = @(Get-ChildItem -LiteralPath (Join-Path $PWD 'build\dist') -File | Where-Object { $_.Extension -in @('.exe', '.txt', '.json') })
+          $assets = @(Get-ChildItem -LiteralPath (Join-Path $PWD 'build\dist') -File | Where-Object { $_.Extension -in @('.zip', '.txt', '.json') })
           $assetNames = @($assets | ForEach-Object { $_.Name })
           $publishedNames = @(& gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name')
           if ($LASTEXITCODE -ne 0 -or ((@($publishedNames | Sort-Object) -join '|') -cne (@($assetNames | Sort-Object) -join '|'))) {

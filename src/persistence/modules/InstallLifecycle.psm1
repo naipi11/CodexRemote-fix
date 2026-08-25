@@ -271,7 +271,9 @@ function Get-CcodLifecycleSourceFiles {
         'src\persistence\SessionController.ps1',
         'src\persistence\StaticProbeWorker.ps1',
         'src\persistence\LifecycleWorker.ps1',
+        'src\persistence\bootstrap.ps1',
         'src\persistence\UninstallBootstrap.ps1',
+        'src\persistence\PortableUninstallFinalizer.ps1',
         'Test-CodexControlOtherDevices.ps1',
         'Start-CodexControlOtherDevices.ps1',
         'Reset-CodexControlOtherDevices.ps1'

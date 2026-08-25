@@ -46,22 +46,30 @@ that existing page and leaves the Codex UI, account authorization, and enrollmen
 
 ## Quick start
 
-1. Download `CodexRemote-fix-2.5.5-setup.exe` and `CodexRemote-fix-2.5.5-setup.exe.sha256.txt` from the [Releases](https://github.com/naipi11/CodexRemote-fix/releases) page, then verify the SHA-256.
-2. Run `CodexRemote-fix-2.5.5-setup.exe`; no administrator rights are required.
-   Windows 10 users should ensure that .NET Framework 4.8 is installed for the native TrayHost.
-3. The tray supervisor starts automatically and creates the desktop shortcut **CodexRemote-fix**. Setup waits until the new runtime and TrayHost are ready, then offers **Restart now** or **Later**. Choose **Restart now** only when it is safe for Codex to close and relaunch into a repaired session; choose **Later** to leave the current Codex session untouched and resume safely after a later manual or normal Codex launch. When the connection reports **Connected**, open **Settings → Connections → Control other devices** to enroll or use the device.
+1. Download `CodexRemote-fix-2.5.6-windows-x64.zip`, its `.sha256.txt`, the release manifest, and the payload manifest from [Releases](https://github.com/naipi11/CodexRemote-fix/releases). Verify the ZIP SHA-256 before opening it.
+2. Extract the verified ZIP into a new empty folder. If Windows marked the downloaded script, unblock only the verified entrypoint, then run it in Windows PowerShell:
 
-The current installer and its SHA-256 checksum are always published on the
+       Unblock-File .\Install-CodexRemote-fix.ps1
+       .\Install-CodexRemote-fix.ps1
+
+   The entrypoint validates every payload file and runs a Microsoft Defender custom scan before it copies anything to the current-user application directory. It neither disables Defender nor adds an exclusion.
+3. The tray supervisor starts automatically. When the connection reports **Connected**, open **Settings → Connections → Control other devices** to enroll or use the device. Windows 10 users should ensure that .NET Framework 4.8 is installed for the native TrayHost.
+
+The current portable bundle, checksum, release manifest, and payload manifest are always published on the
 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) page.
 
-To upgrade, run the new installer over the previous installation. Existing settings and device
-keys are preserved in place. The installer waits for the new runtime and tray before it offers
-the restart choice, and it safely clears only completed recovery work left by an interrupted
-upgrade.
+The portable release intentionally refuses to overwrite an existing portable payload. Before replacing a
+portable build, use its installed `Uninstall-CodexControlOtherDevices.ps1`; settings and the DPAPI
+device-key store stay in place. To transition from an older Inno build, uninstall that older build first.
 
 Verified on Windows 11 · Codex Desktop `26.818.2441.0` · Node.js `22.23.1`:
 the hidden controller tab, native tray menu, bilingual menu switching, and persistent
 supervisor are working.
+
+## What's new in v2.5.6
+
+- Replaced the unsigned self-extracting installer distribution with a manifest-bound portable ZIP. The release validator checks the ZIP, checksum, TrayHost provenance, external payload manifest, and every archived payload file.
+- The portable entrypoint verifies and Defender-scans the payload before install. Its detached external finalizer removes only a marker-bound current-user payload after the existing fail-closed lifecycle cleanup has proved the runtime/session boundary; the DPAPI device-key store remains untouched.
 
 ## What's new in v2.5.5
 
@@ -170,16 +178,18 @@ The tray reports two independent, truthful status lines instead of inferring rea
 
 ## Releases
 
-Every tagged release ships a Windows installer and its SHA-256 checksum as release assets.
-The `.github/workflows/release.yml` workflow builds the installer from the tag automatically,
-so the 2.5.5 release includes the ready-to-run `CodexRemote-fix-2.5.5-setup.exe`
-and `CodexRemote-fix-2.5.5-setup.exe.sha256.txt`.
+Every tagged release ships a Windows portable ZIP, its SHA-256 checksum, a release manifest, and a
+payload manifest. The `.github/workflows/release.yml` workflow builds the bundle from the tag
+automatically, so v2.5.6 includes `CodexRemote-fix-2.5.6-windows-x64.zip`,
+`CodexRemote-fix-2.5.6-windows-x64.zip.sha256.txt`,
+`CodexRemote-fix-2.5.6-release-manifest.json`, and
+`CodexRemote-fix-2.5.6-payload-manifest.json`.
 
 Each release appends a short English change summary to the GitHub release body. The README and
 [CHANGELOG.md](CHANGELOG.md) retain the bilingual documentation history.
 
 After a Codex Desktop update, check the [Releases](https://github.com/naipi11/CodexRemote-fix/releases)
-page for a newer installer, or run the **CodexRemote-fix compatibility check** shortcut from the Start menu
+page for a newer portable bundle, or run the **CodexRemote-fix compatibility check** shortcut from the Start menu
 to confirm the current supervisor still matches.
 
 ## Star history
@@ -235,12 +245,13 @@ Exit Codex, open **CodexRemote-fix** from the desktop, then relaunch Codex.
 
 ## Uninstall
 
-The tray has no uninstall command. Use **Windows Settings → Apps → Installed apps** to uninstall
-**CodexRemote-fix**, or run the installed `unins000.exe` directly from the application folder.
-Both entries use the same external, fail-closed cleanup transaction; if it cannot prove the current
-runtime and session identity, it protects the installed files instead of guessing. The DPAPI device
-key store remains in place, so existing authorized devices are preserved. Removing a local key would
-not revoke server authorization; revoke the device in Codex first if that is your intent.
+The tray has no uninstall command. Run the installed
+`%LOCALAPPDATA%\CodexControlOtherDevices-installer\Uninstall-CodexControlOtherDevices.ps1`.
+It first completes the same external, fail-closed cleanup transaction and then starts a staged finalizer
+that removes only the marker-bound portable payload. If the runtime/session proof fails, files remain in
+place. The DPAPI device-key store remains in place, so existing authorized devices are preserved.
+Removing a local key would not revoke server authorization; revoke the device in Codex first if that is
+your intent.
 
 ## What it fixes
 

@@ -16,10 +16,12 @@ $script:CcodUninstallPhases = @(
     'Requested','Recovering','RecoveryProven','StoppingProtection','ProtectionStopped','TaskRemoved',
     'ApplicationStateRemoved','ReadyForInno','Completed','Failed'
 )
-$script:CcodUninstallContextFields = @('runtimeId','runtimeGeneration','leaseEpoch','userSid','sessionId','payloadEntries')
+$script:CcodUninstallContextFields = @('runtimeId','runtimeGeneration','leaseEpoch','userSid','sessionId','payloadRecords')
 $script:CcodUninstallPayloadEntries = @(
     'src/persistence/UninstallBootstrap.ps1',
+    'src/persistence/PortableUninstallFinalizer.ps1',
     'src/persistence/modules/InstallLifecycle.psm1',
+    'src/persistence/modules/PortableRelease.psm1',
     'src/persistence/modules/PersistenceIO.psm1',
     'src/persistence/modules/RuntimeManifest.psm1',
     'src/persistence/modules/LifecycleEpoch.psm1',
@@ -130,6 +132,28 @@ function Get-CcodUninstallBootstrapFileFingerprint {
         if ($null -ne $stream) { $stream.Dispose() }
         $sha.Dispose()
     }
+}
+
+function New-CcodUninstallBootstrapPayloadRecords {
+    param([hashtable]$RecordMap,[switch]$ResumeOnly)
+    $records = [Collections.Generic.List[object]]::new()
+    foreach ($path in @($script:CcodUninstallPayloadEntries)) {
+        $length = [int64]0
+        $sha256 = ('0' * 64)
+        if (-not $ResumeOnly) {
+            if ($null -eq $RecordMap -or -not $RecordMap.ContainsKey($path)) {
+                Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The verified runtime lacks a cleanup payload record' $path
+            }
+            $record = $RecordMap[$path]
+            if ($null -eq $record -or [int64]$record.length -lt 0 -or [string]$record.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+                Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'A verified cleanup payload record is invalid' $path
+            }
+            $length = [int64]$record.length
+            $sha256 = [string]$record.sha256
+        }
+        $records.Add([pscustomobject][ordered]@{ path=$path; length=$length; sha256=$sha256 })
+    }
+    return @($records.ToArray())
 }
 
 function Test-CcodUninstallBootstrapJsonHasNoDuplicateProperties {
@@ -316,7 +340,9 @@ function New-CcodUninstallBootstrapResumeContext {
         leaseEpoch = [uint64]$Transaction.leaseEpoch
         userSid = [string]$Transaction.userSid
         sessionId = [int]$Transaction.sessionId
-        payloadEntries = @($script:CcodUninstallPayloadEntries)
+        # Resume never re-stages payload after the application-state boundary.
+        # Zero records therefore fail closed if a later change tries to stage them.
+        payloadRecords = New-CcodUninstallBootstrapPayloadRecords -ResumeOnly
     }
 }
 
@@ -400,7 +426,7 @@ function Get-CcodUninstallBootstrapVerifiedRuntimeContext {
             leaseEpoch = [uint64]$epoch
             userSid = [string]$identity.userSid
             sessionId = [int]$identity.sessionId
-            payloadEntries = @($script:CcodUninstallPayloadEntries)
+            payloadRecords = New-CcodUninstallBootstrapPayloadRecords -RecordMap $recordMap
         }
     } catch {
         $code = Get-CcodUninstallBootstrapErrorId $_
@@ -690,15 +716,21 @@ function Stage-CcodUninstallBootstrapPayload {
     $transactionDirectory = Get-CcodUninstallBootstrapComparablePath -Path $TransactionDirectory -Kind 'Uninstall transaction directory'
     $payloadRoot = Join-Path $transactionDirectory 'payload'
     [void](Ensure-CcodUninstallBootstrapSecureDirectory -Path $payloadRoot -UserSid $Context.userSid)
-    foreach ($entry in @($Context.payloadEntries)) {
+    foreach ($record in @($Context.payloadRecords)) {
+        $entry = [string]$record.path
         $source = Resolve-CcodUninstallBootstrapChildPath -Root $runtimeRoot -RelativePath ($entry.Replace('/','\')) -RequireLeafFile
+        $sourceFingerprint = Get-CcodUninstallBootstrapFileFingerprint -Path $source
+        if ($sourceFingerprint.length -ne [int64]$record.length -or $sourceFingerprint.sha256 -cne [string]$record.sha256) {
+            Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PAYLOAD_HASH_MISMATCH' 'A cleanup payload source no longer matches the verified runtime manifest.' $entry
+        }
         $relativeDirectory = Split-Path ($entry.Replace('/','\')) -Parent
         [void](Ensure-CcodUninstallBootstrapPayloadDirectory -PayloadRoot $payloadRoot -RelativeDirectory $relativeDirectory)
         $destination = Resolve-CcodUninstallBootstrapChildPath -Root $payloadRoot -RelativePath ($entry.Replace('/','\')) -AllowMissingLeaf
-        [IO.File]::Copy($source,$destination,$true)
-        $sourceFingerprint = Get-CcodUninstallBootstrapFileFingerprint -Path $source
+        if (-not [IO.File]::Exists($destination)) {
+            [IO.File]::Copy($source,$destination,$false)
+        }
         $destinationFingerprint = Get-CcodUninstallBootstrapFileFingerprint -Path $destination
-        if ($sourceFingerprint.length -ne $destinationFingerprint.length -or $sourceFingerprint.sha256 -cne $destinationFingerprint.sha256) {
+        if ($destinationFingerprint.length -ne [int64]$record.length -or $destinationFingerprint.sha256 -cne [string]$record.sha256) {
             Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PAYLOAD_HASH_MISMATCH' 'A staged cleanup payload file does not match the manifest-bound source' $entry
         }
     }
@@ -749,17 +781,22 @@ function Assert-CcodUninstallBootstrapContext {
         $Context.runtimeId -isnot [string] -or $Context.runtimeId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$' -or
         $Context.userSid -isnot [string] -or $Context.userSid -cnotmatch '^S-\d-\d+(?:-\d+)+$' -or
         $Context.sessionId -isnot [int] -or $Context.sessionId -lt 0 -or
-        $null -eq $Context.payloadEntries) {
+        $null -eq $Context.payloadRecords) {
         Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'The uninstall bootstrap context is invalid' $Context
     }
     [void](ConvertTo-CcodUninstallBootstrapUInt64 $Context.runtimeGeneration 'runtimeGeneration')
     [void](ConvertTo-CcodUninstallBootstrapUInt64 $Context.leaseEpoch 'leaseEpoch')
-    $paths = @($Context.payloadEntries)
-    if ($paths.Count -lt 1) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'The cleanup payload is empty' $Context }
-    foreach ($path in $paths) {
-        if ($path -isnot [string] -or $path -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$' -or $path.Contains('..') -or $path.Contains('\')) {
+    $records = @($Context.payloadRecords)
+    if ($records.Count -ne $script:CcodUninstallPayloadEntries.Count) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'The cleanup payload record set is incomplete' $Context }
+    for ($index = 0; $index -lt $records.Count; $index++) {
+        $record = $records[$index]
+        if (-not (Test-CcodUninstallBootstrapExactProperties $record @('path','length','sha256')) -or
+            $record.path -isnot [string] -or $record.path -cne $script:CcodUninstallPayloadEntries[$index] -or
+            $record.sha256 -isnot [string] -or $record.sha256 -cnotmatch '^[0-9a-f]{64}$') {
             Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'The cleanup payload contains an unsafe path' $Context
         }
+        try { if ([int64]$record.length -lt 0) { throw 'negative length' } }
+        catch { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'The cleanup payload record length is invalid' $Context }
     }
 }
 

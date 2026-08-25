@@ -40,11 +40,16 @@ The persistent tray supervisor is installed per current user, not per machine:
 - The tray exposes only status, one repair action, language, logs, About, and
   safe Exit. Exit writes a protected intent for the current logon and may
   restore Codex to ordinary mode before protection stops.
-- The tray has no uninstall command. Use Windows Settings → Apps → Installed
-  apps or the installed `unins000.exe`. Both routes invoke the same external,
-  fail-closed bootstrap. It verifies the runtime manifest, generation, epoch,
-  SID, and session, then writes a protected receipt before Inno may remove
-  app-owned files. A failed proof leaves those files in place.
+- The tray has no uninstall command. The portable release uses the installed
+  `Uninstall-CodexControlOtherDevices.ps1` entry. It invokes the same
+  external, fail-closed bootstrap, which verifies the runtime manifest,
+  generation, epoch, SID, and session. Only after that proof does a staged
+  finalizer remove the marker-bound portable payload. A failed proof leaves
+  both application files and the installer payload in place.
+- The ZIP release is bound by the release manifest, payload manifest, and
+  SHA-256. Its entrypoint validates every extracted payload file and runs a
+  Defender custom scan before copying files to the current-user installer
+  root. It does not disable Defender or add exclusions.
 
 ## Device-key storage
 
