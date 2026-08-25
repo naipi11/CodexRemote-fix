@@ -6,6 +6,18 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.11
+
+### English
+
+- Fixed the manifest-bound lifecycle worker so its JSON, runtime, lifecycle-fence, and process-control dependencies are bound to the verified module exports before worker adapter scriptblocks are created. Supervisor VerifyRemote now publishes a correlated result instead of failing with `CCOD_LIFECYCLE_WORKER_REQUEST_INVALID` in a real `-File` process.
+- Added a production-scope regression test for the worker dependency binding; the installer and portable launcher continue to share the same verified runtime closure.
+
+### 简体中文
+
+- 修复 manifest 绑定的 lifecycle worker：在创建 worker 适配器脚本块前，将 JSON、runtime、生命周期围栏和进程控制依赖绑定到已验证的模块导出。真实 `-File` 进程中的 Supervisor VerifyRemote 现在会发布相关结果，不再错误返回 `CCOD_LIFECYCLE_WORKER_REQUEST_INVALID`。
+- 增加生产脚本作用域回归测试；安装包和便携启动器继续共享同一份经验证的 runtime 闭包。
+
 ## v2.5.10
 
 ### English

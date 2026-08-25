@@ -7,6 +7,40 @@ $ProgressPreference='SilentlyContinue'
 $VerbosePreference='SilentlyContinue'
 $InformationPreference='SilentlyContinue'
 
+# Import and bind the worker dependency closure before defining adapter
+# scriptblocks. A scriptblock created in this script must call the exact
+# manifest-bound module export; relying on an unqualified command later in the
+# script can leave the worker without PersistenceIO/RuntimeManifest commands
+# when it is launched as a separate -File process.
+$script:CcodLifecycleWorkerModuleRoot=Join-Path $PSScriptRoot 'modules'
+$script:CcodLifecycleWorkerModuleBindings=@{}
+foreach($specification in @(
+    [pscustomobject]@{Name='PersistenceIO';File='PersistenceIO.psm1';Exports=@('Read-CcodStrictJson','Write-CcodAtomicJson')},
+    [pscustomobject]@{Name='RuntimeManifest';File='RuntimeManifest.psm1';Exports=@('Resolve-CcodActiveRuntimeContext')},
+    [pscustomobject]@{Name='LifecycleEpoch';File='LifecycleEpoch.psm1';Exports=@('Enter-CcodLifecycleDelegation','Exit-CcodLifecycleDelegation','Assert-CcodLifecycleFence')},
+    [pscustomobject]@{Name='ProcessControl';File='ProcessControl.psm1';Exports=@('Request-CcodOrdinaryPackagedLaunch','Wait-CcodVerifiedOrdinaryRoot')},
+    [pscustomobject]@{Name='WorkerRuntime';File='WorkerRuntime.psm1';Exports=@()}
+)){
+    $modulePath=[IO.Path]::GetFullPath((Join-Path $script:CcodLifecycleWorkerModuleRoot $specification.File))
+    $loaded=@(Import-Module -Name $modulePath -PassThru -Force -Scope Local -ErrorAction Stop -WarningAction SilentlyContinue)
+    if($loaded.Count -ne 1 -or [IO.Path]::GetFullPath($loaded[0].Path) -cne $modulePath){throw 'The lifecycle worker dependency module path is not manifest-bound.'}
+    $exports=[ordered]@{}
+    foreach($functionName in @($specification.Exports)){
+        $command=$loaded[0].ExportedFunctions[[string]$functionName]
+        if($null -eq $command -or $command -isnot [Management.Automation.FunctionInfo] -or $command.ScriptBlock -isnot [scriptblock] -or
+           $null -eq $command.Module -or [IO.Path]::GetFullPath($command.Module.Path) -cne $modulePath){throw 'The lifecycle worker dependency export is not manifest-bound.'}
+        $exports[[string]$functionName]=$command.ScriptBlock
+    }
+    $script:CcodLifecycleWorkerModuleBindings[[string]$specification.Name]=$exports
+}
+
+function Invoke-CcodLifecycleWorkerModuleFunction {
+    param([Parameter(Mandatory)][string]$Module,[Parameter(Mandatory)][string]$Function,[object[]]$Arguments)
+    $binding=$script:CcodLifecycleWorkerModuleBindings[$Module]
+    if($null -eq $binding -or -not $binding.Contains($Function) -or $binding[$Function] -isnot [scriptblock]){throw 'The lifecycle worker dependency export is unavailable.'}
+    & $binding[$Function] @Arguments
+}
+
 $script:CcodLifecycleWorkerScriptPath=if([string]::IsNullOrWhiteSpace($PSCommandPath)){$null}else{[IO.Path]::GetFullPath($PSCommandPath)}
 $script:CcodLifecycleWorkerRequestFields=@('schemaVersion','transactionId','action','runtimeId','runtimeGeneration','leaseEpoch','ownerIdentity','notBeforeUtc','timeoutMilliseconds')
 $script:CcodLifecycleWorkerResultFields=@('schemaVersion','transactionId','action','ok','outcome','observation','error')
@@ -172,7 +206,7 @@ function Assert-CcodLifecycleWorkerRuntimeClosure {
 function Assert-CcodLifecycleWorkerFence {
     param($Context,$Request,$Delegation)
     $ownership=if($null-ne$Delegation){$Delegation}else{[pscustomobject][ordered]@{schemaVersion=1;lease=[pscustomobject][ordered]@{Released=$false};epoch=[UInt64]$Request.leaseEpoch;runtimeId=$Request.runtimeId;runtimeGeneration=[UInt64]$Request.runtimeGeneration;ownerIdentity=$Request.ownerIdentity;released=$false}}
-    Assert-CcodLifecycleFence -InstallRoot $Context.InstallRoot -Ownership $ownership
+    Invoke-CcodLifecycleWorkerModuleFunction -Module 'LifecycleEpoch' -Function 'Assert-CcodLifecycleFence' -Arguments @($Context.InstallRoot,$ownership)|Out-Null
 }
 
 function Invoke-CcodLifecycleControllerFacade {
@@ -206,16 +240,16 @@ function Get-CcodLifecycleWorkerAdapters {
     $resolved=@{
         GetScriptPath={$script:CcodLifecycleWorkerScriptPath}
         GetBootstrapContext={param($Path)Get-CcodLifecycleWorkerBootstrapContext $Path}
-        ReadRequest={param($Path)Read-CcodStrictJson -Path $Path -ExpectedSchema 1 -Kind 'lifecycle worker request'}
-        ResolveRuntime={param($Path,$Runtime,$Generation)$bootstrap=Get-CcodLifecycleWorkerBootstrapContext $Path;Resolve-CcodActiveRuntimeContext -InstallRoot $bootstrap.InstallRoot -ExpectedRuntimeId $Runtime -ExpectedGeneration $Generation -ExpectedScriptPath $Path -ScriptRelativePath 'src/persistence/LifecycleWorker.ps1'}
-        EnterDelegation={param($Context,$Request)$identity=Get-CcodLifecycleWorkerCurrentIdentity;Enter-CcodLifecycleDelegation -InstallRoot $Context.InstallRoot -RuntimeId $Request.runtimeId -RuntimeGeneration $Request.runtimeGeneration -LeaseEpoch $Request.leaseEpoch -OwnerIdentity $Request.ownerIdentity -UserSid $identity.UserSid -SessionId $identity.SessionId -TimeoutMilliseconds ([Math]::Min(15000,$Request.timeoutMilliseconds))}
-        ExitDelegation={param($Delegation)Exit-CcodLifecycleDelegation -Delegation $Delegation}
+        ReadRequest={param($Path)Invoke-CcodLifecycleWorkerModuleFunction -Module 'PersistenceIO' -Function 'Read-CcodStrictJson' -Arguments @($Path,1,'lifecycle worker request')}
+        ResolveRuntime={param($Path,$Runtime,$Generation)$bootstrap=Get-CcodLifecycleWorkerBootstrapContext $Path;Invoke-CcodLifecycleWorkerModuleFunction -Module 'RuntimeManifest' -Function 'Resolve-CcodActiveRuntimeContext' -Arguments @($bootstrap.InstallRoot,$Runtime,$Generation,$Path,'src/persistence/LifecycleWorker.ps1')}
+        EnterDelegation={param($Context,$Request)$identity=Get-CcodLifecycleWorkerCurrentIdentity;Invoke-CcodLifecycleWorkerModuleFunction -Module 'LifecycleEpoch' -Function 'Enter-CcodLifecycleDelegation' -Arguments @($Context.InstallRoot,$Request.runtimeId,$Request.runtimeGeneration,$Request.leaseEpoch,$Request.ownerIdentity,$identity.UserSid,$identity.SessionId,[Math]::Min(15000,$Request.timeoutMilliseconds))}
+        ExitDelegation={param($Delegation)Invoke-CcodLifecycleWorkerModuleFunction -Module 'LifecycleEpoch' -Function 'Exit-CcodLifecycleDelegation' -Arguments @($Delegation)}
         AssertFence={param($Context,$Request,$Delegation)Assert-CcodLifecycleWorkerFence $Context $Request $Delegation}
         GetCurrentIdentity={Get-CcodLifecycleWorkerCurrentIdentity}
         InvokeController={param($Action,$Request,$Context,$Delegation)Invoke-CcodLifecycleControllerFacade $Action $Request $Context $Delegation}
-        RequestOrdinaryLaunch={param($Request,$Context,$Delegation)$ownership=[pscustomobject][ordered]@{runtimeGeneration=[UInt64]$Request.runtimeGeneration;leaseEpoch=[UInt64]$Request.leaseEpoch;ownerIdentity=$Request.ownerIdentity};$boundContext=$Context;$boundRequest=$Request;$boundDelegation=$Delegation;Request-CcodOrdinaryPackagedLaunch -RequestedAtUtc $Request.notBeforeUtc -Ownership $ownership -AssertLifecycleFence {param($Generation,$Epoch,$Owner)Assert-CcodLifecycleWorkerFence $boundContext $boundRequest $boundDelegation}.GetNewClosure()}
-        ObserveOrdinary={param($Request,$Context)$identity=Get-CcodLifecycleWorkerCurrentIdentity;Wait-CcodVerifiedOrdinaryRoot -NotBeforeUtc $Request.notBeforeUtc -ExpectedUserSid $identity.UserSid -ExpectedSessionId $identity.SessionId -StatusEvidence $null -TimeoutMilliseconds ([Math]::Min(45000,$Request.timeoutMilliseconds))}
-        WriteResult={param($Path,$Value)Write-CcodAtomicJson -Path $Path -Value $Value}
+        RequestOrdinaryLaunch={param($Request,$Context,$Delegation)$ownership=[pscustomobject][ordered]@{runtimeGeneration=[UInt64]$Request.runtimeGeneration;leaseEpoch=[UInt64]$Request.leaseEpoch;ownerIdentity=$Request.ownerIdentity};$boundContext=$Context;$boundRequest=$Request;$boundDelegation=$Delegation;Invoke-CcodLifecycleWorkerModuleFunction -Module 'ProcessControl' -Function 'Request-CcodOrdinaryPackagedLaunch' -Arguments @($Request.notBeforeUtc,$ownership,{param($Generation,$Epoch,$Owner)Assert-CcodLifecycleWorkerFence $boundContext $boundRequest $boundDelegation}.GetNewClosure())}
+        ObserveOrdinary={param($Request,$Context)$identity=Get-CcodLifecycleWorkerCurrentIdentity;Invoke-CcodLifecycleWorkerModuleFunction -Module 'ProcessControl' -Function 'Wait-CcodVerifiedOrdinaryRoot' -Arguments @($Request.notBeforeUtc,$identity.UserSid,$identity.SessionId,$null,[Math]::Min(45000,$Request.timeoutMilliseconds))}
+        WriteResult={param($Path,$Value)Invoke-CcodLifecycleWorkerModuleFunction -Module 'PersistenceIO' -Function 'Write-CcodAtomicJson' -Arguments @($Path,$Value)}
         WriteStdout={param($Line)[Console]::Out.WriteLine($Line)};WriteStderr={param($Line)[Console]::Error.WriteLine($Line)}
     }
     if($null-ne$Adapters){foreach($key in $Adapters.Keys){$resolved[$key]=$Adapters[$key]}}
@@ -273,16 +307,6 @@ function Invoke-CcodLifecycleWorker {
 }
 
 if($MyInvocation.InvocationName -ne '.'){
-    Import-Module (Join-Path $PSScriptRoot 'modules\PersistenceIO.psm1') -Force
-    Import-Module (Join-Path $PSScriptRoot 'modules\RuntimeManifest.psm1') -Force
-    Import-Module (Join-Path $PSScriptRoot 'modules\WorkerRuntime.psm1') -Force
-    Import-Module (Join-Path $PSScriptRoot 'modules\LifecycleEpoch.psm1') -Force
-    Import-Module (Join-Path $PSScriptRoot 'modules\ProcessControl.psm1') -Force
     $run=Invoke-CcodLifecycleWorker -RequestPath $RequestPath -ResultPath $ResultPath
     exit $run.ExitCode
-} else {
-    Import-Module (Join-Path $PSScriptRoot 'modules\PersistenceIO.psm1') -Force
-    Import-Module (Join-Path $PSScriptRoot 'modules\RuntimeManifest.psm1') -Force
-    Import-Module (Join-Path $PSScriptRoot 'modules\LifecycleEpoch.psm1') -Force
-    Import-Module (Join-Path $PSScriptRoot 'modules\ProcessControl.psm1') -Force
 }

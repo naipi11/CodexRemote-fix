@@ -55,6 +55,15 @@ function Get-CcodWorkerErrorCode($Run){ if($null -eq $Run.Result.error){return $
 
 $results=@();$roots=[Collections.Generic.List[string]]::new()
 try {
+    $results += Invoke-CcodTest 'default worker adapter reads a strict JSON request in the production script scope' {
+        $h=New-CcodLifecycleWorkerHarness -Name production-adapter
+        $roots.Add($h.Install)
+        $adapters=Get-CcodLifecycleWorkerAdapters $null
+        $parsed=& $adapters.ReadRequest $h.RequestPath
+        Assert-CcodEqual $h.Request.transactionId $parsed.transactionId 'production ReadRequest preserves request correlation'
+        Assert-CcodEqual $h.Request.action $parsed.action 'production ReadRequest preserves the worker action'
+    }
+
     $results += Invoke-CcodTest 'worker rejects runtime generation and exact request-shape mismatches before dispatch' {
         foreach ($case in @('Runtime','Generation','Extra','UnknownAction')) {
             $h=New-CcodLifecycleWorkerHarness -Name $case;$roots.Add($h.Install)
