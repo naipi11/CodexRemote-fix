@@ -876,6 +876,7 @@ try {
             $readyConfirmed = $true
             if (-not $child.HasExited) { [void]$child.WaitForExit(2000) }
             if ($child.HasExited) { $exitCode = [int]$child.ExitCode }
+            else { $exitCode = 0 }
             if ($exitCode -eq 0) { Start-Sleep -Milliseconds 3000 }
             Write-CcodBootstrapLog -InstallRoot $root -Message ("Runtime {0} signaled ready; supervisor retained for installer verification" -f $runtimeId)
             break

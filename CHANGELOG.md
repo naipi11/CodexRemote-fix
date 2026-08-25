@@ -6,6 +6,18 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.12
+
+### English
+
+- Fixed bootstrap readiness accounting for a long-lived Supervisor: once the verified Ready event is signaled, a still-running Supervisor now returns bootstrap success so post-install activation can complete instead of reporting `CCOD_INSTALL_NEW_RUNTIME_NOT_READY`.
+- Added regression coverage for the persistent Supervisor handoff while preserving nonzero propagation for a Supervisor that exits abnormally after readiness.
+
+### 简体中文
+
+- 修复长驻 Supervisor 的 bootstrap 就绪计数：经验证的 Ready 事件触发后，即使 Supervisor 仍在运行，bootstrap 现在也会返回成功，安装后激活不再错误报告 `CCOD_INSTALL_NEW_RUNTIME_NOT_READY`。
+- 增加长驻 Supervisor 交接回归覆盖，同时继续保留就绪后异常退出码的非零传播。
+
 ## v2.5.11
 
 ### English
