@@ -712,6 +712,23 @@ Invoke-CcodTest 'resumes WaitingForManualLaunch after Supervisor restart and com
     Assert-CcodEqual 0 @($fake.World.Calls|Where-Object{$_ -like 'Start:Controller:*'}).Count 'resume performs no mutation outside LifecycleWorker slot'
 }
 
+Invoke-CcodTest 'ordinary observation uses the durable transaction start as its launch-race lower bound' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $request=New-CcodPersistedLifecycleRequest -Kind RestartAndRepair
+    $transactionModule=Import-Module $lifecycleTransactionPath -Force -PassThru
+    foreach($phase in @('CloseRequested','CloseConfirmed','OrdinaryLaunchRequested')){
+        $request=& $transactionModule {param($Value,$Next)Move-CcodLifecyclePhase -Request $Value -NextPhase $Next -NowUtc '2030-02-03T03:02:00.0000000Z'} $request $phase
+    }
+    $request.ownerIdentity=$hostState.LifecycleOwnership.ownerIdentity
+    $request.leaseEpoch=[UInt64]$hostState.LifecycleOwnership.epoch
+    $world.ActiveLifecycleRequest=$request;$hostState.LifecycleRequest=$request
+    Start-CcodSupervisorLifecycleWorkerSlot $hostState $fixture.Fake.Adapters ObserveOrdinary $null|Out-Null
+    Assert-CcodEqual 1 $world.StartedLifecycleRequests.Count 'one ordinary observation worker request is persisted'
+    $workerRequest=$world.StartedLifecycleRequests[0]
+    Assert-CcodEqual $request.createdAtUtc $workerRequest.notBeforeUtc 'observation accepts an ordinary root created after the verified lifecycle began'
+    Assert-CcodTrue ($workerRequest.notBeforeUtc -cne '2030-02-03T03:04:05.0000000Z') 'observation does not move the lower bound to the current worker tick'
+}
+
 Invoke-CcodTest 'rejects a nonzero lifecycle worker exit even when its result frame claims success' {
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
     $transactionModule=Import-Module $lifecycleTransactionPath -Force -PassThru

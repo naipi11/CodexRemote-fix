@@ -617,7 +617,11 @@ function New-CcodSupervisorLifecycleWorkerPaths {
 function Start-CcodSupervisorLifecycleWorkerSlot {
     param($HostState,[hashtable]$Adapters,[string]$Action,[AllowNull()]$DeadlineUtc)
     if($null-ne$HostState.LifecycleWorkerSlot -or $null-ne$HostState.WorkerSlot -or $null-eq$HostState.LifecycleRequest){throw 'lifecycle worker slot is unavailable'}
-    $requestState=$HostState.LifecycleRequest;$now=Get-CcodSupervisorNowUtc $Adapters;$timeout=30000
+    $requestState=$HostState.LifecycleRequest;$now=Get-CcodSupervisorNowUtc $Adapters;$timeout=30000;$notBefore=$now
+    if($Action-ceq'ObserveOrdinary'){
+        if(-not(Test-CcodSupervisorCanonicalUtc $requestState.createdAtUtc)){throw 'lifecycle observation lower bound is invalid'}
+        $notBefore=$requestState.createdAtUtc
+    }
     if($null-ne$DeadlineUtc){
         if(-not(Test-CcodSupervisorCanonicalUtc $DeadlineUtc)){throw 'lifecycle deadline is invalid'}
         $deadline=[DateTime]::ParseExact($DeadlineUtc,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind)
@@ -625,7 +629,7 @@ function Start-CcodSupervisorLifecycleWorkerSlot {
         $timeout=[int][Math]::Max(1,[Math]::Min(600000,[Math]::Ceiling(($deadline-$current).TotalMilliseconds)))
     }
     $paths=New-CcodSupervisorLifecycleWorkerPaths $HostState $requestState.transactionId
-    $workerRequest=Invoke-CcodSupervisorAdapter $Adapters.NewLifecycleWorkerRequest @($requestState.transactionId,$Action,$requestState.runtimeId,[UInt64]$requestState.runtimeGeneration,[UInt64]$requestState.leaseEpoch,$requestState.ownerIdentity,$now,$timeout) 1
+    $workerRequest=Invoke-CcodSupervisorAdapter $Adapters.NewLifecycleWorkerRequest @($requestState.transactionId,$Action,$requestState.runtimeId,[UInt64]$requestState.runtimeGeneration,[UInt64]$requestState.leaseEpoch,$requestState.ownerIdentity,$notBefore,$timeout) 1
     $owned=[Collections.Generic.List[string]]::new();$suspended=$false
     try{
         Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null

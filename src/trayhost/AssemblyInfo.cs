@@ -5,6 +5,6 @@ using System.Runtime.InteropServices;
 [assembly: AssemblyDescription("Persistent native tray host for CodexRemote-fix")]
 [assembly: AssemblyCompany("CodexRemote-fix contributors")]
 [assembly: AssemblyProduct("CodexRemote-fix")]
-[assembly: AssemblyVersion("2.5.15.0")]
-[assembly: AssemblyFileVersion("2.5.15.0")]
+[assembly: AssemblyVersion("2.5.17.0")]
+[assembly: AssemblyFileVersion("2.5.17.0")]
 [assembly: ComVisible(false)]

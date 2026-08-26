@@ -57,9 +57,9 @@ internal static class TrayHostNativeSelfTest
     private static PresentationSnapshot SnapshotV2(ulong revision)
     {
         string[] strings = new string[] {
-            "CodexRemote-fix 2.5.15", "Connection: Connected", "Protection: Running", "Check and repair remote connection",
+            "CodexRemote-fix 2.5.17", "Connection: Connected", "Protection: Running", "Check and repair remote connection",
             "Language / 语言", "Follow system (English)", "中文", "English", "Open logs", "About", "Exit",
-            "About", "CodexRemote-fix | Version 2.5.15", "Exit CodexRemote-fix?", "Remote control will stop.", "Action failed"
+            "About", "CodexRemote-fix | Version 2.5.17", "Exit CodexRemote-fix?", "Remote control will stop.", "Action failed"
         };
         return new PresentationSnapshot(revision, TrayColor.Green, ConnectionState.Connected, ProtectionState.Running, LanguageMode.English,
             PresentationFlags.LanguageEnabled | PresentationFlags.OpenLogsEnabled | PresentationFlags.AboutEnabled | PresentationFlags.ExitEnabled, strings);
@@ -147,7 +147,7 @@ internal static class TrayHostNativeSelfTest
         FakeTrayPlatform platform = new FakeTrayPlatform();
         TrayWindow window = new TrayWindow(platform); window.Create(SnapshotV2(1));
         platform.TrackResult = 0; window.HandleContextMenu(new TrayPoint(0, 0));
-        AssertEqual("CodexRemote-fix 2.5.15|Connection: Connected|Protection: Running|Check and repair remote connection|Language / 语言|Open logs|About|Exit", String.Join("|", platform.AppendedText.ToArray()), "menu contains only the approved information architecture");
+        AssertEqual("CodexRemote-fix 2.5.17|Connection: Connected|Protection: Running|Check and repair remote connection|Language / 语言|Open logs|About|Exit", String.Join("|", platform.AppendedText.ToArray()), "menu contains only the approved information architecture");
         AssertTrue(!platform.AppendedText.Contains("Allow compatible update trials"), "candidate toggle is removed");
         AssertTrue(!platform.Commands.Contains(1009U), "tray uninstall command is removed");
         TrayCommand selected = TrayCommand.None; window.CommandSelected += delegate(TrayCommand command, ulong revision) { selected = command; };
@@ -163,7 +163,7 @@ internal static class TrayHostNativeSelfTest
         FakeTrayPlatform platform = new FakeTrayPlatform(); TrayWindow window = new TrayWindow(platform); window.Create(SnapshotV2(1));
         window.ShowAbout();
         AssertTrue(platform.MessageBoxes.Count == 1, "verified About shows exactly one native message box");
-        AssertEqual("About|CodexRemote-fix | Version 2.5.15", platform.MessageBoxes[0], "verified About displays the version from the acknowledged snapshot");
+        AssertEqual("About|CodexRemote-fix | Version 2.5.17", platform.MessageBoxes[0], "verified About displays the version from the acknowledged snapshot");
         window.Dispose();
     }
 

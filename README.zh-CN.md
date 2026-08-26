@@ -43,7 +43,7 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 ## 快速开始
 
-1. 从 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 下载 `CodexRemote-fix-2.5.15-setup.exe`（推荐安装包）或便携 ZIP `CodexRemote-fix-2.5.15-windows-x64.zip`；下载并核对对应的 `.sha256.txt`。
+1. 从 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 下载 `CodexRemote-fix-2.5.17-setup.exe`（推荐安装包）或便携 ZIP `CodexRemote-fix-2.5.17-windows-x64.zip`；下载并核对对应的 `.sha256.txt`。
 2. 选择安装包时直接运行并跟随向导；选择便携 ZIP 时解压到新空目录，然后双击 `CodexRemote-fix.exe`。
 
    两条路径都会校验载荷、执行 Microsoft Defender 自定义扫描，并保留 DPAPI 设备密钥。
@@ -78,12 +78,12 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 ## 发布（Releases）
 
-每个带 tag 的发布都会附带 Windows 安装包和便携 ZIP，各自带 SHA-256 校验文件、release manifest，并共享 payload manifest。`.github/workflows/release.yml` 会在 tag 上自动构建两者，因此 v2.5.15 提供：
+每个带 tag 的发布都会附带 Windows 安装包和便携 ZIP，各自带 SHA-256 校验文件、release manifest，并共享 payload manifest。`.github/workflows/release.yml` 会在 tag 上自动构建两者，因此 v2.5.17 提供：
 
-- `CodexRemote-fix-2.5.15-setup.exe` 及其校验文件
-- `CodexRemote-fix-2.5.15-windows-x64.zip` 及其校验文件
-- `CodexRemote-fix-2.5.15-payload-manifest.json`
-- `CodexRemote-fix-2.5.15-release-manifest.json` 和 `CodexRemote-fix-2.5.15-setup-release-manifest.json`
+- `CodexRemote-fix-2.5.17-setup.exe` 及其校验文件
+- `CodexRemote-fix-2.5.17-windows-x64.zip` 及其校验文件
+- `CodexRemote-fix-2.5.17-payload-manifest.json`
+- `CodexRemote-fix-2.5.17-release-manifest.json` 和 `CodexRemote-fix-2.5.17-setup-release-manifest.json`
 
 GitHub Release 正文只发布英文更新说明；本 README 继续保留中英文使用说明。
 完整历史见 [CHANGELOG.md](CHANGELOG.md)。

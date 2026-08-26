@@ -6,6 +6,20 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.17
+
+### English
+
+- Supplied an explicit schema-one empty status object when LifecycleWorker observes an ordinary Codex launch. PowerShell no longer rejects the mandatory `StatusEvidence` parameter before the verified ordinary-root probe can run.
+- Added production-adapter regression coverage that rejects a null observation status and verifies the exact `{schemaVersion, session}` empty-state contract.
+- Ordinary observation now uses the durable lifecycle creation time as its lower bound, so an automatically restored Codex root that appears just before the AppsFolder request remains eligible after the prior Close was proven.
+
+### 简体中文
+
+- LifecycleWorker 观察普通 Codex 启动时现在传入明确的 schema-one 空状态对象。PowerShell 不再在经验证的普通根进程探针运行前拒绝 mandatory `StatusEvidence` 参数。
+- 增加生产 adapter 回归覆盖，拒绝 null 观察状态，并验证精确的 `{schemaVersion, session}` 空状态契约。
+- 普通根观察现在使用持久生命周期创建时间作为下限；此前 Close 已证明完成时，即使 Codex 自动恢复略早于 AppsFolder 请求，该普通根仍可被接受。
+
 ## v2.5.15
 
 ### English

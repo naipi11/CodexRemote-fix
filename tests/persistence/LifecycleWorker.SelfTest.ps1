@@ -64,6 +64,22 @@ try {
         Assert-CcodEqual $h.Request.action $parsed.action 'production ReadRequest preserves the worker action'
     }
 
+    $results += Invoke-CcodTest 'default ordinary observation supplies an explicit empty status instead of null' {
+        $binding=$script:CcodLifecycleWorkerModuleBindings['ProcessControl'];$original=$binding['Wait-CcodVerifiedOrdinaryRoot']
+        $capture=[pscustomobject]@{Status=$null}
+        try{
+            $binding['Wait-CcodVerifiedOrdinaryRoot']={param($NotBefore,$Sid,$SessionId,$Status,$Timeout)$capture.Status=$Status;$null}.GetNewClosure()
+            $adapter=Get-CcodLifecycleWorkerAdapters $null
+            $request=New-CcodLifecycleWorkerFixtureRequest -Action ObserveOrdinary
+            $context=[pscustomobject]@{InstallRoot='C:\install';RuntimeRoot='C:\runtime'}
+            $null=& $adapter.ObserveOrdinary $request $context
+            Assert-CcodTrue ($null-ne$capture.Status) 'ordinary observation passes non-null status evidence'
+            Assert-CcodEqual 'schemaVersion,session' (($capture.Status.PSObject.Properties.Name)-join ',') 'ordinary observation status shape is exact'
+            Assert-CcodEqual 1 $capture.Status.schemaVersion 'ordinary observation status schema is one'
+            Assert-CcodEqual $null $capture.Status.session 'ordinary observation has no persisted special session'
+        }finally{$binding['Wait-CcodVerifiedOrdinaryRoot']=$original}
+    }
+
     $results += Invoke-CcodTest 'controller facade binds delegation before a dot-sourced Action parameter changes scope metadata' {
         $root=[IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) ('ccod-lifecycle-facade-'+[guid]::NewGuid().ToString('N'))));$roots.Add($root)
         $runtime=Join-Path $root 'runtime\2.5.0-a';$controllerDirectory=Join-Path $runtime 'src\persistence';[IO.Directory]::CreateDirectory($controllerDirectory)|Out-Null
@@ -79,8 +95,12 @@ function Invoke-CcodSessionController {
     param($Request,$Paths,[string]$ResultPath,[hashtable]$Adapters)
     $delegated=& $Adapters.GetDelegatedOwnership
     if($null-eq$delegated-or$delegated.marker-cne'delegated'){throw 'delegation was not bound'}
+    $expectedRestart=$Request.action-cne'Close'
+    if($Request.restartOrdinary-ne$expectedRestart){throw "restartOrdinary mismatch for $($Request.action)"}
+    $outcome=switch($Request.action){'Close'{'Closed'}'Apply'{'Activated'}'Inspect'{'Inspected'}default{throw 'unexpected action'}}
+    $safeState=switch($Request.action){'Close'{'Closed'}default{'SpecialValidated'}}
     $result=[pscustomobject][ordered]@{
-        schemaVersion=1;action=$Request.action;ok=$true;outcome='Closed';safeState='Closed';stage='Completed';transactionId=$Request.transactionId
+        schemaVersion=1;action=$Request.action;ok=$true;outcome=$outcome;safeState=$safeState;stage='Completed';transactionId=$Request.transactionId
         package=$null;source=$null;special=$null;probes=$null;recovery=$null;error=$null;logFile=$null
     }
     [pscustomobject][ordered]@{Result=$result;ExitCode=0}
@@ -94,6 +114,10 @@ function Invoke-CcodSessionController {
         Assert-CcodEqual Close $controller.action 'dot-sourced controller receives the Close action'
         Assert-CcodEqual $true $controller.ok 'dot-sourced controller returns one successful result'
         Assert-CcodEqual $request.transactionId $controller.transactionId 'dot-sourced controller result remains correlated'
+        $apply=Invoke-CcodLifecycleControllerFacade -Action Apply -Request $request -Context $context -Delegation $delegation
+        Assert-CcodEqual Apply $apply.action 'Apply uses the restart-enabled controller contract'
+        $verify=Invoke-CcodLifecycleControllerFacade -Action VerifyRemote -Request $request -Context $context -Delegation $delegation
+        Assert-CcodEqual Inspect $verify.action 'VerifyRemote maps to the restart-enabled Inspect contract'
     }
 
     $results += Invoke-CcodTest 'worker rejects runtime generation and exact request-shape mismatches before dispatch' {
