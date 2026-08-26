@@ -183,6 +183,45 @@ $results += Invoke-CcodTest 'real worker remains suspended until exact Job assig
     }
 }
 
+$results += Invoke-CcodTest 'poll uses the retained worker exit code when PID lookup resolves an unrelated live process' {
+    $root = New-CcodWorkerTempRoot
+    $workerScript = Join-Path $root 'failed-worker.ps1'
+    $requestPath = Join-Path $root 'request.json'
+    $resultPath = Join-Path $root 'result.json'
+    try {
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        [IO.File]::WriteAllText($requestPath, '{ "schemaVersion": 1 }', [Text.UTF8Encoding]::new($false))
+        $payload = '{"schemaVersion":1,"ok":false,"error":{"code":"CCOD_TEST_FAILURE"}}'
+        $escapedPayload = $payload.Replace("'", "''")
+        $scriptText = @(
+            '[CmdletBinding()]',
+            'param([string]$RequestPath,[string]$ResultPath)',
+            ("[IO.File]::WriteAllText(`$ResultPath,'" + $escapedPayload + "',[Text.UTF8Encoding]::new(`$false))"),
+            'exit 1'
+        ) -join "`r`n"
+        [IO.File]::WriteAllText($workerScript, $scriptText, [Text.UTF8Encoding]::new($false))
+
+        $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $receipt = Start-CcodWorkerProcess -Kind 'Lifecycle' -ScriptPath $workerScript -RequestPath $requestPath -ResultPath $resultPath -StderrPath $null -PowerShellPath $powershell
+        $slot = New-CcodWorkerSlot -Receipt $receipt -RequestPath $requestPath -ResultPath $resultPath -StderrPath $null
+        try {
+            Assert-CcodTrue (Wait-CcodWorkerExit -Slot $slot -TimeoutMilliseconds 20000) 'failed worker exits within the wait window'
+            Assert-CcodTrue ($null -eq (Get-CcodWorkerIdentity -Pid $slot.ProcessId)) 'failed worker identity is gone before polling'
+            $slot.ProcessId = [int]$PID
+            $poll = Get-CcodWorkerPoll -Slot $slot
+            Assert-CcodEqual $true $poll.Completed 'poll reports failed worker completion'
+            Assert-CcodEqual 1 $poll.ExitCode 'poll ignores an unrelated process returned for the numeric PID lookup'
+            Assert-CcodTrue ($poll.StdoutText -match 'CCOD_TEST_FAILURE') 'poll carries the failed result frame'
+        } finally {
+            Close-CcodWorkerHandle -Slot $slot
+            Remove-CcodWorkerFile -Path $requestPath
+            Remove-CcodWorkerFile -Path $resultPath
+        }
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
 $results += Invoke-CcodTest 'Job assignment failure kills the exact gated child before request operation' {
     $root=New-CcodWorkerTempRoot;$workerScript=Join-Path $root 'assignment-failure.ps1';$requestPath=Join-Path $root 'request.json';$resultPath=Join-Path $root 'result.json';$markerPath=Join-Path $root 'operation.marker';$capturePath=Join-Path $root 'started.json'
     try{

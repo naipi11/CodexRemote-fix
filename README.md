@@ -47,7 +47,7 @@ that existing page and leaves the Codex UI, account authorization, and enrollmen
 ## Quick start
 
 
-1. Download either `CodexRemote-fix-2.5.12-setup.exe` (recommended installer) or `CodexRemote-fix-2.5.12-windows-x64.zip` from [Releases](https://github.com/naipi11/CodexRemote-fix/releases). Download and verify the matching `.sha256.txt` before continuing.
+1. Download either `CodexRemote-fix-2.5.13-setup.exe` (recommended installer) or `CodexRemote-fix-2.5.13-windows-x64.zip` from [Releases](https://github.com/naipi11/CodexRemote-fix/releases). Download and verify the matching `.sha256.txt` before continuing.
 2. If you chose the setup installer, run it and follow the wizard. If you chose the portable ZIP, extract it into a new empty folder and double-click `CodexRemote-fix.exe`.
 
    Both paths validate the payload, run a Microsoft Defender custom scan, and preserve the DPAPI device-key store.
@@ -83,12 +83,12 @@ The tray reports two independent, truthful status lines instead of inferring rea
 
 ## Releases
 
-Every tagged release ships a Windows setup installer and a portable ZIP, each with its SHA-256 checksum, release manifest, and the shared payload manifest. The `.github/workflows/release.yml` workflow builds both from the tag automatically, so v2.5.12 includes:
+Every tagged release ships a Windows setup installer and a portable ZIP, each with its SHA-256 checksum, release manifest, and the shared payload manifest. The `.github/workflows/release.yml` workflow builds both from the tag automatically, so v2.5.13 includes:
 
-- `CodexRemote-fix-2.5.12-setup.exe` and its checksum
-- `CodexRemote-fix-2.5.12-windows-x64.zip` and its checksum
-- `CodexRemote-fix-2.5.12-payload-manifest.json`
-- `CodexRemote-fix-2.5.12-release-manifest.json` and `CodexRemote-fix-2.5.12-setup-release-manifest.json`
+- `CodexRemote-fix-2.5.13-setup.exe` and its checksum
+- `CodexRemote-fix-2.5.13-windows-x64.zip` and its checksum
+- `CodexRemote-fix-2.5.13-payload-manifest.json`
+- `CodexRemote-fix-2.5.13-release-manifest.json` and `CodexRemote-fix-2.5.13-setup-release-manifest.json`
 
 Each release appends a short English change summary to the GitHub release body. The bilingual release history is kept in [CHANGELOG.md](CHANGELOG.md).
 

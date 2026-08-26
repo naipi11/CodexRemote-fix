@@ -258,6 +258,7 @@ function Start-CcodWorkerProcess {
         if($null-eq$native-or$native.ProcessId-lt1-or$null-eq$native.ProcessHandle-or$null-eq$native.ThreadHandle){throw 'native process'}
         $process=[Diagnostics.Process]::GetProcessById([int]$native.ProcessId)
         $created=$process.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)
+        $process.EnableRaisingEvents=$true
         $assigned=[bool](&$adapter.AssignProcessToJob $job $native);if(-not$assigned){throw 'job'}
         $resumed=[bool](&$adapter.ResumeProcess $native);if(-not$resumed){throw 'resume'}
         &$adapter.DisposeNativeProcess $native|Out-Null
@@ -281,20 +282,14 @@ function Get-CcodWorkerPoll {
     }
     $completed = $false
     $exitCode = $null
-    $probe = Get-Process -Id $Slot.ProcessId -ErrorAction SilentlyContinue
-    if ($null -ne $probe) {
-        try {
-            $probe.Refresh()
-            if ($probe.HasExited) {
-                $completed = $true
-                $exitCode = [int]$probe.ExitCode
-            }
-        } finally {
-            $probe.Dispose()
-        }
-    } else {
+    $retainedHandle = $Slot.PSObject.Properties['Handle']
+    if ($null -eq $retainedHandle -or $retainedHandle.Value -isnot [Diagnostics.Process]) {
+        Throw-CcodWorkerRuntimeError 'CCOD_WORKER_SLOT_INVALID' 'Worker slot has no retained exact process handle' $Slot
+    }
+    $retainedHandle.Value.Refresh()
+    if ($retainedHandle.Value.HasExited) {
         $completed = $true
-        $exitCode = [int]0
+        $exitCode = [int]$retainedHandle.Value.ExitCode
     }
     $stdoutText = ''
     if ($completed -and [IO.File]::Exists($Slot.ResultPath)) {

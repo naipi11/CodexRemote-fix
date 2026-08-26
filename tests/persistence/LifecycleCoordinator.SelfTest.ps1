@@ -59,6 +59,12 @@ $results += Invoke-CcodTest 'phase table selects one exact lifecycle operation' 
     }
 }
 
+$results += Invoke-CcodTest 'a recovered close request cannot skip a still-running ordinary root' {
+    $request = New-CcodCoordinatorFixture -Phase CloseRequested -Kind RestartAndRepair
+    $step = Get-CcodLifecycleStep -Request $request -Observation Ordinary -NowUtc '2030-02-03T04:06:00.0000000Z'
+    Assert-CcodCoordinatorStep $step Operation $null Close $null $null 'recovered close request with ordinary root'
+}
+
 $results += Invoke-CcodTest 'repair is idempotent and safe exit never selects Apply' {
     $connected = Get-CcodLifecycleStep -Request (New-CcodCoordinatorFixture -Kind CheckAndRepair) -Observation RemoteVerified -NowUtc '2030-02-03T04:06:00.0000000Z'
     Assert-CcodCoordinatorStep $connected Completed CancelledBeforeClose None $null $null 'already connected repair'

@@ -6,6 +6,18 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.13
+
+### English
+
+- Preserved the real nonzero lifecycle-worker exit code after its PID disappears by arming and retaining the exact process handle before resume. A failed worker result now reduces to its durable terminal phase instead of being misread as exit code 0 and terminating the detached Supervisor.
+- Recovered `CloseRequested` transactions no longer treat a still-running ordinary Codex root as closed. The Supervisor repeats the verified close operation before repair, preventing a restart from skipping directly to Apply.
+
+### 简体中文
+
+- 在 lifecycle worker 恢复运行前启用并保留精确进程句柄，使 PID 消失后仍能读取真实的非零退出码。失败结果现在会归约到持久终态，不再被误读为退出码 0 并导致脱离计划任务的 Supervisor 退出。
+- 恢复中的 `CloseRequested` 事务不再把仍在运行的普通 Codex 根进程当作已关闭；Supervisor 会先重复执行经验证的关闭操作，再进入修复，避免重启后直接跳到 Apply。
+
 ## v2.5.12
 
 ### English

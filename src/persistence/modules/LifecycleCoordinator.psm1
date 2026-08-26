@@ -75,7 +75,7 @@ function Get-CcodLifecycleStep {
         'Requested' { return New-CcodLifecycleStepResult Operation CloseRequested Close $null $null }
         'CloseRequested' {
             if($Observation -ceq 'CloseFailed' -or $Observation -ceq 'Error'){return New-CcodLifecycleStepResult Failed CloseFailed None $null $(if($Request.error){$Request.error}else{'CCOD_CLOSE_FAILED'})}
-            if(@('Closed','NoCodex','Ordinary') -ccontains $Observation){return New-CcodLifecycleStepResult Progress CloseConfirmed None $null $null}
+            if(@('Closed','NoCodex') -ccontains $Observation){return New-CcodLifecycleStepResult Progress CloseConfirmed None $null $null}
             return New-CcodLifecycleStepResult Operation $null Close $null $null
         }
         'CloseConfirmed' {
