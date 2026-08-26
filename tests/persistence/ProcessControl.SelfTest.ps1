@@ -157,6 +157,44 @@ try {
         $probe = & $adapters.ProbeSpecial 100 9335 52359
         Assert-CcodTrue (-not $probe.Valid) 'duplicate renderer targets fail closed'
     }
+
+    Invoke-CcodTest 'normalizes native error 31 only when an independent PID probe proves exit' {
+        $module = Get-Module ProcessControl | Select-Object -First 1
+        $failure31 = [Management.Automation.ErrorRecord]::new(
+            [ComponentModel.Win32Exception]::new(31), 'Win32Exception', [Management.Automation.ErrorCategory]::ReadError, 700)
+        $failure5 = [Management.Automation.ErrorRecord]::new(
+            [ComponentModel.Win32Exception]::new(5), 'Win32Exception', [Management.Automation.ErrorCategory]::PermissionDenied, 700)
+        $nonTerminatingFailure = & $module {
+            param($Failure)
+            Test-CcodNativeProcessQueryProvesExit -Failure $Failure -ProcessId 700 -GetProcess { param($Id) Write-Error 'probe failed' -ErrorAction Continue }
+        } $failure31
+        Assert-CcodEqual $false $nonTerminatingFailure 'a nonterminating PID probe error is never absence proof'
+        $gone = & $module {
+            param($Failure)
+            Test-CcodNativeProcessQueryProvesExit -Failure $Failure -ProcessId 700 -GetProcess { param($Id) [pscustomobject][ordered]@{Outcome='Absent';Process=$null} }
+        } $failure31
+        Assert-CcodEqual $true $gone 'error 31 plus an absent PID is a proven exit race'
+        $live = & $module {
+            param($Failure,$ProcessId)
+            Test-CcodNativeProcessQueryProvesExit -Failure $Failure -ProcessId $ProcessId -GetProcess { param($Id) [pscustomobject][ordered]@{Outcome='Found';Process=(Get-Process -Id $Id -ErrorAction Stop)} }
+        } $failure31 ([int]$PID)
+        Assert-CcodEqual $false $live 'error 31 never hides a live or PID-reused process'
+        $terminatingFailure = & $module {
+            param($Failure)
+            Test-CcodNativeProcessQueryProvesExit -Failure $Failure -ProcessId 700 -GetProcess { param($Id) throw 'probe failed' }
+        } $failure31
+        Assert-CcodEqual $false $terminatingFailure 'a terminating PID probe error is never absence proof'
+        $malformed = & $module {
+            param($Failure)
+            Test-CcodNativeProcessQueryProvesExit -Failure $Failure -ProcessId 700 -GetProcess { param($Id) $null }
+        } $failure31
+        Assert-CcodEqual $false $malformed 'an empty untyped PID probe result is not absence proof'
+        $wrongError = & $module {
+            param($Failure)
+            Test-CcodNativeProcessQueryProvesExit -Failure $Failure -ProcessId 700 -GetProcess { param($Id) [pscustomobject][ordered]@{Outcome='Absent';Process=$null} }
+        } $failure5
+        Assert-CcodEqual $false $wrongError 'other native failures stay fail-closed even when the PID is absent'
+    }
 } catch {
     throw
 }

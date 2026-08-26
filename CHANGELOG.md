@@ -6,6 +6,18 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.15
+
+### English
+
+- Normalized the Windows native process-query exit race that can return Win32 error 31 immediately after an exact controller stop. The query is treated as exited only when an independent PID probe also proves the process absent or exited; a live or reused PID still fails closed.
+- Added regression coverage for the absent-PID, live/PID-reuse, and unrelated native-error boundaries so a successful Close can advance instead of ending as `CCOD_SESSION_FAILED`.
+
+### 简体中文
+
+- 规范化 Windows 原生进程查询在精确停止后可能返回 Win32 error 31 的退出竞态。只有独立 PID 探针也证明进程不存在或已退出时才视为退出；PID 仍存活或被复用时继续失败关闭。
+- 增加 PID 不存在、PID 存活/复用及其他原生错误的回归覆盖，使成功的 Close 能继续推进，而不再以 `CCOD_SESSION_FAILED` 结束。
+
 ## v2.5.14
 
 ### English

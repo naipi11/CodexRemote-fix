@@ -272,6 +272,46 @@ namespace Ccod.Persistence.Native {
 '@
 }
 
+function Get-CcodDefaultProcessProbe {
+    param([Parameter(Mandatory)][ValidateRange(1,2147483647)][int]$ProcessId)
+    try {
+        return [pscustomobject][ordered]@{Outcome='Found';Process=(Get-Process -Id $ProcessId -ErrorAction Stop)}
+    } catch {
+        $id=([string]$_.FullyQualifiedErrorId -split ',')[0]
+        if($id -ceq 'NoProcessFoundForGivenId'){return [pscustomobject][ordered]@{Outcome='Absent';Process=$null}}
+        throw
+    }
+}
+
+function Test-CcodNativeProcessQueryProvesExit {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Failure,
+        [Parameter(Mandatory)][ValidateRange(1,2147483647)][int]$ProcessId,
+        [scriptblock]$GetProcess = { param($Id) Get-CcodDefaultProcessProbe -ProcessId $Id }
+    )
+
+    $exception = $Failure.Exception
+    while ($null -ne $exception -and $exception -isnot [ComponentModel.Win32Exception]) { $exception = $exception.InnerException }
+    if ($null -eq $exception -or $exception.NativeErrorCode -ne 31) { return $false }
+    $probe = $null
+    try {
+        $output=@(& $GetProcess $ProcessId 2>&1)
+        if($output.Count-ne1-or$output[0]-is[Management.Automation.ErrorRecord]){return $false}
+        $state=$output[0]
+        if($state-isnot[pscustomobject]-or(@($state.PSObject.Properties.Name)-join',')-cne'Outcome,Process'){return $false}
+        if($state.Outcome-ceq'Absent'){return $null-eq$state.Process}
+        if($state.Outcome-cne'Found'-or$state.Process-isnot[Diagnostics.Process]){return $false}
+        $probe=$state.Process
+        $probe.Refresh()
+        return [bool]$probe.HasExited
+    } catch {
+        return $false
+    } finally {
+        if ($probe -is [Diagnostics.Process]) { $probe.Dispose() }
+    }
+}
+
 function Get-CcodDefaultNativeProcess {
     param([int]$ProcessId)
 
@@ -280,6 +320,7 @@ function Get-CcodDefaultNativeProcess {
         return [Ccod.Persistence.Native.ProcessIdentityV1]::Query($ProcessId)
     } catch [ComponentModel.Win32Exception] {
         if ($_.Exception.NativeErrorCode -in @(6, 87, 1168)) { return $null }
+        if (Test-CcodNativeProcessQueryProvesExit -Failure $_ -ProcessId $ProcessId) { return $null }
         throw
     }
 }
