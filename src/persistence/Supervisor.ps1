@@ -1275,7 +1275,7 @@ function Invoke-CcodSupervisorRefreshObservations {
     if($special.Count -eq 1 -and $null -ne $HostState.SpecialProof -and
        $null -ne $HostState.SpecialProof.PSObject.Properties['Pid'] -and $null -ne $HostState.SpecialProof.PSObject.Properties['CreationTimeUtc'] -and
        $HostState.SpecialProof.Pid -eq $special[0].Snapshot.Pid -and $HostState.SpecialProof.CreationTimeUtc -ceq $special[0].Snapshot.CreationTimeUtc){$proofMatches=$true}
-    if(-not $proofMatches){$HostState.SpecialProof=$null}
+    if($proofMatches){$special[0].ProbeValid=$true}else{$HostState.SpecialProof=$null}
     $HostState.Ordinary=[object[]]@($ordinary);$HostState.Special=[object[]]@($special)
     $HostState.StaleReconciliationCandidate=if($ordinary.Count -eq 0 -and $special.Count -eq 0 -and $staleCandidates.Count -eq 1){$staleCandidates[0]}else{$null}
     $HostState.SpecialNeedsInspect=$special.Count -gt 0 -and $null -eq $HostState.SpecialProof

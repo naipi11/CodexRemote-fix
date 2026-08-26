@@ -1005,6 +1005,24 @@ Invoke-CcodTest 'converts persisted-special inspection into one durable lifecycl
     Assert-CcodEqual 1 $world.CommandQueue.Count 'durable lifecycle leaves command queued'
 }
 
+Invoke-CcodTest 'matching special proof is projected into the decision and does not schedule redundant repair' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $special=New-CcodSupervisorTestSnapshot -ProcessId 201 -CreationTimeUtc '2030-02-03T03:02:00.0000000Z'
+    $special.Mode='Special';$special.RendererPort=[int]41001;$special.MainPort=[int]41002
+    $world.ProcessIds=@(201);$world.Snapshots[201]=$special
+    $hostState.SpecialProof=$special;$hostState.SessionState='Active';$hostState.Reason='SpecialValidated';$hostState.ForceReconcile=$true
+    $fixture.Fake.Adapters.ReadState={param($StateRoot,$SuppressionKey)$hostState.State}.GetNewClosure()
+    $fixture.Fake.Adapters.GetSupervisorDecision={param($Context)$world.Calls.Add('Decision');Get-CcodSupervisorDecision -Context $Context}.GetNewClosure()
+
+    Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
+
+    Assert-CcodEqual 1 @($hostState.Special).Count 'one matching special process remains observed'
+    Assert-CcodEqual $true $hostState.Special[0].ProbeValid 'matching durable proof is visible to the decision engine'
+    Assert-CcodEqual 'AdoptSpecial' $hostState.LastDecision.Action 'verified special process is adopted without repair'
+    Assert-CcodEqual $null $hostState.LifecycleRequest 'verified special process creates no redundant lifecycle'
+    Assert-CcodEqual 0 $world.LifecycleWrites.Count 'verified special process writes no cancellation receipt precursor'
+}
+
 Invoke-CcodTest 'bounds stale-package special reconciliation to one live process identity without clearing state or keys' {
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
     $special=New-CcodSupervisorTestSnapshot -ProcessId 201 -CreationTimeUtc '2030-02-03T03:02:00.0000000Z'

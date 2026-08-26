@@ -10,15 +10,15 @@ No unreleased changes.
 
 ### English
 
-- Supplied an explicit schema-one empty status object when LifecycleWorker observes an ordinary Codex launch. PowerShell no longer rejects the mandatory `StatusEvidence` parameter before the verified ordinary-root probe can run.
-- Added production-adapter regression coverage that rejects a null observation status and verifies the exact `{schemaVersion, session}` empty-state contract.
+- Fixed LifecycleWorker request construction: ordinary observation now supplies an explicit schema-one empty status object, while `restartOrdinary` remains disabled for Close and enabled for Apply/Inspect repair actions.
 - Ordinary observation now uses the durable lifecycle creation time as its lower bound, so an automatically restored Codex root that appears just before the AppsFolder request remains eligible after the prior Close was proven.
+- A matching durable special-process proof is now projected into the Supervisor decision context, preventing the Guardian from repeatedly creating already-satisfied repair lifecycles and cancellation receipts while the remote bridge is healthy.
 
 ### 简体中文
 
-- LifecycleWorker 观察普通 Codex 启动时现在传入明确的 schema-one 空状态对象。PowerShell 不再在经验证的普通根进程探针运行前拒绝 mandatory `StatusEvidence` 参数。
-- 增加生产 adapter 回归覆盖，拒绝 null 观察状态，并验证精确的 `{schemaVersion, session}` 空状态契约。
+- 修复 LifecycleWorker 请求构造：普通根观察会传入必需的空状态对象；`restartOrdinary` 对 Close 保持禁用，对 Apply/Inspect 修复动作启用。
 - 普通根观察现在使用持久生命周期创建时间作为下限；此前 Close 已证明完成时，即使 Codex 自动恢复略早于 AppsFolder 请求，该普通根仍可被接受。
+- 与当前 special 进程精确匹配的持久证明现在会投影到 Supervisor 决策上下文，避免远程桥已健康时 Guardian 反复创建已满足的修复生命周期和取消回执。
 
 ## v2.5.15
 
