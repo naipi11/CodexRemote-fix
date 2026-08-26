@@ -15,6 +15,9 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License"></a>
 </p>
 
+> [!NOTE]
+> **Release status:** v2.5.17 is the latest published release, and its core remote-connection lifecycle is verified. Stable designation is pending fixes for a tray presentation-revision race that can reject menu actions and an activation-receipt parsing defect that can leave Setup waiting for up to five minutes after files are copied.
+
 CodexRemote-fix enables the UI that ships with Codex Desktop for Windows but is hidden by a runtime defect:
 
 **Settings → Connections → Control other devices**
@@ -58,9 +61,8 @@ The current portable bundle, checksum, release manifest, and payload manifest ar
 
 Before replacing a portable build, use its installed `Uninstall-CodexControlOtherDevices.ps1`; settings and the DPAPI\r\ndevice-key store stay in place.
 
-Verified on Windows 11 · Codex Desktop `26.818.2441.0` · Node.js `22.23.1`:
-the hidden controller tab, native tray menu, bilingual menu switching, and persistent
-supervisor are working.
+Verified on Windows 11 · Codex Desktop `26.820.7780.0` · Node.js `22.23.1`:
+the hidden controller tab, restart-and-repair recovery, and persistent remote connection are working.
 
 ## Everyday use
 
@@ -68,7 +70,7 @@ supervisor are working.
 - The desktop shortcut **CodexRemote-fix** is an optional way to start the tray supervisor if its icon is not visible. It does not start a repair or change a Codex session by itself.
 - When the connection status is **Connected**, open **Settings → Connections → Control other devices** to enroll or use it.
 - New Codex builds start with `--remote-debugging-port` but no `--inspect`; the supervisor recognizes that launch shape and performs the takeover automatically.
-- The tray menu supports Follow system, Chinese, and English; switching applies immediately without restarting anything.
+- The tray menu is intended to support Follow system, Chinese, English, Open logs, and About. In v2.5.17, a known presentation-revision race can silently reject these actions until the tray-action fix is released.
 - Updating this project or Codex does not require reinstalling the supervisor; the installer atomically switches versioned runtimes.
 - If an explicit repair is needed, use **Check and repair remote connection**. Codex may close and relaunch once, and existing device pairing and authorization are preserved. A completed recovery left behind by an interrupted upgrade is cleared safely on the next supervisor start.
 

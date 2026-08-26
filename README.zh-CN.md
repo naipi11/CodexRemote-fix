@@ -15,6 +15,9 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License"></a>
 </p>
 
+> [!NOTE]
+> **发布状态：** v2.5.17 是当前已发布的 Latest 版本，核心远程连接生命周期已经验证。正式标记为稳定版前仍需修复两个问题：托盘 presentation revision 竞态会拒绝菜单操作；activation receipt 解析缺陷会让文件复制完成后的安装向导继续等待最长约五分钟。
+
 CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、但因运行时缺陷被隐藏的：
 
 **设置 → 连接 → 控制其他设备（Control other devices）**
@@ -54,8 +57,8 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 替换便携版本前，请先运行已安装的 `Uninstall-CodexControlOtherDevices.ps1`；设置和 DPAPI 设备密钥会保留。
 
-已验证：Windows 11 · Codex Desktop `26.818.2441.0` · Node.js `22.23.1`；
-隐藏的控制器标签、原生托盘菜单、双语菜单切换和常驻守护程序均可用。
+已验证：Windows 11 · Codex Desktop `26.820.7780.0` · Node.js `22.23.1`；
+隐藏的控制器标签、重启并修复流程以及常驻远程连接均可用。
 
 ## 日常使用
 
@@ -63,7 +66,7 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 - 若未看到托盘图标，可双击桌面上的 **CodexRemote-fix** 启动托盘守护程序；它本身不会启动修复，也不会改变当前 Codex 会话。
 - 连接状态显示 **已连接** 时，当前会话已生效；打开 **设置 → 连接 → 控制其他设备** 即可注册或使用。
 - 新版 Codex 正常启动自带 `--remote-debugging-port`（没有 `--inspect`），守护程序已能识别这种启动方式并自动完成接管。
-- 托盘菜单支持跟随系统、中文、English，切换即时生效，无需重启。
+- 托盘菜单设计上支持跟随系统、中文、English、打开日志和关于；v2.5.17 存在已知的 presentation revision 竞态，在托盘动作修复版发布前，这些操作可能被静默拒绝。
 - 升级本项目或 Codex 后无需重装守护程序本体，安装器只会原子切换版本化运行时。
 - 如需显式修复，请从托盘菜单选择 **检查并修复远程连接**。Codex 可能会关闭并重新启动一次；已有设备配对和授权会被保留。若升级中断后遗留了已完成的恢复事务，守护程序会在下次启动时安全清理它。
 
