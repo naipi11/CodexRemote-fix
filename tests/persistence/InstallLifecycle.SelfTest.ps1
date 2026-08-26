@@ -824,7 +824,7 @@ $results += Invoke-CcodTest 'new-runtime readiness retries a temporary Ready eve
     $install = New-CcodLifecycleTempRoot
     $nodeRoot = New-CcodLifecycleTempRoot
     try {
-        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.18-ready-open-retry' | Out-Null
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.19-ready-open-retry' | Out-Null
         $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
         $installed = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
         $identity = New-CcodLifecycleIdentity
@@ -858,6 +858,24 @@ $results += Invoke-CcodTest 'new-runtime readiness retries a temporary Ready eve
     } finally {
         foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
     }
+}
+
+# Production mutation caught: comparing CIM's microsecond process timestamp to Get-Process's 100ns timestamp as exact text.
+$results += Invoke-CcodTest 'readiness identity accepts only the same CIM-truncated process creation instant' {
+    $module = Get-Module InstallLifecycle -ErrorAction Stop
+    $actual = [DateTime]::ParseExact('2030-02-03T03:04:05.1234569Z','o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind)
+    $exact = '2030-02-03T03:04:05.1234569Z'
+    $cimTruncated = '2030-02-03T03:04:05.1234560Z'
+    $differentMicrosecond = '2030-02-03T03:04:05.1234550Z'
+    $nextMicrosecond = [DateTime]::ParseExact('2030-02-03T03:04:05.1234570Z','o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind)
+    $futureTick = '2030-02-03T03:04:05.1234570Z'
+
+    Assert-CcodEqual $true (& $module {param($Expected,$Observed) Test-CcodLifecycleCimCreationTime -ExpectedUtc $Expected -ActualUtc $Observed} $exact $actual) 'exact creation time remains current'
+    Assert-CcodEqual $true (& $module {param($Expected,$Observed) Test-CcodLifecycleCimCreationTime -ExpectedUtc $Expected -ActualUtc $Observed} $cimTruncated $actual) 'CIM precision loss of at most nine 100ns ticks remains the same process'
+    Assert-CcodEqual $false (& $module {param($Expected,$Observed) Test-CcodLifecycleCimCreationTime -ExpectedUtc $Expected -ActualUtc $Observed} $cimTruncated $nextMicrosecond) 'ten 100ns ticks cross the microsecond identity boundary'
+    Assert-CcodEqual $false (& $module {param($Expected,$Observed) Test-CcodLifecycleCimCreationTime -ExpectedUtc $Expected -ActualUtc $Observed} $differentMicrosecond $actual) 'a different microsecond remains a different process identity'
+    Assert-CcodEqual $false (& $module {param($Expected,$Observed) Test-CcodLifecycleCimCreationTime -ExpectedUtc $Expected -ActualUtc $Observed} $futureTick $actual) 'a future expected timestamp is never normalized backward'
+    Assert-CcodEqual $false (& $module {param($Expected,$Observed) Test-CcodLifecycleCimCreationTime -ExpectedUtc $Expected -ActualUtc $Observed} 'not-a-time' $actual) 'malformed identity timestamps fail closed'
 }
 
 # Production mutation caught: accepting a wrong generation/path/SID/session/start time/parent/command or more than one matching Supervisor candidate.
@@ -2243,9 +2261,9 @@ $results += Invoke-CcodTest 'installer exposes CodexRemote-fix as the searchable
     Assert-CcodTrue ($buildScript -cmatch '\$bundle\.sha256\.txt') 'build script writes a hash beside the public portable ZIP filename'
 }
 
-$results += Invoke-CcodTest 'portable builder publishes the exact CodexRemote-fix 2.5.18 release artifact contract' {
+$results += Invoke-CcodTest 'portable builder publishes the exact CodexRemote-fix 2.5.19 release artifact contract' {
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
-    Assert-CcodEqual '2.5.18' ([string]$package.version) 'package version is exactly 2.5.18'
+    Assert-CcodEqual '2.5.19' ([string]$package.version) 'package version is exactly 2.5.19'
 
     $buildScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
     Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-windows-x64\.zip') 'portable build resolves the exact public ZIP filename'
@@ -2604,16 +2622,16 @@ $results += Invoke-CcodTest 'README and release workflow publish current portabl
     Assert-CcodTrue ($readmeChinese -cmatch '\A(?s:<div align="center">.*?<h1>CodexRemote-fix</h1>)') 'Chinese README uses the centered public product heading'
 
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start[^\r\n]*\r?\n(.*?)(?=^## )').Groups[1].Value
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.18-setup\.exe') 'English Quick Start names the setup installer'
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.18-windows-x64\.zip') 'English Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.19-setup\.exe') 'English Quick Start names the setup installer'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.19-windows-x64\.zip') 'English Quick Start names the exact portable artifact'
     Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix\.exe') 'English Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($quickStart -cmatch '\.sha256\.txt') 'English Quick Start names the checksum artifact'
 
     $quickStartChineseMatch = [regex]::Match($readmeChinese, '(?ms)^## [^\r\n]+\r?\n(?:\r?\n)?(?=1\.[^\r\n]*\[Releases\])(.*?)(?=^## |\z)')
     Assert-CcodTrue $quickStartChineseMatch.Success 'Chinese README exposes a Quick Start section'
     $quickStartChinese = $quickStartChineseMatch.Groups[1].Value
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.18-setup\.exe') 'Chinese Quick Start names the setup installer'
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.18-windows-x64\.zip') 'Chinese Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.19-setup\.exe') 'Chinese Quick Start names the setup installer'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.19-windows-x64\.zip') 'Chinese Quick Start names the exact portable artifact'
     Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix\.exe') 'Chinese Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($quickStartChinese -cmatch '\.sha256\.txt') 'Chinese Quick Start names the checksum artifact'
 

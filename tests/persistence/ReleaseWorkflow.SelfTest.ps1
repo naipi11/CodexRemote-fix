@@ -230,27 +230,26 @@ Invoke-CcodTest 'package scripts build provenance and workflows retain the relea
 }
 
 $iss = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw; Assert-CcodTrue ($iss -match 'PortableArtifactDirectory' -and $iss -match 'CodexRemote.Portable.exe' -and $iss -match 'portable-launcher-provenance.json') 'Inno installer packages the portable launcher into the verified bin set';
-Invoke-CcodTest '2.5.18 documentation matches the stable portable release, Defender gate, and protected uninstall contract' {
+Invoke-CcodTest '2.5.19 documentation matches the stable portable release, Defender gate, and protected uninstall contract' {
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
-    Assert-CcodEqual '2.5.18' ([string]$package.version) 'package metadata is the 2.5.18 release'
+    Assert-CcodEqual '2.5.19' ([string]$package.version) 'package metadata is the 2.5.19 release'
     $changelog = Get-Content -LiteralPath (Join-Path $repositoryRoot 'CHANGELOG.md') -Raw
-    $releaseSection = [regex]::Match($changelog, '(?ms)^## v2\.5\.18\s*\r?\n(?<body>.*?)(?=^## |\z)')
-    Assert-CcodTrue $releaseSection.Success 'v2.5.18 release section exists'
-    Assert-CcodTrue ($releaseSection.Groups['body'].Value.Contains('exact displayed and acknowledged presentation')) 'v2.5.18 changelog records the tray revision authorization fix'
-    Assert-CcodTrue ($releaseSection.Groups['body'].Value.Contains('owned, deadline-bounded installer process')) 'v2.5.18 changelog records the bounded activation-owner fix'
+    $releaseSection = [regex]::Match($changelog, '(?ms)^## v2\.5\.19\s*\r?\n(?<body>.*?)(?=^## |\z)')
+    Assert-CcodTrue $releaseSection.Success 'v2.5.19 release section exists'
+    Assert-CcodTrue ($releaseSection.Groups['body'].Value.Contains('same truncated microsecond')) 'v2.5.19 changelog records the CIM process-identity precision fix'
     $readme = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.md') -Raw
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start\s*\r?\n(?<body>.*?)(?=^## |\z)').Groups['body'].Value
-    Assert-CcodTrue ($readme.Contains('v2.5.18 is the current stable release')) 'English README marks v2.5.18 stable without a version-by-version What''s new block'
+    Assert-CcodTrue ($readme.Contains('v2.5.19 is the current stable release')) 'English README marks v2.5.19 stable without a version-by-version What''s new block'
     Assert-CcodTrue (-not $readme.Contains("## What's new")) 'English README keeps release details off the home page'
-    Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.18-setup.exe')) 'English Quick Start names the setup installer'
-    Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.18-windows-x64.zip')) 'English Quick Start names the portable ZIP'
+    Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.19-setup.exe')) 'English Quick Start names the setup installer'
+    Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.19-windows-x64.zip')) 'English Quick Start names the portable ZIP'
     Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix.exe')) 'English Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($quickStart.Contains('Microsoft Defender')) 'English Quick Start documents the local Defender gate'
     $readmeZh = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.zh-CN.md') -Raw -Encoding UTF8
-    Assert-CcodTrue ($readmeZh -match 'v2\.5\.18 \u662F\u5F53\u524D\u7A33\u5B9A\u7248') 'Chinese README marks v2.5.18 stable'
+    Assert-CcodTrue ($readmeZh -match 'v2\.5\.19 \u662F\u5F53\u524D\u7A33\u5B9A\u7248') 'Chinese README marks v2.5.19 stable'
     Assert-CcodTrue (-not $readmeZh.Contains("## What's new")) 'Chinese README keeps release details off the home page'
-    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.18-setup.exe')) 'Chinese Quick Start names the setup installer'
-    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.18-windows-x64.zip')) 'Chinese Quick Start names the portable ZIP'
+    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.19-setup.exe')) 'Chinese Quick Start names the setup installer'
+    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.19-windows-x64.zip')) 'Chinese Quick Start names the portable ZIP'
     Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix.exe')) 'Chinese Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($readmeZh.Contains('Microsoft Defender')) 'Chinese Quick Start documents the local Defender gate'
     $technical = Get-Content -LiteralPath (Join-Path $repositoryRoot 'docs\TECHNICAL.md') -Raw

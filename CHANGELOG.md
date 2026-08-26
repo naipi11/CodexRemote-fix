@@ -6,6 +6,16 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.19
+
+### English
+
+- Fixed installer readiness identity on Windows: CIM exposes process creation at microsecond precision while `Get-Process` retains 100-nanosecond ticks. The verifier now accepts only the same truncated microsecond (a 0–9 tick forward delta), so the exact new Supervisor can reach its authenticated TrayHost Ready signal without weakening PID-reuse protection.
+
+### 简体中文
+
+- 修复 Windows 安装就绪身份校验：CIM 只提供微秒精度的进程创建时间，而 `Get-Process` 保留 100 纳秒 tick。校验器现在只接受同一截断微秒（向前 0–9 tick），使精确的新 Supervisor 能等待到已认证的 TrayHost Ready 信号，同时不放宽 PID 复用防护。
+
 ## v2.5.18
 
 ### English

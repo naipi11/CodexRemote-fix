@@ -60,7 +60,7 @@ Invoke-CcodTest 'TrayHost reuses an identical presentation revision and records 
     $client|Add-Member -MemberType ScriptMethod -Name TryPublish -Value {param($Snapshot)$this.Published.Add($Snapshot);return $true}
     $client|Add-Member -MemberType ScriptMethod -Name TryDequeueEvent -Value {param([ref]$Event)if($this.Events.Count-eq0){return $false};$Event.Value=$this.Events.Dequeue();return $true}
     $context=[pscustomobject][ordered]@{
-        Client=$client;CommandQueue=[Collections.Generic.Queue[object]]::new();Catalog=$catalog;LanguageMode='en-US';SystemCultureName='en-US';RuntimeId='2.5.18-test'
+        Client=$client;CommandQueue=[Collections.Generic.Queue[object]]::new();Catalog=$catalog;LanguageMode='en-US';SystemCultureName='en-US';RuntimeId='2.5.19-test'
         CurrentRevision=[UInt64]1;LastAcknowledgedRevision=[UInt64]1;LastPublishedSnapshot=$null
         PublishedPresentations=[ordered]@{};AcknowledgedPresentations=[ordered]@{};Exited=$false;LastError=$null
     }

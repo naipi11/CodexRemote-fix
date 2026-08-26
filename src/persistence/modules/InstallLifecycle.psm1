@@ -1315,6 +1315,17 @@ function Start-CcodLifecycleTask {
     & $Adapters.StartSupervisorTask
 }
 
+function Test-CcodLifecycleCimCreationTime {
+    param([AllowNull()][string]$ExpectedUtc,[Parameter(Mandatory)][DateTime]$ActualUtc)
+    if ([string]::IsNullOrWhiteSpace($ExpectedUtc)) { return $false }
+    $expected = [DateTime]::MinValue
+    if (-not [DateTime]::TryParseExact($ExpectedUtc,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$expected) -or
+        $expected.Kind -ne [DateTimeKind]::Utc) { return $false }
+    $actualTicks = $ActualUtc.ToUniversalTime().Ticks
+    $expectedTicks = $expected.ToUniversalTime().Ticks
+    return $actualTicks -ge $expectedTicks -and ($actualTicks - $expectedTicks) -le 9
+}
+
 function Get-CcodLifecycleReadinessAdapters {
     param([hashtable]$Adapters)
     $defaults = @{
@@ -1333,7 +1344,7 @@ function Get-CcodLifecycleReadinessAdapters {
             try {
                 $process = Get-Process -Id $SupervisorIdentity.Pid -ErrorAction SilentlyContinue
                 if ($null -eq $process) { return $false }
-                return $process.StartTime.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture) -ceq $SupervisorIdentity.CreationTimeUtc
+                return Test-CcodLifecycleCimCreationTime -ExpectedUtc $SupervisorIdentity.CreationTimeUtc -ActualUtc $process.StartTime.ToUniversalTime()
             } catch { return $false }
             finally { if ($null -ne $process) { $process.Dispose() } }
         }
