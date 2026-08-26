@@ -60,12 +60,20 @@ function Test-CcodSupervisorStaticProbeResult {
         $signatureFields=@('invertedGate','deviceKeyModuleReference','macOnlyGuard','windowsControllerUi')
         if(-not (Test-CcodSupervisorExactProperties $Result $resultFields) -or
            ($Result.schemaVersion -isnot [int] -and $Result.schemaVersion -isnot [long]) -or $Result.schemaVersion -ne 1 -or
-           $Result.action -isnot [string] -or $Result.action -cne 'StaticProbe' -or $Result.ok -isnot [bool] -or -not $Result.ok -or $null -ne $Result.error -or
+           $Result.action -isnot [string] -or $Result.action -cne 'StaticProbe' -or $Result.ok -isnot [bool] -or
            $Result.requestId -isnot [string] -or $Result.requestId -cne $Request.requestId -or $Result.runtimeId -isnot [string] -or $Result.runtimeId -cne $Request.runtimeId -or
            -not (Test-CcodSupervisorExactProperties $Result.targetIdentity @('pid','creationTimeUtc')) -or
            ($Result.targetIdentity.pid -isnot [int] -and $Result.targetIdentity.pid -isnot [long]) -or $Result.targetIdentity.pid -ne $Request.targetIdentity.pid -or
-           $Result.targetIdentity.creationTimeUtc -isnot [string] -or $Result.targetIdentity.creationTimeUtc -cne $Request.targetIdentity.creationTimeUtc -or
-           -not (Test-CcodSupervisorExactProperties $Result.probe $probeFields)){return $false}
+           $Result.targetIdentity.creationTimeUtc -isnot [string] -or $Result.targetIdentity.creationTimeUtc -cne $Request.targetIdentity.creationTimeUtc){return $false}
+        if(-not$Result.ok){
+            $errorCodes=@('CCOD_STATIC_REQUEST_INVALID','CCOD_STATIC_PATH_INVALID','CCOD_STATIC_RUNTIME_UNAUTHORIZED','CCOD_STATIC_MODULE_LOAD_FAILED','CCOD_STATIC_STATE_INVALID','CCOD_STATIC_SUPERVISOR_CHANGED','CCOD_STATIC_TARGET_CHANGED','CCOD_STATIC_PACKAGE_CHANGED','CCOD_STATIC_PROBE_FAILED','CCOD_STATIC_PROBE_TIMEOUT','CCOD_STATIC_RESULT_INVALID')
+            $errorStages=@('InputValidation','RuntimeAuthorization','ModuleLoad','StateRead','SupervisorPreflight','TargetPreflight','StaticProbe','SupervisorPostflight','TargetPostflight','RuntimePostflight','ResultValidation')
+            return $null-eq$Result.probe -and (Test-CcodSupervisorExactProperties $Result.error @('code','stage','message')) -and
+                $Result.error.code-is[string] -and $errorCodes-ccontains$Result.error.code -and
+                $Result.error.stage-is[string] -and $errorStages-ccontains$Result.error.stage -and
+                $Result.error.message-is[string] -and $Result.error.message-ceq'The static probe worker failed safely.'
+        }
+        if($null-ne$Result.error -or -not(Test-CcodSupervisorExactProperties $Result.probe $probeFields)){return $false}
         $probe=$Result.probe
         if($probe.ready -isnot [bool] -or $probe.code -isnot [string] -or $probe.code -cne 'CHECKER_OK' -or
            $probe.staticClassification -isnot [string] -or @('CandidateCompatible','NativeModulePresent','UnknownOrIncompatible') -cnotcontains $probe.staticClassification -or
@@ -1002,21 +1010,34 @@ function Invoke-CcodSupervisorRendererHandoff {
     }catch{Write-CcodSupervisorRendererHandoffFailure $HostState $Adapters}
 }
 
+function Set-CcodSupervisorStaticProbeFramingFailure {
+    param($HostState,[AllowNull()][string]$AttemptKey)
+    $HostState.Classification=$null
+    if($null-ne$AttemptKey){$HostState.AttemptKeys[$AttemptKey]=$true}
+    $HostState.SessionState='Error';$HostState.BlockAutomaticActions=$true;$HostState.Reason='WorkerFramingFailed'
+}
+
 function Invoke-CcodSupervisorPollSlot {
     param($HostState,[hashtable]$Adapters)
     $slot=$HostState.WorkerSlot
     $staleRepairKey=$null
+    $staticAttemptKey=$null
     if($slot.Kind -ceq 'Controller' -and $slot.Action -ceq 'RepairStale' -and $null -ne $slot.Request.source){
         $staleRepairKey=('{0}|{1}' -f $slot.Request.source.Pid,$slot.Request.source.CreationTimeUtc)
     }
+    if($slot.Kind-ceq'StaticProbe'-and$null-ne$slot.Request.targetIdentity){$staticAttemptKey=('{0}|{1}'-f$slot.Request.targetIdentity.pid,$slot.Request.targetIdentity.creationTimeUtc)}
     $poll=Invoke-CcodSupervisorAdapter $Adapters.PollWorker @($slot) 1
     $fields=@('Completed','ExitCode','StdoutText','StdoutByteCount','StdoutOverflow','StderrByteCount','StderrOverflow')
     if(-not (Test-CcodSupervisorExactProperties $poll $fields) -or $poll.Completed -isnot [bool] -or $poll.StdoutText -isnot [string] -or
        $poll.StdoutByteCount -isnot [int] -or $poll.StdoutByteCount -lt 0 -or $poll.StdoutOverflow -isnot [bool] -or
-       $poll.StderrByteCount -isnot [int] -or $poll.StderrByteCount -lt 0 -or $poll.StderrOverflow -isnot [bool]){Clear-CcodSupervisorWorkerSlot $HostState $Adapters;return}
+       $poll.StderrByteCount -isnot [int] -or $poll.StderrByteCount -lt 0 -or $poll.StderrOverflow -isnot [bool]){
+        if($slot.Kind-ceq'StaticProbe'){Set-CcodSupervisorStaticProbeFramingFailure $HostState $staticAttemptKey}
+        Clear-CcodSupervisorWorkerSlot $HostState $Adapters;return
+    }
     if(-not $poll.Completed){return}
     try{
         if($poll.ExitCode -isnot [int] -or $poll.StdoutByteCount -gt 1048576 -or $poll.StderrByteCount -gt 65536 -or $poll.StdoutOverflow -or $poll.StderrOverflow){throw 'worker framing failed'}
+        if($slot.Kind-ceq'StaticProbe'-and[string]::IsNullOrEmpty($poll.StdoutText)){throw 'static probe result is missing'}
         if(-not [string]::IsNullOrEmpty($poll.StdoutText)){
             $result=Invoke-CcodSupervisorNullableAdapter $Adapters.ReadWorkerResult @($slot.ResultPath)
             if($null -eq $result){throw 'worker result is missing'}
@@ -1043,8 +1064,8 @@ function Invoke-CcodSupervisorPollSlot {
                 }
                 Invoke-CcodSupervisorRendererHandoff $HostState $slot $result $Adapters
             }elseif($slot.Kind -ceq 'StaticProbe'){
-                if($result.ok -and $null -ne $result.probe){
-                    if(-not (Test-CcodSupervisorStaticProbeResult $result $slot.Request)){$HostState.Classification='UnknownOrIncompatible';throw 'static probe framing failed'}
+                if(-not (Test-CcodSupervisorStaticProbeResult $result $slot.Request) -or ($result.ok-and$poll.ExitCode-ne0) -or (-not$result.ok-and$poll.ExitCode-ne1)){$HostState.Classification=$null;throw 'static probe framing failed'}
+                if($result.ok){
                     $HostState.PackageFullName=[string]$result.probe.packageFullName
                     $HostState.AppAsarSha256=[string]$result.probe.appAsarSha256
                     $HostState.Classification=[string]$result.probe.staticClassification
@@ -1052,16 +1073,19 @@ function Invoke-CcodSupervisorPollSlot {
                         $attemptKey=('{0}|{1}' -f $slot.Request.targetIdentity.pid,$slot.Request.targetIdentity.creationTimeUtc)
                         $HostState.StaticCache[$attemptKey]=$result
                     }
-                }elseif($result.ok){
-                    $HostState.Classification='UnknownOrIncompatible'
-                    throw 'static probe framing failed'
                 }else{
-                    $HostState.Classification='UnknownOrIncompatible'
+                    $retryable=@('CCOD_STATIC_TARGET_CHANGED','CCOD_STATIC_PACKAGE_CHANGED','CCOD_STATIC_PROBE_FAILED','CCOD_STATIC_PROBE_TIMEOUT')
+                    $HostState.Classification=$null
+                    if($retryable-cnotcontains$result.error.code){
+                        if($null-ne$staticAttemptKey){$HostState.AttemptKeys[$staticAttemptKey]=$true}
+                        $HostState.SessionState='Error';$HostState.BlockAutomaticActions=$true;$HostState.Reason='StaticProbeFailed'
+                    }
                 }
             }
         }
     }catch{
-        $HostState.SessionState='Error';$HostState.BlockAutomaticActions=$true;$HostState.Reason='WorkerFramingFailed'
+        if($slot.Kind-ceq'StaticProbe'){Set-CcodSupervisorStaticProbeFramingFailure $HostState $staticAttemptKey}
+        else{$HostState.SessionState='Error';$HostState.BlockAutomaticActions=$true;$HostState.Reason='WorkerFramingFailed'}
         if($null -ne $staleRepairKey){$HostState.FailedStaleRepairKey=$staleRepairKey}
     }
     finally{Clear-CcodSupervisorWorkerSlot $HostState $Adapters}
@@ -1205,7 +1229,9 @@ function Invoke-CcodSupervisorCommand {
     if(-not(Test-CcodSupervisorTrayAction $Command)){Throw-CcodSupervisorCommandError 'CCOD_SUPERVISOR_COMMAND_INVALID' 'Tray action is invalid' $Command}
     $displayedPresentation=Get-CcodSupervisorAcknowledgedTrayPresentation $HostState.Tray ([UInt64]$Command.Revision)
     if($null-eq$displayedPresentation){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_TRAY_ACTION_STALE' $null}
-    if(-not(Test-CcodSupervisorTrayPresentationAllowsAction $displayedPresentation $Command.Command)-or-not(Test-CcodSupervisorTrayPresentationAllowsAction $HostState.LastAcknowledgedPresentation $Command.Command)){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_TRAY_ACTION_UNAVAILABLE' $null}
+    $currentPresentation=$HostState.LastAcknowledgedPresentation
+    if($null-eq$currentPresentation-and[UInt64]$Command.Revision-eq[UInt64]1){$currentPresentation=$displayedPresentation}
+    if(-not(Test-CcodSupervisorTrayPresentationAllowsAction $displayedPresentation $Command.Command)-or-not(Test-CcodSupervisorTrayPresentationAllowsAction $currentPresentation $Command.Command)){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_TRAY_ACTION_UNAVAILABLE' $null}
     if($HostState.TrayActionIds.Contains($Command.ActionId.ToString('D'))){Throw-CcodSupervisorCommandError 'CCOD_SUPERVISOR_COMMAND_INVALID' 'Tray action was already handled' $Command}
     $actionEntry=[pscustomobject][ordered]@{Action=$Command;TransactionId=$null;TerminalSent=$false}
     $HostState.TrayActionIds[$Command.ActionId.ToString('D')]=$actionEntry

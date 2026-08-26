@@ -659,6 +659,26 @@ Invoke-CcodTest 'Exit is rejected unless the acknowledged presentation enabled i
     Assert-CcodEqual 0 @($world.Calls|Where-Object { $_ -like 'New:Lifecycle:SafeExit' }).Count 'disabled presentation creates no SafeExit request'
 }
 
+Invoke-CcodTest 'initial acknowledged presentation authorizes About before the first current projection' {
+    # Production mutation caught: requiring LastAcknowledgedPresentation even though the native rev1 handshake is already authoritative.
+    $fixture=New-CcodTickFixture;$hostState=$fixture.Host;$world=$fixture.Fake.World
+    $hostState.LastAcknowledgedPresentation=$null
+    $action=[pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command='ShowAbout';Revision=[UInt64]1}
+    $result=Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action
+    Assert-CcodEqual 'Completed' $result.Status 'manifest-verified About remains available from the acknowledged initial menu'
+    Assert-CcodEqual 1 @($world.Calls|Where-Object{$_-ceq'Verify:About'}).Count 'initial About reaches manifest verification instead of current-capability rejection'
+}
+
+Invoke-CcodTest 'initial acknowledged presentation authorizes language before the first current projection' {
+    # Production mutation caught: rejecting initial language solely because the first reconciliation tick has not projected again.
+    $fixture=New-CcodTickFixture;$hostState=$fixture.Host;$world=$fixture.Fake.World
+    $hostState.LastAcknowledgedPresentation=$null
+    $action=[pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command='SetLanguageEnglish';Revision=[UInt64]1}
+    $result=Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action
+    Assert-CcodEqual 'Completed' $result.Status 'language remains available from the acknowledged initial menu'
+    Assert-CcodEqual 1 @($world.SetUiLanguageModes|Where-Object{$_-ceq'en-US'}).Count 'initial language reaches preference persistence instead of current-capability rejection'
+}
+
 Invoke-CcodTest 'adds the exact localization adapters and host fields at the frozen boundaries' {
     $names=Get-CcodSupervisorAdapterNames
     $first=[Array]::IndexOf($names,'ReadUiPreference')
@@ -1559,6 +1579,118 @@ Invoke-CcodTest 'worker request ids are canonical D-format GUIDs for probe frami
     Assert-CcodTrue ($slot.RequestPath.EndsWith("static-probe-$($slot.RequestId).request.json")) 'request path matches StaticProbeWorker framing'
 }
 
+Invoke-CcodTest 'transient static target failure remains retryable for a new ordinary root' {
+    # Production mutation caught: poisoning the Supervisor lifetime as UnknownOrIncompatible after one startup PID race.
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $first=New-CcodSupervisorTestSnapshot -ProcessId 71 -CreationTimeUtc '2030-02-03T03:01:00.0000000Z'
+    $slot=Start-CcodSupervisorWorkerSlot $hostState $fixture.Fake.Adapters 'StaticProbe' 'StaticProbe' $first
+    $world.WorkerResult=[pscustomobject][ordered]@{
+        schemaVersion=1;action='StaticProbe';ok=$false;requestId=$slot.Request.requestId;runtimeId=$slot.Request.runtimeId
+        targetIdentity=[pscustomobject][ordered]@{pid=$slot.Request.targetIdentity.pid;creationTimeUtc=$slot.Request.targetIdentity.creationTimeUtc}
+        probe=$null;error=[pscustomobject][ordered]@{code='CCOD_STATIC_TARGET_CHANGED';stage='TargetPostflight';message='The static probe worker failed safely.'}
+    }
+    $stdout=$world.WorkerResult|ConvertTo-Json -Depth 20 -Compress
+    $world.Poll=[pscustomobject][ordered]@{Completed=$true;ExitCode=[int]1;StdoutText=$stdout;StdoutByteCount=[int]$stdout.Length;StdoutOverflow=$false;StderrByteCount=[int]0;StderrOverflow=$false}
+    Invoke-CcodSupervisorPollSlot $hostState $fixture.Fake.Adapters
+    Assert-CcodEqual $null $hostState.Classification 'a correlated transient probe failure does not become a permanent compatibility verdict'
+
+    $second=New-CcodSupervisorTestSnapshot -ProcessId 72 -CreationTimeUtc '2030-02-03T03:02:00.0000000Z'
+    $world.ProcessIds=@([int]$second.Pid);$world.Snapshots[[int]$second.Pid]=$second
+    $hostState.ForceReconcile=$true;$hostState.ObservationDirty=$true
+    $fixture.Fake.Adapters.ReadState={param($StateRoot,$SuppressionKey)$hostState.State}.GetNewClosure()
+    $fixture.Fake.Adapters.GetSupervisorDecision={param($Context)$world.Calls.Add('Decision');Get-CcodSupervisorDecision -Context $Context}.GetNewClosure()
+    Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
+    Assert-CcodTrue ($null-ne$hostState.WorkerSlot -and $hostState.WorkerSlot.Kind-ceq'StaticProbe') 'a new stable ordinary root is probed again'
+    Assert-CcodEqual 72 $hostState.WorkerSlot.Request.targetIdentity.pid 'retry is bound to the replacement ordinary root'
+}
+
+Invoke-CcodTest 'valid nonretryable static failure is bound to one ordinary root without breaking the next tick' {
+    # Production mutation caught: setting global UnknownOrIncompatible without the package tuple required by the decision context.
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $target=New-CcodSupervisorTestSnapshot -ProcessId 73 -CreationTimeUtc '2030-02-03T03:03:00.0000000Z'
+    $slot=Start-CcodSupervisorWorkerSlot $hostState $fixture.Fake.Adapters 'StaticProbe' 'StaticProbe' $target
+    $world.WorkerResult=[pscustomobject][ordered]@{
+        schemaVersion=1;action='StaticProbe';ok=$false;requestId=$slot.Request.requestId;runtimeId=$slot.Request.runtimeId
+        targetIdentity=[pscustomobject][ordered]@{pid=$slot.Request.targetIdentity.pid;creationTimeUtc=$slot.Request.targetIdentity.creationTimeUtc}
+        probe=$null;error=[pscustomobject][ordered]@{code='CCOD_STATIC_RUNTIME_UNAUTHORIZED';stage='RuntimePostflight';message='The static probe worker failed safely.'}
+    }
+    $stdout=$world.WorkerResult|ConvertTo-Json -Depth 20 -Compress
+    $world.Poll=[pscustomobject][ordered]@{Completed=$true;ExitCode=[int]1;StdoutText=$stdout;StdoutByteCount=[int]$stdout.Length;StdoutOverflow=$false;StderrByteCount=[int]0;StderrOverflow=$false}
+    Invoke-CcodSupervisorPollSlot $hostState $fixture.Fake.Adapters
+    $attemptKey='73|2030-02-03T03:03:00.0000000Z'
+    Assert-CcodEqual $null $hostState.Classification 'failure without a trusted package tuple cannot set a global compatibility verdict'
+    Assert-CcodTrue $hostState.AttemptKeys.Contains($attemptKey) 'nonretryable failure is bound to the exact ordinary identity'
+    Assert-CcodEqual 'StaticProbeFailed' $hostState.Reason 'nonretryable failure exposes one fixed reason'
+    Assert-CcodEqual $true $hostState.BlockAutomaticActions 'nonretryable failure blocks automatic mutation for that root'
+
+    $world.ProcessIds=@([int]$target.Pid);$world.Snapshots[[int]$target.Pid]=$target
+    $hostState.ForceReconcile=$true;$hostState.ObservationDirty=$true
+    $fixture.Fake.Adapters.ReadState={param($StateRoot,$SuppressionKey)$hostState.State}.GetNewClosure()
+    $fixture.Fake.Adapters.GetSupervisorDecision={param($Context)$world.Calls.Add('Decision');Get-CcodSupervisorDecision -Context $Context}.GetNewClosure()
+    Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
+    Assert-CcodEqual 'KeepOrdinary' $hostState.LastDecision.Action 'same failed ordinary root remains fail-closed without terminating Supervisor'
+    Assert-CcodEqual 'AlreadyAttempted' $hostState.LastDecision.Reason 'same failed ordinary root is not probed in an unbounded loop'
+    Assert-CcodEqual $null $hostState.WorkerSlot 'same failed ordinary root starts no second worker'
+}
+
+Invoke-CcodTest 'malformed static failure frames remain fail-closed' {
+    $cases=@(
+        [pscustomobject]@{Name='wrong request';ExitCode=1;Mutate={param($Result)$Result.requestId=[guid]::NewGuid().ToString('D')}},
+        [pscustomobject]@{Name='invalid stage';ExitCode=1;Mutate={param($Result)$Result.error.stage='PostProbe'}},
+        [pscustomobject]@{Name='unbounded message';ExitCode=1;Mutate={param($Result)$Result.error.message='private target path'}},
+        [pscustomobject]@{Name='contradictory exit';ExitCode=0;Mutate={param($Result)}}
+    )
+    foreach($case in $cases){
+        $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+        $target=New-CcodSupervisorTestSnapshot
+        $slot=Start-CcodSupervisorWorkerSlot $hostState $fixture.Fake.Adapters 'StaticProbe' 'StaticProbe' $target
+        $result=[pscustomobject][ordered]@{
+            schemaVersion=1;action='StaticProbe';ok=$false;requestId=$slot.Request.requestId;runtimeId=$slot.Request.runtimeId
+            targetIdentity=[pscustomobject][ordered]@{pid=$slot.Request.targetIdentity.pid;creationTimeUtc=$slot.Request.targetIdentity.creationTimeUtc}
+            probe=$null;error=[pscustomobject][ordered]@{code='CCOD_STATIC_TARGET_CHANGED';stage='TargetPostflight';message='The static probe worker failed safely.'}
+        }
+        & $case.Mutate $result
+        $world.WorkerResult=$result;$stdout=$result|ConvertTo-Json -Depth 20 -Compress
+        $world.Poll=[pscustomobject][ordered]@{Completed=$true;ExitCode=[int]$case.ExitCode;StdoutText=$stdout;StdoutByteCount=[int]$stdout.Length;StdoutOverflow=$false;StderrByteCount=[int]0;StderrOverflow=$false}
+        Invoke-CcodSupervisorPollSlot $hostState $fixture.Fake.Adapters
+        Assert-CcodEqual $null $hostState.Classification "$($case.Name) cannot create a package verdict without trusted evidence"
+        Assert-CcodTrue $hostState.AttemptKeys.Contains('71|2030-02-03T03:01:00.0000000Z') "$($case.Name) is bound to the exact failed ordinary root"
+        Assert-CcodEqual 'WorkerFramingFailed' $hostState.Reason "$($case.Name) is reduced to the fixed framing failure"
+        Assert-CcodEqual $true $hostState.BlockAutomaticActions "$($case.Name) blocks automatic mutation"
+    }
+}
+
+Invoke-CcodTest 'invalid or empty completed static poll remains fail-closed for the same root' {
+    $cases=@(
+        [pscustomobject]@{Name='invalid poll';Poll=[pscustomobject][ordered]@{Completed=$true;StdoutText='';StdoutByteCount=[int]0;StdoutOverflow=$false;StderrByteCount=[int]0;StderrOverflow=$false}},
+        [pscustomobject]@{Name='empty completed poll';Poll=[pscustomobject][ordered]@{Completed=$true;ExitCode=[int]1;StdoutText='';StdoutByteCount=[int]0;StdoutOverflow=$false;StderrByteCount=[int]0;StderrOverflow=$false}}
+    )
+    $processId=73
+    foreach($case in $cases){
+        $processId++
+        $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+        $created=('2030-02-03T03:{0}:00.0000000Z'-f($processId-70).ToString('00'))
+        $target=New-CcodSupervisorTestSnapshot -ProcessId $processId -CreationTimeUtc $created
+        Start-CcodSupervisorWorkerSlot $hostState $fixture.Fake.Adapters 'StaticProbe' 'StaticProbe' $target|Out-Null
+        $world.Poll=$case.Poll
+        Invoke-CcodSupervisorPollSlot $hostState $fixture.Fake.Adapters
+        $attemptKey=('{0}|{1}'-f$processId,$created)
+        Assert-CcodEqual $null $hostState.Classification "$($case.Name) creates no untrusted package verdict"
+        Assert-CcodTrue $hostState.AttemptKeys.Contains($attemptKey) "$($case.Name) is bound to the exact failed ordinary root"
+        Assert-CcodEqual 'WorkerFramingFailed' $hostState.Reason "$($case.Name) has one fixed failure reason"
+        Assert-CcodEqual $true $hostState.BlockAutomaticActions "$($case.Name) blocks automatic mutation"
+        Assert-CcodEqual $null $hostState.WorkerSlot "$($case.Name) clears the completed worker slot"
+
+        $world.ProcessIds=@([int]$target.Pid);$world.Snapshots[[int]$target.Pid]=$target
+        $hostState.ForceReconcile=$true;$hostState.ObservationDirty=$true
+        $fixture.Fake.Adapters.ReadState={param($StateRoot,$SuppressionKey)$hostState.State}.GetNewClosure()
+        $fixture.Fake.Adapters.GetSupervisorDecision={param($Context)$world.Calls.Add('Decision');Get-CcodSupervisorDecision -Context $Context}.GetNewClosure()
+        Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
+        Assert-CcodEqual 'KeepOrdinary' $hostState.LastDecision.Action "$($case.Name) keeps the same root fail-closed"
+        Assert-CcodEqual 'AlreadyAttempted' $hostState.LastDecision.Reason "$($case.Name) starts no unbounded retry loop"
+    }
+}
+
 Invoke-CcodTest 'fails closed when a static worker fabricates a ready candidate without sentinel proof' {
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
     $target=New-CcodSupervisorTestSnapshot
@@ -1575,7 +1707,8 @@ Invoke-CcodTest 'fails closed when a static worker fabricates a ready candidate 
     $stdout=$world.WorkerResult|ConvertTo-Json -Depth 20 -Compress
     $world.Poll=[pscustomobject][ordered]@{Completed=$true;ExitCode=[int]0;StdoutText=$stdout;StdoutByteCount=[int]$stdout.Length;StdoutOverflow=$false;StderrByteCount=[int]0;StderrOverflow=$false}
     Invoke-CcodSupervisorPollSlot $hostState $fixture.Fake.Adapters
-    Assert-CcodEqual 'UnknownOrIncompatible' $hostState.Classification 'incomplete public proof cannot update the candidate classification'
+    Assert-CcodEqual $null $hostState.Classification 'incomplete public proof cannot update the candidate classification'
+    Assert-CcodTrue $hostState.AttemptKeys.Contains('71|2030-02-03T03:01:00.0000000Z') 'malformed success is bound to the exact failed ordinary root'
     Assert-CcodEqual 'WorkerFramingFailed' $hostState.Reason 'malformed public proof is recorded as a framing failure'
     Assert-CcodEqual $true $hostState.BlockAutomaticActions 'malformed public proof blocks automatic actions'
 }

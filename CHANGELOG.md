@@ -6,6 +6,20 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.20
+
+### English
+
+- TrayHost's native message loop now preserves the target HWND when redispatching posted work, so presentation updates reach the owner window and exact revision acknowledgements complete; About and language actions no longer time out.
+- The acknowledged initial revision now serves as the current capability baseline until the first Supervisor projection, preventing startup or recovery windows from rejecting enabled About and language commands.
+- Guardian now treats correlated transient static probe failures as retryable instead of permanently classifying the entire Supervisor lifetime as incompatible, so a stable replacement Codex root is inspected and taken over after logon races.
+
+### 简体中文
+
+- TrayHost 原生消息循环在重新分发 posted work 时会保留目标 HWND，使 presentation 更新真正到达 owner window 并完成精确 revision acknowledgement；“关于”和语言操作不再超时。
+- 在 Supervisor 首次 projection 前，已确认的初始 revision 会作为当前能力基线，避免启动或恢复窗口错误拒绝菜单中已启用的“关于”和语言命令。
+- Guardian 会把相关联的瞬态 StaticProbe 失败保留为可重试状态，不再把整个 Supervisor 生命周期永久判为不兼容；登录启动竞态结束并出现稳定的新 Codex 根后，会重新检查并接管。
+
 ## v2.5.19
 
 ### English

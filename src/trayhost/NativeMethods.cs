@@ -208,12 +208,12 @@ internal sealed class Win32TrayPlatform : INativeTrayPlatform
     {
         MSG message;
         int result = GetMessageW(out message, IntPtr.Zero, 0U, 0U);
-        value = new Message(message.Message, message.WParam, message.LParam);
+        value = new Message(message.HWnd, message.Message, message.WParam, message.LParam);
         return result;
     }
     internal static void TranslateAndDispatch(Message message)
     {
-        MSG native = new MSG { Message = message.MessageId, WParam = message.WParam, LParam = message.LParam };
+        MSG native = new MSG { HWnd = message.Window, Message = message.MessageId, WParam = message.WParam, LParam = message.LParam };
         TranslateMessage(ref native); DispatchMessageW(ref native);
     }
     internal static void PostQuit(int exitCode) { PostQuitMessage(exitCode); }
@@ -221,8 +221,8 @@ internal sealed class Win32TrayPlatform : INativeTrayPlatform
 
     internal struct Message
     {
-        internal uint MessageId; internal IntPtr WParam; internal IntPtr LParam;
-        internal Message(uint messageId, IntPtr wParam, IntPtr lParam) { MessageId = messageId; WParam = wParam; LParam = lParam; }
+        internal IntPtr Window; internal uint MessageId; internal IntPtr WParam; internal IntPtr LParam;
+        internal Message(IntPtr window, uint messageId, IntPtr wParam, IntPtr lParam) { Window = window; MessageId = messageId; WParam = wParam; LParam = lParam; }
     }
 
     [StructLayout(LayoutKind.Sequential)] private struct POINT { internal int X; internal int Y; }
