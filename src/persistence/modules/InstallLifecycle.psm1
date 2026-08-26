@@ -94,7 +94,7 @@ function Write-CcodActivationReceiptFile {
     [void](Assert-CcodActivationReceipt $Receipt)
     $stateRoot = Join-Path $InstallRoot 'state'
     [IO.Directory]::CreateDirectory($stateRoot) | Out-Null
-    Write-CcodAtomicJson -Path (Join-Path $stateRoot 'post-install-activation.json') -Value $Receipt
+    Write-CcodAtomicJson -Path (Join-Path $stateRoot 'post-install-activation.json') -Value $Receipt -Compress
 }
 
 function Write-CcodInstallActivationPhase {
@@ -1436,7 +1436,10 @@ function Wait-CcodLifecycleNewRuntimeReady {
                 if (-not (& $adapter.IsSupervisorIdentityCurrent $candidate.Identity)) { return New-CcodLifecycleNotReadyProof }
                 $readyToken = [string]$candidate.Token
                 try { $readyEvent = & $adapter.OpenReadyEvent $Identity.UserSid $Identity.SessionId $readyToken }
-                catch { return New-CcodLifecycleNotReadyProof }
+                catch {
+                    & $adapter.Sleep 20
+                    continue
+                }
                 while ([long](& $adapter.GetElapsedMilliseconds $clock) -lt $TimeoutMilliseconds) {
                     if (-not (& $adapter.IsSupervisorIdentityCurrent $candidate.Identity)) { return New-CcodLifecycleNotReadyProof }
                     $remaining = $TimeoutMilliseconds - [long](& $adapter.GetElapsedMilliseconds $clock)

@@ -57,9 +57,9 @@ internal static class TrayHostNativeSelfTest
     private static PresentationSnapshot SnapshotV2(ulong revision)
     {
         string[] strings = new string[] {
-            "CodexRemote-fix 2.5.17", "Connection: Connected", "Protection: Running", "Check and repair remote connection",
+            "CodexRemote-fix 2.5.18", "Connection: Connected", "Protection: Running", "Check and repair remote connection",
             "Language / 语言", "Follow system (English)", "中文", "English", "Open logs", "About", "Exit",
-            "About", "CodexRemote-fix | Version 2.5.17", "Exit CodexRemote-fix?", "Remote control will stop.", "Action failed"
+            "About", "CodexRemote-fix | Version 2.5.18", "Exit CodexRemote-fix?", "Remote control will stop.", "Action failed"
         };
         return new PresentationSnapshot(revision, TrayColor.Green, ConnectionState.Connected, ProtectionState.Running, LanguageMode.English,
             PresentationFlags.LanguageEnabled | PresentationFlags.OpenLogsEnabled | PresentationFlags.AboutEnabled | PresentationFlags.ExitEnabled, strings);
@@ -114,6 +114,38 @@ internal static class TrayHostNativeSelfTest
         window.Dispose();
     }
 
+    private static void TestStalePresentationIsNotReportedAsDisplayed()
+    {
+        FakeTrayPlatform platform = new FakeTrayPlatform(); TrayWindow window = NewWindow(platform);
+        AssertTrue(window.Apply(Snapshot(2)), "newer presentation is displayed");
+        AssertTrue(!window.Apply(Snapshot(1)), "older presentation is rejected instead of being reported as displayed");
+        AssertTrue(window.CurrentRevision == 2UL, "stale presentation cannot roll back the displayed revision");
+        window.Dispose();
+    }
+
+    private static void TestMenuRevisionGateHoldsNewPresentationUntilTheDisplayedActionIsSelected()
+    {
+        FakeTrayPlatform platform = new FakeTrayPlatform();
+        HostTransport transport = new HostTransport();
+        TrayWindow window = new TrayWindow(platform, transport.SetMenuOpen);
+        window.Create(Snapshot(1));
+        ulong selectedRevision = 0UL;
+        window.CommandSelected += delegate(TrayCommand command, ulong revision) { selectedRevision = revision; };
+        platform.DuringTrack = delegate
+        {
+            AssertTrue(window.MenuOpen, "native menu reports open before nested message work can apply a presentation");
+            AssertTrue(transport.TryAcceptPresentation(Snapshot(2)), "new presentation reaches the real host transport while the menu is open");
+            PresentationSnapshot early;
+            AssertTrue(!transport.TryTakePresentation(out early), "menu gate prevents acknowledging a presentation that is not displayed yet");
+        };
+        platform.TrackResult = (uint)TrayCommand.OpenLogs;
+        window.HandleContextMenu(new TrayPoint(0, 0));
+        AssertTrue(selectedRevision == 1UL, "selected action is bound to the revision actually displayed by the native menu");
+        PresentationSnapshot afterClose;
+        AssertTrue(transport.TryTakePresentation(out afterClose) && afterClose.Revision == 2UL, "new presentation becomes eligible only after the displayed menu closes");
+        window.Dispose(); transport.Dispose();
+    }
+
     private static void TestSelectedCommandAndTaskbarRestore()
     {
         FakeTrayPlatform platform = new FakeTrayPlatform();
@@ -147,7 +179,7 @@ internal static class TrayHostNativeSelfTest
         FakeTrayPlatform platform = new FakeTrayPlatform();
         TrayWindow window = new TrayWindow(platform); window.Create(SnapshotV2(1));
         platform.TrackResult = 0; window.HandleContextMenu(new TrayPoint(0, 0));
-        AssertEqual("CodexRemote-fix 2.5.17|Connection: Connected|Protection: Running|Check and repair remote connection|Language / 语言|Open logs|About|Exit", String.Join("|", platform.AppendedText.ToArray()), "menu contains only the approved information architecture");
+        AssertEqual("CodexRemote-fix 2.5.18|Connection: Connected|Protection: Running|Check and repair remote connection|Language / 语言|Open logs|About|Exit", String.Join("|", platform.AppendedText.ToArray()), "menu contains only the approved information architecture");
         AssertTrue(!platform.AppendedText.Contains("Allow compatible update trials"), "candidate toggle is removed");
         AssertTrue(!platform.Commands.Contains(1009U), "tray uninstall command is removed");
         TrayCommand selected = TrayCommand.None; window.CommandSelected += delegate(TrayCommand command, ulong revision) { selected = command; };
@@ -163,7 +195,16 @@ internal static class TrayHostNativeSelfTest
         FakeTrayPlatform platform = new FakeTrayPlatform(); TrayWindow window = new TrayWindow(platform); window.Create(SnapshotV2(1));
         window.ShowAbout();
         AssertTrue(platform.MessageBoxes.Count == 1, "verified About shows exactly one native message box");
-        AssertEqual("About|CodexRemote-fix | Version 2.5.17", platform.MessageBoxes[0], "verified About displays the version from the acknowledged snapshot");
+        AssertEqual("About|CodexRemote-fix | Version 2.5.18", platform.MessageBoxes[0], "verified About displays the version from the acknowledged snapshot");
+        window.Dispose();
+    }
+
+    private static void TestActionFailureUsesTheAcknowledgedSnapshotStrings()
+    {
+        FakeTrayPlatform platform = new FakeTrayPlatform(); TrayWindow window = new TrayWindow(platform); window.Create(SnapshotV2(1));
+        window.ShowActionFailed();
+        AssertTrue(platform.MessageBoxes.Count == 1, "a failed correlated action shows exactly one native message box");
+        AssertEqual("CodexRemote-fix 2.5.18|Action failed", platform.MessageBoxes[0], "action failure uses the localized strings from the acknowledged snapshot");
         window.Dispose();
     }
 
@@ -218,14 +259,17 @@ internal static class TrayHostNativeSelfTest
             TestForegroundFailureFallsBackToNativeMenu();
             TestOwnerShowFailureNeverTracks();
             TestReentryAndPendingSnapshot();
+            TestStalePresentationIsNotReportedAsDisplayed();
+            TestMenuRevisionGateHoldsNewPresentationUntilTheDisplayedActionIsSelected();
             TestSelectedCommandAndTaskbarRestore();
             TestAboutCommandDefersProofToSupervisor();
             TestVerifiedAboutUsesTheAcknowledgedSnapshotVersion();
+            TestActionFailureUsesTheAcknowledgedSnapshotStrings();
             TestSimplifiedMenuAndExitConfirmation();
             TestNoHimcFailureIsSafe();
             TestShellRightClickNotificationMapping();
             TestRealNativePInvokeSurface();
-            Console.WriteLine("TrayHost native self-tests passed: 5");
+            Console.WriteLine("TrayHost native self-tests passed: 14");
             return 0;
         }
         catch (Exception error)

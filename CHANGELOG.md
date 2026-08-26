@@ -6,6 +6,18 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.18
+
+### English
+
+- Restored About, language selection, and Open logs by authorizing every tray action against the exact displayed and acknowledged presentation plus the current capability set; rejected or failed actions now surface localized feedback instead of disappearing silently.
+- Removed the post-copy Setup pause: activation receipts are compact and tolerate legal JSON whitespace, new-runtime readiness retries the early Ready-event creation race, and Setup waits for an owned, deadline-bounded installer process to exit before a separate strict terminal validator can authorize success.
+
+### 简体中文
+
+- 恢复“关于”、语言切换和“打开日志”：每个托盘操作都会同时校验实际显示并确认过的 presentation 与当前能力；被拒绝或执行失败的操作会显示本地化反馈，不再静默消失。
+- 消除文件复制后的安装等待：activation receipt 使用紧凑 JSON 并接受合法空白，新 runtime 就绪检查会重试早期 Ready event 创建竞态；Setup 会等待受控且有截止时间的 installer 进程退出，再由独立严格终态校验器决定是否成功。
+
 ## v2.5.17
 
 ### English

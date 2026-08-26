@@ -6,6 +6,8 @@ param(
     [switch]$ValidateReceiptOnly,
     [switch]$ValidateReceiptWithTimeout,
     [ValidateRange(1,300000)][int]$ValidationTimeoutMilliseconds = 2000,
+    [ValidateRange(1,300000)][int]$FirstReceiptTimeoutMilliseconds = 90000,
+    [ValidateRange(1,300000)][int]$ActivationTimeoutMilliseconds = 300000,
     [switch]$Prompt,
     [switch]$NoUi
 )
@@ -134,6 +136,88 @@ function ConvertTo-CcodNativeProcessArgument {
     return $quoted.ToString()
 }
 
+function Stop-CcodOwnedInstallProcess {
+    param([Parameter(Mandatory)][Diagnostics.Process]$Process)
+    $boundedStopProven = $false
+    try {
+        if (-not $Process.HasExited) { $Process.Kill() }
+        $boundedStopProven = $Process.WaitForExit(5000) -and $Process.HasExited
+    } catch { }
+    if ($boundedStopProven) { return }
+    while ($true) {
+        try {
+            if (-not $Process.HasExited) { $Process.Kill() }
+            [void]$Process.WaitForExit()
+            if ($Process.HasExited) { return }
+        } catch { }
+        [Threading.Thread]::Sleep(100)
+    }
+}
+
+function Invoke-CcodOwnedInstallWorker {
+    param(
+        [Parameter(Mandatory)][string]$PowerShellPath,
+        [Parameter(Mandatory)][string]$InstallScript,
+        [Parameter(Mandatory)][string]$StateRoot,
+        [Parameter(Mandatory)][int]$FirstReceiptTimeout,
+        [Parameter(Mandatory)][int]$ActivationTimeout
+    )
+    $process = $null
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $firstReceiptObserved = $false
+    try {
+        $arguments = @(
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            $InstallScript,
+            '-InstallRoot',
+            $StateRoot,
+            '-EnableCandidateCompatibleUpdates',
+            '-ActivationId',
+            $ActivationId
+        )
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $PowerShellPath
+        $startInfo.Arguments = (($arguments | ForEach-Object { ConvertTo-CcodNativeProcessArgument ([string]$_) }) -join ' ')
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) { throw 'CCOD_ACTIVATION_WORKER_START_FAILED' }
+        while (-not $process.HasExited) {
+            if (-not $firstReceiptObserved) {
+                try {
+                    $null = Read-CcodTerminalActivationReceipt -Root $StateRoot -ExpectedActivationId $ActivationId
+                    $firstReceiptObserved = $true
+                } catch { }
+            }
+            if (-not $firstReceiptObserved -and $clock.ElapsedMilliseconds -ge $FirstReceiptTimeout) {
+                Stop-CcodOwnedInstallProcess -Process $process
+                throw 'CCOD_ACTIVATION_FIRST_RECEIPT_TIMEOUT'
+            }
+            if ($clock.ElapsedMilliseconds -ge $ActivationTimeout) {
+                Stop-CcodOwnedInstallProcess -Process $process
+                throw 'CCOD_ACTIVATION_TIMEOUT'
+            }
+            [void]$process.WaitForExit(50)
+        }
+        [void]$process.WaitForExit()
+        return [int]$process.ExitCode
+    } finally {
+        if ($null -ne $process) {
+            try {
+                if (-not $process.HasExited) { Stop-CcodOwnedInstallProcess -Process $process }
+            } finally {
+                $process.Dispose()
+            }
+        }
+    }
+}
+
 function Invoke-CcodBoundedReceiptValidator {
     param([Parameter(Mandatory)][int]$TimeoutMilliseconds)
     $process = $null
@@ -207,6 +291,7 @@ if ([string]::IsNullOrWhiteSpace($ActivationId)) {
     $ActivationId = [guid]::NewGuid().ToString('D')
 }
 if (-not (Test-CcodCanonicalGuid $ActivationId)) { Write-Error 'CCOD_ACTIVATION_ID_INVALID' -ErrorAction Continue; exit 3 }
+if ($FirstReceiptTimeoutMilliseconds -gt $ActivationTimeoutMilliseconds) { Write-Error 'CCOD_ACTIVATION_TIMEOUT_INVALID' -ErrorAction Continue; exit 3 }
 if ($ValidateReceiptWithTimeout) {
     $validationResult = Invoke-CcodBoundedReceiptValidator -TimeoutMilliseconds $ValidationTimeoutMilliseconds
     exit $validationResult
@@ -232,8 +317,16 @@ try {
     if (-not [IO.File]::Exists($installScript)) { throw 'CCOD_ACTIVATION_INSTALL_SCRIPT_MISSING' }
     $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
     Write-CcodActivationRecord -Code 'STARTED' -DurationMilliseconds $clock.ElapsedMilliseconds
-    $null = & $powershell -NoProfile -ExecutionPolicy Bypass -File $installScript -InstallRoot $stateRoot -EnableCandidateCompatibleUpdates -ActivationId $ActivationId
-    if ($LASTEXITCODE -ne 0) { throw 'CCOD_ACTIVATION_RUNTIME_FAILED' }
+    $installExitCode = Invoke-CcodOwnedInstallWorker -PowerShellPath $powershell -InstallScript $installScript -StateRoot $stateRoot -FirstReceiptTimeout $FirstReceiptTimeoutMilliseconds -ActivationTimeout $ActivationTimeoutMilliseconds
+    if ($installExitCode -ne 0) {
+        $reportedErrorCode = $null
+        try {
+            $failedReceipt = Read-CcodTerminalActivationReceipt -Root $stateRoot -ExpectedActivationId $ActivationId
+            if ($failedReceipt.phase -ceq 'Failed') { $reportedErrorCode = [string]$failedReceipt.errorCode }
+        } catch { }
+        if ($reportedErrorCode -cmatch '^CCOD_[A-Z0-9_]{1,96}$') { throw $reportedErrorCode }
+        throw 'CCOD_ACTIVATION_RUNTIME_FAILED'
+    }
     $activationReceipt = Read-CcodFinalActivationReceipt -Root $stateRoot -ExpectedActivationId $ActivationId
     Write-CcodActivationRecord -Code 'RUNTIME_ACTIVATED' -DurationMilliseconds $clock.ElapsedMilliseconds
 } catch {

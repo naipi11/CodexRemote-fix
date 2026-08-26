@@ -67,6 +67,41 @@ function New-CcodTrayHostInitialPresentation {
     return [pscustomobject][ordered]@{Color='Gray';ConnectionState='WaitingForCodex';ProtectionState='Running';RepairEnabled=$false;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$false;Busy=$false}
 }
 
+function Copy-CcodTrayHostPresentation {
+    param($Presentation)
+    return [pscustomobject][ordered]@{
+        Color=[string]$Presentation.Color;ConnectionState=[string]$Presentation.ConnectionState;ProtectionState=[string]$Presentation.ProtectionState
+        RepairEnabled=[bool]$Presentation.RepairEnabled;LanguageEnabled=[bool]$Presentation.LanguageEnabled;OpenLogsEnabled=[bool]$Presentation.OpenLogsEnabled
+        AboutEnabled=[bool]$Presentation.AboutEnabled;ExitEnabled=[bool]$Presentation.ExitEnabled;Busy=[bool]$Presentation.Busy
+    }
+}
+
+function Test-CcodTrayHostEquivalentSnapshot {
+    param($Left,$Right)
+    if($null-eq$Left-or$null-eq$Right-or$Left.Color-ne$Right.Color-or$Left.Connection-ne$Right.Connection-or$Left.Protection-ne$Right.Protection-or$Left.Language-ne$Right.Language-or$Left.Flags-ne$Right.Flags){return $false}
+    if($Left.Strings.Count-ne$Right.Strings.Count){return $false}
+    for($index=0;$index-lt$Left.Strings.Count;$index++){if([string]$Left.Strings[$index]-cne[string]$Right.Strings[$index]){return $false}}
+    return $true
+}
+
+function Wait-CcodTrayHostPresentationAcknowledgement {
+    param($Context,[UInt64]$Revision)
+    $key=[string]$Revision
+    $deadline=[DateTime]::UtcNow.AddMilliseconds(1250)
+    while(-not$Context.AcknowledgedPresentations.Contains($key)-and[DateTime]::UtcNow-lt$deadline){
+        Receive-CcodTrayHostEvents $Context
+        if($Context.AcknowledgedPresentations.Contains($key)){break}
+        [void]$Context.Client.WaitForActivity([TimeSpan]::FromMilliseconds(25))
+    }
+    if(-not$Context.AcknowledgedPresentations.Contains($key)){throw 'CCOD_TRAYHOST_PRESENTATION_ACK_TIMEOUT'}
+}
+
+function Add-CcodTrayHostBoundedPresentation {
+    param($Map,[string]$Revision,$Presentation)
+    $Map[$Revision]=$Presentation
+    while($Map.Count-gt32){$oldest=@($Map.Keys)[0];[void]$Map.Remove($oldest)}
+}
+
 function New-CcodTrayHostContext {
     param($CommandQueue,$OnTick,$Catalog,[string]$LanguageMode,[string]$SystemCultureName)
     Import-CcodTrayHostAssembly
@@ -78,7 +113,8 @@ function New-CcodTrayHostContext {
         $options=[TrayHostStartOptions]::new();$options.ExePath=$exe;$options.RuntimeId=$runtimeId;$options.ParentPid=$process.Id;$options.ParentCreationFileTimeUtc=$process.StartTime.ToFileTimeUtc();$options.InitialPresentation=$initial
         $client=[TrayHostParentClient]::Start($options)
     }finally{$process.Dispose()}
-    return [pscustomobject][ordered]@{Client=$client;CommandQueue=$CommandQueue;OnTick=$OnTick;Catalog=$Catalog;LanguageMode=$LanguageMode;SystemCultureName=$SystemCultureName;RuntimeId=$runtimeId;CurrentRevision=[UInt64]1;LastAcknowledgedRevision=[UInt64]1;MenuOpen=$false;Exited=$false;LastError=$null;ApplicationContext=[pscustomobject]@{}}
+    $acknowledged=[ordered]@{};Add-CcodTrayHostBoundedPresentation $acknowledged '1' (Copy-CcodTrayHostPresentation $initialPresentation)
+    return [pscustomobject][ordered]@{Client=$client;CommandQueue=$CommandQueue;OnTick=$OnTick;Catalog=$Catalog;LanguageMode=$LanguageMode;SystemCultureName=$SystemCultureName;RuntimeId=$runtimeId;CurrentRevision=[UInt64]1;LastAcknowledgedRevision=[UInt64]1;LastPublishedSnapshot=$initial;PublishedPresentations=[ordered]@{};AcknowledgedPresentations=$acknowledged;MenuOpen=$false;Exited=$false;LastError=$null;ApplicationContext=[pscustomobject]@{}}
 }
 
 function Set-CcodTrayHostPresentation {
@@ -86,16 +122,16 @@ function Set-CcodTrayHostPresentation {
     if($null -eq $Context -or $null -eq $Context.Client){throw 'CCOD_TRAYHOST_CONTEXT_INVALID'}
     $revision=[UInt64]([UInt64]$Context.CurrentRevision + [UInt64]1)
     $snapshot=New-CcodTrayHostSnapshot $Presentation $Catalog $LanguageMode $SystemCultureName $revision $Context.RuntimeId
+    if(Test-CcodTrayHostEquivalentSnapshot $Context.LastPublishedSnapshot $snapshot){
+        $Context.Catalog=$Catalog;$Context.LanguageMode=$LanguageMode;$Context.SystemCultureName=$SystemCultureName
+        if($WaitForAcknowledgement){Wait-CcodTrayHostPresentationAcknowledgement $Context ([UInt64]$Context.CurrentRevision)}
+        return
+    }
     if(-not $Context.Client.TryPublish($snapshot)){throw 'CCOD_TRAYHOST_PRESENTATION_FAILED'}
-    $Context.Catalog=$Catalog;$Context.LanguageMode=$LanguageMode;$Context.SystemCultureName=$SystemCultureName;$Context.CurrentRevision=$revision
+    $Context.Catalog=$Catalog;$Context.LanguageMode=$LanguageMode;$Context.SystemCultureName=$SystemCultureName;$Context.CurrentRevision=$revision;$Context.LastPublishedSnapshot=$snapshot
+    Add-CcodTrayHostBoundedPresentation $Context.PublishedPresentations ([string]$revision) (Copy-CcodTrayHostPresentation $Presentation)
     if($WaitForAcknowledgement){
-        $deadline=[DateTime]::UtcNow.AddMilliseconds(1250)
-        while([UInt64]$Context.LastAcknowledgedRevision -lt $revision -and [DateTime]::UtcNow -lt $deadline){
-            Receive-CcodTrayHostEvents $Context
-            if([UInt64]$Context.LastAcknowledgedRevision -ge $revision){break}
-            [void]$Context.Client.WaitForActivity([TimeSpan]::FromMilliseconds(25))
-        }
-        if([UInt64]$Context.LastAcknowledgedRevision -lt $revision){throw 'CCOD_TRAYHOST_PRESENTATION_ACK_TIMEOUT'}
+        Wait-CcodTrayHostPresentationAcknowledgement $Context $revision
     }
 }
 
@@ -106,7 +142,16 @@ function Receive-CcodTrayHostEvents {
         if(-not $Context.Client.TryDequeueEvent([ref]$event)){break}
         if($null -eq $event){continue}
         switch($event.Kind.ToString()){
-            'PresentationAck' {if($event.Revision -is [UInt64] -or $event.Revision -is [long] -or $event.Revision -is [int]){if([UInt64]$event.Revision -gt [UInt64]$Context.LastAcknowledgedRevision){$Context.LastAcknowledgedRevision=[UInt64]$event.Revision}}}
+            'PresentationAck' {
+                if($event.Revision-is[UInt64]-or$event.Revision-is[long]-or$event.Revision-is[int]){
+                    $acknowledgedRevision=[UInt64]$event.Revision;$key=[string]$acknowledgedRevision
+                    if($Context.PublishedPresentations.Contains($key)){
+                        Add-CcodTrayHostBoundedPresentation $Context.AcknowledgedPresentations $key $Context.PublishedPresentations[$key]
+                        if($acknowledgedRevision-gt[UInt64]$Context.LastAcknowledgedRevision){$Context.LastAcknowledgedRevision=$acknowledgedRevision}
+                        foreach($publishedKey in @($Context.PublishedPresentations.Keys)){if([UInt64]$publishedKey-le$acknowledgedRevision){[void]$Context.PublishedPresentations.Remove($publishedKey)}}
+                    }
+                }
+            }
             'Action' {
                 $command=switch($event.Command){CheckAndRepair{'CheckAndRepair'}SetLanguageSystem{'SetLanguageSystem'}SetLanguageChinese{'SetLanguageChinese'}SetLanguageEnglish{'SetLanguageEnglish'}OpenLogs{'OpenLogs'}ShowAbout{'ShowAbout'}Exit{'Exit'}default{$null}}
                 if($null-eq$command-or$event.ActionId-eq[guid]::Empty-or$event.Revision-isnot[UInt64]-and$event.Revision-isnot[long]-and$event.Revision-isnot[int]){continue}

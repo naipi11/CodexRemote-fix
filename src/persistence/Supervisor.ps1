@@ -1131,6 +1131,31 @@ function Send-CcodSupervisorTrayActionResult {
     return $result
 }
 
+function Get-CcodSupervisorAcknowledgedTrayPresentation {
+    param($Tray,[UInt64]$Revision)
+    if($null-eq$Tray){return $null}
+    $property=$Tray.PSObject.Properties['AcknowledgedPresentations']
+    if($null-eq$property-or$property.Value-isnot[Collections.IDictionary]){return $null}
+    $key=[string]$Revision
+    if(-not$property.Value.Contains($key)){return $null}
+    return $property.Value[$key]
+}
+
+function Test-CcodSupervisorTrayPresentationAllowsAction {
+    param($Presentation,[string]$Command)
+    if($null-eq$Presentation){return $false}
+    $capability=switch($Command){
+        'CheckAndRepair' {'RepairEnabled'}
+        {$_-in@('SetLanguageSystem','SetLanguageChinese','SetLanguageEnglish')} {'LanguageEnabled'}
+        'OpenLogs' {'OpenLogsEnabled'}
+        'ShowAbout' {'AboutEnabled'}
+        'Exit' {'ExitEnabled'}
+        default {return $false}
+    }
+    $property=$Presentation.PSObject.Properties[$capability]
+    return $null-ne$property-and$property.Value-is[bool]-and$property.Value
+}
+
 function Complete-CcodSupervisorLifecycleTrayAction {
     param($HostState,[hashtable]$Adapters,$Request,[bool]$Successful,[AllowNull()][string]$FailureCode='CCOD_LIFECYCLE_ACTION_FAILED')
     foreach($key in @($HostState.TrayActionIds.Keys)){
@@ -1178,8 +1203,9 @@ function Invoke-CcodSupervisorLanguageAction {
 function Invoke-CcodSupervisorCommand {
     param($HostState,[hashtable]$Adapters,$Command)
     if(-not(Test-CcodSupervisorTrayAction $Command)){Throw-CcodSupervisorCommandError 'CCOD_SUPERVISOR_COMMAND_INVALID' 'Tray action is invalid' $Command}
-    $revisionProperty=$HostState.Tray.PSObject.Properties['CurrentRevision']
-    if($null-eq$revisionProperty-or$revisionProperty.Value-isnot[UInt64]-or$revisionProperty.Value-eq0-or[UInt64]$revisionProperty.Value-ne[UInt64]$Command.Revision){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_TRAY_ACTION_STALE' $null}
+    $displayedPresentation=Get-CcodSupervisorAcknowledgedTrayPresentation $HostState.Tray ([UInt64]$Command.Revision)
+    if($null-eq$displayedPresentation){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_TRAY_ACTION_STALE' $null}
+    if(-not(Test-CcodSupervisorTrayPresentationAllowsAction $displayedPresentation $Command.Command)-or-not(Test-CcodSupervisorTrayPresentationAllowsAction $HostState.LastAcknowledgedPresentation $Command.Command)){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_TRAY_ACTION_UNAVAILABLE' $null}
     if($HostState.TrayActionIds.Contains($Command.ActionId.ToString('D'))){Throw-CcodSupervisorCommandError 'CCOD_SUPERVISOR_COMMAND_INVALID' 'Tray action was already handled' $Command}
     $actionEntry=[pscustomobject][ordered]@{Action=$Command;TransactionId=$null;TerminalSent=$false}
     $HostState.TrayActionIds[$Command.ActionId.ToString('D')]=$actionEntry

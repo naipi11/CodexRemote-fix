@@ -38,10 +38,10 @@ internal static class Program
         if (initialFrame.MessageType != TrayHostMessageType.Presentation) { return 2; }
         PresentationSnapshot initial = TrayHostWire.ReadPresentation(initialFrame.Payload);
         Win32TrayPlatform platform = new Win32TrayPlatform();
-        TrayWindow window = new TrayWindow(platform);
-        HostTransport transport = new HostTransport();
-        bool shutdownRequested = false; bool shutdownSent = false; object stateGate = new object();
         TrayHostApplication application = null;
+        HostTransport transport = new HostTransport(delegate { TrayHostApplication current = application; if (current != null) { current.PostWork(); } });
+        TrayWindow window = new TrayWindow(platform, transport.SetMenuOpen);
+        bool shutdownRequested = false; bool shutdownSent = false; object stateGate = new object();
         Action<TrayCommand, ulong> command = delegate(TrayCommand selected, ulong revision)
         {
             TrayHostAction action;
@@ -55,11 +55,15 @@ internal static class Program
             PresentationSnapshot next;
             if (transport.TryTakePresentation(out next))
             {
-                window.Apply(next);
-                lock (WriteGate) { ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.PresentationAck, epoch, outboundSequence++, TrayHostWire.WriteRevision(next.Revision)), keys.HostToParent); }
+                if (window.Apply(next))
+                {
+                    lock (WriteGate) { ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.PresentationAck, epoch, outboundSequence++, TrayHostWire.WriteRevision(next.Revision)), keys.HostToParent); }
+                }
             }
             TrayActionResult about;
             while (transport.TryTakeCompletedAbout(out about)) { window.ShowAbout(); }
+            TrayActionResult failed;
+            while (transport.TryTakeFailedAction(out failed)) { window.ShowActionFailed(); }
             bool shouldShutdown;
             lock (stateGate) { shouldShutdown = shutdownRequested && !shutdownSent; if (shouldShutdown) { shutdownSent = true; } }
             if (shouldShutdown)

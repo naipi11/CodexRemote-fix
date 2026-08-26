@@ -16,7 +16,7 @@
 </p>
 
 > [!NOTE]
-> **发布状态：** v2.5.17 是当前已发布的 Latest 版本，核心远程连接生命周期已经验证。正式标记为稳定版前仍需修复两个问题：托盘 presentation revision 竞态会拒绝菜单操作；activation receipt 解析缺陷会让文件复制完成后的安装向导继续等待最长约五分钟。
+> **发布状态：** v2.5.18 是当前稳定版。安装包、以 EXE 启动的便携 ZIP、托盘操作、重启并修复流程和常驻远程连接均纳入发布验证门禁。
 
 CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、但因运行时缺陷被隐藏的：
 
@@ -46,7 +46,7 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 ## 快速开始
 
-1. 从 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 下载 `CodexRemote-fix-2.5.17-setup.exe`（推荐安装包）或便携 ZIP `CodexRemote-fix-2.5.17-windows-x64.zip`；下载并核对对应的 `.sha256.txt`。
+1. 从 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 下载 `CodexRemote-fix-2.5.18-setup.exe`（推荐安装包）或便携 ZIP `CodexRemote-fix-2.5.18-windows-x64.zip`；下载并核对对应的 `.sha256.txt`。
 2. 选择安装包时直接运行并跟随向导；选择便携 ZIP 时解压到新空目录，然后双击 `CodexRemote-fix.exe`。
 
    两条路径都会校验载荷、执行 Microsoft Defender 自定义扫描，并保留 DPAPI 设备密钥。
@@ -66,7 +66,7 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 - 若未看到托盘图标，可双击桌面上的 **CodexRemote-fix** 启动托盘守护程序；它本身不会启动修复，也不会改变当前 Codex 会话。
 - 连接状态显示 **已连接** 时，当前会话已生效；打开 **设置 → 连接 → 控制其他设备** 即可注册或使用。
 - 新版 Codex 正常启动自带 `--remote-debugging-port`（没有 `--inspect`），守护程序已能识别这种启动方式并自动完成接管。
-- 托盘菜单设计上支持跟随系统、中文、English、打开日志和关于；v2.5.17 存在已知的 presentation revision 竞态，在托盘动作修复版发布前，这些操作可能被静默拒绝。
+- 托盘菜单支持跟随系统、中文、English、打开日志和关于。每个操作同时校验实际显示并确认过的菜单 presentation 与当前能力；能力已撤销时仍会失败关闭。
 - 升级本项目或 Codex 后无需重装守护程序本体，安装器只会原子切换版本化运行时。
 - 如需显式修复，请从托盘菜单选择 **检查并修复远程连接**。Codex 可能会关闭并重新启动一次；已有设备配对和授权会被保留。若升级中断后遗留了已完成的恢复事务，守护程序会在下次启动时安全清理它。
 
@@ -81,12 +81,12 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 ## 发布（Releases）
 
-每个带 tag 的发布都会附带 Windows 安装包和便携 ZIP，各自带 SHA-256 校验文件、release manifest，并共享 payload manifest。`.github/workflows/release.yml` 会在 tag 上自动构建两者，因此 v2.5.17 提供：
+每个带 tag 的发布都会附带 Windows 安装包和便携 ZIP，各自带 SHA-256 校验文件、release manifest，并共享 payload manifest。`.github/workflows/release.yml` 会在 tag 上自动构建两者，因此 v2.5.18 提供：
 
-- `CodexRemote-fix-2.5.17-setup.exe` 及其校验文件
-- `CodexRemote-fix-2.5.17-windows-x64.zip` 及其校验文件
-- `CodexRemote-fix-2.5.17-payload-manifest.json`
-- `CodexRemote-fix-2.5.17-release-manifest.json` 和 `CodexRemote-fix-2.5.17-setup-release-manifest.json`
+- `CodexRemote-fix-2.5.18-setup.exe` 及其校验文件
+- `CodexRemote-fix-2.5.18-windows-x64.zip` 及其校验文件
+- `CodexRemote-fix-2.5.18-payload-manifest.json`
+- `CodexRemote-fix-2.5.18-release-manifest.json` 和 `CodexRemote-fix-2.5.18-setup-release-manifest.json`
 
 GitHub Release 正文只发布英文更新说明；本 README 继续保留中英文使用说明。
 完整历史见 [CHANGELOG.md](CHANGELOG.md)。

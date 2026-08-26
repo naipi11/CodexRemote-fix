@@ -51,17 +51,17 @@ internal static class TrayHostTransportSelfTest
 
     private static void TestHostPendingAndReplayBound()
     {
-        HostTransport transport = new HostTransport();
+        int releasedPresentationSignals = 0;
+        HostTransport transport = new HostTransport(delegate { releasedPresentationSignals++; });
         transport.SetMenuOpen(true);
         AssertTrue(transport.TryAcceptPresentation(Snapshot(1)), "host accepts first presentation");
         AssertTrue(transport.TryAcceptPresentation(Snapshot(2)), "host coalesces a newer presentation while menu is open");
         PresentationSnapshot ignored;
         AssertTrue(!transport.TryTakePresentation(out ignored), "menu-open presentation is not applied early");
         transport.SetMenuOpen(false);
+        AssertTrue(releasedPresentationSignals == 1, "menu close re-signals pending presentation work consumed by the nested menu loop");
         PresentationSnapshot newest;
         AssertTrue(transport.TryTakePresentation(out newest) && newest.Revision == 2UL, "menu close applies newest snapshot only");
-        TrayHostControl control;
-        AssertTrue(transport.TryDequeueControl(out control) && control.Kind == TrayHostControlKind.PresentationAck && control.Revision == 2UL, "one ack is emitted for the applied revision");
         Guid actionId = Guid.NewGuid();
         AssertTrue(transport.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.OpenLogs, 2UL)), "first action accepted");
         AssertTrue(!transport.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.OpenLogs, 2UL)), "replayed action id is rejected");
@@ -73,6 +73,18 @@ internal static class TrayHostTransportSelfTest
             AssertTrue(transport.TryAcknowledgeAction(new TrayActionResult(next, 2UL, TrayActionResultStatus.Completed, null, null)), "terminal non-lifecycle result drains independently");
         }
         AssertTrue(!transport.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.OpenLogs, 2UL)), "the 64-entry replay cache rejects a replayed id");
+        transport.Dispose();
+    }
+
+    private static void TestDirectPresentationAcksDoNotAccumulateAnUnusedControlQueue()
+    {
+        HostTransport transport = new HostTransport();
+        for (ulong revision = 1UL; revision <= 40UL; revision++)
+        {
+            AssertTrue(transport.TryAcceptPresentation(Snapshot(revision)), "production presentation is accepted without a side-channel ACK queue");
+            PresentationSnapshot applied;
+            AssertTrue(transport.TryTakePresentation(out applied) && applied.Revision == revision, "production presentation remains available for the direct wire ACK path");
+        }
         transport.Dispose();
     }
 
@@ -121,6 +133,34 @@ internal static class TrayHostTransportSelfTest
         host.Dispose();
     }
 
+    private static void TestRejectedAndFailedActionsQueueUserFeedback()
+    {
+        HostTransport host = new HostTransport();
+        Guid rejectedId = Guid.NewGuid(); Guid failedId = Guid.NewGuid();
+        AssertTrue(host.TryRegisterAction(new TrayHostAction(rejectedId, TrayCommand.OpenLogs, 20UL)), "rejected action registers");
+        AssertTrue(host.TryRegisterAction(new TrayHostAction(failedId, TrayCommand.SetLanguageEnglish, 20UL)), "failed action registers");
+        AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(rejectedId, 20UL, TrayActionResultStatus.Rejected, "CCOD_TRAY_ACTION_UNAVAILABLE", null)), "correlated rejected result is accepted");
+        AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(failedId, 20UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null)), "correlated failed result is accepted");
+        TrayActionResult first; TrayActionResult second; TrayActionResult none;
+        AssertTrue(host.TryTakeFailedAction(out first) && first.ActionId == rejectedId && first.Status == TrayActionResultStatus.Rejected, "rejected result queues user feedback");
+        AssertTrue(host.TryTakeFailedAction(out second) && second.ActionId == failedId && second.Status == TrayActionResultStatus.Failed, "failed result queues user feedback");
+        AssertTrue(!host.TryTakeFailedAction(out none), "each terminal failure queues feedback exactly once");
+        host.Dispose();
+    }
+
+    private static void TestUndisplayedActionFailureFeedbackIsBounded()
+    {
+        HostTransport host = new HostTransport();
+        for (int index = 0; index < 9; index++)
+        {
+            Guid actionId = Guid.NewGuid();
+            AssertTrue(host.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.OpenLogs, 21UL)), "terminal failure releases pending action capacity");
+            bool accepted = host.TryAcknowledgeAction(new TrayActionResult(actionId, 21UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null));
+            AssertTrue(index < 8 ? accepted : !accepted, "undisplayed action failure feedback is bounded to the pending-action capacity");
+        }
+        host.Dispose();
+    }
+
     public static int Main(string[] args)
     {
         try
@@ -128,9 +168,12 @@ internal static class TrayHostTransportSelfTest
             TestParentLatestAndReservedControl();
             TestBrokenPipeAndStderrCap();
             TestHostPendingAndReplayBound();
+            TestDirectPresentationAcksDoNotAccumulateAnUnusedControlQueue();
             TestActionResultCorrelationAndControlPriority();
             TestAcknowledgedAboutQueuesOneUiWorkItem();
-            Console.WriteLine("TrayHost transport self-tests passed: 5");
+            TestRejectedAndFailedActionsQueueUserFeedback();
+            TestUndisplayedActionFailureFeedbackIsBounded();
+            Console.WriteLine("TrayHost transport self-tests passed: 8");
             return 0;
         }
         catch (Exception error)

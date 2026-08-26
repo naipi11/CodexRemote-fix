@@ -178,7 +178,15 @@ function New-CcodSupervisorFake {
     $adapters.GetSupervisorDecision={param($Context)$world.Calls.Add('Decision');$world.Decision}.GetNewClosure()
     $adapters.AddObservedEvent={param($Observed,$Pid,$Created)$world.Calls.Add("Observed:$Pid");$true}.GetNewClosure()
     $adapters.CompleteControllerRun={param($Result,$TransactionId,$Action,$RuntimeId)$world.Calls.Add("Reduce:$Action");[pscustomobject][ordered]@{SessionState='Idle';BlockAutomaticActions=$false;AttemptKey=$null;RecoveryIgnoreKey=$null;SuppressionKey=$null;ErrorCode=$null;Reason='Reduced'}}.GetNewClosure()
-    $adapters.GetTrayPresentation={param($Arguments)$world.PresentationInputs.Add($Arguments);[pscustomobject][ordered]@{Color='Gray';ConnectionState=$Arguments.ConnectionState;ProtectionState=$Arguments.ProtectionState;RepairEnabled=$false;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true;Busy=[bool]$Arguments.Busy}}.GetNewClosure()
+    $adapters.GetTrayPresentation={
+        param($Arguments)
+        $world.PresentationInputs.Add($Arguments);$blocked=[bool]($Arguments.Busy-or$Arguments.StateDamageBlocksActions)
+        [pscustomobject][ordered]@{
+            Color='Gray';ConnectionState=$Arguments.ConnectionState;ProtectionState=$Arguments.ProtectionState
+            RepairEnabled=[bool]($Arguments.ConnectionState-ceq'RepairNeeded'-and-not$blocked);LanguageEnabled=[bool](-not$blocked);OpenLogsEnabled=$true;AboutEnabled=$true
+            ExitEnabled=[bool]($Arguments.ConnectionState-ceq'Connected'-and$Arguments.ProtectionState-ceq'Running'-and-not$blocked);Busy=[bool]$Arguments.Busy
+        }
+    }.GetNewClosure()
     $adapters.NewQueue={param($Kind)$world.Calls.Add("Queue:$Kind");if($Kind -ceq 'Command'){Write-Output -NoEnumerate $world.CommandQueue}else{Write-Output -NoEnumerate $world.EventQueue}}.GetNewClosure()
     $adapters.GetQueueCount={param($Queue)[int]$Queue.Count}.GetNewClosure()
     $adapters.TryDequeue={param($Queue)$world.TryDequeueSawRealQueue=[object]::ReferenceEquals($Queue,$world.CommandQueue);if($Queue.Count){[pscustomobject][ordered]@{Succeeded=$true;Value=$Queue.Dequeue()}}else{[pscustomobject][ordered]@{Succeeded=$false;Value=$null}}}.GetNewClosure()
@@ -240,7 +248,9 @@ function New-CcodTickFixture {
     [void](& $fake.Adapters.EnterLifecycleOwnership $fake.Layout.InstallRoot $fake.Layout.RuntimeId ([UInt64]7) ([pscustomobject][ordered]@{pid=$fake.Identity.Pid;creationTimeUtc=$fake.Identity.CreationTimeUtc}) $fake.Identity.UserSid $fake.Identity.SessionId 5000)
     $wake=& $fake.Adapters.OpenLifecycleWakeEvent $fake.Identity.UserSid $fake.Identity.SessionId
     $hostState=New-CcodSupervisorHostState -Identity $fake.Identity -Layout $fake.Layout -Clock ([pscustomobject]@{Kind='Clock'}) -ShutdownEvent $shutdown -LifecycleWakeEvent $wake -CommandQueue $fake.World.CommandQueue -EventQueue $fake.World.EventQueue -State $state -Journal $null -LifecycleOwnership $fake.World.LifecycleOwnership -LifecycleRequest $fake.World.ActiveLifecycleRequest -LogonIdentity $fake.World.LogonIdentity
-    $hostState.Tray=[pscustomobject]@{Kind='Tray';CurrentRevision=[UInt64]1;RenderedLanguageMode='System';RenderedCatalog=$script:TestSystemCatalog;RenderedText='old-stable'}
+    $initialPresentation=[pscustomobject][ordered]@{Color='Green';ConnectionState='Connected';ProtectionState='Running';RepairEnabled=$true;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true;Busy=$false}
+    $hostState.Tray=[pscustomobject]@{Kind='Tray';CurrentRevision=[UInt64]1;AcknowledgedPresentations=[ordered]@{'1'=$initialPresentation};RenderedLanguageMode='System';RenderedCatalog=$script:TestSystemCatalog;RenderedText='old-stable'}
+    $hostState.LastAcknowledgedPresentation=$initialPresentation
     $hostState.UiLanguageMode='System';$hostState.UiCatalog=$script:TestSystemCatalog
     [pscustomobject]@{Fake=$fake;Host=$hostState}
 }
@@ -1374,6 +1384,7 @@ Invoke-CcodTest 'authorizes a correlated CheckAndRepair action through the durab
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
     $hostState.ConnectionState='RepairNeeded'
     $hostState.Tray.CurrentRevision=[UInt64]12
+    $hostState.Tray.AcknowledgedPresentations['12']=[pscustomobject][ordered]@{RepairEnabled=$true;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true}
     $action=[pscustomobject][ordered]@{ActionId=[guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';Command='CheckAndRepair';Revision=[UInt64]12}
     $results=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)
     Assert-CcodEqual 1 $results.Count 'authorized repair returns one action result'
@@ -1390,6 +1401,7 @@ Invoke-CcodTest 'authorizes a correlated CheckAndRepair action through the durab
 Invoke-CcodTest 'completes a correlated CheckAndRepair action when its lifecycle reaches a terminal phase' {
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
     $hostState.ConnectionState='RepairNeeded';$hostState.Tray.CurrentRevision=[UInt64]13
+    $hostState.Tray.AcknowledgedPresentations['13']=[pscustomobject][ordered]@{RepairEnabled=$true;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true}
     $action=[pscustomobject][ordered]@{ActionId=[guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeef';Command='CheckAndRepair';Revision=[UInt64]13}
     $accepted=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)[0]
     $hostState.LifecycleRequest.phase='Completed'
@@ -1399,6 +1411,38 @@ Invoke-CcodTest 'completes a correlated CheckAndRepair action when its lifecycle
     Assert-CcodEqual $action.ActionId $terminal.ActionId 'terminal result preserves action id'
     Assert-CcodEqual $accepted.TransactionId $terminal.TransactionId 'terminal result preserves transaction id'
     Assert-CcodEqual 'Completed' $terminal.Status 'successful lifecycle sends completed action result'
+}
+
+Invoke-CcodTest 'authorizes an acknowledged displayed revision after a newer capable presentation is published' {
+    $fixture=New-CcodTickFixture;$hostState=$fixture.Host
+    $hostState.ConnectionState='RepairNeeded';$hostState.Tray.CurrentRevision=[UInt64]8
+    $hostState.Tray.AcknowledgedPresentations['7']=[pscustomobject][ordered]@{RepairEnabled=$true;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true}
+    $hostState.LastAcknowledgedPresentation=[pscustomobject][ordered]@{RepairEnabled=$true;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true}
+    $action=[pscustomobject][ordered]@{ActionId=[guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeee07';Command='CheckAndRepair';Revision=[UInt64]7}
+    $result=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)[0]
+    Assert-CcodEqual 'Accepted' $result.Status 'the displayed and acknowledged revision remains action authority after a newer capable projection'
+}
+
+Invoke-CcodTest 'rejects an action revision that was published but never acknowledged as displayed' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $hostState.Tray.CurrentRevision=[UInt64]9
+    $action=[pscustomobject][ordered]@{ActionId=[guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeee09';Command='OpenLogs';Revision=[UInt64]9}
+    $result=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)[0]
+    Assert-CcodEqual 'Rejected' $result.Status 'unacknowledged presentation revision is rejected'
+    Assert-CcodEqual 'CCOD_TRAY_ACTION_STALE' $result.ErrorCode 'unacknowledged presentation revision has the stable stale error'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -eq 'Open:Logs'}).Count 'unacknowledged action performs no side effect'
+}
+
+Invoke-CcodTest 'rejects an old displayed action after the current presentation revokes its capability' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $hostState.Tray.CurrentRevision=[UInt64]8
+    $hostState.Tray.AcknowledgedPresentations['7']=[pscustomobject][ordered]@{RepairEnabled=$true;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true}
+    $hostState.LastAcknowledgedPresentation=[pscustomobject][ordered]@{RepairEnabled=$false;LanguageEnabled=$false;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$false}
+    $action=[pscustomobject][ordered]@{ActionId=[guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeee17';Command='SetLanguageEnglish';Revision=[UInt64]7}
+    $result=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)[0]
+    Assert-CcodEqual 'Rejected' $result.Status 'current capability revocation fails closed'
+    Assert-CcodEqual 'CCOD_TRAY_ACTION_UNAVAILABLE' $result.ErrorCode 'current capability revocation is unavailable rather than stale'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'Persist:UiLanguage:*'}).Count 'revoked action performs no preference mutation'
 }
 
 Invoke-CcodTest 'completes About only after validating the active runtime manifest' {
