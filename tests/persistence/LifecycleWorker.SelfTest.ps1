@@ -64,6 +64,38 @@ try {
         Assert-CcodEqual $h.Request.action $parsed.action 'production ReadRequest preserves the worker action'
     }
 
+    $results += Invoke-CcodTest 'controller facade binds delegation before a dot-sourced Action parameter changes scope metadata' {
+        $root=[IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) ('ccod-lifecycle-facade-'+[guid]::NewGuid().ToString('N'))));$roots.Add($root)
+        $runtime=Join-Path $root 'runtime\2.5.0-a';$controllerDirectory=Join-Path $runtime 'src\persistence';[IO.Directory]::CreateDirectory($controllerDirectory)|Out-Null
+        $controllerPath=Join-Path $controllerDirectory 'SessionController.ps1'
+        $fixture=@'
+[CmdletBinding(DefaultParameterSetName='Manual')]
+param(
+    [Parameter(ParameterSetName='Manual')]
+    [ValidateSet('Inspect','Close','Apply','RepairRenderer')]
+    [string]$Action
+)
+function Invoke-CcodSessionController {
+    param($Request,$Paths,[string]$ResultPath,[hashtable]$Adapters)
+    $delegated=& $Adapters.GetDelegatedOwnership
+    if($null-eq$delegated-or$delegated.marker-cne'delegated'){throw 'delegation was not bound'}
+    $result=[pscustomobject][ordered]@{
+        schemaVersion=1;action=$Request.action;ok=$true;outcome='Closed';safeState='Closed';stage='Completed';transactionId=$Request.transactionId
+        package=$null;source=$null;special=$null;probes=$null;recovery=$null;error=$null;logFile=$null
+    }
+    [pscustomobject][ordered]@{Result=$result;ExitCode=0}
+}
+'@
+        [IO.File]::WriteAllText($controllerPath,$fixture,[Text.UTF8Encoding]::new($false))
+        $request=New-CcodLifecycleWorkerFixtureRequest -Action Close
+        $context=[pscustomobject][ordered]@{InstallRoot=$root;RuntimeRoot=$runtime}
+        $delegation=[pscustomobject][ordered]@{marker='delegated'}
+        $controller=Invoke-CcodLifecycleControllerFacade -Action Close -Request $request -Context $context -Delegation $delegation
+        Assert-CcodEqual Close $controller.action 'dot-sourced controller receives the Close action'
+        Assert-CcodEqual $true $controller.ok 'dot-sourced controller returns one successful result'
+        Assert-CcodEqual $request.transactionId $controller.transactionId 'dot-sourced controller result remains correlated'
+    }
+
     $results += Invoke-CcodTest 'worker rejects runtime generation and exact request-shape mismatches before dispatch' {
         foreach ($case in @('Runtime','Generation','Extra','UnknownAction')) {
             $h=New-CcodLifecycleWorkerHarness -Name $case;$roots.Add($h.Install)

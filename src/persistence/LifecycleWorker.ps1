@@ -220,7 +220,14 @@ function Invoke-CcodLifecycleControllerFacade {
         source=$null;existingOnly=[bool]($controllerAction -cne 'Apply');rendererPort=$null;mainPort=$null;timeoutMilliseconds=[Math]::Max(500,[Math]::Min(120000,$Request.timeoutMilliseconds));restartOrdinary=$false
     }
     $paths=[pscustomobject][ordered]@{StateRoot=[IO.Path]::GetFullPath((Join-Path $Context.InstallRoot 'state'));TransitionPath=[IO.Path]::GetFullPath((Join-Path $Context.InstallRoot 'state\transition.json'));TransitionLogPath=[IO.Path]::GetFullPath((Join-Path $Context.InstallRoot 'logs\transactions.log'));SessionLogPath=[IO.Path]::GetFullPath((Join-Path $Context.InstallRoot 'logs\session.log'));CheckerPath=[IO.Path]::GetFullPath((Join-Path $Context.RuntimeRoot 'src\check-package.mjs'));OrchestratorPath=[IO.Path]::GetFullPath((Join-Path $Context.RuntimeRoot 'src\runtime\orchestrator.js'));MainPayloadPath=[IO.Path]::GetFullPath((Join-Path $Context.RuntimeRoot 'src\runtime\main-payload.js'))}
-    $run=& {param($Path,$Value,$ControllerPaths,$Delegated). $Path;$noWrite={param($P,$V)};$noLine={param($Line)};$bound=$Delegated;Invoke-CcodSessionController -Request $Value -Paths $ControllerPaths -ResultPath ([IO.Path]::GetFullPath((Join-Path $ControllerPaths.StateRoot 'workers\controller-unused.result.json'))) -Adapters @{WriteResult=$noWrite;WriteStdout=$noLine;WriteStderr=$noLine;GetDelegatedOwnership={$bound}.GetNewClosure()}} $controllerPath $controllerRequest $paths $Delegation
+    $run=& {
+        param($Path,$Value,$ControllerPaths,$Delegated)
+        $bound=$Delegated
+        $getDelegatedOwnership={$bound}.GetNewClosure()
+        . $Path
+        $noWrite={param($P,$V)};$noLine={param($Line)}
+        Invoke-CcodSessionController -Request $Value -Paths $ControllerPaths -ResultPath ([IO.Path]::GetFullPath((Join-Path $ControllerPaths.StateRoot 'workers\controller-unused.result.json'))) -Adapters @{WriteResult=$noWrite;WriteStdout=$noLine;WriteStderr=$noLine;GetDelegatedOwnership=$getDelegatedOwnership}
+    } $controllerPath $controllerRequest $paths $Delegation
     return $run.Result
 }
 

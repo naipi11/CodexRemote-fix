@@ -1979,9 +1979,9 @@ $results += Invoke-CcodTest 'installer exposes CodexRemote-fix as the searchable
     Assert-CcodTrue ($buildScript -cmatch '\$bundle\.sha256\.txt') 'build script writes a hash beside the public portable ZIP filename'
 }
 
-$results += Invoke-CcodTest 'portable builder publishes the exact CodexRemote-fix 2.5.13 release artifact contract' {
+$results += Invoke-CcodTest 'portable builder publishes the exact CodexRemote-fix 2.5.14 release artifact contract' {
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
-    Assert-CcodEqual '2.5.13' ([string]$package.version) 'package version is exactly 2.5.13'
+    Assert-CcodEqual '2.5.14' ([string]$package.version) 'package version is exactly 2.5.14'
 
     $buildScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
     Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-windows-x64\.zip') 'portable build resolves the exact public ZIP filename'
@@ -2345,16 +2345,16 @@ $results += Invoke-CcodTest 'README and release workflow publish current portabl
     Assert-CcodTrue ($readmeChinese -cmatch '\A(?s:<div align="center">.*?<h1>CodexRemote-fix</h1>)') 'Chinese README uses the centered public product heading'
 
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start[^\r\n]*\r?\n(.*?)(?=^## )').Groups[1].Value
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.13-setup\.exe') 'English Quick Start names the setup installer'
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.13-windows-x64\.zip') 'English Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.14-setup\.exe') 'English Quick Start names the setup installer'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.14-windows-x64\.zip') 'English Quick Start names the exact portable artifact'
     Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix\.exe') 'English Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($quickStart -cmatch '\.sha256\.txt') 'English Quick Start names the checksum artifact'
 
     $quickStartChineseMatch = [regex]::Match($readmeChinese, '(?ms)^## [^\r\n]+\r?\n(?:\r?\n)?(?=1\.[^\r\n]*\[Releases\])(.*?)(?=^## |\z)')
     Assert-CcodTrue $quickStartChineseMatch.Success 'Chinese README exposes a Quick Start section'
     $quickStartChinese = $quickStartChineseMatch.Groups[1].Value
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.13-setup\.exe') 'Chinese Quick Start names the setup installer'
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.13-windows-x64\.zip') 'Chinese Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.14-setup\.exe') 'Chinese Quick Start names the setup installer'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.14-windows-x64\.zip') 'Chinese Quick Start names the exact portable artifact'
     Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix\.exe') 'Chinese Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($quickStartChinese -cmatch '\.sha256\.txt') 'Chinese Quick Start names the checksum artifact'
 

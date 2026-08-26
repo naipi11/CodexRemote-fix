@@ -6,6 +6,18 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.14
+
+### English
+
+- Bound the LifecycleWorker delegated-ownership callback before dot-sourcing `SessionController.ps1`. Its validated `Action` parameter can no longer invalidate `GetNewClosure()`, so Close, Apply, and VerifyRemote now reach the manifest-bound controller instead of failing with `CCOD_LIFECYCLE_OPERATION_FAILED`.
+- Added a real scope-metadata regression that reproduces the PowerShell `ValidationMetadataException` and proves the correlated controller result survives the dot-source boundary.
+
+### 简体中文
+
+- 在 dot-source `SessionController.ps1` 前绑定 LifecycleWorker 的 delegated-ownership 回调。控制器带验证的 `Action` 参数不再使 `GetNewClosure()` 失效，Close、Apply 与 VerifyRemote 现在能进入 manifest 绑定的控制器，而不会以 `CCOD_LIFECYCLE_OPERATION_FAILED` 失败。
+- 增加真实作用域元数据回归，复现 PowerShell `ValidationMetadataException`，并证明相关控制器结果可安全跨越 dot-source 边界。
+
 ## v2.5.13
 
 ### English
