@@ -491,7 +491,7 @@ function New-CcodSupervisorHostState {
         ObservedKeys=[ordered]@{};AttemptKeys=[ordered]@{};RecoveryIgnoreKeys=[ordered]@{};SuppressionKeys=[ordered]@{};TrayActionIds=[ordered]@{}
         StaticCache=[ordered]@{};TransportRetries=[ordered]@{};TerminalRecoveries=[ordered]@{}
         PackageFullName=$null;AppAsarSha256=$null;Classification=$null
-        Ordinary=[object[]]@();Special=[object[]]@();SpecialNeedsInspect=$false;SpecialProof=$null;StaleReconciliationCandidate=$null;FailedStaleRepairKey=$null
+        Ordinary=[object[]]@();Special=[object[]]@();SpecialNeedsInspect=$false;SpecialProof=$null;FailedSpecialProofKey=$null;StaleReconciliationCandidate=$null;FailedStaleRepairKey=$null
         SessionState='Idle';BlockAutomaticActions=$false;Reason='Idle';ObservationDirty=$false;NextObservationMilliseconds=[long]0
         ForceReconcile=$true;NextReconcileMilliseconds=[long]0;LastDecision=$null
         RuntimeCleanupCodes=[Collections.Generic.List[string]]::new()
@@ -614,6 +614,64 @@ function New-CcodSupervisorLifecycleWorkerPaths {
     }
 }
 
+function Get-CcodSupervisorSpecialProofKey {
+    param($Snapshot)
+    if($null-eq$Snapshot-or$Snapshot.Pid-isnot[int]-or$Snapshot.Pid-lt1-or-not(Test-CcodSupervisorCanonicalUtc $Snapshot.CreationTimeUtc)){return $null}
+    return ('{0}|{1}'-f$Snapshot.Pid,$Snapshot.CreationTimeUtc)
+}
+
+function Test-CcodSupervisorExactProcessSnapshotMatch {
+    param($Expected,$Actual)
+    $fields=@('Pid','CreationTimeUtc','SessionId','UserSid','Path','PackageFamilyName','CommandLine','ParentPid','IsTopLevel','Mode','RendererPort','MainPort')
+    if(-not(Test-CcodSupervisorExactProperties $Expected $fields)-or-not(Test-CcodSupervisorExactProperties $Actual $fields)){return $false}
+    foreach($field in $fields){if(-not[object]::Equals($Expected.$field,$Actual.$field)){return $false}}
+    return $true
+}
+
+function Update-CcodSupervisorProofObservations {
+    param($HostState,[hashtable]$Adapters)
+    $arguments=[object[]]::new(2);$arguments[0]=$HostState.Layout.StateRoot
+    if(-not[string]::IsNullOrWhiteSpace([string]$HostState.PackageFullName)-and-not[string]::IsNullOrWhiteSpace([string]$HostState.AppAsarSha256)){
+        $arguments[1]=('{0}|{1}|{2}'-f$HostState.PackageFullName,$HostState.AppAsarSha256,$HostState.Layout.RuntimeId)
+    }else{$arguments[1]=$null}
+    $state=Invoke-CcodSupervisorAdapter $Adapters.ReadState $arguments 1
+    if($null-eq$state){throw 'special proof state refresh is invalid'}
+    $HostState.State=$state
+    Invoke-CcodSupervisorRefreshObservations $HostState $Adapters
+}
+
+function Get-CcodSupervisorLifecycleProofCandidate {
+    param($HostState,[hashtable]$Adapters,[string]$Action)
+    if(@('Inspect','VerifyRemote')-cnotcontains$Action){return $null}
+    $fallback=$null
+    if(@($HostState.Special).Count-eq1-and$HostState.Special[0].Snapshot.Mode-ceq'Special'){$fallback=$HostState.Special[0].Snapshot}
+    try{Update-CcodSupervisorProofObservations $HostState $Adapters}catch{return $fallback}
+    if(@($HostState.Special).Count-ne1){return $null}
+    return $HostState.Special[0].Snapshot
+}
+
+function Confirm-CcodSupervisorLifecycleProofCandidate {
+    param($HostState,[hashtable]$Adapters,$Candidate)
+    $candidateKey=Get-CcodSupervisorSpecialProofKey $Candidate
+    if($null-eq$candidateKey){return $false}
+    Update-CcodSupervisorProofObservations $HostState $Adapters
+    if(@($HostState.Special).Count-ne1-or-not(Test-CcodSupervisorExactProcessSnapshotMatch $Candidate $HostState.Special[0].Snapshot)){
+        $HostState.SpecialProof=$null;$HostState.FailedSpecialProofKey=$candidateKey;$HostState.SpecialNeedsInspect=$false
+        return $false
+    }
+    $HostState.SpecialProof=$HostState.Special[0].Snapshot;$HostState.Special[0].ProbeValid=$true;$HostState.SpecialNeedsInspect=$false
+    $HostState.FailedSpecialProofKey=$null;$HostState.LifecycleObservation='RemoteVerified';$HostState.ConnectionState=ConvertTo-CcodSupervisorLifecycleObservation RemoteVerified
+    return $true
+}
+
+function New-CcodSupervisorLifecycleProofFailure {
+    param($Result)
+    return [pscustomobject][ordered]@{
+        schemaVersion=1;transactionId=$Result.transactionId;action=$Result.action;ok=$false;outcome='Error';observation='Error'
+        error=[pscustomobject][ordered]@{code='CCOD_REMOTE_PROOF_REBIND_FAILED';stage='ResultValidation';message='The lifecycle worker failed safely.'}
+    }
+}
+
 function Start-CcodSupervisorLifecycleWorkerSlot {
     param($HostState,[hashtable]$Adapters,[string]$Action,[AllowNull()]$DeadlineUtc)
     if($null-ne$HostState.LifecycleWorkerSlot -or $null-ne$HostState.WorkerSlot -or $null-eq$HostState.LifecycleRequest){throw 'lifecycle worker slot is unavailable'}
@@ -628,6 +686,7 @@ function Start-CcodSupervisorLifecycleWorkerSlot {
         $current=[DateTime]::ParseExact($now,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind)
         $timeout=[int][Math]::Max(1,[Math]::Min(600000,[Math]::Ceiling(($deadline-$current).TotalMilliseconds)))
     }
+    $proofCandidate=Get-CcodSupervisorLifecycleProofCandidate $HostState $Adapters $Action
     $paths=New-CcodSupervisorLifecycleWorkerPaths $HostState $requestState.transactionId
     $workerRequest=Invoke-CcodSupervisorAdapter $Adapters.NewLifecycleWorkerRequest @($requestState.transactionId,$Action,$requestState.runtimeId,[UInt64]$requestState.runtimeGeneration,[UInt64]$requestState.leaseEpoch,$requestState.ownerIdentity,$notBefore,$timeout) 1
     $owned=[Collections.Generic.List[string]]::new();$suspended=$false
@@ -652,7 +711,7 @@ function Start-CcodSupervisorLifecycleWorkerSlot {
         $suspended=$true
         $started=Invoke-CcodSupervisorAdapter $Adapters.StartWorker @('Lifecycle',$HostState.Layout.LifecycleWorkerPath,$paths.RequestPath,$paths.ResultPath,$null,$workerRequest,$HostState.Layout.PowerShellPath) 1
         if(-not(Test-CcodSupervisorExactProperties $started @('ProcessId','CreationTimeUtc','Handle','JobHandle')) -or $started.ProcessId-isnot[int] -or $started.ProcessId-lt1 -or -not(Test-CcodSupervisorCanonicalUtc $started.CreationTimeUtc) -or $null-eq$started.Handle -or $null-eq$started.JobHandle){throw 'lifecycle worker start receipt is invalid'}
-        $HostState.LifecycleWorkerSlot=[pscustomobject][ordered]@{Kind='Lifecycle';Action=$Action;RequestId=$requestState.transactionId;RuntimeId=$requestState.runtimeId;Request=$workerRequest;RequestPath=$paths.RequestPath;ResultPath=$paths.ResultPath;StderrPath=$null;ProcessId=[int]$started.ProcessId;CreationTimeUtc=$started.CreationTimeUtc;Handle=$started.Handle;JobHandle=$started.JobHandle}
+        $HostState.LifecycleWorkerSlot=[pscustomobject][ordered]@{Kind='Lifecycle';Action=$Action;RequestId=$requestState.transactionId;RuntimeId=$requestState.runtimeId;Request=$workerRequest;ProofCandidate=$proofCandidate;RequestPath=$paths.RequestPath;ResultPath=$paths.ResultPath;StderrPath=$null;ProcessId=[int]$started.ProcessId;CreationTimeUtc=$started.CreationTimeUtc;Handle=$started.Handle;JobHandle=$started.JobHandle}
         return $HostState.LifecycleWorkerSlot
     }catch{
         if($suspended){
@@ -727,7 +786,7 @@ function Complete-CcodSupervisorLifecycleTerminal {
     Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
     Invoke-CcodSupervisorAdapter $Adapters.CompleteLifecycleRequest @($HostState.Layout.StateRoot,$request) 0
     [void](Complete-CcodSupervisorLifecycleTrayAction $HostState $Adapters $request $successful)
-    if(-not$successful){$HostState.ConnectionState='Error'}
+    if(-not$successful){$HostState.ConnectionState=$(if($null-ne$HostState.FailedSpecialProofKey){'RepairNeeded'}else{'Error'})}
     $HostState.ProtectionState='Running';$HostState.LifecycleRequest=$null
 }
 
@@ -751,6 +810,20 @@ function Invoke-CcodSupervisorPollLifecycleSlot {
         $expectedExitCode=if($result.ok){[int]0}else{[int]1}
         if($poll.ExitCode-ne$expectedExitCode){throw 'lifecycle worker exit code does not match its result frame'}
         Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
+        if(@('Inspect','VerifyRemote')-ccontains$result.action){
+            if($result.ok-and$result.observation-ceq'RemoteVerified'){
+                $confirmed=$false
+                try{$confirmed=Confirm-CcodSupervisorLifecycleProofCandidate $HostState $Adapters $slot.ProofCandidate}catch{
+                    $failedKey=Get-CcodSupervisorSpecialProofKey $slot.ProofCandidate
+                    if($null-ne$failedKey){$HostState.FailedSpecialProofKey=$failedKey;$HostState.SpecialNeedsInspect=$false}
+                }
+                if(-not$confirmed){$result=New-CcodSupervisorLifecycleProofFailure $result}
+                Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
+            }elseif(-not$result.ok-or$result.action-ceq'VerifyRemote'){
+                $failedKey=Get-CcodSupervisorSpecialProofKey $slot.ProofCandidate;if($null-ne$failedKey){$HostState.FailedSpecialProofKey=$failedKey;$HostState.SpecialNeedsInspect=$false}
+            }
+            Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleWorkerResult @($result,$slot.Request) 0
+        }
         $now=Get-CcodSupervisorNowUtc $Adapters
         $reduced=Invoke-CcodSupervisorAdapter $Adapters.ReduceLifecycleWorkerResult @($HostState.LifecycleRequest,$result,$now) 1
         Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
@@ -1114,6 +1187,7 @@ function Invoke-CcodSupervisorCommand {
     switch($Command.Command){
         'CheckAndRepair' {
             if($busy-or$HostState.ConnectionState-cne'RepairNeeded'){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_TRAY_ACTION_UNAVAILABLE' $null}
+            $HostState.FailedSpecialProofKey=$null
             if(-not(New-CcodSupervisorInternalLifecycleRequest $HostState $Adapters CheckAndRepair Tray)){return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Rejected 'CCOD_LIFECYCLE_SUPERVISOR_BUSY' $null}
             $actionEntry.TransactionId=$HostState.LifecycleRequest.transactionId
             return Send-CcodSupervisorTrayActionResult $HostState $Adapters $Command Accepted $null $HostState.LifecycleRequest.transactionId
@@ -1273,14 +1347,15 @@ function Invoke-CcodSupervisorRefreshObservations {
     }
     $proofMatches=$false
     if($special.Count -eq 1 -and $null -ne $HostState.SpecialProof -and
-       $null -ne $HostState.SpecialProof.PSObject.Properties['Pid'] -and $null -ne $HostState.SpecialProof.PSObject.Properties['CreationTimeUtc'] -and
-       $HostState.SpecialProof.Pid -eq $special[0].Snapshot.Pid -and $HostState.SpecialProof.CreationTimeUtc -ceq $special[0].Snapshot.CreationTimeUtc){$proofMatches=$true}
+       (Test-CcodSupervisorExactProcessSnapshotMatch $HostState.SpecialProof $special[0].Snapshot)){$proofMatches=$true}
     if($proofMatches){$special[0].ProbeValid=$true}else{$HostState.SpecialProof=$null}
+    $specialKey=if($special.Count-eq1){Get-CcodSupervisorSpecialProofKey $special[0].Snapshot}else{$null}
+    if(($null-ne$HostState.FailedSpecialProofKey)-and($HostState.FailedSpecialProofKey-cne$specialKey)){$HostState.FailedSpecialProofKey=$null}
     $HostState.Ordinary=[object[]]@($ordinary);$HostState.Special=[object[]]@($special)
     $HostState.StaleReconciliationCandidate=if($ordinary.Count -eq 0 -and $special.Count -eq 0 -and $staleCandidates.Count -eq 1){$staleCandidates[0]}else{$null}
-    $HostState.SpecialNeedsInspect=$special.Count -gt 0 -and $null -eq $HostState.SpecialProof
+    $HostState.SpecialNeedsInspect=($special.Count-eq1)-and($null-eq$HostState.SpecialProof)-and($HostState.FailedSpecialProofKey-cne$specialKey)
     $HostState.LifecycleObservation=if($ordinary.Count-eq1 -and $special.Count-eq0){'Ordinary'}elseif($ordinary.Count-eq0 -and $special.Count-eq1 -and $null-ne$HostState.SpecialProof){'RemoteVerified'}elseif($ordinary.Count-eq0 -and $special.Count-eq1){'Special'}elseif($ordinary.Count-eq0 -and $special.Count-eq0){'NoCodex'}else{'Error'}
-    $HostState.ConnectionState=ConvertTo-CcodSupervisorLifecycleObservation $HostState.LifecycleObservation
+    $HostState.ConnectionState=if($null-ne$specialKey-and$HostState.FailedSpecialProofKey-ceq$specialKey){'RepairNeeded'}else{ConvertTo-CcodSupervisorLifecycleObservation $HostState.LifecycleObservation}
 }
 
 function Invoke-CcodSupervisorTick {

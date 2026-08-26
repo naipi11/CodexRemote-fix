@@ -12,13 +12,13 @@ No unreleased changes.
 
 - Fixed LifecycleWorker request construction: ordinary observation now supplies an explicit schema-one empty status object, while `restartOrdinary` remains disabled for Close and enabled for Apply/Inspect repair actions.
 - Ordinary observation now uses the durable lifecycle creation time as its lower bound, so an automatically restored Codex root that appears just before the AppsFolder request remains eligible after the prior Close was proven.
-- A matching durable special-process proof is now projected into the Supervisor decision context, preventing the Guardian from repeatedly creating already-satisfied repair lifecycles and cancellation receipts while the remote bridge is healthy.
+- Supervisor now rebuilds special-process proof through one manifest-bound strong Inspect after lifecycle verification or restart; rebind failures produce one terminal receipt and suppress same-root Guardian retry loops.
 
 ### 简体中文
 
 - 修复 LifecycleWorker 请求构造：普通根观察会传入必需的空状态对象；`restartOrdinary` 对 Close 保持禁用，对 Apply/Inspect 修复动作启用。
 - 普通根观察现在使用持久生命周期创建时间作为下限；此前 Close 已证明完成时，即使 Codex 自动恢复略早于 AppsFolder 请求，该普通根仍可被接受。
-- 与当前 special 进程精确匹配的持久证明现在会投影到 Supervisor 决策上下文，避免远程桥已健康时 Guardian 反复创建已满足的修复生命周期和取消回执。
+- Supervisor 现在只通过一次 manifest-bound 强 Inspect 在生命周期验证或自身重启后重建 special 进程证明；重绑定失败会生成一个终态回执，并抑制同根 Guardian 重试循环。
 
 ## v2.5.15
 

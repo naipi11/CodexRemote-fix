@@ -67,6 +67,9 @@ function Get-CcodLifecycleStep {
     if($Request.kind -ceq 'CheckAndRepair' -and $Request.phase -ceq 'Requested' -and $Observation -ceq 'RemoteVerified'){
         return New-CcodLifecycleStepResult Completed CancelledBeforeClose None $null $null
     }
+    if($Request.kind -ceq 'CheckAndRepair' -and $Request.phase -ceq 'Requested' -and $Observation -ceq 'Special'){
+        return New-CcodLifecycleStepResult Operation $null Inspect $null $null
+    }
     if($Request.kind -ceq 'SafeExit' -and $Request.phase -ceq 'Requested' -and @('Ordinary','NoCodex') -ccontains $Observation){
         return New-CcodLifecycleStepResult Completed CancelledBeforeClose None $null $null
     }
@@ -206,7 +209,7 @@ function Reduce-CcodLifecycleWorkerResult {
     }
     $nextPhase=$null;$stableError=$null
     switch($Result.action){
-        'Inspect'{if($Result.observation -ceq 'RemoteVerified'){$nextPhase='CancelledBeforeClose'}}
+        'Inspect'{if($Result.observation -ceq 'RemoteVerified'){$nextPhase='CancelledBeforeClose'}elseif($Result.observation -ceq 'Special'){$nextPhase='CloseRequested'}}
         'Close'{$nextPhase='CloseConfirmed'}
         'RequestOrdinaryLaunch'{
             $nextPhase=$null

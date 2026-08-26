@@ -199,7 +199,17 @@ function New-CcodSupervisorFake {
         $world.Calls.Add("Poll:$($Slot.Kind)")
         if($Slot.Kind -ceq 'Lifecycle' -and $world.AutoCompleteLifecycleWorkers){
             $world.WorkerResult=switch($Slot.Action){
-                'Apply' {[pscustomobject][ordered]@{schemaVersion=1;transactionId=$Slot.Request.transactionId;action='Apply';ok=$true;outcome='Activated';observation='Special';error=$null}}
+                'Apply' {
+                    foreach($processId in @($world.ProcessIds)){
+                        if(-not$world.Snapshots.ContainsKey([int]$processId)){continue}
+                        $snapshot=$world.Snapshots[[int]$processId]
+                        if($snapshot.Mode-cne'Ordinary'){continue}
+                        $special=$snapshot.PSObject.Copy();$special.Mode='Special';$special.RendererPort=[int]41001;$special.MainPort=[int]41002
+                        $world.Snapshots[[int]$processId]=$special
+                    }
+                    [pscustomobject][ordered]@{schemaVersion=1;transactionId=$Slot.Request.transactionId;action='Apply';ok=$true;outcome='Activated';observation='Special';error=$null}
+                }
+                'Inspect' {[pscustomobject][ordered]@{schemaVersion=1;transactionId=$Slot.Request.transactionId;action='Inspect';ok=$true;outcome='Inspected';observation='RemoteVerified';error=$null}}
                 'VerifyRemote' {[pscustomobject][ordered]@{schemaVersion=1;transactionId=$Slot.Request.transactionId;action='VerifyRemote';ok=$true;outcome='Inspected';observation='RemoteVerified';error=$null}}
                 default {throw "UNEXPECTED_LIFECYCLE_ACTION_$($Slot.Action)"}
             }
@@ -710,6 +720,154 @@ Invoke-CcodTest 'resumes WaitingForManualLaunch after Supervisor restart and com
     $calls=@($fake.World.Calls);$firstSuspend=[Array]::IndexOf($calls,'Suspend:LifecycleOwnership:11');$firstStart=[Array]::IndexOf($calls,'Start:Lifecycle:Apply');$firstResume=[Array]::IndexOf($calls,'Resume:LifecycleOwnership:11');$firstReduction=[Array]::IndexOf($calls,'Reduce:Lifecycle:Apply')
     Assert-CcodTrue ($firstSuspend-ge0-and$firstStart-gt$firstSuspend-and$firstResume-gt$firstStart-and$firstReduction-gt$firstResume) 'handoff is durable-intent then worker then reacquire before reduction and persistence'
     Assert-CcodEqual 0 @($fake.World.Calls|Where-Object{$_ -like 'Start:Controller:*'}).Count 'resume performs no mutation outside LifecycleWorker slot'
+}
+
+Invoke-CcodTest 'supervisor restart performs one strong Inspect before adopting a persisted special session' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $special=New-CcodSupervisorTestSnapshot -ProcessId 201 -CreationTimeUtc '2030-02-03T03:02:00.0000000Z'
+    $special.Mode='Special';$special.RendererPort=[int]41001;$special.MainPort=[int]41002
+    $world.ProcessIds=@(201);$world.Snapshots[201]=$special;$world.AutoCompleteLifecycleWorkers=$true
+    $hostState.SpecialProof=$null;$hostState.ForceReconcile=$true
+    $fixture.Fake.Adapters.ReadState={param($StateRoot,$SuppressionKey)$hostState.State}.GetNewClosure()
+    $fixture.Fake.Adapters.GetSupervisorDecision={param($Context)$world.Calls.Add('Decision');Get-CcodSupervisorDecision -Context $Context}.GetNewClosure()
+
+    Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
+    Assert-CcodEqual $null $hostState.SpecialProof 'weak ProcessControl observation never becomes a strong proof by itself'
+    Assert-CcodTrue ($null-ne$hostState.LifecycleRequest-and$hostState.LifecycleRequest.kind-ceq'CheckAndRepair') 'restart creates one durable guardian inspection'
+    Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
+    Assert-CcodEqual 'Inspect' $hostState.LifecycleWorkerSlot.Action 'healthy persisted special runs read-only strong Inspect instead of Close'
+    Assert-CcodEqual 201 $hostState.LifecycleWorkerSlot.ProofCandidate.Pid 'strong Inspect is correlated to the exact pre-probe root'
+    Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
+    Assert-CcodEqual 1 $world.CompletedLifecycleRequests.Count 'one strong Inspect produces one terminal lifecycle receipt'
+    Assert-CcodEqual 'CancelledBeforeClose' $world.CompletedLifecycleRequests[0].phase 'healthy special inspection completes without process mutation'
+    Assert-CcodTrue ($null-ne$hostState.SpecialProof) 'strong Inspect binds the exact post-probe special identity'
+    Assert-CcodEqual 201 $hostState.SpecialProof.Pid 'strong Inspect proof names the exact special process'
+
+    $world.Calls.Clear()
+    foreach($iteration in 1..5){$hostState.ForceReconcile=$true;Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters}
+    Assert-CcodEqual 1 $world.CompletedLifecycleRequests.Count 'later guardian intervals create no additional terminal receipts'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'New:Lifecycle:*'}).Count 'later guardian intervals create no lifecycle submissions'
+    Assert-CcodEqual 'AdoptSpecial' $hostState.LastDecision.Action 'later guardian intervals adopt the strong proof'
+}
+
+Invoke-CcodTest 'successful lifecycle verification binds a fresh special proof before later guardian decisions' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $transactionModule=Import-Module $lifecycleTransactionPath -Force -PassThru
+    $request=New-CcodPersistedLifecycleRequest -Kind RestartAndRepair
+    foreach($phase in @('CloseRequested','CloseConfirmed','RepairRequested')){
+        $request=& $transactionModule {param($Value,$NextPhase)Move-CcodLifecyclePhase -Request $Value -NextPhase $NextPhase -NowUtc '2030-02-03T03:01:05.0000000Z'} $request $phase
+    }
+    $request.ownerIdentity=$hostState.LifecycleOwnership.ownerIdentity;$request.leaseEpoch=[UInt64]$hostState.LifecycleOwnership.epoch
+    $world.ActiveLifecycleRequest=$request;$hostState.LifecycleRequest=$request
+    $special=New-CcodSupervisorTestSnapshot -ProcessId 201 -CreationTimeUtc '2030-02-03T03:02:00.0000000Z'
+    $special.Mode='Special';$special.RendererPort=[int]41001;$special.MainPort=[int]41002
+    $world.ProcessIds=@(201);$world.Snapshots[201]=$special;$world.AutoCompleteLifecycleWorkers=$true
+    $fixture.Fake.Adapters.ReadState={param($StateRoot,$SuppressionKey)$hostState.State}.GetNewClosure()
+    $fixture.Fake.Adapters.GetSupervisorDecision={param($Context)$world.Calls.Add('Decision');Get-CcodSupervisorDecision -Context $Context}.GetNewClosure()
+
+    Start-CcodSupervisorLifecycleWorkerSlot $hostState $fixture.Fake.Adapters VerifyRemote $null|Out-Null
+    Invoke-CcodSupervisorPollLifecycleSlot $hostState $fixture.Fake.Adapters
+
+    Assert-CcodTrue ($null-ne$hostState.SpecialProof) 'successful verification binds one freshly revalidated special identity'
+    Assert-CcodEqual 201 $hostState.SpecialProof.Pid 'bound proof names the exact revalidated special process'
+    Assert-CcodEqual $true $hostState.Special[0].ProbeValid 'freshly bound proof is visible to the decision engine'
+    Assert-CcodEqual $false $hostState.SpecialNeedsInspect 'freshly bound proof suppresses redundant inspection'
+    [void](Invoke-CcodSupervisorDriveLifecycle $hostState $fixture.Fake.Adapters)
+    Assert-CcodEqual $null $hostState.LifecycleRequest 'verified lifecycle reaches one terminal completion'
+
+    $world.Calls.Clear();$hostState.ForceReconcile=$true
+    Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
+    Assert-CcodEqual 'AdoptSpecial' $hostState.LastDecision.Action 'later guardian decision adopts the bound special proof'
+    Assert-CcodEqual $null $hostState.LifecycleRequest 'later guardian decision creates no redundant repair lifecycle'
+}
+
+Invoke-CcodTest 'post-verify identity drift becomes one terminal failure and suppresses same-root guardian retries' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $transactionModule=Import-Module $lifecycleTransactionPath -Force -PassThru
+    $request=New-CcodPersistedLifecycleRequest -Kind RestartAndRepair
+    foreach($phase in @('CloseRequested','CloseConfirmed','RepairRequested')){
+        $request=& $transactionModule {param($Value,$NextPhase)Move-CcodLifecyclePhase -Request $Value -NextPhase $NextPhase -NowUtc '2030-02-03T03:01:05.0000000Z'} $request $phase
+    }
+    $request.ownerIdentity=$hostState.LifecycleOwnership.ownerIdentity;$request.leaseEpoch=[UInt64]$hostState.LifecycleOwnership.epoch
+    $world.ActiveLifecycleRequest=$request;$hostState.LifecycleRequest=$request
+    $special=New-CcodSupervisorTestSnapshot -ProcessId 201 -CreationTimeUtc '2030-02-03T03:02:00.0000000Z'
+    $special.Mode='Special';$special.RendererPort=[int]41001;$special.MainPort=[int]41002
+    $world.ProcessIds=@(201);$world.Snapshots[201]=$special;$world.AutoCompleteLifecycleWorkers=$true
+    $fixture.Fake.Adapters.ReadState={param($StateRoot,$SuppressionKey)$hostState.State}.GetNewClosure()
+    Start-CcodSupervisorLifecycleWorkerSlot $hostState $fixture.Fake.Adapters VerifyRemote $null|Out-Null
+    $drift=$special.PSObject.Copy();$drift.RendererPort=[int]42001;$drift.MainPort=[int]42002;$world.Snapshots[201]=$drift
+
+    Invoke-CcodSupervisorPollLifecycleSlot $hostState $fixture.Fake.Adapters
+
+    Assert-CcodEqual 1 $world.CompletedLifecycleRequests.Count 'rebind drift produces one terminal lifecycle receipt'
+    Assert-CcodEqual 'VerificationFailed' $world.CompletedLifecycleRequests[0].phase 'rebind drift fails verification closed'
+    Assert-CcodEqual 'CCOD_REMOTE_PROOF_REBIND_FAILED' $world.CompletedLifecycleRequests[0].error 'rebind drift uses one stable terminal code'
+    Assert-CcodEqual $null $hostState.SpecialProof 'rebind drift never publishes a strong proof'
+    Assert-CcodEqual ('201|'+$special.CreationTimeUtc) $hostState.FailedSpecialProofKey 'failed proof is bounded to the exact root identity'
+    Assert-CcodEqual 'RepairNeeded' $hostState.ConnectionState 'bounded strong-proof failure remains manually repairable'
+    $world.Calls.Clear();$hostState.ForceReconcile=$true
+    Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
+    Assert-CcodEqual ('201|'+$special.CreationTimeUtc) $hostState.FailedSpecialProofKey 'same-root failure key survives reconciliation'
+    Assert-CcodEqual $hostState.FailedSpecialProofKey (Get-CcodSupervisorSpecialProofKey $hostState.Special[0].Snapshot) 'same-root reconciled snapshot has the identical suppression key'
+    Assert-CcodEqual $false $hostState.SpecialNeedsInspect 'same-root failure remains suppressed after reconciliation'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'New:Lifecycle:*'}).Count 'same-root failure creates no automatic retry loop'
+    $manual=[pscustomobject][ordered]@{ActionId=[guid]'22222222-3333-4444-5555-666666666666';Command='CheckAndRepair';Revision=[UInt64]1}
+    $manualResult=Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $manual
+    Assert-CcodEqual Accepted $manualResult.Status 'manual repair remains available after automatic suppression'
+    Assert-CcodEqual $null $hostState.FailedSpecialProofKey 'manual repair clears the same-root automatic suppression'
+}
+
+Invoke-CcodTest 'post-verify state reread failure becomes a terminal receipt instead of escaping the supervisor loop' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $transactionModule=Import-Module $lifecycleTransactionPath -Force -PassThru
+    $request=New-CcodPersistedLifecycleRequest -Kind RestartAndRepair
+    foreach($phase in @('CloseRequested','CloseConfirmed','RepairRequested')){
+        $request=& $transactionModule {param($Value,$NextPhase)Move-CcodLifecyclePhase -Request $Value -NextPhase $NextPhase -NowUtc '2030-02-03T03:01:05.0000000Z'} $request $phase
+    }
+    $request.ownerIdentity=$hostState.LifecycleOwnership.ownerIdentity;$request.leaseEpoch=[UInt64]$hostState.LifecycleOwnership.epoch
+    $world.ActiveLifecycleRequest=$request;$hostState.LifecycleRequest=$request
+    $special=New-CcodSupervisorTestSnapshot -ProcessId 201 -CreationTimeUtc '2030-02-03T03:02:00.0000000Z'
+    $special.Mode='Special';$special.RendererPort=[int]41001;$special.MainPort=[int]41002
+    $world.ProcessIds=@(201);$world.Snapshots[201]=$special;$world.AutoCompleteLifecycleWorkers=$true
+    $reads=[pscustomobject]@{Count=0}
+    $fixture.Fake.Adapters.ReadState={param($StateRoot,$SuppressionKey)$reads.Count++;if($reads.Count-eq1){return $hostState.State};throw 'injected post-worker reread failure'}.GetNewClosure()
+    Start-CcodSupervisorLifecycleWorkerSlot $hostState $fixture.Fake.Adapters VerifyRemote $null|Out-Null
+
+    Invoke-CcodSupervisorPollLifecycleSlot $hostState $fixture.Fake.Adapters
+
+    Assert-CcodEqual 1 $world.CompletedLifecycleRequests.Count 'reread failure produces one terminal lifecycle receipt'
+    Assert-CcodEqual 'VerificationFailed' $world.CompletedLifecycleRequests[0].phase 'reread failure is a verification failure'
+    Assert-CcodEqual 'CCOD_REMOTE_PROOF_REBIND_FAILED' $world.CompletedLifecycleRequests[0].error 'reread failure exposes only the stable rebind code'
+    Assert-CcodEqual $null $hostState.LifecycleRequest 'reread failure leaves no nonterminal request to restart-loop'
+}
+
+Invoke-CcodTest 'pre-verify candidate reread failure remains contained and cannot publish an unbound worker success' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $transactionModule=Import-Module $lifecycleTransactionPath -Force -PassThru
+    $request=New-CcodPersistedLifecycleRequest -Kind RestartAndRepair
+    foreach($phase in @('CloseRequested','CloseConfirmed','RepairRequested')){
+        $request=& $transactionModule {param($Value,$NextPhase)Move-CcodLifecyclePhase -Request $Value -NextPhase $NextPhase -NowUtc '2030-02-03T03:01:05.0000000Z'} $request $phase
+    }
+    $request.ownerIdentity=$hostState.LifecycleOwnership.ownerIdentity;$request.leaseEpoch=[UInt64]$hostState.LifecycleOwnership.epoch
+    $world.ActiveLifecycleRequest=$request;$hostState.LifecycleRequest=$request;$world.AutoCompleteLifecycleWorkers=$true
+    $special=New-CcodSupervisorTestSnapshot -ProcessId 201 -CreationTimeUtc '2030-02-03T03:02:00.0000000Z'
+    $special.Mode='Special';$special.RendererPort=[int]41001;$special.MainPort=[int]41002
+    $world.ProcessIds=@(201);$world.Snapshots[201]=$special
+    $hostState.Special=[object[]]@([pscustomobject][ordered]@{Snapshot=$special;IdentityValid=$true;ProbeValid=$false});$hostState.SpecialNeedsInspect=$true
+    $reads=[pscustomobject]@{Count=0}
+    $fixture.Fake.Adapters.ReadState={param($StateRoot,$SuppressionKey)$reads.Count++;if($reads.Count-le2){throw 'injected proof reread failure'};return $hostState.State}.GetNewClosure()
+
+    Start-CcodSupervisorLifecycleWorkerSlot $hostState $fixture.Fake.Adapters VerifyRemote $null|Out-Null
+    Assert-CcodEqual 201 $hostState.LifecycleWorkerSlot.ProofCandidate.Pid 'failed pre-read retains only the already-observed identity candidate'
+    Invoke-CcodSupervisorPollLifecycleSlot $hostState $fixture.Fake.Adapters
+
+    Assert-CcodEqual 1 $world.CompletedLifecycleRequests.Count 'unbound worker success produces one terminal receipt'
+    Assert-CcodEqual 'VerificationFailed' $world.CompletedLifecycleRequests[0].phase 'unbound worker success fails verification closed'
+    Assert-CcodEqual 'CCOD_REMOTE_PROOF_REBIND_FAILED' $world.CompletedLifecycleRequests[0].error 'unbound worker success uses the stable rebind code'
+    Assert-CcodEqual 'RepairNeeded' $hostState.ConnectionState 'pre-read failure remains manually repairable'
+    $world.Calls.Clear();$hostState.ForceReconcile=$true
+    Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -like 'New:Lifecycle:*'}).Count 'pre-read failure creates no later guardian receipt loop'
 }
 
 Invoke-CcodTest 'ordinary observation uses the durable transaction start as its launch-race lower bound' {
