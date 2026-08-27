@@ -274,6 +274,7 @@ function New-CcodEngineAdapters {
         StaticProbe={ param($NodeCandidates,$CheckerPath) $eventsValue.Add('StaticProbe'); $probeValue }.GetNewClosure()
         ListProcesses={ param($StatusEvidence) @($processValues) }.GetNewClosure()
         GetProcess={ param($Pid,$StatusEvidence) @($processValues | Where-Object { $_.Pid -eq $Pid } | Select-Object -First 1) }.GetNewClosure()
+        ObserveProcessIdentity={ param($ProcessId,$ExpectedCreationTimeUtc) [pscustomobject][ordered]@{Outcome='SameIdentity';Pid=[int]$ProcessId;CreationTimeUtc=[string]$ExpectedCreationTimeUtc} }
         ProcessMatch={ param($Expected,$Actual) $null -ne $Actual -and $Expected.Pid -eq $Actual.Pid -and $Expected.CreationTimeUtc -ceq $Actual.CreationTimeUtc -and $Expected.Mode -ceq $Actual.Mode }
         NewTransition={
             param($Path,$Source,$Package,$RuntimeId,$RendererPort,$MainPort,$TransactionId)
@@ -319,6 +320,17 @@ function New-CcodEngineAdapters {
         Events=$eventsValue
         Counters=$counts
     }
+}
+
+function Set-CcodEngineAliveIdentityObserver {
+    param([Parameter(Mandatory)][hashtable]$Adapters,[Parameter(Mandatory)][hashtable]$Alive)
+    $aliveMap=$Alive
+    $Adapters.ObserveProcessIdentity={
+        param($ProcessId,$ExpectedCreationTimeUtc)
+        if(-not $aliveMap.ContainsKey([int]$ProcessId)){return [pscustomobject][ordered]@{Outcome='Absent';Pid=[int]$ProcessId;CreationTimeUtc=$null}}
+        $creation=[string]$aliveMap[[int]$ProcessId].CreationTimeUtc
+        [pscustomobject][ordered]@{Outcome=if($creation -ceq $ExpectedCreationTimeUtc){'SameIdentity'}else{'IdentityChanged'};Pid=[int]$ProcessId;CreationTimeUtc=$creation}
+    }.GetNewClosure()
 }
 
 function Assert-CcodEngineResultContract($Result,[string]$TransactionId,[string]$Message) {
@@ -460,7 +472,8 @@ try {
         Assert-CcodEqual 1 $messages.Count 'one core failure writes one diagnostic record'
         Assert-CcodTrue ($messages[0] -cnotmatch 'secret|hunter2|swordfish|command\.exe|[\r\n]') 'diagnostic record excludes raw path command secret and multiline text'
         $record=$messages[0]|ConvertFrom-Json
-        Assert-CcodEqual 'schemaVersion,timestampUtc,action,transactionId,stage,code' (($record.PSObject.Properties.Name)-join ',') 'diagnostic log uses the fixed allowlist'
+        Assert-CcodEqual 'schemaVersion,timestampUtc,action,transactionId,stage,code,reason' (($record.PSObject.Properties.Name)-join ',') 'diagnostic log uses the fixed allowlist'
+        Assert-CcodEqual 'Unclassified' $record.reason 'unknown adapter failure records only the allow-listed fallback reason'
 
         [IO.Directory]::CreateDirectory((Split-Path $paths.SessionLogPath -Parent))|Out-Null
         [IO.File]::WriteAllText($paths.SessionLogPath,('x'*(2MB+1)),[Text.UTF8Encoding]::new($false))
@@ -471,6 +484,34 @@ try {
         Assert-CcodEqual 1 $lines.Count 'default failure log contains one bounded JSONL record'
         Assert-CcodTrue ($lines[0] -cnotmatch 'secret|hunter2|swordfish|command\.exe') 'default rotating log is redacted by construction'
         Assert-CcodEqual $false (Test-Path -LiteralPath ($paths.SessionLogPath+'.11')) 'rotation never creates an eleventh history generation'
+    }
+
+    Invoke-CcodTest 'records only exact safe close failure reasons without exception text' {
+        $cases=@(
+            [pscustomobject]@{Message='Recorded Active root is missing, changed, or accompanied by another root';Reason='RecordedActiveMismatch'},
+            [pscustomobject]@{Message='Recorded Active root cannot be safely replaced';Reason='RecordedActiveMismatch'},
+            [pscustomobject]@{Message='Multiple current-package close roots are ambiguous';Reason='MultipleRoots'},
+            [pscustomobject]@{Message='A status-less debug root lacks one valid distinct port pair';Reason='MissingPortPair'},
+            [pscustomobject]@{Message='A replacement debug root lacks one valid distinct port pair';Reason='MissingPortPair'},
+            [pscustomobject]@{Message='Requested close source is not the one verified current root';Reason='RequestedSourceMismatch'},
+            [pscustomobject]@{Message='Current close target tree is not exact and verified';Reason='EmptyVerifiedTree'},
+            [pscustomobject]@{Message="unknown C:\\private\\target`n--token hunter2";Reason='Unclassified'}
+        )
+        foreach($case in $cases){
+            $messages=[Collections.Generic.List[string]]::new()
+            $record=[Management.Automation.ErrorRecord]::new([InvalidOperationException]::new($case.Message),'CCOD_CLOSE_UNPROVEN',[Management.Automation.ErrorCategory]::InvalidData,$null)
+            $result=Invoke-CcodApplySession -Request (New-CcodEngineRequest -Action Apply -Source (New-CcodEngineSnapshot) -TransactionId ([guid]::NewGuid().ToString('D'))) -Paths $paths -Adapters @{
+                ReadState={throw $record}.GetNewClosure()
+                WriteLog={param($Path,$Message)$messages.Add($Message)}.GetNewClosure()
+            }
+            Assert-CcodEqual 'CCOD_CLOSE_UNPROVEN' $result.error.code "$($case.Reason) retains the stable failure code"
+            Assert-CcodEqual 1 $messages.Count "$($case.Reason) writes one diagnostic record"
+            $diagnostic=$messages[0]|ConvertFrom-Json
+            Assert-CcodEqual 'schemaVersion,timestampUtc,action,transactionId,stage,code,reason' (($diagnostic.PSObject.Properties.Name)-join ',') "$($case.Reason) uses only the diagnostic allowlist"
+            Assert-CcodEqual 2 $diagnostic.schemaVersion "$($case.Reason) uses diagnostic schema 2"
+            Assert-CcodEqual $case.Reason $diagnostic.reason "$($case.Reason) maps only the exact stable predicate"
+            Assert-CcodTrue ($messages[0] -cnotmatch 'private|target|hunter2|[\r\n]') "$($case.Reason) never logs raw exception text"
+        }
     }
 
     Invoke-CcodTest 'maps every unrecognized prefixed error ID to the stable generic code' {
@@ -1145,6 +1186,7 @@ try {
         $adapters=New-CcodEngineAdapters -State (New-CcodEngineState -Status $status) -Processes @($special) -Events $events -Counters $counters
         $adapters.ListProcesses={param($StatusEvidence)@($alive.Values)}.GetNewClosure()
         $adapters.GetProcess={param($ProcessId,$StatusEvidence)if($alive.ContainsKey([int]$ProcessId)){$alive[[int]$ProcessId]}else{$null}}.GetNewClosure()
+        $adapters.ObserveProcessIdentity={param($ProcessId,$ExpectedCreationTimeUtc)if($alive.ContainsKey([int]$ProcessId)){[pscustomobject][ordered]@{Outcome='SameIdentity';Pid=[int]$ProcessId;CreationTimeUtc=[string]$ExpectedCreationTimeUtc}}else{[pscustomobject][ordered]@{Outcome='Absent';Pid=[int]$ProcessId;CreationTimeUtc=$null}}}.GetNewClosure()
         $adapters.GetTree={param($Root,$StatusEvidence)@($special,$child)}.GetNewClosure()
         $adapters.StopProcess={param($Expected,$StatusEvidence,$TimeoutMilliseconds)$events.Add("Stop:$($Expected.Pid)");$alive.Remove([int]$Expected.Pid);[pscustomobject]@{Outcome='Stopped';StoppedByController=$true;Snapshot=$Expected}}.GetNewClosure()
         $request=New-CcodEngineRequest -SchemaVersion 2 -Action Close -Source $special -RestartOrdinary $false
@@ -1152,6 +1194,148 @@ try {
         Assert-CcodEqual 'Closed' $result.outcome 'verified Close reaches the explicit closed outcome'
         Assert-CcodEqual 'Stop:202,Stop:201' ((@($events|Where-Object{$_ -like 'Stop:*'}))-join ',') 'verified Close stops child before root'
         Assert-CcodEqual 0 $counters.OrdinaryStart 'Close never requests ordinary activation'
+    }
+
+    Invoke-CcodTest 'proven stale status adopts and closes the unique current ordinary root' {
+        $oldStatus = New-CcodEngineActiveStatus -RuntimeId '2.5.19-old'
+        $oldStatus.session.codex.pid = 10664
+        $oldStatus.session.codex.creationTimeUtc = '2026-08-26T04:49:22.1551350Z'
+        $oldStatus.session.codex.packageFullName = 'OpenAI.Codex_26.820.7780.0_x64__2p2nqsd0c76g0'
+        $oldStatus.session.codex.packageVersion = '26.820.7780.0'
+        $replacement = New-CcodEngineSnapshot -Pid 13948 -CreationTimeUtc '2026-08-27T07:00:17.0000000Z' -Mode Ordinary
+        $probe = New-CcodEngineProbe
+        $probe.PackageFullName = 'OpenAI.Codex_26.820.9563.0_x64__2p2nqsd0c76g0'
+        $probe.PackageVersion = '26.820.9563.0'
+        $events = [Collections.Generic.List[string]]::new()
+        $alive = @{13948=$replacement}
+        $adapters = New-CcodEngineAdapters -State (New-CcodEngineState -Status $oldStatus) -Probe $probe -Processes @($replacement) -Events $events
+        $adapters.StaticProbe = { param($NodeCandidates,$CheckerPath) $probe }.GetNewClosure()
+        $adapters.ListProcesses = { param($StatusEvidence) @($alive.Values) }.GetNewClosure()
+        $adapters.GetProcess = { param($ProcessId,$StatusEvidence) if($alive.ContainsKey([int]$ProcessId)){$alive[[int]$ProcessId]}else{$null} }.GetNewClosure()
+        $adapters.ObserveProcessIdentity = { param($ProcessId,$ExpectedCreationTimeUtc) [pscustomobject][ordered]@{Outcome='Absent';Pid=[int]$ProcessId;CreationTimeUtc=$null} }
+        $adapters.GetTree = { param($Root,$StatusEvidence) @($Root) }
+        $adapters.StopProcess = { param($Expected,$StatusEvidence,$TimeoutMilliseconds) $events.Add("Stop:$($Expected.Pid)");$alive.Remove([int]$Expected.Pid);[pscustomobject]@{Outcome='Stopped';StoppedByController=$true;Snapshot=$Expected} }.GetNewClosure()
+
+        $result = Invoke-CcodCloseSession -Request (New-CcodEngineRequest -SchemaVersion 2 -Action Close -RestartOrdinary $false) -Paths $paths -Adapters $adapters
+        Assert-CcodEqual 'Closed' $result.outcome "proven stale status adopts and closes the unique current ordinary root error=$($result.error.code):$($result.error.message)"
+        Assert-CcodEqual 'IntentWritten,CloseRequested,Stop:13948,Closed,WriteStatus,Complete:Closed' ($events -join ',') 'journal precedes stop and stale status is cleared only at durable completion'
+    }
+
+    Invoke-CcodTest 'stale status replacement remains fail-closed without one strict replacement root and tree' {
+        $oldStatus = New-CcodEngineActiveStatus -RuntimeId '2.5.19-old'
+        $oldStatus.session.codex.pid = 10664
+        $oldStatus.session.codex.creationTimeUtc = '2026-08-26T04:49:22.1551350Z'
+        $oldStatus.session.codex.packageFullName = 'OpenAI.Codex_26.820.7780.0_x64__2p2nqsd0c76g0'
+        $oldStatus.session.codex.packageVersion = '26.820.7780.0'
+        $probe = New-CcodEngineProbe
+        $probe.PackageFullName = 'OpenAI.Codex_26.820.9563.0_x64__2p2nqsd0c76g0'
+        $probe.PackageVersion = '26.820.9563.0'
+        $ordinary = New-CcodEngineSnapshot -Pid 13948 -CreationTimeUtc '2026-08-27T07:00:17.0000000Z' -Mode Ordinary
+        $second = New-CcodEngineSnapshot -Pid 13949 -CreationTimeUtc '2026-08-27T07:00:18.0000000Z' -Mode Ordinary
+        $missingPort = New-CcodEngineSnapshot -Pid 13950 -CreationTimeUtc '2026-08-27T07:00:19.0000000Z' -Mode Unrelated -RendererPort 42001
+        $equalPorts = New-CcodEngineSnapshot -Pid 13951 -CreationTimeUtc '2026-08-27T07:00:20.0000000Z' -Mode Unrelated -RendererPort 42001 -MainPort 42001
+        $cases = @(
+            @{Name='same native identity';Processes=@($ordinary);Observation=[pscustomobject][ordered]@{Outcome='SameIdentity';Pid=10664;CreationTimeUtc='2026-08-26T04:49:22.1551350Z'}},
+            @{Name='native query exception';Processes=@($ordinary);Throw=$true},
+            @{Name='invalid native receipt';Processes=@($ordinary);Observation=[pscustomobject][ordered]@{Outcome='Absent';Pid=10664;CreationTimeUtc=$null;Extra=$true}},
+            @{Name='zero roots';Processes=@();Observation=[pscustomobject][ordered]@{Outcome='Absent';Pid=10664;CreationTimeUtc=$null}},
+            @{Name='two top-level roots';Processes=@($ordinary,$second);Observation=[pscustomobject][ordered]@{Outcome='Absent';Pid=10664;CreationTimeUtc=$null}},
+            @{Name='one visible root plus one indeterminate root';Processes=@($ordinary);Observation=[pscustomobject][ordered]@{Outcome='Absent';Pid=10664;CreationTimeUtc=$null};EnumerationIncomplete=$true},
+            @{Name='debug root missing one port';Processes=@($missingPort);Observation=[pscustomobject][ordered]@{Outcome='Absent';Pid=10664;CreationTimeUtc=$null}},
+            @{Name='debug root equal ports';Processes=@($equalPorts);Observation=[pscustomobject][ordered]@{Outcome='Absent';Pid=10664;CreationTimeUtc=$null}},
+            @{Name='empty verified tree';Processes=@($ordinary);Observation=[pscustomobject][ordered]@{Outcome='Absent';Pid=10664;CreationTimeUtc=$null};EmptyTree=$true}
+        )
+        foreach($case in $cases){
+            $events=[Collections.Generic.List[string]]::new();$processes=@($case.Processes);$alive=@{};foreach($process in $processes){$alive[[int]$process.Pid]=$process}
+            $adapters=New-CcodEngineAdapters -State (New-CcodEngineState -Status $oldStatus) -Probe $probe -Processes $processes -Events $events
+            $adapters.StaticProbe={param($NodeCandidates,$CheckerPath)$probe}.GetNewClosure()
+            $adapters.ListProcesses={param($StatusEvidence)@($alive.Values)}.GetNewClosure()
+            if($case.ContainsKey('EnumerationIncomplete')){
+                $visible=@($alive.Values)
+                $adapters.ListProcessResult={param($StatusEvidence)[pscustomobject][ordered]@{Outcome='Incomplete';Snapshots=@($visible)}}.GetNewClosure()
+            }
+            $adapters.GetProcess={param($ProcessId,$StatusEvidence)if($alive.ContainsKey([int]$ProcessId)){$alive[[int]$ProcessId]}else{$null}}.GetNewClosure()
+            if($case.Throw){$adapters.ObserveProcessIdentity={param($ProcessId,$ExpectedCreationTimeUtc)throw 'native query failed'}}else{$observation=$case.Observation;$adapters.ObserveProcessIdentity={param($ProcessId,$ExpectedCreationTimeUtc)$observation}.GetNewClosure()}
+            if($case.EmptyTree){$adapters.GetTree={param($Root,$StatusEvidence)@()}}
+            $adapters.StopProcess={param($Expected,$StatusEvidence,$TimeoutMilliseconds)$events.Add("Stop:$($Expected.Pid)");throw 'must not stop'}.GetNewClosure()
+            $result=Invoke-CcodCloseSession -Request (New-CcodEngineRequest -SchemaVersion 2 -Action Close -RestartOrdinary $false -TransactionId ([guid]::NewGuid().ToString('D'))) -Paths $paths -Adapters $adapters
+            Assert-CcodEqual 'Error' $result.outcome "$($case.Name) fails closed"
+            Assert-CcodEqual 'CCOD_CLOSE_UNPROVEN' $result.error.code "$($case.Name) returns the exact stable close rejection"
+            Assert-CcodEqual '' ($events -join ',') "$($case.Name) performs zero journal status or process mutations"
+        }
+    }
+
+    Invoke-CcodTest 'rich null never proves tree exit before stop after stop or during final verification' {
+        $probe=New-CcodEngineProbe
+        $rootProcess=New-CcodEngineSnapshot -Pid 13948 -CreationTimeUtc '2026-08-27T07:00:17.0000000Z' -Mode Ordinary
+        foreach($case in @(
+            @{Name='pre-stop rich null plus SameIdentity';Stage='Pre';Indeterminate=$false},
+            @{Name='post-stop rich null plus SameIdentity';Stage='Post';Indeterminate=$false},
+            @{Name='observer indeterminate';Stage='Pre';Indeterminate=$true},
+            @{Name='final rich null plus SameIdentity';Stage='Final';Indeterminate=$false}
+        )){
+            $events=[Collections.Generic.List[string]]::new();$reads=[pscustomobject]@{Count=0};$observations=[pscustomobject]@{Count=0}
+            $adapters=New-CcodEngineAdapters -State (New-CcodEngineState) -Probe $probe -Processes @($rootProcess) -Events $events
+            $adapters.StaticProbe={param($NodeCandidates,$CheckerPath)$probe}.GetNewClosure()
+            $adapters.ListProcesses={param($StatusEvidence)@($rootProcess)}.GetNewClosure()
+            $stage=[string]$case.Stage
+            $adapters.GetProcess={
+                param($ProcessId,$StatusEvidence)
+                $reads.Count++
+                if($stage -ceq 'Pre'){return $null}
+                if($reads.Count -eq 1){return $rootProcess}
+                return $null
+            }.GetNewClosure()
+            $indeterminate=[bool]$case.Indeterminate
+            $adapters.ObserveProcessIdentity={
+                param($ProcessId,$ExpectedCreationTimeUtc)
+                $observations.Count++
+                if($indeterminate){throw 'native creation observation failed'}
+                if($stage -ceq 'Final' -and $observations.Count -eq 1){return [pscustomobject][ordered]@{Outcome='Absent';Pid=[int]$ProcessId;CreationTimeUtc=$null}}
+                [pscustomobject][ordered]@{Outcome='SameIdentity';Pid=[int]$ProcessId;CreationTimeUtc=[string]$ExpectedCreationTimeUtc}
+            }.GetNewClosure()
+            $adapters.GetTree={param($Root,$StatusEvidence)@($Root)}
+            $adapters.StopProcess={param($Expected,$StatusEvidence,$TimeoutMilliseconds)$events.Add("Stop:$($Expected.Pid)");[pscustomobject]@{Outcome='Stopped';StoppedByController=$true;Snapshot=$Expected}}.GetNewClosure()
+            $result=Invoke-CcodCloseSession -Request (New-CcodEngineRequest -SchemaVersion 2 -Action Close -RestartOrdinary $false -TransactionId ([guid]::NewGuid().ToString('D'))) -Paths $paths -Adapters $adapters
+            Assert-CcodEqual 'Error' $result.outcome "$($case.Name) fails closed"
+            Assert-CcodEqual 'CCOD_CLOSE_UNPROVEN' $result.error.code "$($case.Name) uses the stable close proof error"
+            Assert-CcodTrue (($events -join ',') -cmatch 'IntentWritten,CloseRequested') "$($case.Name) retains the durable CloseRequested checkpoint"
+            Assert-CcodTrue (($events -join ',') -cnotmatch 'Closed|WriteStatus|Complete:') "$($case.Name) never writes Closed clears status or archives completion"
+            Assert-CcodTrue ($observations.Count -ge 1) "$($case.Name) invokes the strict PID and creation observer"
+        }
+    }
+
+    Invoke-CcodTest 'stale status accepts PID reuse and one debug replacement only with its new distinct ports' {
+        $oldStatus = New-CcodEngineActiveStatus -RuntimeId '2.5.19-old'
+        $oldStatus.session.codex.pid = 10664
+        $oldStatus.session.codex.creationTimeUtc = '2026-08-26T04:49:22.1551350Z'
+        $oldStatus.session.codex.packageFullName = 'OpenAI.Codex_26.820.7780.0_x64__2p2nqsd0c76g0'
+        $oldStatus.session.codex.packageVersion = '26.820.7780.0'
+        $probe = New-CcodEngineProbe
+        $probe.PackageFullName = 'OpenAI.Codex_26.820.9563.0_x64__2p2nqsd0c76g0'
+        $probe.PackageVersion = '26.820.9563.0'
+        $reuse = New-CcodEngineSnapshot -Pid 10664 -CreationTimeUtc '2026-08-27T07:00:17.0000000Z' -Mode Ordinary
+        $debug = New-CcodEngineSnapshot -Pid 13948 -CreationTimeUtc '2026-08-27T07:00:18.0000000Z' -Mode Unrelated -RendererPort 42001 -MainPort 42002
+        $debug.CommandLine='"C:\Codex\ChatGPT.exe" --remote-debugging-address=127.0.0.1 --remote-debugging-port=42001 --inspect=127.0.0.1:42002'
+        foreach($case in @(
+            @{Name='PID reuse';Root=$reuse;Observation=[pscustomobject][ordered]@{Outcome='IdentityChanged';Pid=10664;CreationTimeUtc='2026-08-27T07:00:17.0000000Z'};Ports=''},
+            @{Name='debug replacement';Root=$debug;Observation=[pscustomobject][ordered]@{Outcome='Absent';Pid=10664;CreationTimeUtc=$null};Ports='42001,42002'}
+        )){
+            $events=[Collections.Generic.List[string]]::new();$ports=[Collections.Generic.List[int]]::new();$rootValue=$case.Root;$alive=@{([int]$rootValue.Pid)=$rootValue}
+            $adapters=New-CcodEngineAdapters -State (New-CcodEngineState -Status $oldStatus) -Probe $probe -Processes @($rootValue) -Events $events
+            $adapters.StaticProbe={param($NodeCandidates,$CheckerPath)$probe}.GetNewClosure();$adapters.ListProcesses={param($StatusEvidence)@($alive.Values)}.GetNewClosure();$adapters.GetProcess={param($ProcessId,$StatusEvidence)if($alive.ContainsKey([int]$ProcessId)){$alive[[int]$ProcessId]}else{$null}}.GetNewClosure()
+            $adapters.ObserveProcessIdentity={
+                param($ProcessId,$ExpectedCreationTimeUtc)
+                if(-not $alive.ContainsKey([int]$ProcessId)){return [pscustomobject][ordered]@{Outcome='Absent';Pid=[int]$ProcessId;CreationTimeUtc=$null}}
+                $creation=[string]$alive[[int]$ProcessId].CreationTimeUtc
+                [pscustomobject][ordered]@{Outcome=if($creation -ceq $ExpectedCreationTimeUtc){'SameIdentity'}else{'IdentityChanged'};Pid=[int]$ProcessId;CreationTimeUtc=$creation}
+            }.GetNewClosure();$adapters.GetTree={param($Root,$StatusEvidence)@($Root)}
+            $adapters.StopProcess={param($Expected,$StatusEvidence,$TimeoutMilliseconds)$events.Add("Stop:$($Expected.Pid)");$alive.Remove([int]$Expected.Pid);[pscustomobject]@{Outcome='Stopped';StoppedByController=$true;Snapshot=$Expected}}.GetNewClosure()
+            $adapters.WaitPortClosed={param($Port,$TimeoutMilliseconds)$ports.Add([int]$Port);$true}.GetNewClosure()
+            $result=Invoke-CcodCloseSession -Request (New-CcodEngineRequest -SchemaVersion 2 -Action Close -RestartOrdinary $false -TransactionId ([guid]::NewGuid().ToString('D'))) -Paths $paths -Adapters $adapters
+            Assert-CcodEqual 'Closed' $result.outcome "$($case.Name) closes the one proven replacement"
+            Assert-CcodEqual $case.Ports ($ports -join ',') "$($case.Name) uses only the replacement command-line ports"
+        }
     }
 
     Invoke-CcodTest 'schema-v2 mutations revalidate the lifecycle fence immediately before stop launch bridge status and terminal commit' {
@@ -1199,6 +1383,7 @@ try {
             $adapters=New-CcodEngineAdapters -State (New-CcodEngineState -Status $status) -Processes @($rootProcess) -Events $events -Counters $counters
             $adapters.ListProcesses={param($StatusEvidence)@($alive.Values)}.GetNewClosure()
             $adapters.GetProcess={param($ProcessId,$StatusEvidence)if($alive.ContainsKey([int]$ProcessId)){$alive[[int]$ProcessId]}else{$null}}.GetNewClosure()
+            $adapters.ObserveProcessIdentity={param($ProcessId,$ExpectedCreationTimeUtc)if($alive.ContainsKey([int]$ProcessId)){[pscustomobject][ordered]@{Outcome='SameIdentity';Pid=[int]$ProcessId;CreationTimeUtc=[string]$ExpectedCreationTimeUtc}}else{[pscustomobject][ordered]@{Outcome='Absent';Pid=[int]$ProcessId;CreationTimeUtc=$null}}}.GetNewClosure()
             $adapters.GetTree={param($Root,$StatusEvidence)@($rootProcess,$child)}.GetNewClosure()
             $adapters.StopProcess={param($Expected,$StatusEvidence,$TimeoutMilliseconds)$events.Add("Stop:$($Expected.Pid)");$alive.Remove([int]$Expected.Pid);[pscustomobject]@{Outcome='Stopped';StoppedByController=$true;Snapshot=$Expected}}.GetNewClosure()
             $result=Invoke-CcodRecoverSession -Request (New-CcodEngineRequest -Action Recover -RestartOrdinary $false) -Paths $paths -Adapters $adapters
@@ -1232,6 +1417,7 @@ try {
         $debug=New-CcodEngineSnapshot -Mode Unrelated -RendererPort 41001 -MainPort 41002;$alive=@{100=$debug};$events=[Collections.Generic.List[string]]::new();$stops=[Collections.Generic.List[int]]::new()
         $counts=[pscustomobject]@{SpecialStart=0;OrdinaryStart=0;Recover=0;Node=0};$adapters=New-CcodEngineAdapters -Processes @($debug) -Events $events -Counters $counts
         $adapters.ListProcesses={param($StatusEvidence)@($alive.Values)}.GetNewClosure();$adapters.GetProcess={param($ProcessId,$StatusEvidence)if($alive.ContainsKey([int]$ProcessId)){$alive[[int]$ProcessId]}else{$null}}.GetNewClosure();$adapters.GetTree={param($Root,$StatusEvidence)@($Root)}
+        Set-CcodEngineAliveIdentityObserver -Adapters $adapters -Alive $alive
         $adapters.StopProcess={param($Expected,$StatusEvidence,$TimeoutMilliseconds)$stops.Add([int]$Expected.Pid);$alive.Remove([int]$Expected.Pid);[pscustomobject]@{Outcome='Stopped';StoppedByController=$true;Snapshot=$Expected}}.GetNewClosure();$adapters.WaitPortClosed={param($Port,$TimeoutMilliseconds)$true}
         $closed=Invoke-CcodRecoverSession -Request (New-CcodEngineRequest -Action Recover -RestartOrdinary $false) -Paths $paths -Adapters $adapters
         Assert-CcodEqual 'Closed' $closed.outcome 'one exact status-less debug root is durably close-owned'
@@ -1240,6 +1426,7 @@ try {
 
         $openDebug=New-CcodEngineSnapshot -Mode Unrelated -RendererPort 41001 -MainPort 41002;$openAlive=@{100=$openDebug};$openAdapters=New-CcodEngineAdapters -Processes @($openDebug) -Counters $counts
         $openAdapters.ListProcesses={param($StatusEvidence)@($openAlive.Values)}.GetNewClosure();$openAdapters.GetProcess={param($ProcessId,$StatusEvidence)if($openAlive.ContainsKey([int]$ProcessId)){$openAlive[[int]$ProcessId]}else{$null}}.GetNewClosure();$openAdapters.GetTree={param($Root,$StatusEvidence)@($Root)}
+        Set-CcodEngineAliveIdentityObserver -Adapters $openAdapters -Alive $openAlive
         $openAdapters.StopProcess={param($Expected,$StatusEvidence,$TimeoutMilliseconds)$openAlive.Remove([int]$Expected.Pid);[pscustomobject]@{Outcome='Stopped';StoppedByController=$true;Snapshot=$Expected}}.GetNewClosure();$openAdapters.WaitPortClosed={param($Port,$TimeoutMilliseconds)$false}
         $open=Invoke-CcodRecoverSession -Request (New-CcodEngineRequest -Action Recover -RestartOrdinary $false -TransactionId '9c2324b9-07a4-4ad3-9de5-c48dde73c713') -Paths $paths -Adapters $openAdapters
         Assert-CcodEqual 'CCOD_CLOSE_UNPROVEN' $open.error.code 'open debug ports prevent a false Closed result'
@@ -1275,6 +1462,7 @@ try {
         $special=New-CcodEngineSnapshot -Pid 201 -CreationTimeUtc '2030-02-03T04:05:07.0000000Z' -Mode Special -RendererPort 41001 -MainPort 41002
         $alive=@{201=$special};$events=[Collections.Generic.List[string]]::new();$liveAdapters=New-CcodEngineAdapters -Processes @($special) -Events $events -Counters $counters
         $liveAdapters.ListProcesses={param($StatusEvidence)@($alive.Values)}.GetNewClosure();$liveAdapters.GetProcess={param($ProcessId,$StatusEvidence)if($alive.ContainsKey([int]$ProcessId)){$alive[[int]$ProcessId]}else{$null}}.GetNewClosure()
+        Set-CcodEngineAliveIdentityObserver -Adapters $liveAdapters -Alive $alive
         $liveAdapters.GetTree={param($Root,$StatusEvidence)@($Root)};$liveAdapters.StopProcess={param($Expected,$StatusEvidence,$TimeoutMilliseconds)$alive.Remove([int]$Expected.Pid);[pscustomobject]@{Outcome='Stopped';StoppedByController=$true;Snapshot=$Expected}}.GetNewClosure();$liveAdapters.WaitPortClosed={param($Port,$TimeoutMilliseconds)$true}
         $live=Invoke-CcodReplayTransition -Request $request -Paths $paths -Transition $cold -Adapters $liveAdapters
         Assert-CcodEqual 'Closed' $live.outcome 'same-execution retained exact tree can prove absence and complete close'
@@ -1350,6 +1538,7 @@ try {
         $adapters=New-CcodEngineAdapters -State $withOld -Processes @($ordinary) -Events $events -Counters $counters
         $adapters.ReadState={param($StateRoot,$SuppressionKey)$reads.Count++;if($reads.Count -le 2){$withOld}else{$withoutOld}}.GetNewClosure()
         $adapters.ListProcesses={param($StatusEvidence)@($alive.Values)}.GetNewClosure();$adapters.GetProcess={param($ProcessId,$StatusEvidence)if($alive.ContainsKey([int]$ProcessId)){$alive[[int]$ProcessId]}else{$null}}.GetNewClosure();$adapters.GetTree={param($Root,$StatusEvidence)@($Root)}
+        Set-CcodEngineAliveIdentityObserver -Adapters $adapters -Alive $alive
         $adapters.StopProcess={param($Expected,$StatusEvidence,$TimeoutMilliseconds)$alive.Remove([int]$Expected.Pid);[pscustomobject]@{Outcome='Stopped';StoppedByController=$true;Snapshot=$Expected}}.GetNewClosure()
         $request=New-CcodEngineRequest -Action Recover -RestartOrdinary $false -TransactionId '16df4637-47f5-4758-89a4-f04c7e7375cf'
         $result=Invoke-CcodRecoverSession -Request $request -Paths $paths -Adapters $adapters
@@ -1390,6 +1579,7 @@ try {
         $adapters.WaitPortClosed={param($Port,$TimeoutMilliseconds)$counts.Wait++;return ($counts.Wait -gt 1)}.GetNewClosure()
         $adapters.InvokeNode={param($NodePath,$Arguments)$counts.Node++;New-CcodFullBridgeInvocation}.GetNewClosure()
         $adapters.ListProcesses={param($StatusEvidence)@($alive.Values)}.GetNewClosure();$adapters.GetProcess={param($ProcessId,$StatusEvidence)if($alive.ContainsKey([int]$ProcessId)){$alive[[int]$ProcessId]}else{$null}}.GetNewClosure();$adapters.GetTree={param($Root,$StatusEvidence)@($Root)}
+        Set-CcodEngineAliveIdentityObserver -Adapters $adapters -Alive $alive
         $adapters.StopProcess={param($Expected,$StatusEvidence,$TimeoutMilliseconds)$alive.Remove([int]$Expected.Pid);[pscustomobject]@{Outcome='Stopped';StoppedByController=$true;Snapshot=$Expected}}.GetNewClosure()
         $baseSet=$adapters.SetTransition;$adapters.SetTransition={param($Path,$TransactionId,$ExpectedStage,$NewStage,$SpecialIdentity,$RecoveryIdentity,$RendererPort,$MainPort)if($NewStage -ceq 'RecoveryLaunchRequested'){$counts.RecoveryStages++};& $baseSet $Path $TransactionId $ExpectedStage $NewStage $SpecialIdentity $RecoveryIdentity $RendererPort $MainPort}.GetNewClosure()
         $adapters.WriteStatus={param($StateRoot,$Status,$LiveProbe)if($null -ne $LiveProbe){$counts.ActiveWrites++}}
@@ -1456,6 +1646,7 @@ try {
         $writtenVerified=[pscustomobject]@{Value=$null}
         $adapters.InvokeNode={param($NodePath,$Arguments)[pscustomobject][ordered]@{ExitCode=0;Stdout='{}';Stderr=''}}
         $adapters.ListProcesses={param($StatusEvidence)@($alive.Values)}.GetNewClosure();$adapters.GetProcess={param($ProcessId,$StatusEvidence)if($alive.ContainsKey([int]$ProcessId)){$alive[[int]$ProcessId]}else{$null}}.GetNewClosure();$adapters.GetTree={param($Root,$StatusEvidence)@($Root)}
+        Set-CcodEngineAliveIdentityObserver -Adapters $adapters -Alive $alive
         $adapters.StopProcess={param($Expected,$StatusEvidence,$TimeoutMilliseconds)$alive.Remove([int]$Expected.Pid);[pscustomobject]@{Outcome='Stopped';StoppedByController=$true;Snapshot=$Expected}}.GetNewClosure()
         $adapters.ReadVerified={param($StateRoot)$existingVerified}.GetNewClosure()
         $adapters.WriteVerified={param($StateRoot,$Verified)$writtenVerified.Value=$Verified}.GetNewClosure()

@@ -94,7 +94,7 @@ function Write-CcodActivationReceiptFile {
     [void](Assert-CcodActivationReceipt $Receipt)
     $stateRoot = Join-Path $InstallRoot 'state'
     [IO.Directory]::CreateDirectory($stateRoot) | Out-Null
-    Write-CcodAtomicJson -Path (Join-Path $stateRoot 'post-install-activation.json') -Value $Receipt
+    Write-CcodAtomicJson -Path (Join-Path $stateRoot 'post-install-activation.json') -Value $Receipt -Compress
 }
 
 function Write-CcodInstallActivationPhase {
@@ -1315,6 +1315,17 @@ function Start-CcodLifecycleTask {
     & $Adapters.StartSupervisorTask
 }
 
+function Test-CcodLifecycleCimCreationTime {
+    param([AllowNull()][string]$ExpectedUtc,[Parameter(Mandatory)][DateTime]$ActualUtc)
+    if ([string]::IsNullOrWhiteSpace($ExpectedUtc)) { return $false }
+    $expected = [DateTime]::MinValue
+    if (-not [DateTime]::TryParseExact($ExpectedUtc,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$expected) -or
+        $expected.Kind -ne [DateTimeKind]::Utc) { return $false }
+    $actualTicks = $ActualUtc.ToUniversalTime().Ticks
+    $expectedTicks = $expected.ToUniversalTime().Ticks
+    return $actualTicks -ge $expectedTicks -and ($actualTicks - $expectedTicks) -le 9
+}
+
 function Get-CcodLifecycleReadinessAdapters {
     param([hashtable]$Adapters)
     $defaults = @{
@@ -1333,7 +1344,7 @@ function Get-CcodLifecycleReadinessAdapters {
             try {
                 $process = Get-Process -Id $SupervisorIdentity.Pid -ErrorAction SilentlyContinue
                 if ($null -eq $process) { return $false }
-                return $process.StartTime.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture) -ceq $SupervisorIdentity.CreationTimeUtc
+                return Test-CcodLifecycleCimCreationTime -ExpectedUtc $SupervisorIdentity.CreationTimeUtc -ActualUtc $process.StartTime.ToUniversalTime()
             } catch { return $false }
             finally { if ($null -ne $process) { $process.Dispose() } }
         }
@@ -1383,7 +1394,7 @@ function Wait-CcodLifecycleNewRuntimeReady {
         $supervisorPath = [IO.Path]::GetFullPath((Join-Path $runtimeRoot 'src\persistence\Supervisor.ps1'))
         $bootstrapPath = [IO.Path]::GetFullPath((Join-Path $root 'bootstrap.ps1'))
         $hostPrefix = '^\s*(?:"[^"]*powershell\.exe"|[^\s"]*powershell\.exe)'
-        $supervisorPattern = $hostPrefix + '\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-STA\s+-File\s+"(?<path>[^"]+)"\s+-ReadyToken\s+(?<token>[0-9a-f]{64})\s*$'
+        $supervisorPattern = $hostPrefix + '\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-STA\s+-File\s+(?:\"(?<path>[^\"]+)\"|(?<path>[^\s]+))\s+-ReadyToken\s+(?<token>[0-9a-f]{64})\s*$'
         $bootstrapPattern = $hostPrefix + '\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-STA\s+-WindowStyle\s+Hidden\s+-File\s+"(?<path>[^"]+)"\s+-InstallRoot\s+"(?<root>[^"]+)"\s+-EntryMode\s+Task\s*$'
         $started = $TaskStartedAtUtc.ToUniversalTime()
         $clock = & $adapter.StartClock
@@ -1436,7 +1447,10 @@ function Wait-CcodLifecycleNewRuntimeReady {
                 if (-not (& $adapter.IsSupervisorIdentityCurrent $candidate.Identity)) { return New-CcodLifecycleNotReadyProof }
                 $readyToken = [string]$candidate.Token
                 try { $readyEvent = & $adapter.OpenReadyEvent $Identity.UserSid $Identity.SessionId $readyToken }
-                catch { return New-CcodLifecycleNotReadyProof }
+                catch {
+                    & $adapter.Sleep 20
+                    continue
+                }
                 while ([long](& $adapter.GetElapsedMilliseconds $clock) -lt $TimeoutMilliseconds) {
                     if (-not (& $adapter.IsSupervisorIdentityCurrent $candidate.Identity)) { return New-CcodLifecycleNotReadyProof }
                     $remaining = $TimeoutMilliseconds - [long](& $adapter.GetElapsedMilliseconds $clock)
@@ -1697,20 +1711,20 @@ function Invoke-CcodInstall {
         if ($DoNotStart) {
             Throw-CcodLifecycleError 'CCOD_INSTALL_NEW_RUNTIME_NOT_READY' 'Activation cannot succeed without starting and proving the new runtime' $null
         }
-        $taskStartedAt = & $adapters.UtcNow
-        try { & $adapters.StartSupervisorTask }
-        catch { Throw-CcodLifecycleError 'CCOD_INSTALL_SUPERVISOR_START_FAILED' 'The existing scheduled task could not start the new runtime' $null }
         $ownershipReleased = & $adapters.ExitLifecycleOwnership $lifecycleOwnership
         if ($ownershipReleased -isnot [bool] -or -not $ownershipReleased -or -not $lifecycleOwnership.released) {
-            Throw-CcodLifecycleError 'CCOD_INSTALL_LIFECYCLE_RELEASE_FAILED' 'Generation ownership could not be released for scheduled-task bootstrap' $null
+            Throw-CcodLifecycleError 'CCOD_INSTALL_LIFECYCLE_RELEASE_FAILED' 'Generation ownership could not be released before scheduled-task bootstrap' $null
         }
         if ($null -ne $installLease -and $installLease.Outcome -ceq 'Acquired') {
             $installReleased = & $adapters.ExitInstallLease $installLease
             if ($installReleased -isnot [bool] -or -not $installReleased) {
-                Throw-CcodLifecycleError 'CCOD_INSTALL_LIFECYCLE_RELEASE_FAILED' 'Installation lease could not be released for scheduled-task bootstrap' $null
+                Throw-CcodLifecycleError 'CCOD_INSTALL_LIFECYCLE_RELEASE_FAILED' 'Installation lease could not be released before scheduled-task bootstrap' $null
             }
             $installLease = $null
         }
+        $taskStartedAt = & $adapters.UtcNow
+        try { & $adapters.StartSupervisorTask }
+        catch { Throw-CcodLifecycleError 'CCOD_INSTALL_SUPERVISOR_START_FAILED' 'The existing scheduled task could not start the new runtime' $null }
         $readyProof = & $adapters.WaitNewRuntimeReady $root $runtimeId ([UInt64]$pointer.generation) $identity $taskStartedAt 15000
         if ($null -eq $readyProof -or $readyProof.SupervisorReady -isnot [bool] -or $readyProof.TrayReady -isnot [bool] -or
             -not $readyProof.SupervisorReady -or -not $readyProof.TrayReady) {

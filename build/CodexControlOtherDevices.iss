@@ -2,6 +2,9 @@
 #ifndef TrayHostArtifactDirectory
 #define TrayHostArtifactDirectory SourcePath + "\generated\trayhost"
 #endif
+#ifndef PortableArtifactDirectory
+#define PortableArtifactDirectory SourcePath + "\generated\portable"
+#endif
 AppId={{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}
 AppName=CodexRemote-fix
 AppVersion={#ProjectVersion}
@@ -49,6 +52,9 @@ Source: "..\build\trayhost-packages.lock.json"; DestDir: "{app}\build"; Flags: i
 Source: "{#TrayHostArtifactDirectory}\CodexRemote.TrayHost.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#TrayHostArtifactDirectory}\CodexRemote.TrayHost.exe.config"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#TrayHostArtifactDirectory}\trayhost-build-provenance.json"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "{#PortableArtifactDirectory}\CodexRemote.Portable.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "{#PortableArtifactDirectory}\CodexRemote.Portable.exe.config"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "{#PortableArtifactDirectory}\portable-launcher-provenance.json"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "..\.github\workflows\release.yml"; DestDir: "{app}\.github\workflows"; Flags: ignoreversion
 Source: "..\assets\codexremote-fix\codexremote-fix.ico"; DestDir: "{app}\assets"; DestName: "CodexRemote-fix.ico"; Flags: ignoreversion
 Source: "..\assets\codexremote-fix\codexremote-fix.ico"; DestDir: "{app}\assets\codexremote-fix"; Flags: ignoreversion
@@ -83,6 +89,7 @@ Name: "{userdesktop}\CodexRemote-fix"; Filename: "{sys}\WindowsPowerShell\v1.0\p
 [Code]
 const
   ACTIVATION_TIMEOUT_MILLISECONDS = 300000;
+  FIRST_ACTIVATION_RECEIPT_TIMEOUT_MILLISECONDS = 90000;
   ACTIVATION_POLL_MILLISECONDS = 50;
   VALIDATION_RETRY_MILLISECONDS = 500;
   VALIDATION_TIMEOUT_MILLISECONDS = 2000;
@@ -171,10 +178,49 @@ begin
   Result := LoadStringFromFile(ReceiptPath, Content);
 end;
 
-function HasJsonStringValue(const Content, FieldName, FieldValue: String): Boolean;
+function IsJsonWhitespace(const Character: Char): Boolean;
 begin
-  Result := (Pos('"' + FieldName + '": "' + FieldValue + '"', Content) > 0) or
-    (Pos('"' + FieldName + '":"' + FieldValue + '"', Content) > 0);
+  Result := (Character = ' ') or (Character = #9) or
+    (Character = #10) or (Character = #13);
+end;
+
+function HasJsonStringValue(const Content, FieldName, FieldValue: String): Boolean;
+var
+  FieldIndex, RelativeIndex, SearchOffset, ValueIndex: Integer;
+  FieldToken, ValueToken: String;
+begin
+  Result := False;
+  FieldToken := '"' + FieldName + '"';
+  ValueToken := '"' + FieldValue + '"';
+  SearchOffset := 1;
+  while SearchOffset <= Length(Content) do
+  begin
+    RelativeIndex := Pos(FieldToken, Copy(Content, SearchOffset,
+      Length(Content) - SearchOffset + 1));
+    if RelativeIndex = 0 then Exit;
+    FieldIndex := SearchOffset + RelativeIndex - 1;
+    ValueIndex := FieldIndex + Length(FieldToken);
+    while ValueIndex <= Length(Content) do
+    begin
+      if not IsJsonWhitespace(Content[ValueIndex]) then Break;
+      ValueIndex := ValueIndex + 1;
+    end;
+    if (ValueIndex <= Length(Content)) and (Content[ValueIndex] = ':') then
+    begin
+      ValueIndex := ValueIndex + 1;
+      while ValueIndex <= Length(Content) do
+      begin
+        if not IsJsonWhitespace(Content[ValueIndex]) then Break;
+        ValueIndex := ValueIndex + 1;
+      end;
+      if Copy(Content, ValueIndex, Length(ValueToken)) = ValueToken then
+      begin
+        Result := True;
+        Exit;
+      end;
+    end;
+    SearchOffset := FieldIndex + Length(FieldToken);
+  end;
 end;
 
 function DetectActivationPhase(const Content: String): TActivationPhase;
@@ -192,6 +238,13 @@ begin
     Result := apReady
   else if HasJsonStringValue(Content, 'phase', 'Failed') then
     Result := apFailed;
+end;
+
+procedure UpdateActivationStartingPresentation();
+begin
+  WizardForm.StatusLabel.Caption := 'Starting CodexRemote-fix activation...';
+  WizardForm.ProgressGauge.Position := 70;
+  WizardForm.Update;
 end;
 
 procedure UpdateActivationPresentation(const Phase: TActivationPhase);
@@ -228,86 +281,63 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  LaunchResultCode: Integer;
+  ActivationResultCode: Integer;
   ValidationResultCode: Integer;
   PromptResultCode: Integer;
   Parameters, ReceiptPath, ActivationId: String;
-  Phase: TActivationPhase;
-  DeadlineTick, NextValidationAttemptTick: Int64;
-  LastValidationResultCode: Integer;
 begin
   if CurStep <> ssPostInstall then
     Exit;
   ActivationId := NewActivationId();
   ReceiptPath := ExpandConstant('{localappdata}\CodexControlOtherDevices\state\post-install-activation.json');
   RefuseStaleActivationReceipt(ReceiptPath);
-  DeadlineTick := GetTickCount64() + ACTIVATION_TIMEOUT_MILLISECONDS;
-  Parameters := '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ExpandConstant('{app}\Activate-CcodRemoteFix.ps1') + '" -AppRoot "' + ExpandConstant('{app}') + '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') + '" -ActivationId "' + ActivationId + '"';
-  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE, ewNoWait, LaunchResultCode) then
+  UpdateActivationStartingPresentation();
+  Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
+    ExpandConstant('{app}\Activate-CcodRemoteFix.ps1') + '" -AppRoot "' + ExpandConstant('{app}') +
+    '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') +
+    '" -ActivationId "' + ActivationId + '" -FirstReceiptTimeoutMilliseconds ' +
+    IntToStr(FIRST_ACTIVATION_RECEIPT_TIMEOUT_MILLISECONDS) + ' -ActivationTimeoutMilliseconds ' +
+    IntToStr(ACTIVATION_TIMEOUT_MILLISECONDS);
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE,
+      ewWaitUntilTerminated, ActivationResultCode) then
   begin
-    Log('CodexRemote-fix activation worker could not be started: ' + SysErrorMessage(LaunchResultCode));
+    Log('CodexRemote-fix activation owner could not be started: ' + SysErrorMessage(ActivationResultCode));
     RaiseException('CodexRemote-fix activation process could not be started.');
   end;
-  NextValidationAttemptTick := 0;
-  LastValidationResultCode := -1;
-  while True do
+  if ActivationResultCode <> 0 then
   begin
-    if GetTickCount64() >= DeadlineTick then
-    begin
-      Log('CodexRemote-fix activation timed out before a validated current-id terminal result.');
-      RaiseException('CodexRemote-fix activation timed out.');
-    end;
-    Phase := ReadActivationProgressPhase(ReceiptPath, ActivationId);
-    UpdateActivationPresentation(Phase);
-    if (Phase in [apReady, apFailed]) and (GetTickCount64() >= NextValidationAttemptTick) then
-    begin
-      if GetTickCount64() + VALIDATION_LAUNCH_BUDGET_MILLISECONDS >= DeadlineTick then
-      begin
-        Log('CodexRemote-fix activation has insufficient remaining budget for strict receipt validation.');
-        RaiseException('CodexRemote-fix activation timed out.');
-      end;
-      Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ExpandConstant('{app}\Activate-CcodRemoteFix.ps1') + '" -AppRoot "' + ExpandConstant('{app}') + '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') + '" -ValidateReceiptWithTimeout -ValidationTimeoutMilliseconds ' + IntToStr(VALIDATION_TIMEOUT_MILLISECONDS) + ' -ActivationId "' + ActivationId + '"';
-      if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE, ewWaitUntilTerminated, ValidationResultCode) then
-      begin
-        Log('CodexRemote-fix activation validator could not be started: ' + SysErrorMessage(ValidationResultCode));
-        RaiseException('CodexRemote-fix activation validator could not be started.');
-      end;
-      if GetTickCount64() >= DeadlineTick then
-      begin
-        Log('CodexRemote-fix activation validator exceeded the activation deadline.');
-        RaiseException('CodexRemote-fix activation timed out.');
-      end;
-      case ValidationResultCode of
-        0:
-        begin
-          WizardForm.StatusLabel.Caption := 'CodexRemote-fix activation is ready.';
-          WizardForm.ProgressGauge.Position := 100;
-          WizardForm.Update;
-          if not WizardSilent then
-          begin
-            Parameters := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\Prompt-CcodRestart.ps1') + '" -AppRoot "' + ExpandConstant('{app}') + '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') + '" -ActivationId "' + ActivationId + '"';
-            if (not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE, ewWaitUntilTerminated, PromptResultCode)) or (PromptResultCode <> 0) then
-              SuppressibleMsgBox('Codex restart was not submitted. Restart Codex manually when convenient.', mbInformation, MB_OK, IDOK);
-          end;
-          Exit;
-        end;
-        2:
-          begin
-            Log('CodexRemote-fix activation validator reported a strict Failed receipt.');
-            SuppressibleMsgBox('CodexRemote-fix activation failed safely. Use the support code in post-install-activation.log.', mbError, MB_OK, IDOK);
-            RaiseException('CodexRemote-fix activation reported Failed.');
-          end;
-      else
-        begin
-          if ValidationResultCode <> LastValidationResultCode then
-            Log('CodexRemote-fix activation validator has not accepted a strict terminal receipt; verification will retry.');
-          LastValidationResultCode := ValidationResultCode;
-          NextValidationAttemptTick := GetTickCount64() + VALIDATION_RETRY_MILLISECONDS;
-        end;
-      end;
-    end;
+    Log('CodexRemote-fix activation owner exited unsuccessfully, result code ' + IntToStr(ActivationResultCode) + '.');
+    SuppressibleMsgBox('CodexRemote-fix activation failed safely. Use the support code in post-install-activation.log.', mbError, MB_OK, IDOK);
+    RaiseException('CodexRemote-fix activation failed.');
+  end;
+  Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
+    ExpandConstant('{app}\Activate-CcodRemoteFix.ps1') + '" -AppRoot "' + ExpandConstant('{app}') +
+    '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') +
+    '" -ValidateReceiptWithTimeout -ValidationTimeoutMilliseconds ' + IntToStr(VALIDATION_TIMEOUT_MILLISECONDS) +
+    ' -ActivationId "' + ActivationId + '"';
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE,
+      ewWaitUntilTerminated, ValidationResultCode) then
+  begin
+    Log('CodexRemote-fix activation validator could not be started: ' + SysErrorMessage(ValidationResultCode));
+    RaiseException('CodexRemote-fix activation validator could not be started.');
+  end;
+  if ValidationResultCode <> 0 then
+  begin
+    Log('CodexRemote-fix activation validator rejected the terminal receipt, result code ' + IntToStr(ValidationResultCode) + '.');
+    SuppressibleMsgBox('CodexRemote-fix activation failed safe validation. Use the support code in post-install-activation.log.', mbError, MB_OK, IDOK);
+    RaiseException('CodexRemote-fix activation receipt validation failed.');
+  end;
+  if ValidationResultCode = 0 then
+  begin
+    WizardForm.StatusLabel.Caption := 'CodexRemote-fix activation is ready.';
+    WizardForm.ProgressGauge.Position := 100;
     WizardForm.Update;
-    Sleep(ACTIVATION_POLL_MILLISECONDS);
+    if not WizardSilent then
+    begin
+      Parameters := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\Prompt-CcodRestart.ps1') + '" -AppRoot "' + ExpandConstant('{app}') + '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') + '" -ActivationId "' + ActivationId + '"';
+      if (not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE, ewWaitUntilTerminated, PromptResultCode)) or (PromptResultCode <> 0) then
+        SuppressibleMsgBox('Codex restart was not submitted. Restart Codex manually when convenient.', mbInformation, MB_OK, IDOK);
+    end;
   end;
 end;
 

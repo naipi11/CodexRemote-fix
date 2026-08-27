@@ -59,9 +59,21 @@ $results += Invoke-CcodTest 'phase table selects one exact lifecycle operation' 
     }
 }
 
+$results += Invoke-CcodTest 'a recovered close request cannot skip a still-running ordinary root' {
+    $request = New-CcodCoordinatorFixture -Phase CloseRequested -Kind RestartAndRepair
+    $step = Get-CcodLifecycleStep -Request $request -Observation Ordinary -NowUtc '2030-02-03T04:06:00.0000000Z'
+    Assert-CcodCoordinatorStep $step Operation $null Close $null $null 'recovered close request with ordinary root'
+}
+
 $results += Invoke-CcodTest 'repair is idempotent and safe exit never selects Apply' {
     $connected = Get-CcodLifecycleStep -Request (New-CcodCoordinatorFixture -Kind CheckAndRepair) -Observation RemoteVerified -NowUtc '2030-02-03T04:06:00.0000000Z'
     Assert-CcodCoordinatorStep $connected Completed CancelledBeforeClose None $null $null 'already connected repair'
+    $inspectRequest=New-CcodCoordinatorFixture -Kind CheckAndRepair
+    $inspect=Get-CcodLifecycleStep -Request $inspectRequest -Observation Special -NowUtc '2030-02-03T04:06:00.0000000Z'
+    Assert-CcodCoordinatorStep $inspect Operation $null Inspect $null $null 'unproven persisted special inspection'
+    $inspectResult=[pscustomobject][ordered]@{schemaVersion=1;transactionId=$inspectRequest.transactionId;action='Inspect';ok=$true;outcome='Inspected';observation='Special';error=$null}
+    $repair=Reduce-CcodLifecycleWorkerResult -Request $inspectRequest -Result $inspectResult -NowUtc '2030-02-03T04:06:01.0000000Z'
+    Assert-CcodEqual CloseRequested $repair.phase 'renderer-invalid strong Inspect advances to the normal repair close boundary'
     foreach ($observation in @('Ordinary','NoCodex')) {
         $safe = Get-CcodLifecycleStep -Request (New-CcodCoordinatorFixture -Kind SafeExit) -Observation $observation -NowUtc '2030-02-03T04:06:00.0000000Z'
         Assert-CcodCoordinatorStep $safe Completed CancelledBeforeClose None $null $null "safe exit $observation"

@@ -370,6 +370,28 @@ $results += Invoke-CcodTest 'keeps a ready active runtime and does not rewrite t
     }
 }
 
+$results += Invoke-CcodTest 'returns success when a ready Supervisor remains alive for installer verification' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-" + [guid]::NewGuid().ToString('N'))
+    $supervisorPid = $null
+    try {
+        New-CcodBootstrapFixture -Root $root | Out-Null
+        $pidPath = Join-Path $root 'ready-long-lived.pid'
+        $activeId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'ReadyLongLived' -MarkerPath $pidPath)
+        Set-CcodTestActivePointer -Root $root -ActiveRuntime $activeId -PreviousRuntime $null
+
+        $run = Invoke-CcodBootstrapTimed -Root $root -ReadyToken (New-CcodBootstrapToken) -TimeoutMilliseconds 10000
+        if ([IO.File]::Exists($pidPath)) { $supervisorPid = [int][IO.File]::ReadAllText($pidPath) }
+        Assert-CcodExactEqual $false $run.TimedOut 'ready long-lived Supervisor does not hold bootstrap open'
+        Assert-CcodExactEqual 0 $run.ExitCode 'ready long-lived Supervisor is a successful bootstrap outcome'
+    } finally {
+        if ($null -ne $supervisorPid) {
+            $leftover = Get-Process -Id $supervisorPid -ErrorAction SilentlyContinue
+            if ($null -ne $leftover) { try { $leftover.Kill(); $leftover.WaitForExit(2000) | Out-Null } finally { $leftover.Dispose() } }
+        }
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
 $results += Invoke-CcodTest 'launches a schema-two active pointer without downgrading its generation' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-" + [guid]::NewGuid().ToString('N'))
     try {
@@ -602,8 +624,8 @@ $results += Invoke-CcodTest 'bootstrap contains no Codex process, package, or ta
 
 $results += Invoke-CcodTest 'launches the supervisor child with an explicit STA apartment' {
     $source = Get-Content -LiteralPath $bootstrapScript -Raw
-    Assert-CcodTrue ($source.Contains('-STA -File')) 'bootstrap supervisor launch arguments include -STA before -File'
-    Assert-CcodTrue ($source.Contains('-NoProfile -ExecutionPolicy Bypass -STA -File')) 'bootstrap uses the exact STA launch argument prefix'
+    Assert-CcodTrue (($source.Contains('-STA -File') -or $source.Contains("'-STA', '-File'"))) 'bootstrap supervisor launch arguments include -STA before -File'
+    Assert-CcodTrue (($source.Contains('-NoProfile -ExecutionPolicy Bypass -STA -File') -or $source.Contains("'-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File'"))) 'bootstrap uses the exact STA launch argument prefix'
     Assert-CcodTrue (-not $source.Contains('-NoProfile -ExecutionPolicy Bypass -File "')) 'bootstrap no longer launches the supervisor without -STA'
 }
 

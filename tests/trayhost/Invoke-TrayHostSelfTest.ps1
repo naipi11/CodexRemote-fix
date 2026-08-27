@@ -37,7 +37,7 @@ $parentClientFiles=@(
 $testPath=if($ProtocolOnly){Join-Path $repositoryRoot 'tests\trayhost\TrayHostProtocolSelfTest.cs'}elseif($NativeOnly){Join-Path $repositoryRoot 'tests\trayhost\TrayHostNativeSelfTest.cs'}elseif($TransportOnly){Join-Path $repositoryRoot 'tests\trayhost\TrayHostTransportSelfTest.cs'}else{Join-Path $repositoryRoot 'tests\trayhost\TrayHostParentClientSelfTest.cs'}
 $requiredFiles=@($protocolPath,$presentationPath,$testPath)
 if($ProtocolOnly){$requiredFiles+=$protocolSupportFiles}
-if($NativeOnly){$requiredFiles+=$nativeFiles}
+if($NativeOnly){$requiredFiles+=$nativeFiles+$transportFiles}
 if($TransportOnly){$requiredFiles+=$transportFiles}
 if($ParentClientOnly){$requiredFiles+=$transportFiles+$parentClientFiles}
 if($ProductionOnly){$requiredFiles+=(Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'src\trayhost') -Filter '*.cs' -File | ForEach-Object FullName)}
@@ -59,7 +59,7 @@ try{
     {
         $args+=@($protocolPath,$presentationPath)
         if($ProtocolOnly){$args+=$protocolSupportFiles}
-        if($NativeOnly){$args+=$nativeFiles}
+        if($NativeOnly){$args+=$nativeFiles+$transportFiles}
         if($TransportOnly){$args+=$transportFiles}
         if($ParentClientOnly){$args+=$transportFiles+$parentClientFiles}
     }

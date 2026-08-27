@@ -67,6 +67,9 @@ function Get-CcodLifecycleStep {
     if($Request.kind -ceq 'CheckAndRepair' -and $Request.phase -ceq 'Requested' -and $Observation -ceq 'RemoteVerified'){
         return New-CcodLifecycleStepResult Completed CancelledBeforeClose None $null $null
     }
+    if($Request.kind -ceq 'CheckAndRepair' -and $Request.phase -ceq 'Requested' -and $Observation -ceq 'Special'){
+        return New-CcodLifecycleStepResult Operation $null Inspect $null $null
+    }
     if($Request.kind -ceq 'SafeExit' -and $Request.phase -ceq 'Requested' -and @('Ordinary','NoCodex') -ccontains $Observation){
         return New-CcodLifecycleStepResult Completed CancelledBeforeClose None $null $null
     }
@@ -75,7 +78,7 @@ function Get-CcodLifecycleStep {
         'Requested' { return New-CcodLifecycleStepResult Operation CloseRequested Close $null $null }
         'CloseRequested' {
             if($Observation -ceq 'CloseFailed' -or $Observation -ceq 'Error'){return New-CcodLifecycleStepResult Failed CloseFailed None $null $(if($Request.error){$Request.error}else{'CCOD_CLOSE_FAILED'})}
-            if(@('Closed','NoCodex','Ordinary') -ccontains $Observation){return New-CcodLifecycleStepResult Progress CloseConfirmed None $null $null}
+            if(@('Closed','NoCodex') -ccontains $Observation){return New-CcodLifecycleStepResult Progress CloseConfirmed None $null $null}
             return New-CcodLifecycleStepResult Operation $null Close $null $null
         }
         'CloseConfirmed' {
@@ -206,7 +209,7 @@ function Reduce-CcodLifecycleWorkerResult {
     }
     $nextPhase=$null;$stableError=$null
     switch($Result.action){
-        'Inspect'{if($Result.observation -ceq 'RemoteVerified'){$nextPhase='CancelledBeforeClose'}}
+        'Inspect'{if($Result.observation -ceq 'RemoteVerified'){$nextPhase='CancelledBeforeClose'}elseif($Result.observation -ceq 'Special'){$nextPhase='CloseRequested'}}
         'Close'{$nextPhase='CloseConfirmed'}
         'RequestOrdinaryLaunch'{
             $nextPhase=$null

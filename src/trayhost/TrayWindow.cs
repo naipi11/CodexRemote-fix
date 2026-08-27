@@ -3,6 +3,7 @@ using System;
 internal sealed class TrayWindow : IDisposable
 {
     private readonly INativeTrayPlatform _native;
+    private readonly Action<bool> _menuOpenChanged;
     private InputModeGuard _inputGuard;
     private TrayIconData _icon;
     private IntPtr _owner;
@@ -18,10 +19,14 @@ internal sealed class TrayWindow : IDisposable
     internal IntPtr OwnerHandle { get { return _owner; } }
     internal LanguageMode CurrentLanguage { get { return _current == null ? LanguageMode.System : _current.Language; } }
 
-    internal TrayWindow(INativeTrayPlatform native)
+    internal TrayWindow(INativeTrayPlatform native) : this(native, null)
+    {
+    }
+
+    internal TrayWindow(INativeTrayPlatform native, Action<bool> menuOpenChanged)
     {
         if (native == null) { throw new ArgumentNullException("native"); }
-        _native = native;
+        _native = native; _menuOpenChanged = menuOpenChanged;
     }
 
     internal void Create(PresentationSnapshot initial)
@@ -48,12 +53,13 @@ internal sealed class TrayWindow : IDisposable
         }
     }
 
-    internal void Apply(PresentationSnapshot snapshot)
+    internal bool Apply(PresentationSnapshot snapshot)
     {
         if (snapshot == null) { throw new ArgumentNullException("snapshot"); }
         if (!_created || _disposed) { throw new InvalidOperationException("tray window is not active"); }
-        if (_menuOpen) { _pending = snapshot; return; }
-        if (snapshot.Revision >= CurrentRevision) { _current = snapshot; }
+        if (_menuOpen) { _pending = snapshot; return false; }
+        if (snapshot.Revision < CurrentRevision) { return false; }
+        _current = snapshot; return true;
     }
 
     internal uint? HandleContextMenu(TrayPoint point)
@@ -63,6 +69,8 @@ internal sealed class TrayWindow : IDisposable
         uint result = 0U;
         try
         {
+            Action<bool> menuOpenChanged = _menuOpenChanged;
+            if (menuOpenChanged != null) { menuOpenChanged(true); }
             _inputGuard.VerifyNoOwnerInputContext(_owner);
             using (NativeMenu menu = new NativeMenu(_native, _owner, _current)) { result = menu.Show(point); }
             if (result != 0U && Enum.IsDefined(typeof(TrayCommand), (ushort)result) && (TrayCommand)result != TrayCommand.None)
@@ -83,6 +91,8 @@ internal sealed class TrayWindow : IDisposable
                 _pending = null;
                 if (pending.Revision >= CurrentRevision) { _current = pending; }
             }
+            Action<bool> menuOpenChanged = _menuOpenChanged;
+            if (menuOpenChanged != null) { menuOpenChanged(false); }
         }
     }
 
@@ -102,6 +112,12 @@ internal sealed class TrayWindow : IDisposable
     {
         if (!_created || _disposed || _current == null) { throw new InvalidOperationException("tray window is not active"); }
         _native.ShowMessageBox(_owner, _current.Strings[12], _current.Strings[11]);
+    }
+
+    internal void ShowActionFailed()
+    {
+        if (!_created || _disposed || _current == null) { throw new InvalidOperationException("tray window is not active"); }
+        _native.ShowMessageBox(_owner, _current.Strings[15], _current.Strings[0]);
     }
 
     private TrayIconData CreateIconData(IntPtr owner)

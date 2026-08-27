@@ -15,6 +15,9 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License"></a>
 </p>
 
+> [!NOTE]
+> **Release status:** v2.5.21 is the current stable release. The setup installer, EXE-based portable ZIP, tray actions, restart-and-repair flow, and persistent remote connection are covered by the release validation gates.
+
 CodexRemote-fix enables the UI that ships with Codex Desktop for Windows but is hidden by a runtime defect:
 
 **Settings → Connections → Control other devices**
@@ -47,7 +50,7 @@ that existing page and leaves the Codex UI, account authorization, and enrollmen
 ## Quick start
 
 
-1. Download either `CodexRemote-fix-2.5.9-setup.exe` (recommended installer) or `CodexRemote-fix-2.5.9-windows-x64.zip` from [Releases](https://github.com/naipi11/CodexRemote-fix/releases). Download and verify the matching `.sha256.txt` before continuing.
+1. Download either `CodexRemote-fix-2.5.21-setup.exe` (recommended installer) or `CodexRemote-fix-2.5.21-windows-x64.zip` from [Releases](https://github.com/naipi11/CodexRemote-fix/releases). Download and verify the matching `.sha256.txt` before continuing.
 2. If you chose the setup installer, run it and follow the wizard. If you chose the portable ZIP, extract it into a new empty folder and double-click `CodexRemote-fix.exe`.
 
    Both paths validate the payload, run a Microsoft Defender custom scan, and preserve the DPAPI device-key store.
@@ -58,9 +61,8 @@ The current portable bundle, checksum, release manifest, and payload manifest ar
 
 Before replacing a portable build, use its installed `Uninstall-CodexControlOtherDevices.ps1`; settings and the DPAPI\r\ndevice-key store stay in place.
 
-Verified on Windows 11 · Codex Desktop `26.818.2441.0` · Node.js `22.23.1`:
-the hidden controller tab, native tray menu, bilingual menu switching, and persistent
-supervisor are working.
+Verified on Windows 11 · Codex Desktop `26.820.7780.0` · Node.js `22.23.1`:
+the hidden controller tab, restart-and-repair recovery, and persistent remote connection are working.
 
 ## Everyday use
 
@@ -68,7 +70,7 @@ supervisor are working.
 - The desktop shortcut **CodexRemote-fix** is an optional way to start the tray supervisor if its icon is not visible. It does not start a repair or change a Codex session by itself.
 - When the connection status is **Connected**, open **Settings → Connections → Control other devices** to enroll or use it.
 - New Codex builds start with `--remote-debugging-port` but no `--inspect`; the supervisor recognizes that launch shape and performs the takeover automatically.
-- The tray menu supports Follow system, Chinese, and English; switching applies immediately without restarting anything.
+- The tray menu supports Follow system, Chinese, English, Open logs, and About. Actions are authorized against the exact menu presentation that was displayed and acknowledged, while current capabilities remain fail-closed.
 - Updating this project or Codex does not require reinstalling the supervisor; the installer atomically switches versioned runtimes.
 - If an explicit repair is needed, use **Check and repair remote connection**. Codex may close and relaunch once, and existing device pairing and authorization are preserved. A completed recovery left behind by an interrupted upgrade is cleared safely on the next supervisor start.
 
@@ -83,12 +85,12 @@ The tray reports two independent, truthful status lines instead of inferring rea
 
 ## Releases
 
-Every tagged release ships a Windows setup installer and a portable ZIP, each with its SHA-256 checksum, release manifest, and the shared payload manifest. The `.github/workflows/release.yml` workflow builds both from the tag automatically, so v2.5.9 includes:
+Every tagged release ships a Windows setup installer and an EXE-entry portable ZIP, each with its SHA-256 checksum, release manifest, and the shared payload manifest. The `.github/workflows/release.yml` workflow builds both from the tag automatically, so v2.5.21 includes:
 
-- `CodexRemote-fix-2.5.9-setup.exe` and its checksum
-- `CodexRemote-fix-2.5.9-windows-x64.zip` and its checksum
-- `CodexRemote-fix-2.5.9-payload-manifest.json`
-- `CodexRemote-fix-2.5.9-release-manifest.json` and `CodexRemote-fix-2.5.9-setup-release-manifest.json`
+- `CodexRemote-fix-2.5.21-setup.exe` and its checksum
+- `CodexRemote-fix-2.5.21-windows-x64.zip` and its checksum
+- `CodexRemote-fix-2.5.21-payload-manifest.json`
+- `CodexRemote-fix-2.5.21-release-manifest.json` and `CodexRemote-fix-2.5.21-setup-release-manifest.json`
 
 Each release appends a short English change summary to the GitHub release body. The bilingual release history is kept in [CHANGELOG.md](CHANGELOG.md).
 

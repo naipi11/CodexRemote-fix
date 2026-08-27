@@ -252,10 +252,26 @@ function Set-CcodSessionFailure($Result, $Record, [string]$Stage) {
     return $Result
 }
 
+function Get-CcodSessionDiagnosticReason {
+    param($Record,[string]$Code)
+    if($Code -cne 'CCOD_CLOSE_UNPROVEN' -or $null -eq $Record -or $null -eq $Record.Exception){return 'Unclassified'}
+    switch -CaseSensitive ([string]$Record.Exception.Message) {
+        'Recorded Active root is missing, changed, or accompanied by another root' {return 'RecordedActiveMismatch'}
+        'Recorded Active root cannot be safely replaced' {return 'RecordedActiveMismatch'}
+        'Multiple current-package close roots are ambiguous' {return 'MultipleRoots'}
+        'A status-less debug root lacks one valid distinct port pair' {return 'MissingPortPair'}
+        'A replacement debug root lacks one valid distinct port pair' {return 'MissingPortPair'}
+        'Requested close source is not the one verified current root' {return 'RequestedSourceMismatch'}
+        'Current close target tree is not exact and verified' {return 'EmptyVerifiedTree'}
+        default {return 'Unclassified'}
+    }
+}
+
 function Write-CcodSessionDiagnostic {
-    param($Result,[string]$Action,[string]$TransactionId,[string]$Stage,[string]$Code,$Paths,[hashtable]$Adapter)
+    param($Result,[string]$Action,[string]$TransactionId,[string]$Stage,[string]$Code,$Record,$Paths,[hashtable]$Adapter)
     if($null -eq $Paths -or $null -eq $Adapter -or $null -eq $Adapter.WriteLog){return}
-    $record=[pscustomobject][ordered]@{schemaVersion=1;timestampUtc=[DateTime]::UtcNow.ToString('o',[Globalization.CultureInfo]::InvariantCulture);action=$Action;transactionId=$TransactionId;stage=$Stage;code=$Code}
+    $reason=Get-CcodSessionDiagnosticReason $Record $Code
+    $record=[pscustomobject][ordered]@{schemaVersion=2;timestampUtc=[DateTime]::UtcNow.ToString('o',[Globalization.CultureInfo]::InvariantCulture);action=$Action;transactionId=$TransactionId;stage=$Stage;code=$Code;reason=$reason}
     try{& $Adapter.WriteLog $Paths.SessionLogPath ($record|ConvertTo-Json -Depth 4 -Compress)|Out-Null;$Result.logFile=$Paths.SessionLogPath}catch{}
 }
 
@@ -460,7 +476,27 @@ function Get-CcodCurrentPackageRoots {
     if($null -eq $identity -or [string]$identity.SessionId -cne [string]$Request.supervisorIdentity.sessionId -or [string]::IsNullOrWhiteSpace([string]$identity.UserSid)){
         Throw-CcodSessionError 'CCOD_SOURCE_AMBIGUOUS' 'The request supervisor does not match the current Windows session identity' $Request.supervisorIdentity
     }
-    return @(& $Adapter.ListProcesses $StatusEvidence|Where-Object{
+    try { $enumerationOutput=@(& $Adapter.ListProcessResult $StatusEvidence 2>&1) } catch {
+        Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Current ChatGPT process enumeration was indeterminate' $null
+    }
+    if($enumerationOutput.Count -ne 1 -or $enumerationOutput[0] -is [Management.Automation.ErrorRecord]){
+        Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Current ChatGPT process enumeration was malformed' $null
+    }
+    $enumeration=$enumerationOutput[0]
+    Assert-CcodSessionExactProperties $enumeration @('Outcome','Snapshots') 'CCOD_CLOSE_UNPROVEN' 'current ChatGPT process enumeration'
+    if($enumeration.Outcome -isnot [string] -or @('Complete','Incomplete') -cnotcontains $enumeration.Outcome -or
+       $null -eq $enumeration.Snapshots -or $enumeration.Snapshots -is [string]){
+        Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Current ChatGPT process enumeration receipt was invalid' $enumeration
+    }
+    if($enumeration.Outcome -ceq 'Incomplete'){
+        Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Current ChatGPT process enumeration was incomplete' $null
+    }
+    $snapshots=@($enumeration.Snapshots)
+    foreach($snapshot in $snapshots){
+        if($null -eq $snapshot){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Current ChatGPT process enumeration contained an indeterminate member' $null}
+        Assert-CcodSessionExactProperties $snapshot @('Pid','CreationTimeUtc','SessionId','UserSid','Path','PackageFamilyName','CommandLine','ParentPid','IsTopLevel','Mode','RendererPort','MainPort') 'CCOD_CLOSE_UNPROVEN' 'current ChatGPT process snapshot'
+    }
+    return @($snapshots|Where-Object{
         $_.IsTopLevel -and
         [string]$_.SessionId -ceq [string]$Request.supervisorIdentity.sessionId -and
         $_.UserSid -ceq $identity.UserSid -and
@@ -558,14 +594,39 @@ function Invoke-CcodCloseVerifiedTree {
     $ordered=@($Tree|Sort-Object @{Expression={-(Get-CcodTreeDepth $_ $byPid)}},@{Expression={$_.Pid}})
     foreach($member in $ordered){
         $current=& $Adapter.GetProcess $member.Pid $StatusEvidence
-        if($null -eq $current){continue}
-        if(-not (& $Adapter.ProcessMatch $member $current)){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Close tree identity changed before stop' $member}
+        if($null -eq $current){
+            $identity=Get-CcodStrictProcessIdentityObservation -ProcessId ([int]$member.Pid) -ExpectedCreationTimeUtc ([string]$member.CreationTimeUtc) -Adapter $Adapter
+            if($identity.Outcome -notin @('Absent','IdentityChanged')){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Close tree member exit was not strictly proven before stop' $member}
+            continue
+        }
+        if(-not (& $Adapter.ProcessMatch $member $current)){
+            $identity=Get-CcodStrictProcessIdentityObservation -ProcessId ([int]$member.Pid) -ExpectedCreationTimeUtc ([string]$member.CreationTimeUtc) -Adapter $Adapter
+            if($identity.Outcome -in @('Absent','IdentityChanged')){continue}
+            Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Close tree identity changed before stop' $member
+        }
         $receipt=Invoke-CcodSessionMutation $Request $Adapter 'StopProcess' @($member,$StatusEvidence,$processTimeout)
         if($receipt.Outcome -cne 'Stopped' -and $receipt.Outcome -cne 'SourceExited'){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Close tree member did not stop safely' $member}
+        $after=& $Adapter.GetProcess $member.Pid $StatusEvidence
+        if($null -eq $after){
+            $identity=Get-CcodStrictProcessIdentityObservation -ProcessId ([int]$member.Pid) -ExpectedCreationTimeUtc ([string]$member.CreationTimeUtc) -Adapter $Adapter
+            if($identity.Outcome -notin @('Absent','IdentityChanged')){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Close tree member exit was not strictly proven after stop' $member}
+        }elseif(& $Adapter.ProcessMatch $member $after){
+            Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Close tree member remains alive after stop' $member
+        }else{
+            $identity=Get-CcodStrictProcessIdentityObservation -ProcessId ([int]$member.Pid) -ExpectedCreationTimeUtc ([string]$member.CreationTimeUtc) -Adapter $Adapter
+            if($identity.Outcome -notin @('Absent','IdentityChanged')){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Close tree member replacement was not strictly proven after stop' $member}
+        }
     }
     foreach($member in $Tree){
         $current=& $Adapter.GetProcess $member.Pid $StatusEvidence
-        if($null -ne $current -and (& $Adapter.ProcessMatch $member $current)){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Close tree member remains alive after stop' $member}
+        if($null -eq $current){
+            $identity=Get-CcodStrictProcessIdentityObservation -ProcessId ([int]$member.Pid) -ExpectedCreationTimeUtc ([string]$member.CreationTimeUtc) -Adapter $Adapter
+            if($identity.Outcome -notin @('Absent','IdentityChanged')){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Final close tree absence was not strictly proven' $member}
+            continue
+        }
+        if(& $Adapter.ProcessMatch $member $current){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Close tree member remains alive after stop' $member}
+        $identity=Get-CcodStrictProcessIdentityObservation -ProcessId ([int]$member.Pid) -ExpectedCreationTimeUtc ([string]$member.CreationTimeUtc) -Adapter $Adapter
+        if($identity.Outcome -notin @('Absent','IdentityChanged')){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Final close tree identity replacement was not strictly proven' $member}
     }
     if($null -ne $RendererPort -and $null -ne $MainPort){
         foreach($port in @($RendererPort,$MainPort)){if(-not (& $Adapter.WaitPortClosed $port $processTimeout)){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'A recorded close port did not explicitly refuse' $port}}
@@ -580,11 +641,56 @@ function Complete-CcodCloseResult {
     return $Result
 }
 
+function Get-CcodStrictProcessIdentityObservation {
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [Parameter(Mandatory)][string]$ExpectedCreationTimeUtc,
+        [Parameter(Mandatory)][hashtable]$Adapter
+    )
+
+    try { $output=@(& $Adapter.ObserveProcessIdentity $ProcessId $ExpectedCreationTimeUtc 2>&1) } catch {
+        Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Recorded Active process identity could not be observed strictly' $ProcessId
+    }
+    if($output.Count -ne 1 -or $output[0] -is [Management.Automation.ErrorRecord]){
+        Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Recorded Active process identity observation was malformed' $output
+    }
+    $identity=$output[0]
+    Assert-CcodSessionExactProperties $identity @('Outcome','Pid','CreationTimeUtc') 'CCOD_CLOSE_UNPROVEN' 'process identity observation'
+    if($identity.Outcome -isnot [string] -or @('Absent','SameIdentity','IdentityChanged') -cnotcontains $identity.Outcome -or
+       $identity.Pid -isnot [int] -or $identity.Pid -ne $ProcessId){
+        Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Recorded Active process identity observation was invalid' $identity
+    }
+    switch -CaseSensitive ($identity.Outcome) {
+        'Absent' {
+            if($null -ne $identity.CreationTimeUtc){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Absent identity observation carried a creation time' $identity}
+        }
+        'SameIdentity' {
+            if($identity.CreationTimeUtc -isnot [string] -or $identity.CreationTimeUtc -cne $ExpectedCreationTimeUtc){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Same identity observation did not match the recorded creation time' $identity}
+        }
+        'IdentityChanged' {
+            if(-not (Test-CcodSessionCanonicalUtc $identity.CreationTimeUtc) -or $identity.CreationTimeUtc -ceq $ExpectedCreationTimeUtc){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Changed identity observation lacked a distinct canonical creation time' $identity}
+        }
+    }
+    return $identity
+}
+
 function Merge-CcodSessionAdapters($Adapters) {
     $defaults = @{
         ReadState={ param($StateRoot,$SuppressionKey) Read-CcodState -StateRoot $StateRoot -CurrentSuppressionKey $SuppressionKey }
         GetPackageIdentity={ Get-CcodPackageIdentity }
         StaticProbe={ param($NodeCandidates,$CheckerPath) Invoke-CcodStaticProbe -NodeCandidates $NodeCandidates -CheckerPath $CheckerPath }
+        ListProcessResult={ param($StatusEvidence)
+            $current=[Diagnostics.Process]::GetCurrentProcess();try{$sessionId=$current.SessionId}finally{$current.Dispose()}
+            $identity=[Security.Principal.WindowsIdentity]::GetCurrent();try{$sid=$identity.User.Value}finally{$identity.Dispose()}
+            $snapshots=[Collections.Generic.List[object]]::new();$incomplete=$false
+            foreach($process in @(Get-Process -Name ChatGPT -ErrorAction SilentlyContinue)){
+                try{$snapshot=Get-CcodProcessSnapshot -ProcessId $process.Id -StatusEvidence $StatusEvidence}catch{$snapshot=$null}
+                if($null -eq $snapshot){$incomplete=$true;continue}
+                if($snapshot.PSObject.Properties['SessionId'] -eq $null -or $snapshot.PSObject.Properties['UserSid'] -eq $null){$incomplete=$true;continue}
+                if($snapshot.SessionId -eq $sessionId -and $snapshot.UserSid -ceq $sid){$snapshots.Add($snapshot)}
+            }
+            [pscustomobject][ordered]@{Outcome=if($incomplete){'Incomplete'}else{'Complete'};Snapshots=@($snapshots.ToArray())}
+        }
         ListProcesses={ param($StatusEvidence)
             $current=[Diagnostics.Process]::GetCurrentProcess();try{$sessionId=$current.SessionId}finally{$current.Dispose()}
             $identity=[Security.Principal.WindowsIdentity]::GetCurrent();try{$sid=$identity.User.Value}finally{$identity.Dispose()}
@@ -596,6 +702,7 @@ function Merge-CcodSessionAdapters($Adapters) {
             return $snapshots.ToArray()
         }
         GetProcess={ param($ProcessId,$StatusEvidence) Get-CcodProcessSnapshot -ProcessId $ProcessId -StatusEvidence $StatusEvidence }
+        ObserveProcessIdentity={ param($ProcessId,$ExpectedCreationTimeUtc) Get-CcodProcessIdentityObservation -ProcessId $ProcessId -ExpectedCreationTimeUtc $ExpectedCreationTimeUtc }
         ProcessMatch={ param($Expected,$Actual) Test-CcodProcessMatch -Expected $Expected -Actual $Actual }
         NewTransition={ param($Path,$Source,$Package,$RuntimeId,$RendererPort,$MainPort,$TransactionId) New-CcodTransition -Path $Path -Source $Source -Package $Package -RuntimeId $RuntimeId -RendererPort $RendererPort -MainPort $MainPort -TransactionId $TransactionId }
         SetTransition={ param($Path,$TransactionId,$ExpectedStage,$NewStage,$SpecialIdentity,$RecoveryIdentity,$RendererPort,$MainPort)
@@ -651,6 +758,15 @@ function Merge-CcodSessionAdapters($Adapters) {
     if ($null -ne $Adapters) {
         foreach($key in $Adapters.Keys){$defaults[$key]=$Adapters[$key]}
         if($Adapters.ContainsKey('ObserveSpecial') -and -not $Adapters.ContainsKey('ObserveSpecialIsDefault')){$defaults.ObserveSpecialIsDefault=$false}
+        if($Adapters.ContainsKey('ListProcesses') -and -not $Adapters.ContainsKey('ListProcessResult')){
+            $listProcesses=$defaults.ListProcesses
+            $defaults.ListProcessResult={
+                param($StatusEvidence)
+                try{$output=@(& $listProcesses $StatusEvidence 2>&1)}catch{return [pscustomobject][ordered]@{Outcome='Incomplete';Snapshots=@()}}
+                if(@($output|Where-Object{$_ -is [Management.Automation.ErrorRecord]}).Count -gt 0){return [pscustomobject][ordered]@{Outcome='Incomplete';Snapshots=@()}}
+                [pscustomobject][ordered]@{Outcome='Complete';Snapshots=@($output)}
+            }.GetNewClosure()
+        }
     }
     return $defaults
 }
@@ -961,7 +1077,7 @@ function Invoke-CcodSessionCore {
     } catch {
         if(Test-CcodSessionLifecycleFenceFailure $_){throw}
         $result=Set-CcodSessionFailure -Result $result -Record $_ -Stage $result.stage
-        if($pathsValidated -and -not $SuppressDiagnostic){Write-CcodSessionDiagnostic $result $Action $result.transactionId $result.stage $result.error.code $Paths $adapter}
+        if($pathsValidated -and -not $SuppressDiagnostic){Write-CcodSessionDiagnostic $result $Action $result.transactionId $result.stage $result.error.code $_ $Paths $adapter}
         return $result
     }
 }
@@ -1116,7 +1232,7 @@ function Invoke-CcodActivationSession {
             $result.ok=$true;$result.outcome='Activated';$result.safeState='SpecialValidated';$result.stage='Completed';return $result
         } catch {
             if(Test-CcodSessionLifecycleFenceFailure $_){throw}
-            Write-CcodSessionDiagnostic $result $Action $Request.transactionId $result.stage (Get-CcodSessionErrorCode $_) $Paths $adapter
+            Write-CcodSessionDiagnostic $result $Action $Request.transactionId $result.stage (Get-CcodSessionErrorCode $_) $_ $Paths $adapter
             if($recoveryAttempted){Throw-CcodSessionError 'CCOD_RECOVERY_UNPROVEN' 'Recursive recovery is forbidden' $_}
             $recoveryAttempted=$true
             $recoveryRenderer=$null;$recoveryMain=$null
@@ -1193,7 +1309,7 @@ function Invoke-CcodRepairRenderer {
             $result.ok=$true;$result.outcome='NoAction';$result.safeState='SpecialValidated';$result.stage='RendererRepaired';return $result
         }catch{
             if(Test-CcodSessionLifecycleFenceFailure $_){throw}
-            Write-CcodSessionDiagnostic $result 'RepairRenderer' $Request.transactionId $result.stage (Get-CcodSessionErrorCode $_) $Paths $adapter
+            Write-CcodSessionDiagnostic $result 'RepairRenderer' $Request.transactionId $result.stage (Get-CcodSessionErrorCode $_) $_ $Paths $adapter
             if($recoveryAttempted){Throw-CcodSessionError 'CCOD_RECOVERY_UNPROVEN' 'Recursive renderer recovery is forbidden' $_}
             $recoveryAttempted=$true
             $journalPackage=ConvertTo-CcodJournalPackage $probe
@@ -1218,8 +1334,24 @@ function Invoke-CcodCloseSession {
         $target=$null;$isSpecial=$false
         if($null -ne $statusCodex){
             $candidate=& $adapter.GetProcess $statusCodex.pid $state.Status
-            if($roots.Count -ne 1 -or $null -eq $candidate -or $candidate.CreationTimeUtc -cne $statusCodex.creationTimeUtc -or -not (& $adapter.ProcessMatch $roots[0] $candidate)){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Recorded Active root is missing, changed, or accompanied by another root' $statusCodex}
-            $target=$candidate;$isSpecial=$true
+            $recordedExact=$roots.Count -eq 1 -and $null -ne $candidate -and $candidate.CreationTimeUtc -ceq $statusCodex.creationTimeUtc -and (& $adapter.ProcessMatch $roots[0] $candidate)
+            if($recordedExact){
+                $target=$candidate;$isSpecial=$true
+            }else{
+                $identity=Get-CcodStrictProcessIdentityObservation -ProcessId ([int]$statusCodex.pid) -ExpectedCreationTimeUtc ([string]$statusCodex.creationTimeUtc) -Adapter $adapter
+                if($identity.Outcome -in @('Absent','IdentityChanged') -and $roots.Count -eq 1){
+                    $target=$roots[0]
+                    $statusCodex=$null
+                    $isSpecial=$target.Mode -cne 'Ordinary'
+                    if($isSpecial -and ($target.RendererPort -isnot [int] -or $target.MainPort -isnot [int] -or
+                       $target.RendererPort -lt 1 -or $target.RendererPort -gt 65535 -or $target.MainPort -lt 1 -or $target.MainPort -gt 65535 -or
+                       $target.RendererPort -eq $target.MainPort)){
+                        Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'A replacement debug root lacks one valid distinct port pair' $target
+                    }
+                }else{
+                    Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Recorded Active root cannot be safely replaced' $statusCodex
+                }
+            }
         }else{
             if($roots.Count -gt 1){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Multiple current-package close roots are ambiguous' $roots}
             if($roots.Count -eq 1){

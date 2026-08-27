@@ -6,6 +6,137 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.21
+
+### English
+
+- Repaired stale-status recovery around one exact live Codex root, rejecting ambiguous roots and stale identity correlation.
+- Added exact, safe lifecycle diagnostics that explain rejected repair evidence without broad process actions.
+
+## v2.5.20
+
+### English
+
+- TrayHost's native message loop now preserves the target HWND when redispatching posted work, so presentation updates reach the owner window and exact revision acknowledgements complete; About and language actions no longer time out.
+- The acknowledged initial revision now serves as the current capability baseline until the first Supervisor projection, preventing startup or recovery windows from rejecting enabled About and language commands.
+- Guardian now treats correlated transient static probe failures as retryable instead of permanently classifying the entire Supervisor lifetime as incompatible, so a stable replacement Codex root is inspected and taken over after logon races.
+
+### 简体中文
+
+- TrayHost 原生消息循环在重新分发 posted work 时会保留目标 HWND，使 presentation 更新真正到达 owner window 并完成精确 revision acknowledgement；“关于”和语言操作不再超时。
+- 在 Supervisor 首次 projection 前，已确认的初始 revision 会作为当前能力基线，避免启动或恢复窗口错误拒绝菜单中已启用的“关于”和语言命令。
+- Guardian 会把相关联的瞬态 StaticProbe 失败保留为可重试状态，不再把整个 Supervisor 生命周期永久判为不兼容；登录启动竞态结束并出现稳定的新 Codex 根后，会重新检查并接管。
+
+## v2.5.19
+
+### English
+
+- Fixed installer readiness identity on Windows: CIM exposes process creation at microsecond precision while `Get-Process` retains 100-nanosecond ticks. The verifier now accepts only the same truncated microsecond (a 0–9 tick forward delta), so the exact new Supervisor can reach its authenticated TrayHost Ready signal without weakening PID-reuse protection.
+
+### 简体中文
+
+- 修复 Windows 安装就绪身份校验：CIM 只提供微秒精度的进程创建时间，而 `Get-Process` 保留 100 纳秒 tick。校验器现在只接受同一截断微秒（向前 0–9 tick），使精确的新 Supervisor 能等待到已认证的 TrayHost Ready 信号，同时不放宽 PID 复用防护。
+
+## v2.5.18
+
+### English
+
+- Restored About, language selection, and Open logs by authorizing every tray action against the exact displayed and acknowledged presentation plus the current capability set; rejected or failed actions now surface localized feedback instead of disappearing silently.
+- Removed the post-copy Setup pause: activation receipts are compact and tolerate legal JSON whitespace, new-runtime readiness retries the early Ready-event creation race, and Setup waits for an owned, deadline-bounded installer process to exit before a separate strict terminal validator can authorize success.
+
+### 简体中文
+
+- 恢复“关于”、语言切换和“打开日志”：每个托盘操作都会同时校验实际显示并确认过的 presentation 与当前能力；被拒绝或执行失败的操作会显示本地化反馈，不再静默消失。
+- 消除文件复制后的安装等待：activation receipt 使用紧凑 JSON 并接受合法空白，新 runtime 就绪检查会重试早期 Ready event 创建竞态；Setup 会等待受控且有截止时间的 installer 进程退出，再由独立严格终态校验器决定是否成功。
+
+## v2.5.17
+
+### English
+
+- Fixed LifecycleWorker request construction: ordinary observation now supplies an explicit schema-one empty status object, while `restartOrdinary` remains disabled for Close and enabled for Apply/Inspect repair actions.
+- Ordinary observation now uses the durable lifecycle creation time as its lower bound, so an automatically restored Codex root that appears just before the AppsFolder request remains eligible after the prior Close was proven.
+- Supervisor now rebuilds special-process proof through one manifest-bound strong Inspect after lifecycle verification or restart; rebind failures produce one terminal receipt and suppress same-root Guardian retry loops.
+
+### 简体中文
+
+- 修复 LifecycleWorker 请求构造：普通根观察会传入必需的空状态对象；`restartOrdinary` 对 Close 保持禁用，对 Apply/Inspect 修复动作启用。
+- 普通根观察现在使用持久生命周期创建时间作为下限；此前 Close 已证明完成时，即使 Codex 自动恢复略早于 AppsFolder 请求，该普通根仍可被接受。
+- Supervisor 现在只通过一次 manifest-bound 强 Inspect 在生命周期验证或自身重启后重建 special 进程证明；重绑定失败会生成一个终态回执，并抑制同根 Guardian 重试循环。
+
+## v2.5.15
+
+### English
+
+- Normalized the Windows native process-query exit race that can return Win32 error 31 immediately after an exact controller stop. The query is treated as exited only when an independent PID probe also proves the process absent or exited; a live or reused PID still fails closed.
+- Added regression coverage for the absent-PID, live/PID-reuse, and unrelated native-error boundaries so a successful Close can advance instead of ending as `CCOD_SESSION_FAILED`.
+
+### 简体中文
+
+- 规范化 Windows 原生进程查询在精确停止后可能返回 Win32 error 31 的退出竞态。只有独立 PID 探针也证明进程不存在或已退出时才视为退出；PID 仍存活或被复用时继续失败关闭。
+- 增加 PID 不存在、PID 存活/复用及其他原生错误的回归覆盖，使成功的 Close 能继续推进，而不再以 `CCOD_SESSION_FAILED` 结束。
+
+## v2.5.14
+
+### English
+
+- Bound the LifecycleWorker delegated-ownership callback before dot-sourcing `SessionController.ps1`. Its validated `Action` parameter can no longer invalidate `GetNewClosure()`, so Close, Apply, and VerifyRemote now reach the manifest-bound controller instead of failing with `CCOD_LIFECYCLE_OPERATION_FAILED`.
+- Added a real scope-metadata regression that reproduces the PowerShell `ValidationMetadataException` and proves the correlated controller result survives the dot-source boundary.
+
+### 简体中文
+
+- 在 dot-source `SessionController.ps1` 前绑定 LifecycleWorker 的 delegated-ownership 回调。控制器带验证的 `Action` 参数不再使 `GetNewClosure()` 失效，Close、Apply 与 VerifyRemote 现在能进入 manifest 绑定的控制器，而不会以 `CCOD_LIFECYCLE_OPERATION_FAILED` 失败。
+- 增加真实作用域元数据回归，复现 PowerShell `ValidationMetadataException`，并证明相关控制器结果可安全跨越 dot-source 边界。
+
+## v2.5.13
+
+### English
+
+- Preserved the real nonzero lifecycle-worker exit code after its PID disappears by arming and retaining the exact process handle before resume. A failed worker result now reduces to its durable terminal phase instead of being misread as exit code 0 and terminating the detached Supervisor.
+- Recovered `CloseRequested` transactions no longer treat a still-running ordinary Codex root as closed. The Supervisor repeats the verified close operation before repair, preventing a restart from skipping directly to Apply.
+
+### 简体中文
+
+- 在 lifecycle worker 恢复运行前启用并保留精确进程句柄，使 PID 消失后仍能读取真实的非零退出码。失败结果现在会归约到持久终态，不再被误读为退出码 0 并导致脱离计划任务的 Supervisor 退出。
+- 恢复中的 `CloseRequested` 事务不再把仍在运行的普通 Codex 根进程当作已关闭；Supervisor 会先重复执行经验证的关闭操作，再进入修复，避免重启后直接跳到 Apply。
+
+## v2.5.12
+
+### English
+
+- Fixed bootstrap readiness accounting for a long-lived Supervisor: once the verified Ready event is signaled, a still-running Supervisor now returns bootstrap success so post-install activation can complete instead of reporting `CCOD_INSTALL_NEW_RUNTIME_NOT_READY`.
+- Added regression coverage for the persistent Supervisor handoff while preserving nonzero propagation for a Supervisor that exits abnormally after readiness.
+
+### 简体中文
+
+- 修复长驻 Supervisor 的 bootstrap 就绪计数：经验证的 Ready 事件触发后，即使 Supervisor 仍在运行，bootstrap 现在也会返回成功，安装后激活不再错误报告 `CCOD_INSTALL_NEW_RUNTIME_NOT_READY`。
+- 增加长驻 Supervisor 交接回归覆盖，同时继续保留就绪后异常退出码的非零传播。
+
+## v2.5.11
+
+### English
+
+- Fixed the manifest-bound lifecycle worker so its JSON, runtime, lifecycle-fence, and process-control dependencies are bound to the verified module exports before worker adapter scriptblocks are created. Supervisor VerifyRemote now publishes a correlated result instead of failing with `CCOD_LIFECYCLE_WORKER_REQUEST_INVALID` in a real `-File` process.
+- Added a production-scope regression test for the worker dependency binding; the installer and portable launcher continue to share the same verified runtime closure.
+
+### 简体中文
+
+- 修复 manifest 绑定的 lifecycle worker：在创建 worker 适配器脚本块前，将 JSON、runtime、生命周期围栏和进程控制依赖绑定到已验证的模块导出。真实 `-File` 进程中的 Supervisor VerifyRemote 现在会发布相关结果，不再错误返回 `CCOD_LIFECYCLE_WORKER_REQUEST_INVALID`。
+- 增加生产脚本作用域回归测试；安装包和便携启动器继续共享同一份经验证的 runtime 闭包。
+
+## v2.5.10
+
+### English
+
+- Fixed the Inno Setup installer so it bundles the portable launcher with TrayHost; post-install activation now passes source validation instead of failing closed.
+- Fixed bootstrap fallback sequencing so each verified runtime acquires and releases the transition lease around its launch, allowing the previous runtime to recover cleanly after an early exit.
+- Increased the Supervisor startup proof budget and retained the ready Supervisor long enough for installer verification, while preserving lifecycle fencing and the DPAPI device-key store.
+
+### 简体中文
+
+- 修复 Inno Setup 安装包：安装时会与 TrayHost 一起安装便携启动器，安装后激活现在能通过源校验，而不再失败关闭。
+- 修复启动回退时序：每个经验证的 runtime 只在启动边界内获取并释放 transition lease，活动 runtime 提前退出时可安全回退到 previous runtime。
+- 增加 Supervisor 启动证明预算，并在安装器验证窗口内保留 ready Supervisor，同时继续保护生命周期围栏和 DPAPI 设备密钥存储。
+
 ## v2.5.9
 
 ### English

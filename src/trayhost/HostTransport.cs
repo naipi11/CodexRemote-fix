@@ -10,8 +10,9 @@ internal sealed class HostTransport : IDisposable
     }
 
     private readonly object _gate = new object();
-    private readonly Queue<TrayHostControl> _controls = new Queue<TrayHostControl>();
+    private readonly Action _presentationReady;
     private readonly Queue<TrayActionResult> _completedAbout = new Queue<TrayActionResult>();
+    private readonly Queue<TrayActionResult> _failedActions = new Queue<TrayActionResult>();
     private readonly Dictionary<Guid, PendingAction> _pendingActions = new Dictionary<Guid, PendingAction>();
     private readonly Queue<Guid> _recentActionOrder = new Queue<Guid>();
     private readonly HashSet<Guid> _recentActions = new HashSet<Guid>();
@@ -19,9 +20,29 @@ internal sealed class HostTransport : IDisposable
     private bool _menuOpen;
     private bool _disposed;
 
+    internal HostTransport() : this(null)
+    {
+    }
+
+    internal HostTransport(Action presentationReady)
+    {
+        _presentationReady = presentationReady;
+    }
+
     internal void SetMenuOpen(bool value)
     {
-        lock (_gate) { if (!_disposed) { _menuOpen = value; } }
+        bool notify = false;
+        lock (_gate)
+        {
+            if (!_disposed)
+            {
+                bool wasOpen = _menuOpen;
+                _menuOpen = value;
+                notify = wasOpen && !value && _pendingPresentation != null;
+            }
+        }
+        Action presentationReady = _presentationReady;
+        if (notify && presentationReady != null) { presentationReady(); }
     }
 
     internal bool TryAcceptPresentation(PresentationSnapshot snapshot)
@@ -42,8 +63,6 @@ internal sealed class HostTransport : IDisposable
             if (_menuOpen || _pendingPresentation == null) { snapshot = null; return false; }
             snapshot = _pendingPresentation;
             _pendingPresentation = null;
-            if (_controls.Count >= 16) { throw new InvalidOperationException("host control queue is exhausted"); }
-            _controls.Enqueue(new TrayHostControl(TrayHostControlKind.PresentationAck, ShutdownReason.SupervisorExit, snapshot.Revision));
             return true;
         }
     }
@@ -78,8 +97,10 @@ internal sealed class HostTransport : IDisposable
             }
             if (result.Status != TrayActionResultStatus.Completed && result.Status != TrayActionResultStatus.Rejected && result.Status != TrayActionResultStatus.Failed) { return false; }
             if (result.Status == TrayActionResultStatus.Completed && TrayCommandPolicy.RequiresAcceptedBeforeCompleted(pending.Action.Command) && !pending.Accepted) { return false; }
+            if ((result.Status == TrayActionResultStatus.Rejected || result.Status == TrayActionResultStatus.Failed) && _failedActions.Count >= 8) { return false; }
             _pendingActions.Remove(result.ActionId);
             if (result.Status == TrayActionResultStatus.Completed && pending.Action.Command == TrayCommand.ShowAbout) { _completedAbout.Enqueue(result); }
+            if (result.Status == TrayActionResultStatus.Rejected || result.Status == TrayActionResultStatus.Failed) { _failedActions.Enqueue(result); }
             return true;
         }
     }
@@ -93,13 +114,12 @@ internal sealed class HostTransport : IDisposable
         }
     }
 
-    internal bool TryDequeueControl(out TrayHostControl control)
+    internal bool TryTakeFailedAction(out TrayActionResult result)
     {
         lock (_gate)
         {
-            if (_controls.Count == 0) { control = null; return false; }
-            control = _controls.Dequeue();
-            return true;
+            if (_failedActions.Count == 0) { result = null; return false; }
+            result = _failedActions.Dequeue(); return true;
         }
     }
 
@@ -109,8 +129,8 @@ internal sealed class HostTransport : IDisposable
         {
             if (_disposed) { return; }
             _disposed = true;
-            _controls.Clear();
             _completedAbout.Clear();
+            _failedActions.Clear();
             _pendingActions.Clear();
             _recentActions.Clear();
             _recentActionOrder.Clear();

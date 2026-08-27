@@ -357,6 +357,7 @@ function Write-CcodAtomicJson {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)]$Value,
+        [switch]$Compress,
         [hashtable]$Adapters
     )
 
@@ -364,7 +365,7 @@ function Write-CcodAtomicJson {
     $Adapters = Get-CcodAtomicWriteAdapters -Adapters $Adapters
     $directory = Split-Path -Path $Path -Parent
     [IO.Directory]::CreateDirectory($directory) | Out-Null
-    $json = ($Value | ConvertTo-Json -Depth 16) + "`n"
+    $json = ($Value | ConvertTo-Json -Depth 16 -Compress:$Compress) + "`n"
     $encoding = [Text.UTF8Encoding]::new($false)
     $temporary = New-CcodAtomicOwnedFile -Directory $directory -Purpose 'replacement' -Adapters $Adapters
     $oldBytes = $null

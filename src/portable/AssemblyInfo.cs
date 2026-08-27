@@ -1,8 +1,8 @@
 using System.Reflection;
 using System.Runtime.InteropServices;
 
-[assembly: AssemblyTitle("CodexRemote-fix TrayHost")]
-[assembly: AssemblyDescription("Persistent native tray host for CodexRemote-fix")]
+[assembly: AssemblyTitle("CodexRemote-fix Portable")]
+[assembly: AssemblyDescription("EXE launcher for the verified CodexRemote-fix portable bundle")]
 [assembly: AssemblyCompany("CodexRemote-fix contributors")]
 [assembly: AssemblyProduct("CodexRemote-fix")]
 [assembly: AssemblyVersion("2.5.21.0")]

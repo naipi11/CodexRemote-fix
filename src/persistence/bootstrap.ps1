@@ -567,7 +567,7 @@ function Start-CcodBootstrapSupervisor {
     )
 
     $powershell = Get-CcodBootstrapPowerShellPath
-    $arguments = '-NoProfile -ExecutionPolicy Bypass -STA -File "' + $SupervisorPath + '" -ReadyToken ' + $ReadyToken
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', $SupervisorPath, '-ReadyToken', $ReadyToken)
     try {
         return Start-Process -FilePath $powershell -ArgumentList $arguments -WindowStyle Hidden -WorkingDirectory $WorkingDirectory -PassThru
     } catch {
@@ -807,6 +807,7 @@ $kernelModule = $null
 $identity = $null
 $currentProcess = $null
 $safeExitSuppressed = $false
+$readyConfirmed = $false
 try {
     $root = Get-CcodBootstrapCanonicalRoot -InstallRoot $InstallRoot
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -827,19 +828,13 @@ try {
         }
         AcquireLaunchLease = {
             $module = Import-CcodBootstrapKernelObjects -InstallRoot $root -Pointer $initialPointer
-            $lease = & $module { param($Sid,$Timeout) Enter-CcodMutex -Kind 'AccountTransition' -UserSid $Sid -TimeoutMilliseconds $Timeout } $userSid ([int]($ReadyTimeoutSeconds * 1000))
-            [pscustomobject]@{ KernelModule = $module; LaunchLease = $lease }
+            [pscustomobject]@{ KernelModule = $module; LaunchLease = $null }
         }
     }
     $safeExitSuppressed = $prelaunch.Suppressed
     if($safeExitSuppressed){Throw-CcodBootstrapError 'CCOD_SAFE_EXIT_SUPPRESSED' 'Task startup was intentionally suppressed by the same-logon safe-exit marker' $root}
 
     $kernelModule = $prelaunch.KernelModule
-    $launchLease = $prelaunch.LaunchLease
-    if ($launchLease.Outcome -cne 'Acquired') {
-        Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_LAUNCH_BUSY' 'An installation transition is in progress; bootstrap will retry through the scheduled task' $root
-    }
-
     $readyEvent = New-CcodBootstrapReadyEvent -UserSid $userSid -SessionId $sessionId -Token $token
     if (-not $readyEvent.CreatedNew) {
         Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_READY_EVENT_EXISTS' 'A stale ready event already exists; bootstrap refuses to reuse it' $readyEvent.Name
@@ -861,21 +856,29 @@ try {
             Write-CcodBootstrapLog -InstallRoot $root -Message ("Runtime {0} rejected before launch: {1}" -f $runtimeId, $validation.Code)
             continue
         }
-
+        $launchLease = & $kernelModule { param($Sid,$Timeout) Enter-CcodMutex -Kind 'AccountTransition' -UserSid $Sid -TimeoutMilliseconds $Timeout } $userSid ([int]($ReadyTimeoutSeconds * 1000))
+        if ($launchLease.Outcome -cne 'Acquired') {
+            Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_LAUNCH_BUSY' 'An installation transition is in progress; bootstrap will retry through the scheduled task' $root
+        }
         $child = Start-CcodBootstrapSupervisor -SupervisorPath $validation.SupervisorPath -ReadyToken $token -WorkingDirectory $root
+        $released = & $kernelModule { param($Lease) Exit-CcodMutex -Lease $Lease } $launchLease
+        if ($released -isnot [bool] -or -not $released) {
+            Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_LAUNCH_RELEASE_FAILED' 'The launch serialization lease could not be released before Supervisor readiness' $root
+        }
+        $launchLease = $null
         $outcome = Wait-CcodBootstrapReady -Event $readyEvent -Process $child -TimeoutSeconds $ReadyTimeoutSeconds
         if ($outcome -ceq 'Ready') {
             if ($runtimeId -cne $pointer.ActiveRuntime) {
                 $updated = Invoke-CcodBootstrapFencedPointerPromotion -InstallRoot $root -Pointer $pointer -Validation $validation -NewRuntimeId $runtimeId -UserSid $userSid -SessionId $sessionId
                 Write-CcodBootstrapLog -InstallRoot $root -Message ("Runtime {0} signaled ready; active pointer switched from {1}" -f $runtimeId, $pointer.ActiveRuntime)
             }
-            $released = & $kernelModule { param($Lease) Exit-CcodMutex -Lease $Lease } $launchLease
-            if ($released -isnot [bool] -or -not $released) {
-                Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_LAUNCH_RELEASE_FAILED' 'The launch serialization lease could not be released after Supervisor readiness' $root
-            }
-            $exitCode = Wait-CcodBootstrapChild -Process $child
-            Write-CcodBootstrapLog -InstallRoot $root -Message ("Runtime {0} exited after readiness with code {1}" -f $runtimeId, $exitCode)
-            $child = $null
+
+            $readyConfirmed = $true
+            if (-not $child.HasExited) { [void]$child.WaitForExit(2000) }
+            if ($child.HasExited) { $exitCode = [int]$child.ExitCode }
+            else { $exitCode = 0 }
+            if ($exitCode -eq 0) { Start-Sleep -Milliseconds 3000 }
+            Write-CcodBootstrapLog -InstallRoot $root -Message ("Runtime {0} signaled ready; supervisor retained for installer verification" -f $runtimeId)
             break
         }
 
@@ -890,10 +893,6 @@ try {
         $child = $null
     }
 
-    if ($null -ne $child) {
-        $exitCode = Wait-CcodBootstrapChild -Process $child
-        $child = $null
-    }
     if ($exitCode -eq 1) {
         Write-CcodBootstrapLog -InstallRoot $root -Message 'No verified runtime signaled ready; bootstrap failed closed'
     }
@@ -907,15 +906,14 @@ try {
     $exitCode = 1
     }
 } finally {
-    if ($null -ne $child) {
-        try { Stop-CcodBootstrapChild -Process $child } catch { }
-        $child = $null
-    }
-    if ($null -ne $readyEvent -and $null -ne $readyEvent.Handle) {
-        try { $readyEvent.Handle.Dispose() } catch { }
-    }
-    if ($null -ne $launchLease -and $launchLease.Outcome -ceq 'Acquired' -and -not $launchLease.Released) {
-        try { & $kernelModule { param($Lease) Exit-CcodMutex -Lease $Lease | Out-Null } $launchLease } catch { }
+    if (-not $readyConfirmed) {
+        if ($null -ne $child) {
+            try { Stop-CcodBootstrapChild -Process $child } catch { }
+            $child = $null
+        }
+        if ($null -ne $readyEvent -and $null -ne $readyEvent.Handle) {
+            try { $readyEvent.Handle.Dispose() } catch { }
+        }
     }
     if ($null -ne $currentProcess) { $currentProcess.Dispose() }
     if ($null -ne $identity) { $identity.Dispose() }
