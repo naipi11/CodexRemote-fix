@@ -9,7 +9,7 @@ Set-StrictMode -Version 2.0
 $script:CcodSupervisorScriptPath=if([string]::IsNullOrWhiteSpace($PSCommandPath)){$null}else{[IO.Path]::GetFullPath($PSCommandPath)}
 $script:CcodSupervisorLogPath=$null
 $script:CcodSupervisorAdapterNames=@(
-    'GetIdentity','ResolveLayout','StartClock','GetElapsedMilliseconds','GetUtcNow',
+    'GetIdentity','ResolveLayout','StartClock','GetElapsedMilliseconds','GetUtcNow','Delay',
     'EnterLease','ExitLease','OpenReadyEvent','OpenShutdownEvent','IsEventSignaled','SignalEvent','CloseEvent',
     'ReadActiveRuntime','GetTrustedLogonIdentity','WriteSafeExitIntent','ClearSafeExitIntent','EnterLifecycleOwnership','AssertLifecycleFence','SuspendLifecycleOwnership','ResumeLifecycleOwnership','ExitLifecycleOwnership','OpenLifecycleWakeEvent','ResetLifecycleWakeEvent',
     'ReadLifecycleRequest','ReceiveLifecycleSubmissions','WriteLifecycleSubmissionReceipt','NewLifecycleRequest','WriteLifecycleRequest','MoveLifecyclePhase','CompleteLifecycleRequest','GetLifecycleStep','ReduceLifecycleWorkerResult','NewLifecycleWorkerRequest','AssertLifecycleWorkerResult',
@@ -248,6 +248,7 @@ function Get-CcodSupervisorDefaultAdapters {
     $defaults.StartClock={[Diagnostics.Stopwatch]::StartNew()}
     $defaults.GetElapsedMilliseconds={param($Clock)[long]$Clock.ElapsedMilliseconds}
     $defaults.GetUtcNow={[DateTime]::UtcNow}
+    $defaults.Delay={param($Milliseconds)Start-Sleep -Milliseconds ([int]$Milliseconds)}
     $defaults.EnterLease={param($Kind,$UserSid,$SessionId,$TimeoutMilliseconds)if($Kind -ceq 'AccountSupervisor'){Enter-CcodMutex -Kind $Kind -UserSid $UserSid -TimeoutMilliseconds $TimeoutMilliseconds}else{Enter-CcodMutex -Kind $Kind -UserSid $UserSid -SessionId $SessionId -TimeoutMilliseconds $TimeoutMilliseconds}}
     $defaults.ExitLease={param($Lease)Exit-CcodMutex -Lease $Lease}
     $defaults.OpenReadyEvent={param($UserSid,$SessionId,$Token) $kernelModule=Get-Module -Name KernelObjects|Select-Object -First 1;if($null -eq $kernelModule){throw 'kernel-object module unavailable'};& $kernelModule {param($Sid,$Sess,$Tok)Open-CcodEvent -Kind Ready -UserSid $Sid -SessionId $Sess -ReadyToken $Tok} ([string]$UserSid) ([int]$SessionId) ([string]$Token)}
@@ -662,14 +663,21 @@ function Confirm-CcodSupervisorLifecycleProofCandidate {
     param($HostState,[hashtable]$Adapters,$Candidate)
     $candidateKey=Get-CcodSupervisorSpecialProofKey $Candidate
     if($null-eq$candidateKey){return $false}
-    Update-CcodSupervisorProofObservations $HostState $Adapters
-    if(@($HostState.Special).Count-ne1-or-not(Test-CcodSupervisorExactProcessSnapshotMatch $Candidate $HostState.Special[0].Snapshot)){
-        $HostState.SpecialProof=$null;$HostState.FailedSpecialProofKey=$candidateKey;$HostState.SpecialNeedsInspect=$false
-        return $false
+    for($attempt=0;$attempt-lt2;$attempt++){
+        Update-CcodSupervisorProofObservations $HostState $Adapters
+        if(@($HostState.Special).Count-eq1-and(Test-CcodSupervisorExactProcessSnapshotMatch $Candidate $HostState.Special[0].Snapshot)){
+            $HostState.SpecialProof=$HostState.Special[0].Snapshot;$HostState.Special[0].ProbeValid=$true;$HostState.SpecialNeedsInspect=$false
+            $HostState.FailedSpecialProofKey=$null;$HostState.LifecycleObservation='RemoteVerified';$HostState.ConnectionState=ConvertTo-CcodSupervisorLifecycleObservation RemoteVerified
+            return $true
+        }
+        if($attempt-ne0-or@($HostState.Special).Count-ne0-or@($HostState.Ordinary).Count-ne0){break}
+        $statusEvidence=if($null-ne$HostState.State-and$null-ne$HostState.State.PSObject.Properties['Status']){$HostState.State.Status}else{$null}
+        $current=Invoke-CcodSupervisorNullableAdapter $Adapters.GetProcessSnapshot @([int]$Candidate.Pid,$statusEvidence)
+        if($null-eq$current-or-not(Test-CcodSupervisorExactProcessSnapshotMatch $Candidate $current)){break}
+        Invoke-CcodSupervisorAdapter $Adapters.Delay @([int]50) 0
     }
-    $HostState.SpecialProof=$HostState.Special[0].Snapshot;$HostState.Special[0].ProbeValid=$true;$HostState.SpecialNeedsInspect=$false
-    $HostState.FailedSpecialProofKey=$null;$HostState.LifecycleObservation='RemoteVerified';$HostState.ConnectionState=ConvertTo-CcodSupervisorLifecycleObservation RemoteVerified
-    return $true
+    $HostState.SpecialProof=$null;$HostState.FailedSpecialProofKey=$candidateKey;$HostState.SpecialNeedsInspect=$false
+    return $false
 }
 
 function New-CcodSupervisorLifecycleProofFailure {

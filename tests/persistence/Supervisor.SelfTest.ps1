@@ -106,6 +106,7 @@ function New-CcodSupervisorFake {
     $adapters.StartClock={$world.Calls.Add('Clock');[pscustomobject]@{Kind='Clock'}}.GetNewClosure()
     $adapters.GetElapsedMilliseconds={param($Clock)if($world.Elapsed.Count){[long]$world.Elapsed.Dequeue()}else{[long]0}}.GetNewClosure()
     $adapters.GetUtcNow={[DateTime]::Parse('2030-02-03T03:04:05Z').ToUniversalTime()}.GetNewClosure()
+    $adapters.Delay={param($Milliseconds)}
     $adapters.EnterLease={
         param($Kind,$UserSid,$SessionId,$TimeoutMilliseconds)
         $world.Calls.Add("Enter:$Kind`:$TimeoutMilliseconds")
@@ -809,6 +810,95 @@ Invoke-CcodTest 'successful lifecycle verification binds a fresh special proof b
     Invoke-CcodSupervisorTick $hostState $fixture.Fake.Adapters
     Assert-CcodEqual 'AdoptSpecial' $hostState.LastDecision.Action 'later guardian decision adopts the bound special proof'
     Assert-CcodEqual $null $hostState.LifecycleRequest 'later guardian decision creates no redundant repair lifecycle'
+}
+
+Invoke-CcodTest 'post-worker rebind retries one transient missing enumeration for the same exact candidate' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $transactionModule=Import-Module $lifecycleTransactionPath -Force -PassThru
+    $request=New-CcodPersistedLifecycleRequest -Kind RestartAndRepair
+    foreach($phase in @('CloseRequested','CloseConfirmed','RepairRequested')){
+        $request=& $transactionModule {param($Value,$NextPhase)Move-CcodLifecyclePhase -Request $Value -NextPhase $NextPhase -NowUtc '2030-02-03T03:01:05.0000000Z'} $request $phase
+    }
+    $request.ownerIdentity=$hostState.LifecycleOwnership.ownerIdentity;$request.leaseEpoch=[UInt64]$hostState.LifecycleOwnership.epoch
+    $world.ActiveLifecycleRequest=$request;$hostState.LifecycleRequest=$request;$world.AutoCompleteLifecycleWorkers=$true
+    $special=New-CcodSupervisorTestSnapshot -ProcessId 201 -CreationTimeUtc '2030-02-03T03:02:00.0000000Z'
+    $special.Mode='Special';$special.RendererPort=[int]41001;$special.MainPort=[int]41002
+    $world.ProcessIds=@(201);$world.Snapshots[201]=$special
+    $fixture.Fake.Adapters.ReadState={param($StateRoot,$SuppressionKey)$hostState.State}.GetNewClosure()
+    $enumerations=[pscustomobject]@{Count=0};$delays=[Collections.Generic.List[int]]::new()
+    $fixture.Fake.Adapters.Delay={param($Milliseconds)$delays.Add([int]$Milliseconds)}.GetNewClosure()
+    $fixture.Fake.Adapters.EnumerateProcessIds={
+        $enumerations.Count++
+        if($enumerations.Count-eq2){Write-Output -NoEnumerate @();return}
+        Write-Output -NoEnumerate @(201)
+    }.GetNewClosure()
+
+    Start-CcodSupervisorLifecycleWorkerSlot $hostState $fixture.Fake.Adapters VerifyRemote $null|Out-Null
+    Invoke-CcodSupervisorPollLifecycleSlot $hostState $fixture.Fake.Adapters
+
+    Assert-CcodEqual 3 $enumerations.Count 'one transient empty rebind enumeration receives exactly one bounded retry'
+    Assert-CcodEqual '50' (($delays)-join ',') 'same-candidate retry enters one bounded condition-based delay'
+    Assert-CcodTrue ($null-ne$hostState.SpecialProof) 'same exact candidate is rebound after transient enumeration churn'
+    Assert-CcodEqual 201 $hostState.SpecialProof.Pid 'rebound proof retains the original candidate PID'
+    Assert-CcodEqual $special.CreationTimeUtc $hostState.SpecialProof.CreationTimeUtc 'rebound proof retains the original candidate creation time'
+    Assert-CcodEqual 'RemoteVerified' $hostState.LifecycleObservation 'same-candidate retry publishes RemoteVerified'
+}
+
+Invoke-CcodTest 'post-worker rebind does not retry a transient enumeration after candidate creation-time drift' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $transactionModule=Import-Module $lifecycleTransactionPath -Force -PassThru
+    $request=New-CcodPersistedLifecycleRequest -Kind RestartAndRepair
+    foreach($phase in @('CloseRequested','CloseConfirmed','RepairRequested')){
+        $request=& $transactionModule {param($Value,$NextPhase)Move-CcodLifecyclePhase -Request $Value -NextPhase $NextPhase -NowUtc '2030-02-03T03:01:05.0000000Z'} $request $phase
+    }
+    $request.ownerIdentity=$hostState.LifecycleOwnership.ownerIdentity;$request.leaseEpoch=[UInt64]$hostState.LifecycleOwnership.epoch
+    $world.ActiveLifecycleRequest=$request;$hostState.LifecycleRequest=$request;$world.AutoCompleteLifecycleWorkers=$true
+    $special=New-CcodSupervisorTestSnapshot -ProcessId 201 -CreationTimeUtc '2030-02-03T03:02:00.0000000Z'
+    $special.Mode='Special';$special.RendererPort=[int]41001;$special.MainPort=[int]41002
+    $drift=$special.PSObject.Copy();$drift.CreationTimeUtc='2030-02-03T03:02:01.0000000Z'
+    $world.ProcessIds=@(201);$world.Snapshots[201]=$special
+    $fixture.Fake.Adapters.ReadState={param($StateRoot,$SuppressionKey)$hostState.State}.GetNewClosure()
+    $enumerations=[pscustomobject]@{Count=0};$delays=[Collections.Generic.List[int]]::new()
+    $fixture.Fake.Adapters.Delay={param($Milliseconds)$delays.Add([int]$Milliseconds)}.GetNewClosure()
+    $fixture.Fake.Adapters.EnumerateProcessIds={
+        $enumerations.Count++
+        if($enumerations.Count-eq1){Write-Output -NoEnumerate @(201);return}
+        $world.Snapshots[201]=$drift
+        Write-Output -NoEnumerate @()
+    }.GetNewClosure()
+
+    Start-CcodSupervisorLifecycleWorkerSlot $hostState $fixture.Fake.Adapters VerifyRemote $null|Out-Null
+    Invoke-CcodSupervisorPollLifecycleSlot $hostState $fixture.Fake.Adapters
+
+    Assert-CcodEqual 2 $enumerations.Count 'changed candidate receives no post-drift retry'
+    Assert-CcodEqual 0 $delays.Count 'changed candidate never enters the rebind delay'
+    Assert-CcodEqual 1 $world.CompletedLifecycleRequests.Count 'candidate drift produces one terminal lifecycle receipt'
+    Assert-CcodEqual 'CCOD_REMOTE_PROOF_REBIND_FAILED' $world.CompletedLifecycleRequests[0].error 'candidate drift keeps the stable rebind failure reason'
+    Assert-CcodEqual $null $hostState.SpecialProof 'changed candidate never receives proof authority'
+}
+
+Invoke-CcodTest 'candidate port or mode drift never enters the bounded rebind delay' {
+    foreach($case in @(
+        @{Name='port';Mutate={param($Snapshot)$Snapshot.RendererPort=[int]42001;$Snapshot}},
+        @{Name='mode';Mutate={param($Snapshot)$Snapshot.Mode='Ordinary';$Snapshot.RendererPort=$null;$Snapshot.MainPort=$null;$Snapshot}}
+    )){
+        $fixture=New-CcodTickFixture;$hostState=$fixture.Host
+        $candidate=New-CcodSupervisorTestSnapshot -ProcessId 201 -CreationTimeUtc '2030-02-03T03:02:00.0000000Z'
+        $candidate.Mode='Special';$candidate.RendererPort=[int]41001;$candidate.MainPort=[int]41002
+        $changed=& $case.Mutate $candidate.PSObject.Copy()
+        $delays=[Collections.Generic.List[int]]::new()
+        $fixture.Fake.Adapters.ReadState={param($StateRoot,$SuppressionKey)$hostState.State}.GetNewClosure()
+        $fixture.Fake.Adapters.EnumerateProcessIds={Write-Output -NoEnumerate @()}
+        $fixture.Fake.Adapters.GetProcessSnapshot={param($ProcessId,$StatusEvidence)$changed}.GetNewClosure()
+        $fixture.Fake.Adapters.Delay={param($Milliseconds)$delays.Add([int]$Milliseconds)}.GetNewClosure()
+
+        $confirmed=Confirm-CcodSupervisorLifecycleProofCandidate $hostState $fixture.Fake.Adapters $candidate
+
+        Assert-CcodEqual $false $confirmed "$($case.Name) drift cannot confirm the candidate"
+        Assert-CcodEqual 0 $delays.Count "$($case.Name) drift never enters the retry delay"
+        Assert-CcodEqual $null $hostState.SpecialProof "$($case.Name) drift receives no proof authority"
+        Assert-CcodEqual ('201|'+$candidate.CreationTimeUtc) $hostState.FailedSpecialProofKey "$($case.Name) drift records the original stable failure key"
+    }
 }
 
 Invoke-CcodTest 'post-verify identity drift becomes one terminal failure and suppresses same-root guardian retries' {

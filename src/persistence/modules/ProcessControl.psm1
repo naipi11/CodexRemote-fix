@@ -1408,6 +1408,44 @@ function Get-CcodVerifiedProcessTree {
     return @($included | Sort-Object | ForEach-Object { $rereadByPid[[int]$_] })
 }
 
+function Get-CcodStableVerifiedProcessTree {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Root,
+        $StatusEvidence,
+        [ValidateRange(0, 2)][int]$RetryBudget = 1,
+        [hashtable]$Adapters
+    )
+
+    $adapter = Get-CcodProcessAdapters -Adapters $Adapters
+    if (-not $adapter.ContainsKey('GetVerifiedTree')) {
+        $adapter.GetVerifiedTree = {
+            param($ExpectedRoot, $Evidence)
+            Get-CcodVerifiedProcessTree -Root $ExpectedRoot -StatusEvidence $Evidence -Adapters $adapter
+        }.GetNewClosure()
+    }
+
+    for ($attempt = 0; $attempt -le $RetryBudget; $attempt++) {
+        try { $tree = @(& $adapter.GetVerifiedTree $Root $StatusEvidence) } catch { $tree = @() }
+        if ($tree.Count -gt 0) {
+            $matchingRoots = @($tree | Where-Object {
+                $null -ne $_ -and $_.PSObject.Properties['Pid'] -ne $null -and
+                $_.Pid -is [int] -and $_.Pid -eq [int]$Root.Pid -and
+                (Test-CcodProcessMatch -Expected $Root -Actual $_)
+            })
+            if ($matchingRoots.Count -ne 1) { return @() }
+            return @($tree)
+        }
+        if ($attempt -ge $RetryBudget) { return @() }
+
+        try { $rootOutput = @(& $adapter.GetProcess ([int]$Root.Pid) $StatusEvidence 2>&1) } catch { return @() }
+        if ($rootOutput.Count -ne 1 -or $rootOutput[0] -is [Management.Automation.ErrorRecord] -or
+            $null -eq $rootOutput[0] -or -not (Test-CcodProcessMatch -Expected $Root -Actual $rootOutput[0])) { return @() }
+        try { & $adapter.Delay 50 | Out-Null } catch { return @() }
+    }
+    return @()
+}
+
 function Get-CcodVerifiedStaleProcessTree {
     [CmdletBinding()]
     param(
@@ -1995,4 +2033,4 @@ function Start-CcodProcess {
     return New-CcodStartResult -Outcome 'Started' -Snapshot $null -Process $process
 }
 
-Export-ModuleMember -Function Get-CcodProcessIdentityObservation, Get-CcodProcessSnapshot, Test-CcodProcessMatch, Get-CcodStalePackageProcessSnapshot, Get-CcodStalePackageRootResult, Get-CcodVerifiedProcessTree, Get-CcodVerifiedStaleProcessTree, Get-CcodTransactionProcessResult, Find-CcodTransactionProcess, Stop-CcodProcessIfMatch, Stop-CcodStaleProcessIfMatch, Request-CcodProcessGracefulCloseIfMatch, Request-CcodStaleProcessGracefulCloseIfMatch, Wait-CcodProcessExitIfMatch, Wait-CcodStaleProcessExitIfMatch, Start-CcodProcess, Request-CcodOrdinaryPackagedLaunch, Wait-CcodVerifiedOrdinaryRoot, Get-CcodAvailableLoopbackPort, Wait-CcodPortClosed
+Export-ModuleMember -Function Get-CcodProcessIdentityObservation, Get-CcodProcessSnapshot, Test-CcodProcessMatch, Get-CcodStalePackageProcessSnapshot, Get-CcodStalePackageRootResult, Get-CcodVerifiedProcessTree, Get-CcodStableVerifiedProcessTree, Get-CcodVerifiedStaleProcessTree, Get-CcodTransactionProcessResult, Find-CcodTransactionProcess, Stop-CcodProcessIfMatch, Stop-CcodStaleProcessIfMatch, Request-CcodProcessGracefulCloseIfMatch, Request-CcodStaleProcessGracefulCloseIfMatch, Wait-CcodProcessExitIfMatch, Wait-CcodStaleProcessExitIfMatch, Start-CcodProcess, Request-CcodOrdinaryPackagedLaunch, Wait-CcodVerifiedOrdinaryRoot, Get-CcodAvailableLoopbackPort, Wait-CcodPortClosed

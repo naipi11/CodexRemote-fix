@@ -1029,6 +1029,7 @@ try {
         $stopped=[Collections.Generic.List[int]]::new();$adapters=New-CcodEngineAdapters -Processes @($source)
         $adapters.InvokeNode={param($NodePath,$Arguments)throw 'bridge failed'}
         $adapters.ListProcesses={param($StatusEvidence)@()}
+        $adapters.GetPreferredRendererPort={param($Excluded)41001}
         $adapters.GetTree={param($Root,$StatusEvidence)@($rootSpecial,$child)}.GetNewClosure()
         $adapters.GetProcess={param($ProcessId,$StatusEvidence)switch($ProcessId){201{$rootSpecial}202{$child}999{$unrelated}default{$source}}}.GetNewClosure()
         $adapters.StopProcess={param($Expected,$StatusEvidence,$TimeoutMilliseconds)$stopped.Add([int]$Expected.Pid);[pscustomobject]@{Outcome='Stopped';StoppedByController=$true;Snapshot=$Expected}}.GetNewClosure()
@@ -1396,6 +1397,41 @@ try {
         }
     }
 
+    Invoke-CcodTest 'retries transient Electron tree churn before committing and closes every verified member' {
+        $root=New-CcodEngineSnapshot
+        $child=New-CcodEngineSnapshot -Pid 101 -CreationTimeUtc '2030-02-03T04:05:07.0000000Z' -Mode Unrelated -ParentPid 100 -IsTopLevel $false
+        $alive=@{100=$root;101=$child};$events=[Collections.Generic.List[string]]::new();$treeReads=[pscustomobject]@{Count=0}
+        $adapters=New-CcodEngineAdapters -State (New-CcodEngineState -Status ([pscustomobject]@{schemaVersion=1;session=$null})) -Processes @($root) -Events $events
+        $adapters.ListProcesses={param($StatusEvidence)@($root)}.GetNewClosure()
+        $adapters.GetProcess={param($ProcessId,$StatusEvidence)if($alive.ContainsKey([int]$ProcessId)){$alive[[int]$ProcessId]}else{$null}}.GetNewClosure()
+        $adapters.GetTree={param($Root,$StatusEvidence)$treeReads.Count++;if($treeReads.Count-eq1){@()}else{@($root,$child)}}.GetNewClosure()
+        $adapters.StopProcess={param($Expected,$StatusEvidence,$TimeoutMilliseconds)$events.Add("Stop:$($Expected.Pid)");$alive.Remove([int]$Expected.Pid);[pscustomobject]@{Outcome='Stopped';StoppedByController=$true;Snapshot=$Expected}}.GetNewClosure()
+        Set-CcodEngineAliveIdentityObserver -Adapters $adapters -Alive $alive
+
+        $result=Invoke-CcodCloseSession -Request (New-CcodEngineRequest -SchemaVersion 2 -Action Close -RestartOrdinary $false) -Paths $paths -Adapters $adapters
+
+        Assert-CcodEqual 'Closed' $result.outcome 'transient tree churn still reaches durable Closed'
+        Assert-CcodEqual 2 $treeReads.Count 'close retries the one transient empty verified tree'
+        Assert-CcodEqual 'Stop:101,Stop:100' ((@($events|Where-Object{$_ -like 'Stop:*'}))-join ',') 'retry preserves child-first proof for every stopped member'
+        Assert-CcodTrue ([Array]::IndexOf(@($events),'IntentWritten') -lt [Array]::IndexOf(@($events),'Stop:101')) 'all mutations remain after stable tree acquisition'
+    }
+
+    Invoke-CcodTest 'root drift during stable tree acquisition performs no close mutation' {
+        $root=New-CcodEngineSnapshot
+        $changed=New-CcodEngineSnapshot -CreationTimeUtc '2030-02-03T04:05:09.0000000Z'
+        $events=[Collections.Generic.List[string]]::new();$processReads=[pscustomobject]@{Count=0}
+        $adapters=New-CcodEngineAdapters -State (New-CcodEngineState -Status ([pscustomobject]@{schemaVersion=1;session=$null})) -Processes @($root) -Events $events
+        $adapters.ListProcesses={param($StatusEvidence)@($root)}.GetNewClosure()
+        $adapters.GetProcess={param($ProcessId,$StatusEvidence)$processReads.Count++;if($processReads.Count-eq1){$root}else{$changed}}.GetNewClosure()
+        $adapters.GetTree={param($Root,$StatusEvidence)@()}
+
+        $result=Invoke-CcodCloseSession -Request (New-CcodEngineRequest -SchemaVersion 2 -Action Close -RestartOrdinary $false) -Paths $paths -Adapters $adapters
+
+        Assert-CcodEqual 'Error' $result.outcome 'root drift fails close safely'
+        Assert-CcodEqual 'CCOD_CLOSE_UNPROVEN' $result.error.code 'root drift keeps the stable close failure code'
+        Assert-CcodEqual 0 @($events|Where-Object{$_ -in @('IntentWritten','CloseRequested','StopProcess') -or $_ -like 'Stop:*'}).Count 'root drift occurs before every close mutation'
+    }
+
     Invoke-CcodTest 'closes an already empty session and leaves unsafe close evidence durable' {
         $counters=[pscustomobject]@{SpecialStart=0;OrdinaryStart=0;Recover=0;Node=0};$adapters=New-CcodEngineAdapters -Processes @() -Counters $counters
         $empty=Invoke-CcodRecoverSession -Request (New-CcodEngineRequest -Action Recover -RestartOrdinary $false) -Paths $paths -Adapters $adapters
@@ -1678,7 +1714,7 @@ try {
 
     Invoke-CcodTest 'production adapter declarations call upstream APIs and contain no empty process placeholder' {
         $moduleText=[IO.File]::ReadAllText((Join-Path $repositoryRoot 'src\persistence\modules\SessionEngine.psm1'))
-        foreach($command in @('Invoke-CcodStaticProbe','Get-CcodProcessSnapshot','Test-CcodProcessMatch','Stop-CcodProcessIfMatch','Get-CcodVerifiedProcessTree','Get-CcodTransactionProcessResult','Get-CcodAvailableLoopbackPort','Start-CcodProcess','Wait-CcodPortClosed','Read-CcodState','Write-CcodStatus','Write-CcodVerifiedPackages','New-CcodTransition','Set-CcodTransitionStage','Complete-CcodTransition')){Assert-CcodTrue ($moduleText -cmatch [regex]::Escape($command)) "production adapters wire $command"}
+        foreach($command in @('Invoke-CcodStaticProbe','Get-CcodProcessSnapshot','Test-CcodProcessMatch','Stop-CcodProcessIfMatch','Get-CcodVerifiedProcessTree','Get-CcodStableVerifiedProcessTree','Get-CcodTransactionProcessResult','Get-CcodAvailableLoopbackPort','Start-CcodProcess','Wait-CcodPortClosed','Read-CcodState','Write-CcodStatus','Write-CcodVerifiedPackages','New-CcodTransition','Set-CcodTransitionStage','Complete-CcodTransition')){Assert-CcodTrue ($moduleText -cmatch [regex]::Escape($command)) "production adapters wire $command"}
         Assert-CcodTrue ($moduleText -cnotmatch 'ListProcesses=\{\s*param\([^)]*\)\s*@\(\)\s*\}') 'production process enumeration is not an always-empty placeholder'
         $inspectionStart=$moduleText.IndexOf('function Merge-CcodInspectionAdapters',[StringComparison]::Ordinal)
         $inspectionEnd=$moduleText.IndexOf('function Assert-CcodInspectionState',[StringComparison]::Ordinal)
