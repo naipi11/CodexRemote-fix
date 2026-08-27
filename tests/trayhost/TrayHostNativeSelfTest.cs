@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 
 internal sealed class FakeTrayPlatform : INativeTrayPlatform
 {
@@ -208,6 +209,21 @@ internal static class TrayHostNativeSelfTest
         window.Dispose();
     }
 
+    private static void TestTerminalDiagnosticLogIsSanitizedAndReportsPersistence()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        string path = Path.Combine(root, "trayhost-actions.log");
+        try
+        {
+            TrayTerminalDiagnostic record = new TrayTerminalDiagnostic(TrayCommand.OpenLogs, 23UL, TrayActionResultStatus.Rejected, "CCOD_TRAY_ACTION_STALE");
+            AssertTrue(TrayTerminalDiagnosticLog.TryAppend(path, record), "terminal diagnostic append reports durable success");
+            AssertEqual("command=OpenLogs revision=23 status=Rejected code=CCOD_TRAY_ACTION_STALE" + Environment.NewLine, File.ReadAllText(path), "terminal diagnostic file contains only the approved correlation fields");
+            AssertTrue(!TrayTerminalDiagnosticLog.TryAppend(root, record), "terminal diagnostic append reports persistence failure without throwing");
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
     private static void TestNoHimcFailureIsSafe()
     {
         FakeTrayPlatform platform = new FakeTrayPlatform();
@@ -287,12 +303,13 @@ internal static class TrayHostNativeSelfTest
             TestAboutCommandDefersProofToSupervisor();
             TestVerifiedAboutUsesTheAcknowledgedSnapshotVersion();
             TestActionFailureUsesTheAcknowledgedSnapshotStrings();
+            TestTerminalDiagnosticLogIsSanitizedAndReportsPersistence();
             TestSimplifiedMenuAndExitConfirmation();
             TestNoHimcFailureIsSafe();
             TestShellRightClickNotificationMapping();
             TestRealNativePInvokeSurface();
             TestPostedWorkMessageDispatchesToItsOwnerWindow();
-            Console.WriteLine("TrayHost native self-tests passed: 15");
+            Console.WriteLine("TrayHost native self-tests passed: 16");
             return 0;
         }
         catch (Exception error)

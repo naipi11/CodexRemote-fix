@@ -38,11 +38,18 @@ public sealed class TrayHostCorrelationTestBridge : IDisposable
     private readonly TrayWindow _window;
     private TrayHostAction _selected;
     private TrayActionResult _terminal;
+    private bool _persistDiagnostics = true;
+    private int _feedbackCount;
 
-    public TrayHostCorrelationTestBridge(ulong revision, TrayCommand command)
+    public TrayHostCorrelationTestBridge(ulong revision, TrayCommand command) : this(revision, command, true)
+    {
+    }
+
+    public TrayHostCorrelationTestBridge(ulong revision, TrayCommand command, bool persistDiagnostics)
     {
         _platform = new Platform { Selection = (uint)command };
-        _transport = new HostTransport();
+        _persistDiagnostics = persistDiagnostics;
+        _transport = new HostTransport(null, delegate(TrayTerminalDiagnostic record) { return _persistDiagnostics; });
         _window = new TrayWindow(_platform, _transport.SetMenuOpen);
         _window.CommandSelected += delegate(TrayCommand selected, ulong displayedRevision)
         {
@@ -69,15 +76,17 @@ public sealed class TrayHostCorrelationTestBridge : IDisposable
         TrayActionResult result = new TrayActionResult(actionId, revision, parsed, errorCode, null);
         bool accepted = _transport.TryAcknowledgeAction(result);
         if (!accepted) { return false; }
+        _terminal = result;
         if (parsed == TrayActionResultStatus.Rejected || parsed == TrayActionResultStatus.Failed)
         {
             TrayActionResult queued;
-            if (!_transport.TryTakeFailedAction(out queued)) { return false; }
-            _terminal = queued;
+            if (_transport.TryTakeFailedAction(out queued)) { _terminal = queued; _feedbackCount++; }
         }
-        else { _terminal = result; }
         return true;
     }
+
+    public void SetDiagnosticPersistence(bool value) { _persistDiagnostics = value; }
+    public int FeedbackCount { get { return _feedbackCount; } }
 
     public string TerminalStatus { get { return _terminal == null ? String.Empty : _terminal.Status.ToString(); } }
     public string TerminalCode { get { return _terminal == null ? String.Empty : (_terminal.ErrorCode ?? String.Empty); } }

@@ -11,6 +11,7 @@ internal sealed class HostTransport : IDisposable
 
     private readonly object _gate = new object();
     private readonly Action _presentationReady;
+    private readonly Func<TrayTerminalDiagnostic, bool> _writeTerminalDiagnostic;
     private readonly Queue<TrayActionResult> _completedAbout = new Queue<TrayActionResult>();
     private readonly Queue<TrayActionResult> _failedActions = new Queue<TrayActionResult>();
     private readonly Dictionary<Guid, PendingAction> _pendingActions = new Dictionary<Guid, PendingAction>();
@@ -20,13 +21,18 @@ internal sealed class HostTransport : IDisposable
     private bool _menuOpen;
     private bool _disposed;
 
-    internal HostTransport() : this(null)
+    internal HostTransport() : this(null, null)
     {
     }
 
-    internal HostTransport(Action presentationReady)
+    internal HostTransport(Action presentationReady) : this(presentationReady, null)
+    {
+    }
+
+    internal HostTransport(Action presentationReady, Func<TrayTerminalDiagnostic, bool> writeTerminalDiagnostic)
     {
         _presentationReady = presentationReady;
+        _writeTerminalDiagnostic = writeTerminalDiagnostic;
     }
 
     internal void SetMenuOpen(bool value)
@@ -97,10 +103,16 @@ internal sealed class HostTransport : IDisposable
             }
             if (result.Status != TrayActionResultStatus.Completed && result.Status != TrayActionResultStatus.Rejected && result.Status != TrayActionResultStatus.Failed) { return false; }
             if (result.Status == TrayActionResultStatus.Completed && TrayCommandPolicy.RequiresAcceptedBeforeCompleted(pending.Action.Command) && !pending.Accepted) { return false; }
-            if ((result.Status == TrayActionResultStatus.Rejected || result.Status == TrayActionResultStatus.Failed) && _failedActions.Count >= 8) { return false; }
+            bool recorded = false;
+            Func<TrayTerminalDiagnostic, bool> writer = _writeTerminalDiagnostic;
+            if (writer != null)
+            {
+                try { recorded = writer(new TrayTerminalDiagnostic(pending.Action.Command, result.Revision, result.Status, result.ErrorCode)); }
+                catch { recorded = false; }
+            }
             _pendingActions.Remove(result.ActionId);
-            if (result.Status == TrayActionResultStatus.Completed && pending.Action.Command == TrayCommand.ShowAbout) { _completedAbout.Enqueue(result); }
-            if (result.Status == TrayActionResultStatus.Rejected || result.Status == TrayActionResultStatus.Failed) { _failedActions.Enqueue(result); }
+            if (recorded && result.Status == TrayActionResultStatus.Completed && pending.Action.Command == TrayCommand.ShowAbout) { _completedAbout.Enqueue(result); }
+            if (recorded && (result.Status == TrayActionResultStatus.Rejected || result.Status == TrayActionResultStatus.Failed) && _failedActions.Count < 8) { _failedActions.Enqueue(result); }
             return true;
         }
     }

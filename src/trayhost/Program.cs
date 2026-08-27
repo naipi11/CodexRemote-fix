@@ -39,7 +39,9 @@ internal static class Program
         PresentationSnapshot initial = TrayHostWire.ReadPresentation(initialFrame.Payload);
         Win32TrayPlatform platform = new Win32TrayPlatform();
         TrayHostApplication application = null;
-        HostTransport transport = new HostTransport(delegate { TrayHostApplication current = application; if (current != null) { current.PostWork(); } });
+        string terminalLogPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexControlOtherDevices", "logs", "trayhost-actions.log");
+        try { Directory.CreateDirectory(Path.GetDirectoryName(terminalLogPath)); } catch { }
+        HostTransport transport = new HostTransport(delegate { TrayHostApplication current = application; if (current != null) { current.PostWork(); } }, delegate(TrayTerminalDiagnostic record) { return TrayTerminalDiagnosticLog.TryAppend(terminalLogPath, record); });
         TrayWindow window = new TrayWindow(platform, transport.SetMenuOpen);
         bool shutdownRequested = false; bool shutdownSent = false; object stateGate = new object();
         Action<TrayCommand, ulong> command = delegate(TrayCommand selected, ulong revision)

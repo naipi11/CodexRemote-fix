@@ -3,6 +3,8 @@ using System.Collections.Generic;
 
 internal static class TrayHostTransportSelfTest
 {
+    private static bool PersistTerminal(TrayTerminalDiagnostic record) { return true; }
+
     private static void AssertTrue(bool value, string message)
     {
         if (!value) { throw new InvalidOperationException(message); }
@@ -124,7 +126,7 @@ internal static class TrayHostTransportSelfTest
 
     private static void TestAcknowledgedAboutQueuesOneUiWorkItem()
     {
-        HostTransport host = new HostTransport(); Guid actionId = Guid.NewGuid();
+        HostTransport host = new HostTransport(null, PersistTerminal); Guid actionId = Guid.NewGuid();
         AssertTrue(host.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.ShowAbout, 14UL)), "About action registers");
         AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(actionId, 14UL, TrayActionResultStatus.Completed, null, null)), "verified About completion is accepted");
         TrayActionResult result;
@@ -135,7 +137,7 @@ internal static class TrayHostTransportSelfTest
 
     private static void TestRejectedAndFailedActionsQueueUserFeedback()
     {
-        HostTransport host = new HostTransport();
+        HostTransport host = new HostTransport(null, PersistTerminal);
         Guid rejectedId = Guid.NewGuid(); Guid failedId = Guid.NewGuid();
         AssertTrue(host.TryRegisterAction(new TrayHostAction(rejectedId, TrayCommand.OpenLogs, 20UL)), "rejected action registers");
         AssertTrue(host.TryRegisterAction(new TrayHostAction(failedId, TrayCommand.SetLanguageEnglish, 20UL)), "failed action registers");
@@ -150,14 +152,49 @@ internal static class TrayHostTransportSelfTest
 
     private static void TestUndisplayedActionFailureFeedbackIsBounded()
     {
-        HostTransport host = new HostTransport();
+        HostTransport host = new HostTransport(null, PersistTerminal);
         for (int index = 0; index < 9; index++)
         {
             Guid actionId = Guid.NewGuid();
             AssertTrue(host.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.OpenLogs, 21UL)), "terminal failure releases pending action capacity");
             bool accepted = host.TryAcknowledgeAction(new TrayActionResult(actionId, 21UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null));
-            AssertTrue(index < 8 ? accepted : !accepted, "undisplayed action failure feedback is bounded to the pending-action capacity");
+            AssertTrue(accepted, "bounded undisplayed feedback never strands an authenticated terminal action");
         }
+        host.Dispose();
+    }
+
+    private static void TestTerminalDiagnosticFailureNeverStrandsPendingActions()
+    {
+        HostTransport missingWriter = new HostTransport();
+        Guid missingWriterId = Guid.NewGuid();
+        AssertTrue(missingWriter.TryRegisterAction(new TrayHostAction(missingWriterId, TrayCommand.OpenLogs, 22UL)), "action registers without a diagnostic writer");
+        AssertTrue(missingWriter.TryAcknowledgeAction(new TrayActionResult(missingWriterId, 22UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null)), "missing diagnostic writer still releases the authenticated terminal action");
+        TrayActionResult missingWriterFeedback;
+        AssertTrue(!missingWriter.TryTakeFailedAction(out missingWriterFeedback), "missing diagnostic writer cannot authorize generic feedback");
+        missingWriter.Dispose();
+
+        bool persist = false;
+        List<TrayTerminalDiagnostic> records = new List<TrayTerminalDiagnostic>();
+        HostTransport host = new HostTransport(null, delegate(TrayTerminalDiagnostic record) { records.Add(record); return persist; });
+        for (int index = 0; index < 10; index++)
+        {
+            Guid actionId = Guid.NewGuid();
+            AssertTrue(host.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.OpenLogs, 22UL)), "diagnostic failure never consumes pending-action capacity");
+            AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(actionId, 22UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null)), "authenticated terminal result releases its pending action even when local persistence fails");
+            TrayActionResult suppressed;
+            AssertTrue(!host.TryTakeFailedAction(out suppressed), "generic feedback is suppressed when its local terminal diagnostic did not persist");
+        }
+        persist = true;
+        Guid recoveredId = Guid.NewGuid();
+        AssertTrue(host.TryRegisterAction(new TrayHostAction(recoveredId, TrayCommand.OpenLogs, 22UL)), "new action registers after repeated diagnostic failures");
+        AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(recoveredId, 22UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null)), "recovered diagnostic persistence accepts a new terminal result");
+        TrayActionResult recoveredFeedback;
+        AssertTrue(host.TryTakeFailedAction(out recoveredFeedback) && recoveredFeedback.ActionId == recoveredId, "generic feedback resumes only after local terminal persistence recovers");
+        Guid completedId = Guid.NewGuid();
+        AssertTrue(host.TryRegisterAction(new TrayHostAction(completedId, TrayCommand.OpenLogs, 22UL)), "post-recovery command can still register");
+        AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(completedId, 22UL, TrayActionResultStatus.Completed, null, null)), "post-recovery command can complete");
+        TrayTerminalDiagnostic last = records[records.Count - 1];
+        AssertTrue(last.Command == TrayCommand.OpenLogs && last.Revision == 22UL && last.Status == TrayActionResultStatus.Completed && String.Equals(last.Code, "CCOD_TRAY_ACTION_COMPLETED", StringComparison.Ordinal), "terminal diagnostic exposes only the exact canonical correlation fields");
         host.Dispose();
     }
 
@@ -173,7 +210,8 @@ internal static class TrayHostTransportSelfTest
             TestAcknowledgedAboutQueuesOneUiWorkItem();
             TestRejectedAndFailedActionsQueueUserFeedback();
             TestUndisplayedActionFailureFeedbackIsBounded();
-            Console.WriteLine("TrayHost transport self-tests passed: 8");
+            TestTerminalDiagnosticFailureNeverStrandsPendingActions();
+            Console.WriteLine("TrayHost transport self-tests passed: 9");
             return 0;
         }
         catch (Exception error)

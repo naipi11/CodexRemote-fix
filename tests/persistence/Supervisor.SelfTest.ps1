@@ -819,6 +819,7 @@ function Import-CcodTrayHostCorrelationTestBridge {
         (Join-Path $trayRoot 'PresentationSnapshot.cs'),
         (Join-Path $trayRoot 'PipeProtocol.cs'),
         (Join-Path $trayRoot 'TransportMessages.cs'),
+        (Join-Path $trayRoot 'TrayTerminalDiagnostic.cs'),
         (Join-Path $trayRoot 'NativeMethods.cs'),
         (Join-Path $trayRoot 'InputModeGuard.cs'),
         (Join-Path $trayRoot 'NativeMenu.cs'),
@@ -1646,18 +1647,37 @@ Invoke-CcodTest 'sanitizes a malformed terminal action code before local logging
 }
 
 Invoke-CcodTest 'does not queue generic terminal feedback when its local diagnostic write fails' {
-    # Production mutation caught: delivering a rejected terminal result to TrayHost after the required local diagnostic failed to persist.
+    # Production mutation caught: stranding a pending HostTransport action when Supervisor logging fails instead of using the authenticated host-side diagnostic gate.
+    Import-CcodTrayHostCorrelationTestBridge
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host;$world.FailAt='WriteLog'
-    $action=[pscustomobject][ordered]@{ActionId=[guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeb1';Command='OpenLogs';Revision=[UInt64]2}
+    $bridge=[TrayHostCorrelationTestBridge]::new([UInt64]2,[TrayCommand]::OpenLogs,$false)
+    try{
+        $world|Add-Member -NotePropertyName Bridge -NotePropertyValue $bridge
+        $fixture.Fake.Adapters.SendTrayActionResult={
+            param($Tray,$ActionId,$Revision,$Status,$ErrorCode,$TransactionId)
+            $world.TrayActionResults.Add([pscustomobject][ordered]@{ActionId=$ActionId;Revision=[UInt64]$Revision;Status=$Status;ErrorCode=$ErrorCode;TransactionId=$TransactionId})
+            return $world.Bridge.Acknowledge($ActionId,[UInt64]$Revision,$Status,$ErrorCode)
+        }.GetNewClosure()
+        foreach($index in 1..10){
+            $bridge.SelectFromNativeMenu()
+            $action=[pscustomobject][ordered]@{ActionId=$bridge.ActionId;Command=$bridge.Command;Revision=[UInt64]$bridge.Revision}
+            $result=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)[0]
+            Assert-CcodEqual 'Rejected' $result.Status "log-failure stale action $index retains its Supervisor status"
+            Assert-CcodEqual $true $result.Delivered "log-failure stale action $index is terminally accepted by HostTransport"
+        }
+        Assert-CcodEqual 0 $bridge.FeedbackCount 'host-side diagnostic failures suppress every generic feedback item'
+        Assert-CcodTrue ($hostState.RuntimeCleanupCodes.Contains('CCOD_SUPERVISOR_LOG_FAILED')) 'Supervisor log failure remains visible in the cleanup receipt'
 
-    $result=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)[0]
-
-    Assert-CcodEqual 'Rejected' $result.Status 'stale action retains its supervisor terminal status'
-    Assert-CcodEqual 'CCOD_TRAY_ACTION_STALE' $result.ErrorCode 'stale action retains its stable code'
-    Assert-CcodEqual $false $result.Delivered 'failed diagnostic persistence prevents terminal feedback delivery'
-    Assert-CcodEqual 0 $world.TrayActionResults.Count 'TrayHost receives no terminal result without a durable local record'
-    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -eq 'Open:Logs'}).Count 'stale action still performs no handler side effect'
-    Assert-CcodTrue ($hostState.RuntimeCleanupCodes.Contains('CCOD_SUPERVISOR_LOG_FAILED')) 'failed diagnostic persistence remains visible in the supervisor cleanup receipt'
+        $world.FailAt=$null;$bridge.SetDiagnosticPersistence($true)
+        $enabled=[pscustomobject][ordered]@{RepairEnabled=$true;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true}
+        $hostState.Tray.AcknowledgedPresentations['2']=$enabled;$hostState.LastAcknowledgedPresentation=$enabled
+        $bridge.SelectFromNativeMenu()
+        $recovered=[pscustomobject][ordered]@{ActionId=$bridge.ActionId;Command=$bridge.Command;Revision=[UInt64]$bridge.Revision}
+        $result=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $recovered)[0]
+        Assert-CcodEqual 'Completed' $result.Status 'new command completes after both diagnostic paths recover'
+        Assert-CcodEqual $true $result.Delivered 'recovered HostTransport acknowledges the new completed result'
+        Assert-CcodEqual 1 @($world.Calls|Where-Object{$_ -eq 'Open:Logs'}).Count 'recovered new command reaches its handler exactly once'
+    }finally{$bridge.Dispose()}
 }
 
 Invoke-CcodTest 'correlates native menu actions through HostTransport Supervisor ACK authorization and result ACK' {

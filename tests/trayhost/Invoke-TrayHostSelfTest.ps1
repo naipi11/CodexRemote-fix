@@ -22,6 +22,7 @@ $nativeFiles=@(
 )
 $transportFiles=@(
     (Join-Path $repositoryRoot 'src\trayhost\TransportMessages.cs'),
+    (Join-Path $repositoryRoot 'src\trayhost\TrayTerminalDiagnostic.cs'),
     (Join-Path $repositoryRoot 'src\trayhost\ParentTransport.cs'),
     (Join-Path $repositoryRoot 'src\trayhost\HostTransport.cs')
 )

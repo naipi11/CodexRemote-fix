@@ -1174,7 +1174,7 @@ function Write-CcodSupervisorTrayActionTerminal {
 function Send-CcodSupervisorTrayActionResult {
     param($HostState,[hashtable]$Adapters,$Action,[ValidateSet('Accepted','Completed','Rejected','Failed')][string]$Status,[AllowNull()][string]$ErrorCode,[AllowNull()][string]$TransactionId)
     $result=[pscustomobject][ordered]@{ActionId=$Action.ActionId;Revision=[UInt64]$Action.Revision;Status=$Status;ErrorCode=$ErrorCode;TransactionId=$TransactionId}
-    if($Status-cne'Accepted'-and-not(Write-CcodSupervisorTrayActionTerminal $HostState $Adapters $Action $Status $ErrorCode)){$result|Add-Member -NotePropertyName Delivered -NotePropertyValue $false;return $result}
+    if($Status-cne'Accepted'){[void](Write-CcodSupervisorTrayActionTerminal $HostState $Adapters $Action $Status $ErrorCode)}
     try{
         $delivered=Invoke-CcodSupervisorAdapter $Adapters.SendTrayActionResult @($HostState.Tray,$result.ActionId,$result.Revision,$result.Status,$result.ErrorCode,$result.TransactionId) 1
         if($delivered-isnot[bool]-or-not$delivered){throw 'tray action result was not acknowledged'}
