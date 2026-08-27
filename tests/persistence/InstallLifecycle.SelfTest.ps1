@@ -2622,16 +2622,16 @@ $results += Invoke-CcodTest 'README and release workflow publish current portabl
     Assert-CcodTrue ($readmeChinese -cmatch '\A(?s:<div align="center">.*?<h1>CodexRemote-fix</h1>)') 'Chinese README uses the centered public product heading'
 
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start[^\r\n]*\r?\n(.*?)(?=^## )').Groups[1].Value
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.20-setup\.exe') 'English Quick Start names the setup installer'
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.20-windows-x64\.zip') 'English Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.21-setup\.exe') 'English Quick Start names the setup installer'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.21-windows-x64\.zip') 'English Quick Start names the exact portable artifact'
     Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix\.exe') 'English Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($quickStart -cmatch '\.sha256\.txt') 'English Quick Start names the checksum artifact'
 
     $quickStartChineseMatch = [regex]::Match($readmeChinese, '(?ms)^## [^\r\n]+\r?\n(?:\r?\n)?(?=1\.[^\r\n]*\[Releases\])(.*?)(?=^## |\z)')
     Assert-CcodTrue $quickStartChineseMatch.Success 'Chinese README exposes a Quick Start section'
     $quickStartChinese = $quickStartChineseMatch.Groups[1].Value
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.20-setup\.exe') 'Chinese Quick Start names the setup installer'
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.20-windows-x64\.zip') 'Chinese Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.21-setup\.exe') 'Chinese Quick Start names the setup installer'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.21-windows-x64\.zip') 'Chinese Quick Start names the exact portable artifact'
     Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix\.exe') 'Chinese Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($quickStartChinese -cmatch '\.sha256\.txt') 'Chinese Quick Start names the checksum artifact'
 
