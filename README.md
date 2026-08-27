@@ -16,7 +16,7 @@
 </p>
 
 > [!NOTE]
-> **Release status:** v2.5.20 is the current stable release. The setup installer, EXE-based portable ZIP, tray actions, restart-and-repair flow, and persistent remote connection are covered by the release validation gates.
+> **Release status:** v2.5.21 is the current stable release. The setup installer, EXE-based portable ZIP, tray actions, restart-and-repair flow, and persistent remote connection are covered by the release validation gates.
 
 CodexRemote-fix enables the UI that ships with Codex Desktop for Windows but is hidden by a runtime defect:
 
@@ -50,7 +50,7 @@ that existing page and leaves the Codex UI, account authorization, and enrollmen
 ## Quick start
 
 
-1. Download either `CodexRemote-fix-2.5.20-setup.exe` (recommended installer) or `CodexRemote-fix-2.5.20-windows-x64.zip` from [Releases](https://github.com/naipi11/CodexRemote-fix/releases). Download and verify the matching `.sha256.txt` before continuing.
+1. Download either `CodexRemote-fix-2.5.21-setup.exe` (recommended installer) or `CodexRemote-fix-2.5.21-windows-x64.zip` from [Releases](https://github.com/naipi11/CodexRemote-fix/releases). Download and verify the matching `.sha256.txt` before continuing.
 2. If you chose the setup installer, run it and follow the wizard. If you chose the portable ZIP, extract it into a new empty folder and double-click `CodexRemote-fix.exe`.
 
    Both paths validate the payload, run a Microsoft Defender custom scan, and preserve the DPAPI device-key store.
@@ -85,12 +85,12 @@ The tray reports two independent, truthful status lines instead of inferring rea
 
 ## Releases
 
-Every tagged release ships a Windows setup installer and a portable ZIP, each with its SHA-256 checksum, release manifest, and the shared payload manifest. The `.github/workflows/release.yml` workflow builds both from the tag automatically, so v2.5.20 includes:
+Every tagged release ships a Windows setup installer and an EXE-entry portable ZIP, each with its SHA-256 checksum, release manifest, and the shared payload manifest. The `.github/workflows/release.yml` workflow builds both from the tag automatically, so v2.5.21 includes:
 
-- `CodexRemote-fix-2.5.20-setup.exe` and its checksum
-- `CodexRemote-fix-2.5.20-windows-x64.zip` and its checksum
-- `CodexRemote-fix-2.5.20-payload-manifest.json`
-- `CodexRemote-fix-2.5.20-release-manifest.json` and `CodexRemote-fix-2.5.20-setup-release-manifest.json`
+- `CodexRemote-fix-2.5.21-setup.exe` and its checksum
+- `CodexRemote-fix-2.5.21-windows-x64.zip` and its checksum
+- `CodexRemote-fix-2.5.21-payload-manifest.json`
+- `CodexRemote-fix-2.5.21-release-manifest.json` and `CodexRemote-fix-2.5.21-setup-release-manifest.json`
 
 Each release appends a short English change summary to the GitHub release body. The bilingual release history is kept in [CHANGELOG.md](CHANGELOG.md).
 

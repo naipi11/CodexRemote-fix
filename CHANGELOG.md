@@ -6,6 +6,14 @@ This file keeps the release record. GitHub Release bodies are generated from the
 
 No unreleased changes.
 
+## v2.5.21
+
+### English
+
+- Repaired stale-status recovery around one exact live Codex root, rejecting ambiguous roots and stale identity correlation.
+- Added exact, safe lifecycle diagnostics that explain rejected repair evidence without broad process actions.
+- Validated installed Supervisor and TrayHost lifecycle evidence against the real current Codex root and renderer listener.
+
 ## v2.5.20
 
 ### English
