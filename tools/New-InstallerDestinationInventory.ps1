@@ -32,11 +32,25 @@ function Add-CcodExpectedDirectory {
     }
 }
 
-$lines = @(Get-Content -LiteralPath $inno -Encoding UTF8)
-$includeDirectives = @($lines | Where-Object { $_ -match '^\s*#\s*(?:include\b|\+)' })
-if ($includeDirectives.Count -ne 0) {
-    throw 'Setup destination inventory requires an include-free template; external #include and #+ directives are not permitted.'
+function Assert-CcodInstallerInnoPreprocessorLines {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
+    $allowedDirectives = @('ifndef','define','error','endif')
+    for ($lineIndex = 0; $lineIndex -lt $Lines.Count; $lineIndex++) {
+        $line = [string]$Lines[$lineIndex]
+        $lineNumber = $lineIndex + 1
+        if ($line -match '\\[ \t]*$') {
+            throw "Setup destination inventory requires an include-free simple preprocessor template; line continuation is not permitted at line $lineNumber."
+        }
+        if ($line -notmatch '^[ \t]*#') { continue }
+        $directiveMatch = [regex]::Match($line,'^[ \t]*#(?<directive>[A-Za-z]+)\b')
+        if (-not $directiveMatch.Success -or $allowedDirectives -cnotcontains $directiveMatch.Groups['directive'].Value) {
+            throw "Setup destination inventory requires an include-free simple preprocessor template; unsafe directive at line ${lineNumber}: $line"
+        }
+    }
 }
+
+$lines = @(Get-Content -LiteralPath $inno -Encoding UTF8)
+Assert-CcodInstallerInnoPreprocessorLines -Lines $lines
 $filesSectionCount = @($lines | Where-Object { $_ -match '^\s*\[Files\]\s*$' }).Count
 if ($filesSectionCount -ne 1) { throw "Setup destination inventory requires exactly one [Files] section; found $filesSectionCount." }
 $insideFiles = $false

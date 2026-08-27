@@ -203,6 +203,237 @@ $($fixture.Directive)
     }
 }
 
+Invoke-CcodTest 'line-spanned include forms are rejected before inventory generation or real ISCC' {
+    $iscc = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+    ) | Where-Object { $_ -and [IO.File]::Exists($_) } | Select-Object -First 1
+    if (-not $iscc) { throw 'Inno Setup 6 is required for the line-spanned include fixtures' }
+    . (Join-Path $repositoryRoot 'build\build.ps1') -Library
+    $results = [Collections.Generic.List[object]]::new()
+    foreach ($fixture in @(
+        [pscustomobject]@{Name='line-spanned include keyword';Lines=@('# \','include "extra.iss"')},
+        [pscustomobject]@{Name='line-spanned plus alias';Lines=@('# \','+ "extra.iss"')}
+    )) {
+        $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-line-spanned-include-' + [guid]::NewGuid().ToString('N'))
+        try {
+            $payload = Join-Path $root 'payload'
+            $output = Join-Path $root 'output'
+            [IO.Directory]::CreateDirectory($payload) | Out-Null
+            [IO.Directory]::CreateDirectory($output) | Out-Null
+            $firstSource = Join-Path $root 'fixture-a.txt'
+            $secondSource = Join-Path $root 'fixture-b.txt'
+            [IO.File]::WriteAllText($firstSource,'first',[Text.UTF8Encoding]::new($false))
+            [IO.File]::WriteAllText($secondSource,'second',[Text.UTF8Encoding]::new($false))
+            $extraPath = Join-Path $root 'extra.iss'
+            $extraSource = @"
+[Files]
+Source: "$secondSource"; DestDir: "{app}\second"; Flags: ignoreversion
+"@
+            [IO.File]::WriteAllText($extraPath,$extraSource,[Text.UTF8Encoding]::new($false))
+            $templatePath = Join-Path $root 'Template.iss'
+            $directive = $fixture.Lines -join "`r`n"
+            $templateSource = @"
+[Setup]
+AppName=LineSpannedInclude
+AppVersion=1.0.0
+DefaultDirName={tmp}\LineSpannedInclude
+OutputDir=$output
+OutputBaseFilename=LineSpannedInclude
+Uninstallable=no
+$directive
+[Files]
+Source: "$firstSource"; DestDir: "{app}\first"; Flags: ignoreversion
+[Code]
+// CCOD_INSTALLER_DESTINATION_INVENTORY
+"@
+            [IO.File]::WriteAllText($templatePath,$templateSource,[Text.UTF8Encoding]::new($false))
+            $inventoryPath = Join-Path $root 'Inventory.iss'
+            $setupPath = Join-Path $output 'LineSpannedInclude.exe'
+            $failure = $null
+            $compilerAttempted = $false
+            try {
+                & (Join-Path $repositoryRoot 'tools\New-InstallerDestinationInventory.ps1') -RepositoryRoot $repositoryRoot -PayloadRoot $payload -ProjectVersion '2.5.22' -InnoScriptPath $templatePath -OutputPath $inventoryPath | Out-Null
+                $compilerAttempted = $true
+                Invoke-CcodBuildInnoCompiler -TemplatePath $templatePath -InventoryPath $inventoryPath -IsccPath $iscc -Arguments @() -SetupPath $setupPath
+            } catch { $failure = $_ }
+            $results.Add([pscustomobject]@{
+                Name = $fixture.Name
+                Failure = $failure
+                CompilerAttempted = $compilerAttempted
+                InventoryExists = [IO.File]::Exists($inventoryPath)
+                SetupExists = [IO.File]::Exists($setupPath)
+                GeneratedCount = @(Get-ChildItem -LiteralPath $root -Filter '.ccod-generated-setup-*.iss' -File -Force).Count
+            })
+        } finally {
+            if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+        }
+    }
+    foreach ($result in $results) {
+        Assert-CcodTrue ($null -ne $result.Failure) "$($result.Name) is rejected before the compiler boundary"
+        Assert-CcodTrue ($result.Failure.Exception.Message -cmatch 'preprocessor|continuation') "$($result.Name) failure identifies the strict preprocessor boundary"
+        Assert-CcodTrue (-not $result.CompilerAttempted) "$($result.Name) never reaches the real ISCC boundary"
+        Assert-CcodTrue (-not $result.InventoryExists) "$($result.Name) leaves no inventory output"
+        Assert-CcodTrue (-not $result.SetupExists) "$($result.Name) leaves no setup artifact"
+        Assert-CcodEqual 0 $result.GeneratedCount "$($result.Name) leaves no generated compiler input"
+    }
+}
+
+Invoke-CcodTest 'inventory generation rejects pragma, emit, and unknown simple preprocessor directives' {
+    $results = [Collections.Generic.List[object]]::new()
+    foreach ($fixture in @(
+        [pscustomobject]@{Name='pragma';Directive='#pragma parseroption -u+'},
+        [pscustomobject]@{Name='emit';Directive='#emit "[Files]"'},
+        [pscustomobject]@{Name='unknown';Directive='#futuredirective "extra.iss"'}
+    )) {
+        $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-unsafe-inno-directive-' + [guid]::NewGuid().ToString('N'))
+        try {
+            $payload = Join-Path $root 'payload'
+            [IO.Directory]::CreateDirectory($payload) | Out-Null
+            $sourcePath = Join-Path $root 'fixture.txt'
+            [IO.File]::WriteAllText($sourcePath,'fixture',[Text.UTF8Encoding]::new($false))
+            $templatePath = Join-Path $root 'Template.iss'
+            $templateSource = @"
+[Setup]
+AppName=UnsafeDirective
+AppVersion=1.0.0
+DefaultDirName={app}
+[Files]
+Source: "$sourcePath"; DestDir: "{app}\first"; Flags: ignoreversion
+[Code]
+// CCOD_INSTALLER_DESTINATION_INVENTORY
+$($fixture.Directive)
+"@
+            [IO.File]::WriteAllText($templatePath,$templateSource,[Text.UTF8Encoding]::new($false))
+            $inventoryPath = Join-Path $root 'Inventory.iss'
+            $failure = $null
+            try {
+                & (Join-Path $repositoryRoot 'tools\New-InstallerDestinationInventory.ps1') -RepositoryRoot $repositoryRoot -PayloadRoot $payload -ProjectVersion '2.5.22' -InnoScriptPath $templatePath -OutputPath $inventoryPath | Out-Null
+            } catch { $failure = $_ }
+            $results.Add([pscustomobject]@{
+                Name = $fixture.Name
+                Failure = $failure
+                InventoryExists = [IO.File]::Exists($inventoryPath)
+            })
+        } finally {
+            if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+        }
+    }
+    foreach ($result in $results) {
+        Assert-CcodTrue ($null -ne $result.Failure) "$($result.Name) directive is rejected before inventory generation"
+        Assert-CcodTrue ($result.Failure.Exception.Message -cmatch 'preprocessor|directive') "$($result.Name) failure identifies the strict directive boundary"
+        Assert-CcodTrue (-not $result.InventoryExists) "$($result.Name) directive leaves no inventory output"
+    }
+}
+
+Invoke-CcodTest 'generated setup creation applies the same strict preprocessor boundary before ISCC' {
+    . (Join-Path $repositoryRoot 'build\build.ps1') -Library
+    $results = [Collections.Generic.List[object]]::new()
+    foreach ($fixture in @(
+        [pscustomobject]@{Name='line-spanned include keyword';Directive=(@('# \','include "extra.iss"') -join "`r`n")},
+        [pscustomobject]@{Name='line-spanned plus alias';Directive=(@('# \','+ "extra.iss"') -join "`r`n")},
+        [pscustomobject]@{Name='pragma';Directive='#pragma parseroption -u+'},
+        [pscustomobject]@{Name='emit';Directive='#emit "[Files]"'},
+        [pscustomobject]@{Name='unknown';Directive='#futuredirective "extra.iss"'}
+    )) {
+        $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-generated-unsafe-directive-' + [guid]::NewGuid().ToString('N'))
+        try {
+            [IO.Directory]::CreateDirectory($root) | Out-Null
+            $templatePath = Join-Path $root 'Template.iss'
+            $templateSource = @"
+[Setup]
+AppName=GeneratedUnsafeDirective
+AppVersion=1.0.0
+DefaultDirName={tmp}\GeneratedUnsafeDirective
+OutputBaseFilename=GeneratedUnsafeDirective
+Uninstallable=no
+[Code]
+// CCOD_INSTALLER_DESTINATION_INVENTORY
+$($fixture.Directive)
+"@
+            [IO.File]::WriteAllText($templatePath,$templateSource,[Text.UTF8Encoding]::new($false))
+            $inventoryPath = Join-Path $root 'Inventory.iss'
+            $inventorySource = @'
+procedure AddCcodExpectedSetupDirectories(Directories: TStrings);
+begin
+end;
+'@
+            [IO.File]::WriteAllText($inventoryPath,$inventorySource,[Text.UTF8Encoding]::new($false))
+            $compilerMarker = Join-Path $root 'iscc-invoked.txt'
+            $compilerPath = Join-Path $root 'fake-iscc.cmd'
+            $setupPath = Join-Path $root 'setup.exe'
+            $compilerSource = "@echo off`r`n> `"$compilerMarker`" echo invoked`r`n> `"$setupPath`" echo setup`r`nexit /b 0`r`n"
+            [IO.File]::WriteAllText($compilerPath,$compilerSource,[Text.ASCIIEncoding]::new())
+            $failure = $null
+            try {
+                Invoke-CcodBuildInnoCompiler -TemplatePath $templatePath -InventoryPath $inventoryPath -IsccPath $compilerPath -Arguments @() -SetupPath $setupPath
+            } catch { $failure = $_ }
+            $results.Add([pscustomobject]@{
+                Name = $fixture.Name
+                Failure = $failure
+                CompilerInvoked = [IO.File]::Exists($compilerMarker)
+                SetupExists = [IO.File]::Exists($setupPath)
+                GeneratedCount = @(Get-ChildItem -LiteralPath $root -Filter '.ccod-generated-setup-*.iss' -File -Force).Count
+            })
+        } finally {
+            if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+        }
+    }
+    foreach ($result in $results) {
+        Assert-CcodTrue ($null -ne $result.Failure) "$($result.Name) is rejected before generated setup compilation"
+        Assert-CcodTrue ($result.Failure.Exception.Message -cmatch 'preprocessor|continuation|directive') "$($result.Name) failure identifies the strict generated-source boundary"
+        Assert-CcodTrue (-not $result.CompilerInvoked) "$($result.Name) does not invoke ISCC"
+        Assert-CcodTrue (-not $result.SetupExists) "$($result.Name) leaves no setup artifact"
+        Assert-CcodEqual 0 $result.GeneratedCount "$($result.Name) leaves no generated compiler input"
+    }
+}
+
+Invoke-CcodTest 'generated setup rejects an unsafe directive introduced by inventory before ISCC' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-generated-unsafe-inventory-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        $templatePath = Join-Path $root 'Template.iss'
+        $templateSource = @'
+[Setup]
+AppName=GeneratedUnsafeInventory
+AppVersion=1.0.0
+DefaultDirName={tmp}\GeneratedUnsafeInventory
+OutputBaseFilename=GeneratedUnsafeInventory
+Uninstallable=no
+[Code]
+// CCOD_INSTALLER_DESTINATION_INVENTORY
+'@
+        [IO.File]::WriteAllText($templatePath,$templateSource,[Text.UTF8Encoding]::new($false))
+        $inventoryPath = Join-Path $root 'Inventory.iss'
+        $inventorySource = @'
+procedure AddCcodExpectedSetupDirectories(Directories: TStrings);
+begin
+end;
+#emit "[Files]"
+'@
+        [IO.File]::WriteAllText($inventoryPath,$inventorySource,[Text.UTF8Encoding]::new($false))
+        $compilerMarker = Join-Path $root 'iscc-invoked.txt'
+        $compilerPath = Join-Path $root 'fake-iscc.cmd'
+        $setupPath = Join-Path $root 'setup.exe'
+        $compilerSource = "@echo off`r`n> `"$compilerMarker`" echo invoked`r`n> `"$setupPath`" echo setup`r`nexit /b 0`r`n"
+        [IO.File]::WriteAllText($compilerPath,$compilerSource,[Text.ASCIIEncoding]::new())
+        . (Join-Path $repositoryRoot 'build\build.ps1') -Library
+        $failure = $null
+        try {
+            Invoke-CcodBuildInnoCompiler -TemplatePath $templatePath -InventoryPath $inventoryPath -IsccPath $compilerPath -Arguments @() -SetupPath $setupPath
+        } catch { $failure = $_ }
+
+        Assert-CcodTrue ($null -ne $failure) 'unsafe inventory directive is rejected after marker replacement'
+        Assert-CcodTrue ($failure.Exception.Message -cmatch 'preprocessor|directive') 'unsafe inventory failure identifies the final generated-source boundary'
+        Assert-CcodTrue (-not [IO.File]::Exists($compilerMarker)) 'unsafe inventory does not invoke ISCC'
+        Assert-CcodTrue (-not [IO.File]::Exists($setupPath)) 'unsafe inventory leaves no setup artifact'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath $root -Filter '.ccod-generated-setup-*.iss' -File -Force).Count 'unsafe inventory leaves no generated setup script'
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
 Invoke-CcodTest 'build rejects invalid generated setup inputs before invoking ISCC' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-generated-setup-invalid-' + [guid]::NewGuid().ToString('N'))
     try {
@@ -320,6 +551,53 @@ end;
         Assert-CcodTrue (-not $compiledSource.Contains('// CCOD_INSTALLER_DESTINATION_INVENTORY')) 'compiled source contains no unresolved inventory marker'
         Assert-CcodTrue ($compiledSource -cnotmatch '(?m)^\s*#\s*(?:include\b|\+)') 'compiled source contains no external include directive'
         Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath $root -Filter '.ccod-generated-setup-*.iss' -File -Force).Count 'successful compile leaves no generated setup script'
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'build cleans the GUID generated setup when ISCC returns nonzero' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-generated-setup-compiler-failure-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        $templatePath = Join-Path $root 'Template.iss'
+        $templateSource = @'
+[Setup]
+AppName=GeneratedSetupCompilerFailure
+AppVersion=1.0.0
+DefaultDirName={tmp}\GeneratedSetupCompilerFailure
+OutputBaseFilename=GeneratedSetupCompilerFailure
+Uninstallable=no
+[Code]
+// CCOD_INSTALLER_DESTINATION_INVENTORY
+'@
+        [IO.File]::WriteAllText($templatePath,$templateSource,[Text.UTF8Encoding]::new($false))
+        $inventoryPath = Join-Path $root 'Inventory.iss'
+        $inventorySource = @'
+procedure AddCcodExpectedSetupDirectories(Directories: TStrings);
+begin
+end;
+'@
+        [IO.File]::WriteAllText($inventoryPath,$inventorySource,[Text.UTF8Encoding]::new($false))
+        $compilerArgument = Join-Path $root 'iscc-argument.txt'
+        $compilerPath = Join-Path $root 'fake-iscc.cmd'
+        $setupPath = Join-Path $root 'setup.exe'
+        $compilerSource = "@echo off`r`n> `"$compilerArgument`" echo %~f1`r`nexit /b 23`r`n"
+        [IO.File]::WriteAllText($compilerPath,$compilerSource,[Text.ASCIIEncoding]::new())
+        . (Join-Path $repositoryRoot 'build\build.ps1') -Library
+        $failure = $null
+        try {
+            Invoke-CcodBuildInnoCompiler -TemplatePath $templatePath -InventoryPath $inventoryPath -IsccPath $compilerPath -Arguments @() -SetupPath $setupPath
+        } catch { $failure = $_ }
+
+        Assert-CcodTrue ($null -ne $failure) 'nonzero ISCC exit fails the build boundary'
+        Assert-CcodTrue ($failure.Exception.Message -cmatch 'exit code 23') 'compiler failure retains the exact nonzero exit code'
+        Assert-CcodTrue ([IO.File]::Exists($compilerArgument)) 'nonzero compiler records the generated source argument'
+        $compiledPath = [IO.File]::ReadAllText($compilerArgument).Trim()
+        Assert-CcodTrue ([IO.Path]::GetFileName($compiledPath) -cmatch '^\.ccod-generated-setup-[0-9a-f]{32}\.iss$') 'nonzero compiler receives the GUID generated source'
+        Assert-CcodTrue (-not [IO.File]::Exists($compiledPath)) 'nonzero compiler path is removed by the build finally boundary'
+        Assert-CcodTrue (-not [IO.File]::Exists($setupPath)) 'nonzero compiler produces no accepted setup artifact'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath $root -Filter '.ccod-generated-setup-*.iss' -File -Force).Count 'nonzero compiler leaves no generated setup script'
     } finally {
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
     }

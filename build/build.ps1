@@ -116,6 +116,26 @@ function Assert-CcodBuildInstallerDestinationInventory {
     return $inventoryPath
 }
 
+function Assert-CcodBuildInnoPreprocessorLines {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines,
+        [Parameter(Mandatory)][string]$Kind
+    )
+    $allowedDirectives = @('ifndef','define','error','endif')
+    for ($lineIndex = 0; $lineIndex -lt $Lines.Count; $lineIndex++) {
+        $line = [string]$Lines[$lineIndex]
+        $lineNumber = $lineIndex + 1
+        if ($line -match '\\[ \t]*$') {
+            throw "$Kind requires an include-free simple preprocessor source; line continuation is not permitted at line $lineNumber."
+        }
+        if ($line -notmatch '^[ \t]*#') { continue }
+        $directiveMatch = [regex]::Match($line,'^[ \t]*#(?<directive>[A-Za-z]+)\b')
+        if (-not $directiveMatch.Success -or $allowedDirectives -cnotcontains $directiveMatch.Groups['directive'].Value) {
+            throw "$Kind requires an include-free simple preprocessor source; unsafe directive at line ${lineNumber}: $line"
+        }
+    }
+}
+
 function New-CcodBuildGeneratedInnoScript {
     param(
         [Parameter(Mandatory)][string]$TemplatePath,
@@ -137,9 +157,7 @@ function New-CcodBuildGeneratedInnoScript {
 
     $marker = '// CCOD_INSTALLER_DESTINATION_INVENTORY'
     $templateSource = [IO.File]::ReadAllText($template,[Text.UTF8Encoding]::new($false))
-    if ($templateSource -match '(?m)^\s*#\s*(?:include\b|\+)') {
-        throw 'The Inno Setup template must be include-free; external #include and #+ directives are not permitted.'
-    }
+    Assert-CcodBuildInnoPreprocessorLines -Lines ([IO.File]::ReadAllLines($template,[Text.UTF8Encoding]::new($false))) -Kind 'The Inno Setup template'
     $markerCount = [regex]::Matches($templateSource,[regex]::Escape($marker)).Count
     $markerLineCount = [regex]::Matches($templateSource,'(?m)^\s*// CCOD_INSTALLER_DESTINATION_INVENTORY\s*$').Count
     if ($markerCount -ne 1 -or $markerLineCount -ne 1) {
@@ -151,9 +169,7 @@ function New-CcodBuildGeneratedInnoScript {
     if ($generatedSource.Contains($marker)) {
         throw 'The generated Inno Setup script contains an unresolved inventory marker.'
     }
-    if ($generatedSource -match '(?m)^\s*#\s*(?:include\b|\+)') {
-        throw 'The generated Inno Setup script contains an external #include or #+ directive.'
-    }
+    Assert-CcodBuildInnoPreprocessorLines -Lines ([regex]::Split($generatedSource,'\r\n|\n|\r')) -Kind 'The generated Inno Setup script'
 
     try {
         Write-CcodBuildUtf8 -Path $output -Text $generatedSource
