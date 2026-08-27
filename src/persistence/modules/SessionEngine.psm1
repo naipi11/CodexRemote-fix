@@ -252,10 +252,25 @@ function Set-CcodSessionFailure($Result, $Record, [string]$Stage) {
     return $Result
 }
 
+function Get-CcodSessionDiagnosticReason {
+    param($Record,[string]$Code)
+    if($Code -cne 'CCOD_CLOSE_UNPROVEN' -or $null -eq $Record -or $null -eq $Record.Exception){return 'Unclassified'}
+    switch -CaseSensitive ([string]$Record.Exception.Message) {
+        'Recorded Active root is missing, changed, or accompanied by another root' {return 'RecordedActiveMismatch'}
+        'Recorded Active root cannot be safely replaced' {return 'RecordedActiveMismatch'}
+        'Multiple current-package close roots are ambiguous' {return 'MultipleRoots'}
+        'A status-less debug root lacks one valid distinct port pair' {return 'MissingPortPair'}
+        'Requested close source is not the one verified current root' {return 'RequestedSourceMismatch'}
+        'Current close target tree is not exact and verified' {return 'EmptyVerifiedTree'}
+        default {return 'Unclassified'}
+    }
+}
+
 function Write-CcodSessionDiagnostic {
-    param($Result,[string]$Action,[string]$TransactionId,[string]$Stage,[string]$Code,$Paths,[hashtable]$Adapter)
+    param($Result,[string]$Action,[string]$TransactionId,[string]$Stage,[string]$Code,$Record,$Paths,[hashtable]$Adapter)
     if($null -eq $Paths -or $null -eq $Adapter -or $null -eq $Adapter.WriteLog){return}
-    $record=[pscustomobject][ordered]@{schemaVersion=1;timestampUtc=[DateTime]::UtcNow.ToString('o',[Globalization.CultureInfo]::InvariantCulture);action=$Action;transactionId=$TransactionId;stage=$Stage;code=$Code}
+    $reason=Get-CcodSessionDiagnosticReason $Record $Code
+    $record=[pscustomobject][ordered]@{schemaVersion=2;timestampUtc=[DateTime]::UtcNow.ToString('o',[Globalization.CultureInfo]::InvariantCulture);action=$Action;transactionId=$TransactionId;stage=$Stage;code=$Code;reason=$reason}
     try{& $Adapter.WriteLog $Paths.SessionLogPath ($record|ConvertTo-Json -Depth 4 -Compress)|Out-Null;$Result.logFile=$Paths.SessionLogPath}catch{}
 }
 
@@ -995,7 +1010,7 @@ function Invoke-CcodSessionCore {
     } catch {
         if(Test-CcodSessionLifecycleFenceFailure $_){throw}
         $result=Set-CcodSessionFailure -Result $result -Record $_ -Stage $result.stage
-        if($pathsValidated -and -not $SuppressDiagnostic){Write-CcodSessionDiagnostic $result $Action $result.transactionId $result.stage $result.error.code $Paths $adapter}
+        if($pathsValidated -and -not $SuppressDiagnostic){Write-CcodSessionDiagnostic $result $Action $result.transactionId $result.stage $result.error.code $_ $Paths $adapter}
         return $result
     }
 }
@@ -1150,7 +1165,7 @@ function Invoke-CcodActivationSession {
             $result.ok=$true;$result.outcome='Activated';$result.safeState='SpecialValidated';$result.stage='Completed';return $result
         } catch {
             if(Test-CcodSessionLifecycleFenceFailure $_){throw}
-            Write-CcodSessionDiagnostic $result $Action $Request.transactionId $result.stage (Get-CcodSessionErrorCode $_) $Paths $adapter
+            Write-CcodSessionDiagnostic $result $Action $Request.transactionId $result.stage (Get-CcodSessionErrorCode $_) $_ $Paths $adapter
             if($recoveryAttempted){Throw-CcodSessionError 'CCOD_RECOVERY_UNPROVEN' 'Recursive recovery is forbidden' $_}
             $recoveryAttempted=$true
             $recoveryRenderer=$null;$recoveryMain=$null
@@ -1227,7 +1242,7 @@ function Invoke-CcodRepairRenderer {
             $result.ok=$true;$result.outcome='NoAction';$result.safeState='SpecialValidated';$result.stage='RendererRepaired';return $result
         }catch{
             if(Test-CcodSessionLifecycleFenceFailure $_){throw}
-            Write-CcodSessionDiagnostic $result 'RepairRenderer' $Request.transactionId $result.stage (Get-CcodSessionErrorCode $_) $Paths $adapter
+            Write-CcodSessionDiagnostic $result 'RepairRenderer' $Request.transactionId $result.stage (Get-CcodSessionErrorCode $_) $_ $Paths $adapter
             if($recoveryAttempted){Throw-CcodSessionError 'CCOD_RECOVERY_UNPROVEN' 'Recursive renderer recovery is forbidden' $_}
             $recoveryAttempted=$true
             $journalPackage=ConvertTo-CcodJournalPackage $probe

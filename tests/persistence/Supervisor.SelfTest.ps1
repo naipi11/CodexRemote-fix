@@ -1433,6 +1433,20 @@ Invoke-CcodTest 'completes a correlated CheckAndRepair action when its lifecycle
     Assert-CcodEqual 'Completed' $terminal.Status 'successful lifecycle sends completed action result'
 }
 
+Invoke-CcodTest 'propagates a validated CloseFailed lifecycle error to its correlated terminal tray action' {
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $hostState.ConnectionState='RepairNeeded';$hostState.Tray.CurrentRevision=[UInt64]13
+    $hostState.Tray.AcknowledgedPresentations['13']=[pscustomobject][ordered]@{RepairEnabled=$true;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true}
+    $action=[pscustomobject][ordered]@{ActionId=[guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeece';Command='CheckAndRepair';Revision=[UInt64]13}
+    [void]@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)
+    $hostState.LifecycleRequest.phase='CloseFailed';$hostState.LifecycleRequest.error='CCOD_CLOSE_UNPROVEN'
+    Complete-CcodSupervisorLifecycleTerminal $hostState $fixture.Fake.Adapters
+    Assert-CcodEqual 2 $world.TrayActionResults.Count 'failed repair lifecycle emits accepted and terminal correlated results'
+    $terminal=$world.TrayActionResults[1]
+    Assert-CcodEqual 'Failed' $terminal.Status 'CloseFailed lifecycle sends a failed action result'
+    Assert-CcodEqual 'CCOD_CLOSE_UNPROVEN' $terminal.ErrorCode 'validated terminal lifecycle error is preserved exactly'
+}
+
 Invoke-CcodTest 'authorizes an acknowledged displayed revision after a newer capable presentation is published' {
     $fixture=New-CcodTickFixture;$hostState=$fixture.Host
     $hostState.ConnectionState='RepairNeeded';$hostState.Tray.CurrentRevision=[UInt64]8

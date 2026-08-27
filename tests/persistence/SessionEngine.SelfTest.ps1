@@ -461,7 +461,8 @@ try {
         Assert-CcodEqual 1 $messages.Count 'one core failure writes one diagnostic record'
         Assert-CcodTrue ($messages[0] -cnotmatch 'secret|hunter2|swordfish|command\.exe|[\r\n]') 'diagnostic record excludes raw path command secret and multiline text'
         $record=$messages[0]|ConvertFrom-Json
-        Assert-CcodEqual 'schemaVersion,timestampUtc,action,transactionId,stage,code' (($record.PSObject.Properties.Name)-join ',') 'diagnostic log uses the fixed allowlist'
+        Assert-CcodEqual 'schemaVersion,timestampUtc,action,transactionId,stage,code,reason' (($record.PSObject.Properties.Name)-join ',') 'diagnostic log uses the fixed allowlist'
+        Assert-CcodEqual 'Unclassified' $record.reason 'unknown adapter failure records only the allow-listed fallback reason'
 
         [IO.Directory]::CreateDirectory((Split-Path $paths.SessionLogPath -Parent))|Out-Null
         [IO.File]::WriteAllText($paths.SessionLogPath,('x'*(2MB+1)),[Text.UTF8Encoding]::new($false))
@@ -472,6 +473,33 @@ try {
         Assert-CcodEqual 1 $lines.Count 'default failure log contains one bounded JSONL record'
         Assert-CcodTrue ($lines[0] -cnotmatch 'secret|hunter2|swordfish|command\.exe') 'default rotating log is redacted by construction'
         Assert-CcodEqual $false (Test-Path -LiteralPath ($paths.SessionLogPath+'.11')) 'rotation never creates an eleventh history generation'
+    }
+
+    Invoke-CcodTest 'records only exact safe close failure reasons without exception text' {
+        $cases=@(
+            [pscustomobject]@{Message='Recorded Active root is missing, changed, or accompanied by another root';Reason='RecordedActiveMismatch'},
+            [pscustomobject]@{Message='Recorded Active root cannot be safely replaced';Reason='RecordedActiveMismatch'},
+            [pscustomobject]@{Message='Multiple current-package close roots are ambiguous';Reason='MultipleRoots'},
+            [pscustomobject]@{Message='A status-less debug root lacks one valid distinct port pair';Reason='MissingPortPair'},
+            [pscustomobject]@{Message='Requested close source is not the one verified current root';Reason='RequestedSourceMismatch'},
+            [pscustomobject]@{Message='Current close target tree is not exact and verified';Reason='EmptyVerifiedTree'},
+            [pscustomobject]@{Message="unknown C:\\private\\target`n--token hunter2";Reason='Unclassified'}
+        )
+        foreach($case in $cases){
+            $messages=[Collections.Generic.List[string]]::new()
+            $record=[Management.Automation.ErrorRecord]::new([InvalidOperationException]::new($case.Message),'CCOD_CLOSE_UNPROVEN',[Management.Automation.ErrorCategory]::InvalidData,$null)
+            $result=Invoke-CcodApplySession -Request (New-CcodEngineRequest -Action Apply -Source (New-CcodEngineSnapshot) -TransactionId ([guid]::NewGuid().ToString('D'))) -Paths $paths -Adapters @{
+                ReadState={throw $record}.GetNewClosure()
+                WriteLog={param($Path,$Message)$messages.Add($Message)}.GetNewClosure()
+            }
+            Assert-CcodEqual 'CCOD_CLOSE_UNPROVEN' $result.error.code "$($case.Reason) retains the stable failure code"
+            Assert-CcodEqual 1 $messages.Count "$($case.Reason) writes one diagnostic record"
+            $diagnostic=$messages[0]|ConvertFrom-Json
+            Assert-CcodEqual 'schemaVersion,timestampUtc,action,transactionId,stage,code,reason' (($diagnostic.PSObject.Properties.Name)-join ',') "$($case.Reason) uses only the diagnostic allowlist"
+            Assert-CcodEqual 2 $diagnostic.schemaVersion "$($case.Reason) uses diagnostic schema 2"
+            Assert-CcodEqual $case.Reason $diagnostic.reason "$($case.Reason) maps only the exact stable predicate"
+            Assert-CcodTrue ($messages[0] -cnotmatch 'private|target|hunter2|[\r\n]') "$($case.Reason) never logs raw exception text"
+        }
     }
 
     Invoke-CcodTest 'maps every unrecognized prefixed error ID to the stable generic code' {
