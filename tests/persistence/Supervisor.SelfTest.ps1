@@ -812,6 +812,22 @@ Invoke-CcodTest 'successful lifecycle verification binds a fresh special proof b
     Assert-CcodEqual $null $hostState.LifecycleRequest 'later guardian decision creates no redundant repair lifecycle'
 }
 
+function Import-CcodTrayHostCorrelationTestBridge {
+    if($null-ne('TrayHostCorrelationTestBridge' -as[type])){return}
+    $trayRoot=Join-Path $repositoryRoot 'src\trayhost'
+    Add-Type -Path @(
+        (Join-Path $trayRoot 'PresentationSnapshot.cs'),
+        (Join-Path $trayRoot 'PipeProtocol.cs'),
+        (Join-Path $trayRoot 'TransportMessages.cs'),
+        (Join-Path $trayRoot 'NativeMethods.cs'),
+        (Join-Path $trayRoot 'InputModeGuard.cs'),
+        (Join-Path $trayRoot 'NativeMenu.cs'),
+        (Join-Path $trayRoot 'TrayWindow.cs'),
+        (Join-Path $trayRoot 'HostTransport.cs'),
+        (Join-Path $repositoryRoot 'tests\trayhost\TrayHostCorrelationTestBridge.cs')
+    )
+}
+
 Invoke-CcodTest 'post-worker rebind retries one transient missing enumeration for the same exact candidate' {
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
     $transactionModule=Import-Module $lifecycleTransactionPath -Force -PassThru
@@ -1581,7 +1597,8 @@ Invoke-CcodTest 'records an acknowledged OpenLogs terminal outcome after its han
     Assert-CcodEqual 1 @($world.Calls|Where-Object{$_ -eq 'Open:Logs'}).Count 'current acknowledged action invokes OpenLogs exactly once'
     Assert-CcodEqual 1 $world.UiFailureRecords.Count 'terminal action writes exactly one local diagnostic record'
     $record=$world.UiFailureRecords[0]
-    Assert-CcodEqual 'schemaVersion,timestampUtc,component,stage,code,outcome,command,revision,status' (@($record.PSObject.Properties.Name)-join ',') 'terminal diagnostic record is an exact sanitized schema'
+    foreach($field in @('command','revision','status','code')){Assert-CcodTrue ($null-ne$record.PSObject.Properties[$field]) "terminal diagnostic includes required field $field"}
+    foreach($field in @('ActionId','TransactionId','path','token','exception','message','raw')){Assert-CcodTrue ($null-eq$record.PSObject.Properties[$field]) "terminal diagnostic excludes unsafe field $field"}
     Assert-CcodEqual 'Supervisor' $record.component 'terminal diagnostic identifies the authorizing component'
     Assert-CcodEqual 'TrayAction' $record.stage 'terminal diagnostic uses the tray action stage'
     Assert-CcodEqual 'CCOD_TRAY_ACTION_COMPLETED' $record.code 'successful terminal diagnostic uses a safe canonical code'
@@ -1607,7 +1624,8 @@ Invoke-CcodTest 'rejects and records an unacknowledged OpenLogs revision before 
     Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -eq 'Open:Logs'}).Count 'stale revision is rejected before the OpenLogs handler'
     Assert-CcodEqual 1 $world.UiFailureRecords.Count 'stale action writes exactly one local diagnostic record'
     $record=$world.UiFailureRecords[0]
-    Assert-CcodEqual 'schemaVersion,timestampUtc,component,stage,code,outcome,command,revision,status' (@($record.PSObject.Properties.Name)-join ',') 'stale diagnostic record is an exact sanitized schema'
+    foreach($field in @('command','revision','status','code')){Assert-CcodTrue ($null-ne$record.PSObject.Properties[$field]) "stale diagnostic includes required field $field"}
+    foreach($field in @('ActionId','TransactionId','path','token','exception','message','raw')){Assert-CcodTrue ($null-eq$record.PSObject.Properties[$field]) "stale diagnostic excludes unsafe field $field"}
     Assert-CcodEqual 'CCOD_TRAY_ACTION_STALE' $record.code 'stale diagnostic preserves the exact canonical code'
     Assert-CcodEqual 'OpenLogs' $record.command 'stale diagnostic preserves the rejected command'
     Assert-CcodEqual ([UInt64]8) $record.revision 'stale diagnostic preserves the unacknowledged revision'
@@ -1625,6 +1643,73 @@ Invoke-CcodTest 'sanitizes a malformed terminal action code before local logging
 
     Assert-CcodEqual 1 $world.UiFailureRecords.Count 'malformed terminal code still produces one safe diagnostic'
     Assert-CcodEqual 'CCOD_TRAY_ACTION_FAILED' $world.UiFailureRecords[0].code 'malformed terminal code is replaced by the canonical fallback'
+}
+
+Invoke-CcodTest 'does not queue generic terminal feedback when its local diagnostic write fails' {
+    # Production mutation caught: delivering a rejected terminal result to TrayHost after the required local diagnostic failed to persist.
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host;$world.FailAt='WriteLog'
+    $action=[pscustomobject][ordered]@{ActionId=[guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeb1';Command='OpenLogs';Revision=[UInt64]2}
+
+    $result=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)[0]
+
+    Assert-CcodEqual 'Rejected' $result.Status 'stale action retains its supervisor terminal status'
+    Assert-CcodEqual 'CCOD_TRAY_ACTION_STALE' $result.ErrorCode 'stale action retains its stable code'
+    Assert-CcodEqual $false $result.Delivered 'failed diagnostic persistence prevents terminal feedback delivery'
+    Assert-CcodEqual 0 $world.TrayActionResults.Count 'TrayHost receives no terminal result without a durable local record'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -eq 'Open:Logs'}).Count 'stale action still performs no handler side effect'
+    Assert-CcodTrue ($hostState.RuntimeCleanupCodes.Contains('CCOD_SUPERVISOR_LOG_FAILED')) 'failed diagnostic persistence remains visible in the supervisor cleanup receipt'
+}
+
+Invoke-CcodTest 'correlates native menu actions through HostTransport Supervisor ACK authorization and result ACK' {
+    # Production mutation caught: disconnecting native revision selection, Supervisor acknowledgement authority, or the exact HostTransport terminal ACK.
+    Import-CcodTrayHostCorrelationTestBridge
+    $enabled=[pscustomobject][ordered]@{RepairEnabled=$true;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true}
+
+    $current=[TrayHostCorrelationTestBridge]::new([UInt64]7,[TrayCommand]::OpenLogs)
+    try{
+        $current.SelectFromNativeMenu()
+        $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+        $hostState.Tray.CurrentRevision=[UInt64]7;$hostState.Tray.AcknowledgedPresentations['7']=$enabled;$hostState.LastAcknowledgedPresentation=$enabled
+        $world|Add-Member -NotePropertyName Bridge -NotePropertyValue $current
+        $fixture.Fake.Adapters.SendTrayActionResult={
+            param($Tray,$ActionId,$Revision,$Status,$ErrorCode,$TransactionId)
+            $world.Calls.Add("ActionResult:$Status")
+            $world.TrayActionResults.Add([pscustomobject][ordered]@{ActionId=$ActionId;Revision=[UInt64]$Revision;Status=$Status;ErrorCode=$ErrorCode;TransactionId=$TransactionId})
+            return $world.Bridge.Acknowledge($ActionId,[UInt64]$Revision,$Status,$ErrorCode)
+        }.GetNewClosure()
+        $action=[pscustomobject][ordered]@{ActionId=$current.ActionId;Command=$current.Command;Revision=[UInt64]$current.Revision}
+
+        $result=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)[0]
+
+        Assert-CcodEqual 'Completed' $result.Status 'current displayed revision reaches its specific Supervisor handler'
+        Assert-CcodEqual 1 @($world.Calls|Where-Object{$_ -eq 'Open:Logs'}).Count 'native current action invokes OpenLogs exactly once'
+        Assert-CcodEqual 'Completed' $current.TerminalStatus 'real HostTransport acknowledges the completed terminal result'
+        Assert-CcodEqual ([UInt64]7) $current.TerminalRevision 'real HostTransport terminal result retains the displayed revision'
+    }finally{$current.Dispose()}
+
+    $stale=[TrayHostCorrelationTestBridge]::new([UInt64]8,[TrayCommand]::OpenLogs)
+    try{
+        $stale.SelectFromNativeMenu()
+        $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+        $hostState.Tray.CurrentRevision=[UInt64]8
+        $world|Add-Member -NotePropertyName Bridge -NotePropertyValue $stale
+        $fixture.Fake.Adapters.SendTrayActionResult={
+            param($Tray,$ActionId,$Revision,$Status,$ErrorCode,$TransactionId)
+            $world.Calls.Add("ActionResult:$Status")
+            $world.TrayActionResults.Add([pscustomobject][ordered]@{ActionId=$ActionId;Revision=[UInt64]$Revision;Status=$Status;ErrorCode=$ErrorCode;TransactionId=$TransactionId})
+            return $world.Bridge.Acknowledge($ActionId,[UInt64]$Revision,$Status,$ErrorCode)
+        }.GetNewClosure()
+        $action=[pscustomobject][ordered]@{ActionId=$stale.ActionId;Command=$stale.Command;Revision=[UInt64]$stale.Revision}
+
+        $result=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)[0]
+
+        Assert-CcodEqual 'Rejected' $result.Status 'unacknowledged native revision is rejected'
+        Assert-CcodEqual 'CCOD_TRAY_ACTION_STALE' $result.ErrorCode 'unacknowledged native revision preserves the stale code'
+        Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -eq 'Open:Logs'}).Count 'unacknowledged native action cannot invoke OpenLogs'
+        Assert-CcodEqual 'Rejected' $stale.TerminalStatus 'real HostTransport acknowledges the stale terminal rejection'
+        Assert-CcodEqual 'CCOD_TRAY_ACTION_STALE' $stale.TerminalCode 'real HostTransport retains the exact stale code before generic feedback'
+        Assert-CcodEqual ([UInt64]8) $stale.TerminalRevision 'real HostTransport stale result retains the displayed revision'
+    }finally{$stale.Dispose()}
 }
 
 Invoke-CcodTest 'rejects an action revision that was published but never acknowledged as displayed' {

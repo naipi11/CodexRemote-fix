@@ -1167,13 +1167,14 @@ function Write-CcodSupervisorTrayActionTerminal {
             command=[string]$Action.Command;revision=[UInt64]$Action.Revision;status=$Status
         }
         Invoke-CcodSupervisorAdapter $Adapters.WriteLog @($record) 0
-    }catch{Add-CcodSupervisorCleanupCode $HostState.RuntimeCleanupCodes 'CCOD_SUPERVISOR_LOG_FAILED'}
+        return $true
+    }catch{Add-CcodSupervisorCleanupCode $HostState.RuntimeCleanupCodes 'CCOD_SUPERVISOR_LOG_FAILED';return $false}
 }
 
 function Send-CcodSupervisorTrayActionResult {
     param($HostState,[hashtable]$Adapters,$Action,[ValidateSet('Accepted','Completed','Rejected','Failed')][string]$Status,[AllowNull()][string]$ErrorCode,[AllowNull()][string]$TransactionId)
     $result=[pscustomobject][ordered]@{ActionId=$Action.ActionId;Revision=[UInt64]$Action.Revision;Status=$Status;ErrorCode=$ErrorCode;TransactionId=$TransactionId}
-    if($Status-cne'Accepted'){Write-CcodSupervisorTrayActionTerminal $HostState $Adapters $Action $Status $ErrorCode}
+    if($Status-cne'Accepted'-and-not(Write-CcodSupervisorTrayActionTerminal $HostState $Adapters $Action $Status $ErrorCode)){$result|Add-Member -NotePropertyName Delivered -NotePropertyValue $false;return $result}
     try{
         $delivered=Invoke-CcodSupervisorAdapter $Adapters.SendTrayActionResult @($HostState.Tray,$result.ActionId,$result.Revision,$result.Status,$result.ErrorCode,$result.TransactionId) 1
         if($delivered-isnot[bool]-or-not$delivered){throw 'tray action result was not acknowledged'}
