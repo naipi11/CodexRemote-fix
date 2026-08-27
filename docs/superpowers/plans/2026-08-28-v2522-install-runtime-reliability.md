@@ -92,7 +92,7 @@ fixtures fail before active-pointer mutation.
 fix: bind setup activation to immutable payload
 ```
 
-### Task 1b: Compile an include-free generated setup script
+### Task 2: Compile an include-free generated setup script
 
 **Files:**
 - Modify: `build/build.ps1`
@@ -154,7 +154,7 @@ leave neither setup nor inventory output.
 fix: compile include-free setup inventory
 ```
 
-### Task 2: Retry only transient Electron tree reads
+### Task 3: Retry only transient Electron tree reads
 
 **Files:**
 - Modify: `src/persistence/modules/ProcessControl.psm1`
@@ -221,7 +221,7 @@ member.
 fix: stabilize verified Electron process trees
 ```
 
-### Task 3: Make tray action correlation testable and diagnosable
+### Task 4: Make tray action correlation testable and diagnosable
 
 **Files:**
 - Modify: `src/persistence/modules/TrayHostClient.psm1`
@@ -274,7 +274,7 @@ exact terminal code into local diagnostics.
 test: cover tray action revision correlation
 ```
 
-### Task 4: Version, documentation, and release acceptance
+### Task 5: Version, documentation, and release acceptance
 
 **Files:**
 - Modify: `package.json`
@@ -318,13 +318,13 @@ release: prepare CodexRemote-fix v2.5.22
 
 - Task 1 produces the immutable source/expected-version contract consumed by
   the new setup flow and release contract.
-- Task 1b removes the preprocessor include ambiguity from the Task 1 setup
+- Task 2 removes the preprocessor include ambiguity from the Task 1 setup
   source before any release compiler invocation.
-- Task 2 changes only pre-mutation tree acquisition and explicitly leaves all
+- Task 3 changes only pre-mutation tree acquisition and explicitly leaves all
   identity and post-stop checks strict.
-- Task 3 has no dependency on Task 2 and can be reviewed independently; its
+- Task 4 has no dependency on Task 3 and can be reviewed independently; its
   diagnostics make future live failures actionable without weakening protocol
   authentication.
-- Task 4 consumes the completed behavior and performs no release publication;
+- Task 5 consumes the completed behavior and performs no release publication;
   publishing, installation, and reboot remain a separately authorized final
   acceptance step.
