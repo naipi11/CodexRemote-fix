@@ -104,14 +104,17 @@ Invoke-CcodTest 'production installer payload generator writes ordered version-b
     }
 }
 
-Invoke-CcodTest 'production setup destination inventory derives every nested directory from Inno sources and payload input' {
+Invoke-CcodTest 'production setup destination inventory accepts the literal symbolic include and derives every nested directory' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-installer-directory-inventory-' + [guid]::NewGuid().ToString('N'))
     try {
         $payload = Join-Path $root 'payload'
         [IO.Directory]::CreateDirectory((Join-Path $payload 'src\persistence\modules')) | Out-Null
         [IO.File]::WriteAllText((Join-Path $payload 'src\persistence\modules\InstallLifecycle.psm1'),'fixture',[Text.UTF8Encoding]::new($false))
         $output = Join-Path $root 'InstallerDestinationInventory.iss'
-        & (Join-Path $repositoryRoot 'tools\New-InstallerDestinationInventory.ps1') -RepositoryRoot $repositoryRoot -PayloadRoot $payload -ProjectVersion '2.5.22' -InnoScriptPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -OutputPath $output | Out-Null
+        $innoPath = Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'
+        $allowedIncludes = @([IO.File]::ReadAllLines($innoPath,[Text.UTF8Encoding]::new($false)) | Where-Object { [string]$_ -ceq '#include InstallerDestinationInventoryInclude' })
+        Assert-CcodEqual 1 $allowedIncludes.Count 'production fixture exercises the one permitted literal include directive'
+        & (Join-Path $repositoryRoot 'tools\New-InstallerDestinationInventory.ps1') -RepositoryRoot $repositoryRoot -PayloadRoot $payload -ProjectVersion '2.5.22' -InnoScriptPath $innoPath -OutputPath $output | Out-Null
         $inventory = [IO.File]::ReadAllText($output,[Text.UTF8Encoding]::new($false))
         foreach ($relative in @('src','src\persistence','src\persistence\modules','payload','payload\2.5.22','payload\2.5.22\src','payload\2.5.22\src\persistence','payload\2.5.22\src\persistence\modules')) {
             Assert-CcodTrue ($inventory.Contains("Directories.Add('$relative');")) "generated setup inventory contains $relative"
@@ -151,6 +154,109 @@ Source: "fixture-b.txt"; DestDir: "{app}\second"; Flags: ignoreversion
         Assert-CcodTrue ($null -ne $failure) 'generator fails closed when the Inno source contains multiple Files sections'
         Assert-CcodTrue ($failure.Exception.Message -cmatch 'exactly one \[Files\] section') 'multiple-section failure explains the structural contract'
         Assert-CcodTrue (-not (Test-Path -LiteralPath $output)) 'multiple Files sections produce no partial inventory artifact'
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'production setup destination inventory rejects an included second Files section before ISCC' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-installer-included-files-section-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $payload = Join-Path $root 'payload'
+        $setupOutput = Join-Path $root 'setup-output'
+        [IO.Directory]::CreateDirectory($payload) | Out-Null
+        [IO.Directory]::CreateDirectory($setupOutput) | Out-Null
+        $firstSource = Join-Path $root 'fixture-a.txt'
+        $secondSource = Join-Path $root 'fixture-b.txt'
+        [IO.File]::WriteAllText($firstSource,'first',[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($secondSource,'second',[Text.UTF8Encoding]::new($false))
+        $extraPath = Join-Path $root 'extra.iss'
+        $extraSource = @"
+[Files]
+Source: "$secondSource"; DestDir: "{app}\second"; Flags: ignoreversion
+"@
+        [IO.File]::WriteAllText($extraPath,$extraSource,[Text.UTF8Encoding]::new($false))
+        $innoPath = Join-Path $root 'IncludedFilesSection.iss'
+        $innoSource = @"
+[Setup]
+AppName=IncludedFilesSection
+AppVersion=1.0.0
+DefaultDirName={tmp}\IncludedFilesSection
+OutputDir=$setupOutput
+OutputBaseFilename=IncludedFilesSection
+Uninstallable=no
+[Files]
+Source: "$firstSource"; DestDir: "{app}\first"; Flags: ignoreversion
+[Code]
+procedure Fixture();
+begin
+end;
+#include "extra.iss"
+"@
+        [IO.File]::WriteAllText($innoPath,$innoSource,[Text.UTF8Encoding]::new($false))
+        $inventoryPath = Join-Path $root 'Inventory.iss'
+        $setupPath = Join-Path $setupOutput 'IncludedFilesSection.exe'
+        $generatorFailure = $null
+        $compileExitCode = $null
+        try {
+            & (Join-Path $repositoryRoot 'tools\New-InstallerDestinationInventory.ps1') -RepositoryRoot $repositoryRoot -PayloadRoot $payload -ProjectVersion '2.5.22' -InnoScriptPath $innoPath -OutputPath $inventoryPath | Out-Null
+            $iscc = @(
+                (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+                (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+                (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+            ) | Where-Object { $_ -and [IO.File]::Exists($_) } | Select-Object -First 1
+            if (-not $iscc) { throw 'Inno Setup 6 is required for the include-boundary fixture' }
+            $previousPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                $null = @(& $iscc $innoPath 2>&1)
+                $compileExitCode = $LASTEXITCODE
+            } finally { $ErrorActionPreference = $previousPreference }
+        } catch { $generatorFailure = $_ }
+        Assert-CcodTrue ($null -ne $generatorFailure) ("generator rejects the arbitrary include before ISCC; inventory={0} compileExit={1} setup={2}" -f [IO.File]::Exists($inventoryPath),$compileExitCode,[IO.File]::Exists($setupPath))
+        Assert-CcodTrue ($generatorFailure.Exception.Message -cmatch 'literal include directive') 'arbitrary include failure identifies the literal include boundary'
+        Assert-CcodTrue (-not [IO.File]::Exists($inventoryPath)) 'rejected include produces no destination inventory artifact'
+        Assert-CcodTrue (-not [IO.File]::Exists($setupPath)) 'rejected include produces no setup artifact'
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'build validates generated inventory before invoking ISCC' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-installer-inventory-header-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        $inventoryPath = Join-Path $root 'Inventory.iss'
+        $inventorySource = @'
+procedure AddCcodExpectedSetupDirectories(Directories: TStrings);
+begin
+end;
+[Files]
+'@
+        [IO.File]::WriteAllText($inventoryPath,$inventorySource,[Text.UTF8Encoding]::new($false))
+        $compilerMarker = Join-Path $root 'iscc-invoked.txt'
+        $compilerPath = Join-Path $root 'fake-iscc.cmd'
+        $setupPath = Join-Path $root 'setup.exe'
+        $compilerSource = "@echo off`r`n> `"$compilerMarker`" echo invoked`r`n> `"$setupPath`" echo setup`r`nexit /b 0`r`n"
+        [IO.File]::WriteAllText($compilerPath,$compilerSource,[Text.ASCIIEncoding]::new())
+        . (Join-Path $repositoryRoot 'build\build.ps1') -Library
+        $failure = $null
+        try {
+            Invoke-CcodBuildInnoCompiler -InventoryPath $inventoryPath -IsccPath $compilerPath -Arguments @() -SetupPath $setupPath
+        } catch { $failure = $_ }
+        Assert-CcodTrue ($null -ne $failure) 'build rejects a generated inventory carrying an Inno section header'
+        Assert-CcodTrue ($failure.Exception.Message -cmatch 'section header') 'inventory validation explains the forbidden section header'
+        Assert-CcodTrue (-not [IO.File]::Exists($compilerMarker)) 'ISCC is not invoked after inventory validation fails'
+        Assert-CcodTrue (-not [IO.File]::Exists($setupPath)) 'invalid inventory produces no setup artifact'
+        $validInventorySource = @'
+procedure AddCcodExpectedSetupDirectories(Directories: TStrings);
+begin
+end;
+'@
+        [IO.File]::WriteAllText($inventoryPath,$validInventorySource,[Text.UTF8Encoding]::new($false))
+        Invoke-CcodBuildInnoCompiler -InventoryPath $inventoryPath -IsccPath $compilerPath -Arguments @() -SetupPath $setupPath
+        Assert-CcodTrue ([IO.File]::Exists($compilerMarker)) 'validated inventory reaches ISCC'
+        Assert-CcodTrue ([IO.File]::Exists($setupPath)) 'validated inventory accepts the compiler setup artifact'
     } finally {
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
     }

@@ -2,7 +2,8 @@
 param(
     [string]$Version,
     [switch]$UseExistingTrayHost,
-    [string]$TrayHostArtifactDirectory
+    [string]$TrayHostArtifactDirectory,
+    [switch]$Library
 )
 
 Set-StrictMode -Version Latest
@@ -103,6 +104,34 @@ function Write-CcodBuildUtf8 {
     if ([IO.File]::Exists($Path) -or [IO.Directory]::Exists($Path)) { throw "Refusing to overwrite immutable release output: $Path" }
     [IO.File]::WriteAllText($Path,$Text,[Text.UTF8Encoding]::new($false))
 }
+
+function Assert-CcodBuildInstallerDestinationInventory {
+    param([Parameter(Mandatory)][string]$Path)
+    $inventoryPath = Assert-CcodBuildRegularFile -Path $Path -Kind 'Installer destination inventory'
+    foreach ($line in [IO.File]::ReadAllLines($inventoryPath,[Text.UTF8Encoding]::new($false))) {
+        if ($line -match '^\s*\[[^\[\]\r\n]+\]\s*(?:;.*)?$') {
+            throw "Installer destination inventory contains an Inno section header: $line"
+        }
+    }
+    return $inventoryPath
+}
+
+function Invoke-CcodBuildInnoCompiler {
+    param(
+        [Parameter(Mandatory)][string]$InventoryPath,
+        [Parameter(Mandatory)][string]$IsccPath,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments,
+        [Parameter(Mandatory)][string]$SetupPath
+    )
+    Assert-CcodBuildInstallerDestinationInventory -Path $InventoryPath | Out-Null
+    & $IsccPath @Arguments
+    $compilerExitCode = $LASTEXITCODE
+    if ($compilerExitCode -ne 0 -or -not (Test-Path -LiteralPath $SetupPath -PathType Leaf)) {
+        throw "Inno Setup compilation failed with exit code $compilerExitCode"
+    }
+}
+
+if ($Library) { return }
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $package = Get-Content -LiteralPath (Join-Path $repoRoot 'package.json') -Raw | ConvertFrom-Json
@@ -279,10 +308,17 @@ $iscc = $isccCandidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -
 if (-not $iscc) { throw 'Inno Setup 6 (ISCC.exe) was not found. Install it with: winget install --id JRSoftware.InnoSetup --exact' }
 $issPath = Join-Path $PSScriptRoot 'CodexControlOtherDevices.iss'
 $portableArtifact = Join-Path $PSScriptRoot 'generated\portable'
-& $iscc "/DProjectVersion=$Version" "/DTrayHostArtifactDirectory=$trayHostArtifact" "/DPortableArtifactDirectory=$portableArtifact" "/DInstallerPayloadDirectory=$installerPayloadDirectory" "/DInstallerPayloadManifestSha256=$installerPayloadManifestSha256" "/DInstallerDestinationInventoryInclude=$installerDestinationInventoryPath" "/O$dist\." $issPath
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $setupExe -PathType Leaf)) {
-    throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
-}
+$isccArguments = @(
+    "/DProjectVersion=$Version",
+    "/DTrayHostArtifactDirectory=$trayHostArtifact",
+    "/DPortableArtifactDirectory=$portableArtifact",
+    "/DInstallerPayloadDirectory=$installerPayloadDirectory",
+    "/DInstallerPayloadManifestSha256=$installerPayloadManifestSha256",
+    "/DInstallerDestinationInventoryInclude=$installerDestinationInventoryPath",
+    "/O$dist\.",
+    $issPath
+)
+Invoke-CcodBuildInnoCompiler -InventoryPath $installerDestinationInventoryPath -IsccPath $iscc -Arguments $isccArguments -SetupPath $setupExe
 $setupHash = Get-CcodBuildFileSha256 -Path $setupExe
 Write-CcodBuildUtf8 -Path $setupChecksum -Text ("{0} *{1}" -f $setupHash,[IO.Path]::GetFileName($setupExe))
 $setupReleaseManifest = Join-Path $dist "CodexRemote-fix-$Version-setup-release-manifest.json"

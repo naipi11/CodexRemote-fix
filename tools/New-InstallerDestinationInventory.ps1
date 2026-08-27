@@ -33,6 +33,12 @@ function Add-CcodExpectedDirectory {
 }
 
 $lines = @(Get-Content -LiteralPath $inno -Encoding UTF8)
+$includeDirectives = @($lines | Where-Object { $_ -match '^\s*#\s*include\b' })
+$allowedIncludeDirective = '#include InstallerDestinationInventoryInclude'
+if ($includeDirectives.Count -gt 1 -or
+    ($includeDirectives.Count -eq 1 -and [string]$includeDirectives[0] -cne $allowedIncludeDirective)) {
+    throw "Setup destination inventory permits only one literal include directive: $allowedIncludeDirective"
+}
 $filesSectionCount = @($lines | Where-Object { $_ -match '^\s*\[Files\]\s*$' }).Count
 if ($filesSectionCount -ne 1) { throw "Setup destination inventory requires exactly one [Files] section; found $filesSectionCount." }
 $insideFiles = $false
