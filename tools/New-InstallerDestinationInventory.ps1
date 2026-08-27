@@ -34,17 +34,44 @@ function Add-CcodExpectedDirectory {
 
 function Assert-CcodInstallerInnoPreprocessorLines {
     param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
-    $allowedDirectives = @('ifndef','define','error','endif')
+    $allowedSimpleDirectives = @(
+        '#ifndef TrayHostArtifactDirectory',
+        '#define TrayHostArtifactDirectory SourcePath + "\generated\trayhost"',
+        '#ifndef PortableArtifactDirectory',
+        '#define PortableArtifactDirectory SourcePath + "\generated\portable"',
+        '#ifndef InstallerPayloadDirectory',
+        '#error InstallerPayloadDirectory must be supplied by the release builder',
+        '#ifndef InstallerPayloadManifestSha256',
+        '#error InstallerPayloadManifestSha256 must be supplied by the release builder',
+        '#endif'
+    )
+    $allowedInlineConstructs = @(
+        '{#ProjectVersion}',
+        '{#TrayHostArtifactDirectory}',
+        '{#PortableArtifactDirectory}',
+        '{#InstallerPayloadDirectory}',
+        '{#InstallerPayloadManifestSha256}'
+    )
     for ($lineIndex = 0; $lineIndex -lt $Lines.Count; $lineIndex++) {
         $line = [string]$Lines[$lineIndex]
         $lineNumber = $lineIndex + 1
-        if ($line -match '\\[ \t]*$') {
+        if ($line -match '\\\s*$') {
             throw "Setup destination inventory requires an include-free simple preprocessor template; line continuation is not permitted at line $lineNumber."
         }
-        if ($line -notmatch '^[ \t]*#') { continue }
-        $directiveMatch = [regex]::Match($line,'^[ \t]*#(?<directive>[A-Za-z]+)\b')
-        if (-not $directiveMatch.Success -or $allowedDirectives -cnotcontains $directiveMatch.Groups['directive'].Value) {
-            throw "Setup destination inventory requires an include-free simple preprocessor template; unsafe directive at line ${lineNumber}: $line"
+        if ($line -match '^\s*#' -and $allowedSimpleDirectives -cnotcontains $line) {
+            throw "Setup destination inventory requires an include-free exact preprocessor template; unsafe simple directive at line ${lineNumber}: $line"
+        }
+        $inlineStart = $line.IndexOf('{#',[StringComparison]::Ordinal)
+        while ($inlineStart -ge 0) {
+            $inlineEnd = $line.IndexOf('}',$inlineStart + 2)
+            if ($inlineEnd -lt 0) {
+                throw "Setup destination inventory contains an unterminated inline preprocessor construct at line $lineNumber."
+            }
+            $inlineConstruct = $line.Substring($inlineStart,$inlineEnd - $inlineStart + 1)
+            if ($allowedInlineConstructs -cnotcontains $inlineConstruct) {
+                throw "Setup destination inventory contains an unsafe inline preprocessor construct at line ${lineNumber}: $inlineConstruct"
+            }
+            $inlineStart = $line.IndexOf('{#',$inlineEnd + 1,[StringComparison]::Ordinal)
         }
     }
 }
