@@ -80,17 +80,290 @@ Invoke-CcodTest 'release defender tool exposes manifest and scan functions witho
     Assert-CcodTrue ($null -ne (Get-Command Invoke-CcodReleaseDefenderCheck -ErrorAction SilentlyContinue)) 'Defender invocation is available'
 }
 
+Invoke-CcodTest 'production installer payload generator writes ordered version-bound file records' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-installer-manifest-generator-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $payload = Join-Path $root 'payload'
+        [IO.Directory]::CreateDirectory((Join-Path $payload 'nested')) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $payload 'z-last.txt'),'z',[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $payload 'nested\a-first.txt'),'alpha',[Text.UTF8Encoding]::new($false))
+        $manifestPath = Join-Path $root 'installer-payload.manifest.json'
+        & (Join-Path $repositoryRoot 'tools\New-InstallerPayloadManifest.ps1') -PayloadRoot $payload -ProjectVersion '2.5.22' -OutputPath $manifestPath | Out-Null
+        Assert-CcodTrue (Test-Path -LiteralPath $manifestPath -PathType Leaf) 'production manifest generator writes its requested output'
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        Assert-CcodEqual 'schemaVersion,projectVersion,files' (@($manifest.PSObject.Properties.Name) -join ',') 'generator writes the canonical manifest field order'
+        Assert-CcodEqual '2.5.22' $manifest.projectVersion 'generator binds the requested project version'
+        Assert-CcodEqual 'nested/a-first.txt,z-last.txt' (@($manifest.files.path) -join ',') 'generator sorts file records ordinally'
+        foreach ($record in $manifest.files) {
+            $file = Join-Path $payload ([string]$record.path).Replace('/','\')
+            Assert-CcodEqual ([int64](Get-Item -LiteralPath $file).Length) ([int64]$record.length) 'record length binds the file bytes'
+            Assert-CcodEqual (Get-CcodTestFileSha256 -Path $file) ([string]$record.sha256) 'record hash binds the file bytes'
+        }
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+function New-CcodActivationPayloadFixture {
+    param([string]$Version = '2.5.22')
+
+    $appRoot = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-payload-' + [guid]::NewGuid().ToString('N'))
+    $payloadRoot = Join-Path $appRoot "payload\$Version"
+    [IO.Directory]::CreateDirectory((Join-Path $payloadRoot 'src\persistence\modules')) | Out-Null
+    [IO.File]::WriteAllText((Join-Path $payloadRoot 'package.json'),([ordered]@{name='fixture';version=$Version}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $payloadRoot 'Install-CodexControlOtherDevices.ps1'),'exit 0',[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $payloadRoot 'src\persistence\modules\InstallLifecycle.psm1'),'function Get-CcodLifecyclePayloadManifestFiles { @() }',[Text.UTF8Encoding]::new($false))
+    $records = [Collections.Generic.List[object]]::new()
+    foreach ($file in @(Get-ChildItem -LiteralPath $payloadRoot -File -Force -Recurse)) {
+        $relative = $file.FullName.Substring($payloadRoot.TrimEnd('\').Length + 1).Replace('\','/')
+        $records.Add([pscustomobject][ordered]@{path=$relative;length=[int64]$file.Length;sha256=Get-CcodTestFileSha256 -Path $file.FullName})
+    }
+    $comparison = [System.Comparison[object]]{param($left,$right)[StringComparer]::Ordinal.Compare([string]$left.path,[string]$right.path)}
+    $records.Sort($comparison)
+    $manifestPath = Join-Path $payloadRoot 'installer-payload.manifest.json'
+    [IO.File]::WriteAllText($manifestPath,([ordered]@{schemaVersion=1;projectVersion=$Version;files=@($records)}|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    return [pscustomobject]@{AppRoot=$appRoot;PayloadRoot=$payloadRoot;ManifestPath=$manifestPath;ManifestSha256=Get-CcodTestFileSha256 -Path $manifestPath}
+}
+
+function Invoke-CcodActivationVerifierFixture {
+    param([Parameter(Mandatory)]$Fixture,[Parameter(Mandatory)][string]$ExpectedManifestSha256,[string]$PayloadRoot)
+
+    $stdoutPath = Join-Path $Fixture.AppRoot ('stdout-' + [guid]::NewGuid().ToString('N') + '.txt')
+    $stderrPath = Join-Path $Fixture.AppRoot ('stderr-' + [guid]::NewGuid().ToString('N') + '.txt')
+    if ([string]::IsNullOrWhiteSpace($PayloadRoot)) { $PayloadRoot = $Fixture.PayloadRoot }
+    $argumentLine = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -AppRoot "{1}" -InstallRoot "{1}" -PayloadRoot "{2}" -ExpectedVersion "2.5.22" -ExpectedPayloadManifestSha256 "{3}" -ActivationId "77777777-6666-5555-4444-333333333333" -ValidateReceiptOnly' -f (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1'),$Fixture.AppRoot,$PayloadRoot,$ExpectedManifestSha256
+    $process = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $argumentLine -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -Wait -PassThru
+    try { $exitCode = [int]$process.ExitCode } finally { $process.Dispose() }
+    return [pscustomobject]@{ExitCode=$exitCode;Output=([IO.File]::ReadAllText($stdoutPath)+[IO.File]::ReadAllText($stderrPath))}
+}
+
+function Invoke-CcodInnoPayloadCompileFixture {
+    param([switch]$IncludePayloadDefines)
+
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-inno-payload-contract-' + [guid]::NewGuid().ToString('N'))
+    $tray = Join-Path $root 'tray'
+    $portable = Join-Path $root 'portable'
+    $payload = Join-Path $root 'payload'
+    $output = Join-Path $root 'output'
+    foreach ($directory in @($tray,$portable,$payload,$output)) { [IO.Directory]::CreateDirectory($directory) | Out-Null }
+    foreach ($leaf in @('CodexRemote.TrayHost.exe','CodexRemote.TrayHost.exe.config','trayhost-build-provenance.json')) {
+        [IO.File]::WriteAllText((Join-Path $tray $leaf),"fixture $leaf",[Text.UTF8Encoding]::new($false))
+    }
+    foreach ($leaf in @('CodexRemote.Portable.exe','CodexRemote.Portable.exe.config','portable-launcher-provenance.json')) {
+        [IO.File]::WriteAllText((Join-Path $portable $leaf),"fixture $leaf",[Text.UTF8Encoding]::new($false))
+    }
+    [IO.File]::WriteAllText((Join-Path $payload 'package.json'),'{"version":"2.5.21"}',[Text.UTF8Encoding]::new($false))
+    $packageHash = Get-CcodTestFileSha256 -Path (Join-Path $payload 'package.json')
+    $manifest = [ordered]@{schemaVersion=1;projectVersion='2.5.21';files=@([ordered]@{path='package.json';length=[int64](Get-Item -LiteralPath (Join-Path $payload 'package.json')).Length;sha256=$packageHash})}
+    $manifestPath = Join-Path $payload 'installer-payload.manifest.json'
+    [IO.File]::WriteAllText($manifestPath,($manifest|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    $iscc = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+    ) | Where-Object { $_ -and [IO.File]::Exists($_) } | Select-Object -First 1
+    if (-not $iscc) { throw 'Inno Setup 6 is required for the setup payload contract' }
+    $arguments = @('/DProjectVersion=2.5.21',"/DTrayHostArtifactDirectory=$tray","/DPortableArtifactDirectory=$portable","/O$output\",(Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'))
+    if ($IncludePayloadDefines) {
+        $arguments = @('/DProjectVersion=2.5.21',"/DTrayHostArtifactDirectory=$tray","/DPortableArtifactDirectory=$portable","/DInstallerPayloadDirectory=$payload","/DInstallerPayloadManifestSha256=$(Get-CcodTestFileSha256 -Path $manifestPath)","/O$output\",(Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'))
+    }
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $compileOutput = @(& $iscc @arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousPreference }
+    return [pscustomobject]@{Root=$root;ExitCode=$exitCode;Output=($compileOutput -join "`n");SetupPath=(Join-Path $output 'CodexRemote-fix-2.5.21-setup.exe')}
+}
+
 Invoke-CcodTest 'setup build and activation bind one immutable versioned payload end to end' {
     $build = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw -Encoding UTF8
     $inno = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
     $activation = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -Raw -Encoding UTF8
     $installer = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Install-CodexControlOtherDevices.ps1') -Raw -Encoding UTF8
 
-    Assert-CcodTrue ($build -cmatch 'installer-payload\.manifest\.json' -and $build -cmatch 'schemaVersion\s*=\s*1\s+projectVersion\s*=\s*\$Version\s+files\s*=\s*\$payloadRecords') 'build emits the canonical ordered setup payload manifest'
+    Assert-CcodTrue ($build -cmatch 'New-InstallerPayloadManifest\.ps1' -and $build -cmatch 'InstallerPayloadManifestSha256') 'build invokes the tested generator and binds its manifest hash into setup compilation'
     Assert-CcodTrue ($inno -cmatch 'InstallerPayloadDirectory' -and $inno -cmatch 'DestDir:\s*"\{app\}\\payload\\\{#ProjectVersion\}"') 'Inno copies the immutable build payload into its exact version directory'
     Assert-CcodTrue ($inno -cmatch "ExpandConstant\('\{app\}\\payload\\\{#ProjectVersion\}'\)" -and $inno -cmatch '-ExpectedVersion\s+"\{#ProjectVersion\}') 'Inno binds activation to its compiled payload version'
-    Assert-CcodTrue ($activation -cmatch '\[string\]\$ExpectedVersion' -and $activation -cmatch 'installer-payload\.manifest\.json') 'activation accepts and resolves the expected payload contract'
+    Assert-CcodTrue ($activation -cmatch '\[string\]\$ExpectedVersion' -and $activation -cmatch '\[string\]\$ExpectedPayloadManifestSha256' -and $activation -cmatch 'installer-payload\.manifest\.json') 'activation accepts and resolves the expected payload contract'
     Assert-CcodTrue ($installer -cmatch '\[string\]\$ExpectedVersion' -and $installer -cmatch '\[string\]\$PayloadManifestPath' -and $installer -cmatch '-ExpectedVersion\s+\$ExpectedVersion' -and $installer -cmatch '-PayloadManifestPath\s+\$PayloadManifestPath') 'installer forwards the immutable payload contract to lifecycle activation'
+}
+
+Invoke-CcodTest 'activation accepts a compile-bound installer manifest hash before payload verification' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-hash-interface-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        $activationId = '77777777-6666-5555-4444-333333333333'
+        $stdoutPath = Join-Path $root 'stdout.txt'
+        $stderrPath = Join-Path $root 'stderr.txt'
+        $argumentLine = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -AppRoot "{1}" -InstallRoot "{1}" -PayloadRoot "{1}\payload\2.5.22" -ExpectedVersion "2.5.22" -ExpectedPayloadManifestSha256 "{2}" -ActivationId "{3}" -ValidateReceiptOnly' -f (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1'),$root,('0' * 64),$activationId
+        $process = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $argumentLine -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -Wait -PassThru
+        try { $exitCode = [int]$process.ExitCode } finally { $process.Dispose() }
+        $output = [IO.File]::ReadAllText($stdoutPath) + [IO.File]::ReadAllText($stderrPath)
+        Assert-CcodEqual 3 $exitCode 'missing payload reaches the bounded verifier contract after accepting the manifest hash parameter'
+        Assert-CcodTrue ($output -cnotmatch 'parameter name .ExpectedPayloadManifestSha256') 'compile-bound hash is a real activation parameter'
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'activation rejects a changed payload module before any payload code executes' {
+    $fixture = New-CcodActivationPayloadFixture
+    try {
+        $marker = Join-Path $fixture.AppRoot 'payload-module-executed.txt'
+        $modulePath = Join-Path $fixture.PayloadRoot 'src\persistence\modules\InstallLifecycle.psm1'
+        $markerLiteral = $marker.Replace("'","''")
+        [IO.File]::WriteAllText($modulePath,"[IO.File]::WriteAllText('$markerLiteral','executed'); function Get-CcodLifecyclePayloadManifestFiles { @() }",[Text.UTF8Encoding]::new($false))
+
+        $result = Invoke-CcodActivationVerifierFixture -Fixture $fixture -ExpectedManifestSha256 $fixture.ManifestSha256
+
+        Assert-CcodEqual 3 $result.ExitCode 'payload hash mismatch is a bounded verification failure'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath $marker)) 'unverified payload module code never executes'
+        Assert-CcodTrue ($result.Output -cmatch 'CCOD_INSTALL_FILE_HASH_MISMATCH|CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID') 'failure retains a stable payload verification code'
+    } finally {
+        if (Test-Path -LiteralPath $fixture.AppRoot) { Remove-Item -LiteralPath $fixture.AppRoot -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'activation distinguishes a valid payload from a bad compile-bound manifest hash' {
+    $fixture = New-CcodActivationPayloadFixture
+    try {
+        $valid = Invoke-CcodActivationVerifierFixture -Fixture $fixture -ExpectedManifestSha256 $fixture.ManifestSha256
+        Assert-CcodEqual 3 $valid.ExitCode 'valid payload advances to bounded receipt verification'
+        Assert-CcodTrue ($valid.Output -cmatch 'CCOD_ACTIVATION_RECEIPT_MISSING') 'valid payload reaches the receipt boundary after independent verification'
+        $invalid = Invoke-CcodActivationVerifierFixture -Fixture $fixture -ExpectedManifestSha256 ('0' * 64)
+        Assert-CcodEqual 3 $invalid.ExitCode 'bad compile-bound manifest hash fails verification'
+        Assert-CcodTrue ($invalid.Output -cmatch 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID') 'bad manifest hash retains the stable payload code'
+    } finally {
+        if (Test-Path -LiteralPath $fixture.AppRoot) { Remove-Item -LiteralPath $fixture.AppRoot -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'activation requires the exact versioned payload root' {
+    $fixture = New-CcodActivationPayloadFixture
+    try {
+        $wrongRoot = Join-Path $fixture.AppRoot 'payload\other'
+        [IO.Directory]::CreateDirectory($wrongRoot) | Out-Null
+        $result = Invoke-CcodActivationVerifierFixture -Fixture $fixture -ExpectedManifestSha256 $fixture.ManifestSha256 -PayloadRoot $wrongRoot
+        Assert-CcodEqual 3 $result.ExitCode 'wrong version directory fails before receipt processing'
+        Assert-CcodTrue ($result.Output -cmatch 'CCOD_INSTALL_PAYLOAD_PATH_INVALID') 'wrong payload root retains a stable path code'
+    } finally {
+        if (Test-Path -LiteralPath $fixture.AppRoot) { Remove-Item -LiteralPath $fixture.AppRoot -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'activation rejects a reparse payload ancestor' {
+    $fixture = New-CcodActivationPayloadFixture
+    $targetRoot = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-payload-target-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $sourceVersion = $fixture.PayloadRoot
+        [IO.Directory]::CreateDirectory($targetRoot) | Out-Null
+        Move-Item -LiteralPath $sourceVersion -Destination (Join-Path $targetRoot '2.5.22')
+        Remove-Item -LiteralPath (Join-Path $fixture.AppRoot 'payload') -Force
+        New-Item -ItemType Junction -Path (Join-Path $fixture.AppRoot 'payload') -Target $targetRoot | Out-Null
+        $result = Invoke-CcodActivationVerifierFixture -Fixture $fixture -ExpectedManifestSha256 $fixture.ManifestSha256
+        Assert-CcodEqual 3 $result.ExitCode 'payload junction fails before receipt processing'
+        Assert-CcodTrue ($result.Output -cmatch 'CCOD_INSTALL_SOURCE_REPARSE') 'payload junction retains the reparse support code'
+    } finally {
+        $junction = Join-Path $fixture.AppRoot 'payload'
+        if (Test-Path -LiteralPath $junction) { [IO.Directory]::Delete($junction) }
+        if (Test-Path -LiteralPath $fixture.AppRoot) { Remove-Item -LiteralPath $fixture.AppRoot -Recurse -Force }
+        if (Test-Path -LiteralPath $targetRoot) { Remove-Item -LiteralPath $targetRoot -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'activation rejects an unlisted nested payload junction' {
+    $fixture = New-CcodActivationPayloadFixture
+    $targetRoot = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-nested-target-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($targetRoot) | Out-Null
+        $junction = Join-Path $fixture.PayloadRoot 'unlisted-junction'
+        New-Item -ItemType Junction -Path $junction -Target $targetRoot | Out-Null
+        $result = Invoke-CcodActivationVerifierFixture -Fixture $fixture -ExpectedManifestSha256 $fixture.ManifestSha256
+        Assert-CcodEqual 3 $result.ExitCode 'nested payload junction fails before receipt processing'
+        Assert-CcodTrue ($result.Output -cmatch 'CCOD_INSTALL_SOURCE_REPARSE') 'nested payload junction retains the reparse support code'
+    } finally {
+        $junction = Join-Path $fixture.PayloadRoot 'unlisted-junction'
+        if (Test-Path -LiteralPath $junction) { [IO.Directory]::Delete($junction) }
+        if (Test-Path -LiteralPath $fixture.AppRoot) { Remove-Item -LiteralPath $fixture.AppRoot -Recurse -Force }
+        if (Test-Path -LiteralPath $targetRoot) { Remove-Item -LiteralPath $targetRoot -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'Inno compile refuses an implicit installer payload source' {
+    $compile = Invoke-CcodInnoPayloadCompileFixture
+    try {
+        Assert-CcodTrue ($compile.ExitCode -ne 0) 'setup compilation fails without an explicit installer payload directory and manifest hash'
+        Assert-CcodTrue ($compile.Output -cmatch 'InstallerPayloadDirectory') 'compiler identifies the missing immutable payload define'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath $compile.SetupPath)) 'missing payload define produces no setup artifact'
+    } finally {
+        if (Test-Path -LiteralPath $compile.Root) { Remove-Item -LiteralPath $compile.Root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'Inno compile packages the explicit manifest-bound installer payload' {
+    $compile = Invoke-CcodInnoPayloadCompileFixture -IncludePayloadDefines
+    try {
+        Assert-CcodEqual 0 $compile.ExitCode "explicit setup payload contract compiles: $($compile.Output)"
+        Assert-CcodTrue (Test-Path -LiteralPath $compile.SetupPath -PathType Leaf) 'explicit payload compile produces the setup artifact'
+        Assert-CcodTrue ($compile.Output -cmatch 'installer-payload\.manifest\.json' -and $compile.Output -cmatch 'payload\\package\.json') 'compiler input trace contains the exact payload manifest and manifest-listed file'
+    } finally {
+        if (Test-Path -LiteralPath $compile.Root) { Remove-Item -LiteralPath $compile.Root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'Inno exposes a pre-write payload-directory reparse gate' {
+    $inno = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
+    $helper = [regex]::Match($inno,'(?ms)^function IsSafeExistingPayloadDirectory\(.*?^end;')
+    Assert-CcodTrue $helper.Success 'production Inno script exposes the directory predicate used before payload writes'
+    Assert-CcodTrue ($inno -cmatch '(?ms)^function PrepareToInstall\(var NeedsRestart: Boolean\): String;.*?IsSafeExistingPayloadDirectory') 'PrepareToInstall rejects unsafe app and payload directories before file copy'
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-inno-reparse-harness-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $normal = Join-Path $root 'normal'
+        $target = Join-Path $root 'target'
+        $junction = Join-Path $root 'junction'
+        $missing = Join-Path $root 'missing'
+        $resultPath = Join-Path $root 'result.txt'
+        [IO.Directory]::CreateDirectory($normal) | Out-Null
+        [IO.Directory]::CreateDirectory($target) | Out-Null
+        New-Item -ItemType Junction -Path $junction -Target $target | Out-Null
+        $harnessPath = Join-Path $root 'ReparseGate.iss'
+        $harness = @"
+[Setup]
+AppName=ReparseGate
+AppVersion=1.0.0
+DefaultDirName={tmp}\ReparseGate
+PrivilegesRequired=lowest
+OutputDir=$($root.Replace('\','\\'))
+OutputBaseFilename=ReparseGate
+Uninstallable=no
+[Code]
+const
+  CCOD_FILE_ATTRIBUTE_DIRECTORY = `$00000010;
+  CCOD_FILE_ATTRIBUTE_REPARSE_POINT = `$00000400;
+  CCOD_INVALID_FILE_ATTRIBUTES = `$FFFFFFFF;
+function GetFileAttributesW(const FileName: String): Cardinal;
+  external 'GetFileAttributesW@kernel32.dll stdcall';
+$($helper.Value)
+function InitializeSetup(): Boolean;
+begin
+  if IsSafeExistingPayloadDirectory('$($normal.Replace("'","''"))') and
+     IsSafeExistingPayloadDirectory('$($missing.Replace("'","''"))') and
+     (not IsSafeExistingPayloadDirectory('$($junction.Replace("'","''"))')) then
+    SaveStringToFile('$($resultPath.Replace("'","''"))','pass',False);
+  Result := False;
+end;
+"@
+        [IO.File]::WriteAllText($harnessPath,$harness,[Text.UTF8Encoding]::new($false))
+        $iscc = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'
+        $compileOutput = @(& $iscc $harnessPath 2>&1)
+        Assert-CcodEqual 0 $LASTEXITCODE "reparse predicate harness compiles: $($compileOutput -join ' ')"
+        $process = Start-Process -FilePath (Join-Path $root 'ReparseGate.exe') -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-') -WindowStyle Hidden -Wait -PassThru
+        try { $null = $process.ExitCode } finally { $process.Dispose() }
+        Assert-CcodEqual 'pass' ([IO.File]::ReadAllText($resultPath,[Text.UTF8Encoding]::new($false))) 'production predicate accepts absent/normal directories and rejects a junction'
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
 }
 
 Invoke-CcodTest 'release manifest binds the final asset names hashes version commit and timestamp' {

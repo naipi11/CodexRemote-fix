@@ -6,7 +6,10 @@
 #define PortableArtifactDirectory SourcePath + "\generated\portable"
 #endif
 #ifndef InstallerPayloadDirectory
-#define InstallerPayloadDirectory SourcePath + "\.."
+#error InstallerPayloadDirectory must be supplied by the release builder
+#endif
+#ifndef InstallerPayloadManifestSha256
+#error InstallerPayloadManifestSha256 must be supplied by the release builder
 #endif
 AppId={{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}
 AppName=CodexRemote-fix
@@ -71,6 +74,7 @@ Source: "..\Reset-CodexControlOtherDevices.ps1"; DestDir: "{app}"; Flags: ignore
 Source: "..\Test-CodexControlOtherDevices.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Activate-CcodRemoteFix.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Prompt-CcodRestart.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\tools\New-InstallerPayloadManifest.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "{#InstallerPayloadDirectory}\*"; DestDir: "{app}\payload\{#ProjectVersion}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [InstallDelete]
@@ -114,6 +118,30 @@ function StringFromGUID2(var Guid: TGUID; GuidString: String; MaxCharacters: Int
   external 'StringFromGUID2@ole32.dll stdcall';
 function GetFileAttributesW(const FileName: String): Cardinal;
   external 'GetFileAttributesW@kernel32.dll stdcall';
+
+function IsSafeExistingPayloadDirectory(const DirectoryName: String): Boolean;
+var
+  Attributes: Cardinal;
+begin
+  Attributes := GetFileAttributesW(DirectoryName);
+  Result := (Attributes = CCOD_INVALID_FILE_ATTRIBUTES) or
+    (((Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) and
+     ((Attributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) = 0));
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  AppDirectory, PayloadDirectory, VersionDirectory: String;
+begin
+  Result := '';
+  AppDirectory := ExpandConstant('{app}');
+  PayloadDirectory := ExpandConstant('{app}\payload');
+  VersionDirectory := ExpandConstant('{app}\payload\{#ProjectVersion}');
+  if not IsSafeExistingPayloadDirectory(AppDirectory) or
+     not IsSafeExistingPayloadDirectory(PayloadDirectory) or
+     not IsSafeExistingPayloadDirectory(VersionDirectory) then
+    Result := 'CodexRemote-fix refused an unsafe existing payload directory.';
+end;
 
 function NewActivationId(): String;
 var
@@ -300,6 +328,7 @@ begin
     ExpandConstant('{app}\Activate-CcodRemoteFix.ps1') + '" -AppRoot "' + ExpandConstant('{app}') +
     '" -PayloadRoot "' + ExpandConstant('{app}\payload\{#ProjectVersion}') +
     '" -ExpectedVersion "{#ProjectVersion}' +
+    '" -ExpectedPayloadManifestSha256 "{#InstallerPayloadManifestSha256}' +
     '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') +
     '" -ActivationId "' + ActivationId + '" -FirstReceiptTimeoutMilliseconds ' +
     IntToStr(FIRST_ACTIVATION_RECEIPT_TIMEOUT_MILLISECONDS) + ' -ActivationTimeoutMilliseconds ' +
@@ -320,6 +349,7 @@ begin
     ExpandConstant('{app}\Activate-CcodRemoteFix.ps1') + '" -AppRoot "' + ExpandConstant('{app}') +
     '" -PayloadRoot "' + ExpandConstant('{app}\payload\{#ProjectVersion}') +
     '" -ExpectedVersion "{#ProjectVersion}' +
+    '" -ExpectedPayloadManifestSha256 "{#InstallerPayloadManifestSha256}' +
     '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') +
     '" -ValidateReceiptWithTimeout -ValidationTimeoutMilliseconds ' + IntToStr(VALIDATION_TIMEOUT_MILLISECONDS) +
     ' -ActivationId "' + ActivationId + '"';

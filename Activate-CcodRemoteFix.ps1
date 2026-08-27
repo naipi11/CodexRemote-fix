@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory)][string]$InstallRoot,
     [string]$PayloadRoot,
     [string]$ExpectedVersion,
+    [string]$ExpectedPayloadManifestSha256,
     [string]$ActivationId,
     [switch]$ValidateReceiptOnly,
     [switch]$ValidateReceiptWithTimeout,
@@ -53,33 +54,125 @@ function Write-CcodActivationRecord {
     } catch { }
 }
 
+function Get-CcodActivationFileSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open([IO.Path]::GetFullPath($Path),[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-','').ToLowerInvariant()
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        $sha.Dispose()
+    }
+}
+
+function Assert-CcodActivationNonReparsePath {
+    param([Parameter(Mandatory)][string]$Root,[Parameter(Mandatory)][string]$Path)
+    $canonicalRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $canonicalPath = [IO.Path]::GetFullPath($Path)
+    $prefix = $canonicalRoot + '\'
+    if (-not ($canonicalPath.Equals($canonicalRoot,[StringComparison]::OrdinalIgnoreCase) -or $canonicalPath.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase))) {
+        throw 'CCOD_INSTALL_PAYLOAD_PATH_INVALID'
+    }
+    $cursor = $canonicalPath
+    while ($true) {
+        $item = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'CCOD_INSTALL_SOURCE_REPARSE' }
+        if ($cursor.Equals($canonicalRoot,[StringComparison]::OrdinalIgnoreCase)) { break }
+        $parent = Split-Path $cursor -Parent
+        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $cursor) { throw 'CCOD_INSTALL_PAYLOAD_PATH_INVALID' }
+        $cursor = $parent
+    }
+    return $canonicalPath
+}
+
+function Test-CcodActivationAlternateDataStreams {
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        foreach ($stream in @(Get-Item -LiteralPath $Path -Stream * -ErrorAction Stop)) {
+            if ([string]$stream.Stream -cnotin @(':$DATA','::$DATA','$DATA')) { return $true }
+        }
+        return $false
+    } catch {
+        throw 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID'
+    }
+}
+
 function Assert-CcodActivationPayload {
     param(
+        [Parameter(Mandatory)][string]$AppRoot,
         [Parameter(Mandatory)][string]$Root,
-        [Parameter(Mandatory)][string]$Version
+        [Parameter(Mandatory)][string]$Version,
+        [Parameter(Mandatory)][string]$ExpectedManifestSha256
     )
 
-    if ($Version -cnotmatch '^\d+\.\d+\.\d+$') { throw 'CCOD_INSTALL_PAYLOAD_VERSION_MISMATCH' }
-    $payload = [IO.Path]::GetFullPath($Root)
+    if ($Version -cnotmatch '^\d+\.\d+\.\d+$' -or $ExpectedManifestSha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'CCOD_INSTALL_PAYLOAD_VERSION_MISMATCH' }
+    $app = [IO.Path]::GetFullPath($AppRoot).TrimEnd('\')
+    $payload = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $expectedPayload = [IO.Path]::GetFullPath((Join-Path (Join-Path $app 'payload') $Version)).TrimEnd('\')
+    if (-not $payload.Equals($expectedPayload,[StringComparison]::OrdinalIgnoreCase)) { throw 'CCOD_INSTALL_PAYLOAD_PATH_INVALID' }
+    [void](Assert-CcodActivationNonReparsePath -Root $app -Path $app)
+    [void](Assert-CcodActivationNonReparsePath -Root $app -Path (Join-Path $app 'payload'))
+    [void](Assert-CcodActivationNonReparsePath -Root $app -Path $payload)
     $packagePath = Join-Path $payload 'package.json'
     $manifestPath = Join-Path $payload 'installer-payload.manifest.json'
     $modulePath = Join-Path $payload 'src\persistence\modules\InstallLifecycle.psm1'
     if (-not [IO.File]::Exists($packagePath) -or -not [IO.File]::Exists($manifestPath) -or -not [IO.File]::Exists($modulePath)) {
         throw 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID'
     }
-    try { $package = Get-Content -LiteralPath $packagePath -Raw | ConvertFrom-Json -ErrorAction Stop }
+    [void](Assert-CcodActivationNonReparsePath -Root $payload -Path $manifestPath)
+    $manifestItem = Get-Item -LiteralPath $manifestPath -Force -ErrorAction Stop
+    if ($manifestItem.PSIsContainer -or $manifestItem.Length -le 0 -or $manifestItem.Length -gt 4194304 -or
+        (Test-CcodActivationAlternateDataStreams -Path $manifestPath) -or
+        (Get-CcodActivationFileSha256 -Path $manifestPath) -cne $ExpectedManifestSha256) {
+        throw 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID'
+    }
+    try {
+        $manifest = [IO.File]::ReadAllText($manifestPath,[Text.Encoding]::UTF8) | ConvertFrom-Json -ErrorAction Stop
+    } catch { throw 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' }
+    $properties = @($manifest.PSObject.Properties.Name)
+    $expectedProperties = @('schemaVersion','projectVersion','files')
+    if ($manifest -isnot [pscustomobject] -or $properties.Count -ne $expectedProperties.Count) { throw 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' }
+    for ($index=0;$index-lt$expectedProperties.Count;$index++) {
+        if ($properties[$index] -cne $expectedProperties[$index]) { throw 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' }
+    }
+    if ($manifest.schemaVersion -isnot [int] -or $manifest.schemaVersion -ne 1 -or $manifest.projectVersion -isnot [string] -or $manifest.projectVersion -cne $Version) {
+        throw 'CCOD_INSTALL_PAYLOAD_VERSION_MISMATCH'
+    }
+    $records = @($manifest.files)
+    if ($records.Count -eq 0) { throw 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $previous = $null
+    foreach ($record in $records) {
+        $recordProperties = @($record.PSObject.Properties.Name)
+        if ($record -isnot [pscustomobject] -or $recordProperties.Count -ne 3 -or $recordProperties[0] -cne 'path' -or $recordProperties[1] -cne 'length' -or $recordProperties[2] -cne 'sha256' -or
+            $record.path -isnot [string] -or $record.path -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$' -or $record.path.Contains('//') -or $record.path.Contains('..') -or $record.path.Contains(':') -or $record.path.Contains('\') -or
+            $record.length -isnot [ValueType] -or [decimal]$record.length -ne [decimal][int64]$record.length -or [int64]$record.length -lt 0 -or
+            $record.sha256 -isnot [string] -or $record.sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' }
+        if (($null-ne$previous -and [StringComparer]::Ordinal.Compare([string]$previous,[string]$record.path)-ge 0) -or -not $seen.Add([string]$record.path)) { throw 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' }
+        $previous = [string]$record.path
+        $source = [IO.Path]::GetFullPath((Join-Path $payload ($record.path.Replace('/','\'))))
+        [void](Assert-CcodActivationNonReparsePath -Root $payload -Path $source)
+        $item = Get-Item -LiteralPath $source -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or (Test-CcodActivationAlternateDataStreams -Path $source) -or [int64]$item.Length -ne [int64]$record.length -or
+            (Get-CcodActivationFileSha256 -Path $source) -cne [string]$record.sha256) { throw 'CCOD_INSTALL_FILE_HASH_MISMATCH' }
+    }
+    $actualFileList = [Collections.Generic.List[string]]::new()
+    foreach ($actualItem in @(Get-ChildItem -LiteralPath $payload -Force -Recurse -ErrorAction Stop)) {
+        if (($actualItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'CCOD_INSTALL_SOURCE_REPARSE' }
+        if ($actualItem.PSIsContainer -or $actualItem.FullName.Equals($manifestPath,[StringComparison]::OrdinalIgnoreCase)) { continue }
+        $actualFileList.Add($actualItem.FullName.Substring($payload.Length + 1).Replace('\','/'))
+    }
+    $actualFiles = @($actualFileList)
+    if ($actualFiles.Count -ne $records.Count) { throw 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' }
+    foreach ($actual in $actualFiles) {
+        if (-not $seen.Contains([string]$actual)) { throw 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' }
+    }
+    try { $package = [IO.File]::ReadAllText($packagePath,[Text.Encoding]::UTF8) | ConvertFrom-Json -ErrorAction Stop }
     catch { throw 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' }
     if ($package.version -isnot [string] -or [string]$package.version -cne $Version) {
         throw 'CCOD_INSTALL_PAYLOAD_VERSION_MISMATCH'
-    }
-    $module = Import-Module $modulePath -Force -PassThru
-    try {
-        & $module {
-            param($SourceRoot,$ExpectedVersion,$ManifestPath)
-            Get-CcodLifecyclePayloadManifestFiles -SourceRoot $SourceRoot -ExpectedVersion $ExpectedVersion -PayloadManifestPath $ManifestPath | Out-Null
-        } $payload $Version $manifestPath
-    } finally {
-        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
     }
     return $manifestPath
 }
@@ -301,7 +394,7 @@ function Invoke-CcodBoundedReceiptValidator {
             '-ActivationId',
             $ActivationId
         )
-        if (-not [string]::IsNullOrWhiteSpace($ExpectedVersion)) { $arguments += @('-ExpectedVersion',$ExpectedVersion) }
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedVersion)) { $arguments += @('-ExpectedVersion',$ExpectedVersion,'-ExpectedPayloadManifestSha256',$ExpectedPayloadManifestSha256) }
         $startInfo = [Diagnostics.ProcessStartInfo]::new()
         $startInfo.FileName = $hostExecutable
         $startInfo.Arguments = (($arguments | ForEach-Object { ConvertTo-CcodNativeProcessArgument ([string]$_) }) -join ' ')
@@ -350,7 +443,7 @@ if ($ValidateReceiptOnly -and $ValidateReceiptWithTimeout) { Write-Error 'CCOD_A
 if ([string]::IsNullOrWhiteSpace($PayloadRoot)) { $PayloadRoot = $AppRoot }
 $PayloadRoot = [IO.Path]::GetFullPath($PayloadRoot)
 if (-not [string]::IsNullOrWhiteSpace($ExpectedVersion)) {
-    try { $null = Assert-CcodActivationPayload -Root $PayloadRoot -Version $ExpectedVersion }
+    try { $null = Assert-CcodActivationPayload -AppRoot $AppRoot -Root $PayloadRoot -Version $ExpectedVersion -ExpectedManifestSha256 $ExpectedPayloadManifestSha256 }
     catch {
         $candidate = ([string]$_.FullyQualifiedErrorId -split ',')[0]
         $code = if ($candidate -cmatch '^CCOD_[A-Z0-9_]{1,96}$') { $candidate } elseif ($_.Exception.Message -cmatch '^CCOD_[A-Z0-9_]{1,96}$') { $Matches[0] } else { 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' }

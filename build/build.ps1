@@ -191,12 +191,19 @@ try {
     foreach ($record in $payloadRecords) {
         Copy-CcodBuildPayloadFile -Source (Join-Path $payloadRoot ([string]$record.path).Replace('/','\')) -PayloadRoot $installerPayloadDirectory -Relative ([string]$record.path)
     }
-    $installerPayloadManifest = [ordered]@{
-        schemaVersion = 1
-        projectVersion = $Version
-        files = $payloadRecords
+    $installerPayloadManifestPath = Join-Path $installerPayloadDirectory 'installer-payload.manifest.json'
+    $installerPayloadGenerator = Join-Path $repoRoot 'tools\New-InstallerPayloadManifest.ps1'
+    if (-not [IO.File]::Exists($installerPayloadGenerator)) { throw "Installer payload manifest generator is missing: $installerPayloadGenerator" }
+    $installerPayloadManifest = & $installerPayloadGenerator -PayloadRoot $installerPayloadDirectory -ProjectVersion $Version -OutputPath $installerPayloadManifestPath
+    if (@($installerPayloadManifest.files).Count -ne $payloadRecords.Count) { throw 'Installer payload generator record count differs from the verified portable payload.' }
+    for ($recordIndex = 0; $recordIndex -lt $payloadRecords.Count; $recordIndex++) {
+        if ([string]$installerPayloadManifest.files[$recordIndex].path -cne [string]$payloadRecords[$recordIndex].path -or
+            [int64]$installerPayloadManifest.files[$recordIndex].length -ne [int64]$payloadRecords[$recordIndex].length -or
+            [string]$installerPayloadManifest.files[$recordIndex].sha256 -cne [string]$payloadRecords[$recordIndex].sha256) {
+            throw 'Installer payload generator records differ from the verified portable payload.'
+        }
     }
-    Write-CcodBuildUtf8 -Path (Join-Path $installerPayloadDirectory 'installer-payload.manifest.json') -Text (($installerPayloadManifest | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
+    $installerPayloadManifestSha256 = Get-CcodBuildFileSha256 -Path $installerPayloadManifestPath
     $payloadManifestPath = Join-Path $stageRoot 'payload-manifest.json'
     $payloadManifest = [ordered]@{
         schemaVersion = 1
@@ -268,7 +275,7 @@ $iscc = $isccCandidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -
 if (-not $iscc) { throw 'Inno Setup 6 (ISCC.exe) was not found. Install it with: winget install --id JRSoftware.InnoSetup --exact' }
 $issPath = Join-Path $PSScriptRoot 'CodexControlOtherDevices.iss'
 $portableArtifact = Join-Path $PSScriptRoot 'generated\portable'
-& $iscc "/DProjectVersion=$Version" "/DTrayHostArtifactDirectory=$trayHostArtifact" "/DPortableArtifactDirectory=$portableArtifact" "/DInstallerPayloadDirectory=$installerPayloadDirectory" "/O$dist\." $issPath
+& $iscc "/DProjectVersion=$Version" "/DTrayHostArtifactDirectory=$trayHostArtifact" "/DPortableArtifactDirectory=$portableArtifact" "/DInstallerPayloadDirectory=$installerPayloadDirectory" "/DInstallerPayloadManifestSha256=$installerPayloadManifestSha256" "/O$dist\." $issPath
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $setupExe -PathType Leaf)) {
     throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
 }

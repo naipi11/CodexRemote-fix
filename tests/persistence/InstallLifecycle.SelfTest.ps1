@@ -746,6 +746,141 @@ $results += Invoke-CcodTest 'payload-bound install rereads the active pointer af
     }
 }
 
+# Production mutation caught: copying stable bootstrap/uninstaller from mutable source paths after their manifest-verified staging copies already exist.
+$results += Invoke-CcodTest 'stable bootstrap and uninstaller come from manifest-verified staging bytes' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $uninstallerSource = Join-Path $source 'Uninstall-CodexControlOtherDevices.ps1'
+        [IO.File]::WriteAllText($uninstallerSource,"# verified uninstaller`r`n",[Text.UTF8Encoding]::new($false))
+        $manifestPath = New-CcodLifecyclePayloadManifest -Root $source -Version '2.5.22'
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        $fake = New-CcodLifecycleFake -NodePath $nodePath
+        $fake.World.CopyOverride = [pscustomobject]@{
+            Match = '*Uninstall-CodexControlOtherDevices.ps1'
+            Action = {
+                param($SourcePath,$DestinationPath)
+                [IO.Directory]::CreateDirectory((Split-Path $DestinationPath -Parent)) | Out-Null
+                [IO.File]::Copy($SourcePath,$DestinationPath,$true)
+                if ([IO.Path]::GetFullPath($SourcePath).Equals([IO.Path]::GetFullPath($uninstallerSource),[StringComparison]::OrdinalIgnoreCase)) {
+                    [IO.File]::WriteAllText($SourcePath,"# mutated after staging`r`n",[Text.UTF8Encoding]::new($false))
+                }
+            }.GetNewClosure()
+        }
+
+        $receipt = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -ExpectedVersion '2.5.22' -PayloadManifestPath $manifestPath -Adapters $fake.Adapters
+
+        $runtimeRoot = Join-Path $install "runtime\$($receipt.RuntimeId)"
+        Assert-CcodEqual (Get-CcodTestFileSha256 -Path (Join-Path $runtimeRoot 'src\persistence\bootstrap.ps1')) (Get-CcodTestFileSha256 -Path (Join-Path $install 'bootstrap.ps1')) 'stable bootstrap equals its verified runtime byte copy'
+        Assert-CcodEqual (Get-CcodTestFileSha256 -Path (Join-Path $runtimeRoot 'Uninstall-CodexControlOtherDevices.ps1')) (Get-CcodTestFileSha256 -Path (Join-Path $install 'Uninstall-CodexControlOtherDevices.ps1')) 'stable uninstaller ignores post-staging source mutation'
+    } finally {
+        foreach ($path in @($source,$install,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+$results += Invoke-CcodTest 'install root junction is rejected before staging writes' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $target = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source | Out-Null
+        [IO.Directory]::CreateDirectory($target) | Out-Null
+        New-Item -ItemType Junction -Path $install -Target $target | Out-Null
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        Assert-CcodThrows { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters | Out-Null } 'CCOD_INSTALL_REPARSE_PATH'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $target 'active.json'))) 'install-root junction target receives no active pointer'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $target '.staging'))) 'install-root junction target receives no staging directory'
+    } finally {
+        if (Test-Path -LiteralPath $install) { [IO.Directory]::Delete($install) }
+        foreach ($path in @($source,$target,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+$results += Invoke-CcodTest 'staging junction is rejected before payload writes' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $target = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source | Out-Null
+        [IO.Directory]::CreateDirectory($install) | Out-Null
+        [IO.Directory]::CreateDirectory($target) | Out-Null
+        New-Item -ItemType Junction -Path (Join-Path $install '.staging') -Target $target | Out-Null
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        Assert-CcodThrows { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters | Out-Null } 'CCOD_INSTALL_REPARSE_PATH'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath $target -Force).Count 'staging junction target remains empty'
+    } finally {
+        $junction = Join-Path $install '.staging'
+        if (Test-Path -LiteralPath $junction) { [IO.Directory]::Delete($junction) }
+        foreach ($path in @($source,$install,$target,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+$results += Invoke-CcodTest 'runtime junction is rejected before staging promotion' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $target = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source | Out-Null
+        [IO.Directory]::CreateDirectory($install) | Out-Null
+        [IO.Directory]::CreateDirectory($target) | Out-Null
+        New-Item -ItemType Junction -Path (Join-Path $install 'runtime') -Target $target | Out-Null
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        Assert-CcodThrows { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters | Out-Null } 'CCOD_INSTALL_REPARSE_PATH'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath $target -Force).Count 'runtime junction target receives no promoted runtime'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $install 'active.json'))) 'runtime junction cannot reach active pointer mutation'
+    } finally {
+        $junction = Join-Path $install 'runtime'
+        if (Test-Path -LiteralPath $junction) { [IO.Directory]::Delete($junction) }
+        foreach ($path in @($source,$install,$target,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+$results += Invoke-CcodTest 'payload manifest ancestry treats Windows root equality case-insensitively' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $manifestPath = New-CcodLifecyclePayloadManifest -Root $source -Version '2.5.22'
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        $receipt = Invoke-CcodInstall -SourceRoot $source.ToUpperInvariant() -InstallRoot $install -ExpectedVersion '2.5.22' -PayloadManifestPath $manifestPath -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
+        Assert-CcodEqual 'Installed' $receipt.Outcome 'case-only source-root difference preserves valid Windows payload ancestry'
+    } finally {
+        foreach ($path in @($source,$install,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+$results += Invoke-CcodTest 'payload-bound install rejects a changed runtime manifest after readiness' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $manifestPath = New-CcodLifecyclePayloadManifest -Root $source -Version '2.5.22'
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        $fake = New-CcodLifecycleFake -NodePath $nodePath
+        $fake.Adapters.WaitNewRuntimeReady = {
+            param($InstallRoot,$RuntimeId,$RuntimeGeneration,$Identity,$TaskStartedAtUtc,$TimeoutMilliseconds)
+            $runtimeManifestPath = Join-Path $InstallRoot "runtime\$RuntimeId\manifest.json"
+            $runtimeManifest = Get-Content -LiteralPath $runtimeManifestPath -Raw | ConvertFrom-Json
+            $runtimeManifest.projectVersion = '2.5.13'
+            [IO.File]::WriteAllText($runtimeManifestPath,($runtimeManifest|ConvertTo-Json -Depth 16),[Text.UTF8Encoding]::new($false))
+            [pscustomobject][ordered]@{SupervisorReady=$true;TrayReady=$true}
+        }.GetNewClosure()
+        Assert-CcodThrows {
+            Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -ExpectedVersion '2.5.22' -PayloadManifestPath $manifestPath -Adapters $fake.Adapters | Out-Null
+        } 'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN'
+        Assert-CcodTrue ($fake.World.Phases -notcontains 'Ready') 'changed selected runtime manifest cannot produce Ready'
+    } finally {
+        foreach ($path in @($source,$install,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
 # Production mutation caught: routing the activation progress receipt through the generic pretty-printed JSON writer.
 $results += Invoke-CcodTest 'activation progress receipt uses one compact JSON line for PowerShell 5.1 and Inno' {
     $install = New-CcodLifecycleTempRoot
