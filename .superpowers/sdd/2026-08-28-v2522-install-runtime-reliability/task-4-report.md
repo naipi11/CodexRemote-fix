@@ -446,3 +446,183 @@ the new diagnostic type, and runs only the existing no-UI headless path.
   path; the production path was compiled but not exercised against user data.
 - No independent agent was used because this fix round explicitly prohibited
   agents. Parent re-review remains the next gate.
+
+## Fix round 3: bounded reparse-safe receipts and production correlation trace
+
+Independent re-review retained three Important findings: the host action log
+was unbounded, its fixed LocalAppData path lacked reparse-component checks,
+diagnostic I/O ran while holding HostTransport's correlation lock, and the
+in-process bridge did not prove the real TrayHostClient/ParentClient/Wire/Program
+authenticated path.
+
+Fix implementation commit: `9c1e4df`
+(`fix: harden tray terminal diagnostics`).
+
+### RED evidence
+
+Tests were added before each production change.
+
+The blocking-writer transport test deliberately held the diagnostic writer for
+up to three seconds, then attempted to register another action. Current code
+failed because writer I/O still held `_gate`:
+
+```text
+TrayHost transport self-test failed: System.InvalidOperationException
+blocking terminal I/O cannot hold the correlation lock or pending capacity
+```
+
+The bounded-retention native test failed at compile time before the fixed log
+contract existed:
+
+```text
+CS0117: TrayTerminalDiagnosticLog does not contain a definition for MaximumBytes
+CCOD_TRAYHOST_NATIVE_COMPILE_FAILED
+```
+
+After adding the first lock/retention implementation, a missing-writer assertion
+was retained from fix round 2 and remained green: no writer cannot authorize
+generic feedback but still releases the terminal pending action.
+
+The production authenticated trace test referenced Program's actual result
+dispatch before it was extracted. ParentClient-only compilation failed:
+
+```text
+CS0117: Program does not contain a definition for TryDispatchAuthenticatedActionResult
+CCOD_TRAYHOST_NATIVE_COMPILE_FAILED
+```
+
+This proved the old peer was not traversing Program's production result branch.
+
+### Bounded deterministic retention
+
+`TrayTerminalDiagnosticLog.MaximumBytes` is fixed at 64 KiB. Each record is
+encoded as UTF-8 without a BOM. Under the logger's private file gate, the writer
+selects one of two deterministic modes:
+
+- append when existing bytes plus the complete new record remain within 64 KiB;
+- recreate the file with only the complete newest record when the next append
+  would exceed 64 KiB or an already oversized file is encountered.
+
+The stream is closed after `Flush(true)`. The test writes 1,400 distinct
+records, proves the file never exceeds `MaximumBytes`, and proves the complete
+latest record remains at the end after rollover. This prevents long-running
+tray action volume from growing the file without bound.
+
+### Fixed-path and reparse defense
+
+Production no longer calls an unconditional `Directory.CreateDirectory` over
+the full path. `TryGetDefaultPath` starts from the system-provided current-user
+LocalApplicationData root and creates only the fixed
+`CodexControlOtherDevices` and `logs` child directories, one level at a time.
+Before each creation it verifies the existing parent chain, and after creation
+it verifies the new directory.
+
+`TryAppend` accepts only an absolute path whose leaf is exactly
+`trayhost-actions.log`. It rejects a directory leaf, a reparse-point file, any
+missing directory, or any existing directory component with the
+`FileAttributes.ReparsePoint` bit. Production supplies only the fixed path; no
+wire field, CLI value, action property, or user payload can select a path.
+
+The native test creates a real junction inside an isolated temporary root and
+proves a fixed-name log beneath that junction is rejected. All temporary files
+and the junction are removed by the test.
+
+### Diagnostic I/O outside the correlation lock
+
+HostTransport now validates the exact action id/revision and lifecycle state,
+constructs the typed diagnostic, and removes the terminal action from
+`_pendingActions` while holding `_gate`. It then releases `_gate` before calling
+the writer. After the writer returns, it reacquires `_gate` only to enqueue the
+About/generic feedback item when persistence succeeded and the transport is
+still active.
+
+The blocking-writer regression starts terminal acknowledgement on a background
+thread, waits until the writer is blocked, then registers a distinct action.
+Registration completes within 250 ms, proving neither correlation lock nor
+pending capacity is held by file I/O. After releasing the writer, both the first
+terminal acknowledgement and the concurrently registered action complete.
+
+False, throwing, absent, blocked, and full-feedback-queue outcomes continue to
+release pending capacity. Only persisted records authorize UI feedback.
+
+### Production authenticated correlation trace
+
+`Program.TryDispatchAuthenticatedActionResult` is the exact production reader
+operation extracted from the existing ActionResult branch:
+
+```text
+TrayHostWire.ReadActionResult(payload)
+  -> HostTransport.TryAcknowledgeAction(result)
+```
+
+The production reader itself now calls this internal function. No new CLI mode,
+frame type, wire field, external endpoint, or unauthenticated channel was added.
+
+The ParentClient self-test compiles Program and the real native/transport/wire
+sources into its isolated test executable. Its existing test-only peer process
+performs the real parent/host bootstrap, key derivation, MAC verification,
+sequence checks, and Action/ActionResult serialization. The peer registers the
+same action in real HostTransport and sends it over `TrayHostWire`; the result
+returns over the real authenticated `TrayHostParentClient` writer and is
+consumed by Program's production dispatch.
+
+`TrayHostProductionTrace.SelfTest.ps1` then loads that same compiled assembly
+and uses the real production PowerShell wrapper:
+
+```text
+TrayHostClient.Receive-CcodTrayHostEvents
+  -> TrayHostParentClient authenticated event
+  -> current or stale terminal decision fixture
+  -> TrayHostClient.Send-CcodTrayHostActionResult
+  -> TrayHostParentClient authenticated writer
+  -> TrayHostWire ActionResult
+  -> Program production dispatch
+  -> HostTransport diagnostic and feedback gate
+```
+
+The current case preserves `OpenLogs` revision 1, receives `Completed`, and
+produces no generic failure feedback. The stale case preserves `OpenLogs`
+revision 8 and `CCOD_TRAY_ACTION_STALE`; after the persisted typed receipt, the
+real feedback queue is consumed and `TrayWindow.ShowActionFailed` runs against a
+fake native platform. It proves the dialog contains only the acknowledged
+snapshot's generic `string-0|string-15` title/message, not the internal code.
+The fake platform creates no real window or interactive UI.
+
+Test-only peer arguments remain implemented only by the self-test main type;
+they are not recognized by production Program and therefore create no product
+control surface.
+
+### Fresh verification
+
+Fresh verification completed with these results:
+
+```text
+TrayHost client: exit 0; 8 behavioral cases
+Supervisor: exit 0; 98 behavioral cases
+TrayHost transport: exit 0; 10 behavioral cases
+TrayHost native: exit 0; 17 behavioral cases
+TrayHost parent-client: exit 0; 4 behavioral cases
+TrayHost production correlation trace: exit 0; 2 current/stale cases
+TrayHost production compile/headless smoke: exit 0
+git diff --check: exit 0
+git diff --cached --check: exit 0
+```
+
+The first combined verification command exceeded its 30-second tool window
+after the ParentClient cases and before the trace receipt was printed. It was
+not counted as evidence for the remaining stages. ParentClient+production trace
+and ProductionOnly smoke were rerun independently and both returned explicit
+exit `0` receipts.
+
+### Fix-round scope and concerns
+
+- Changed only TrayHost terminal logging/correlation production files, focused
+  tests/trace orchestration, and this report.
+- No real Codex/ChatGPT or production interactive TrayHost process was started,
+  stopped, signaled, or controlled. Native behavior used fake platforms; the
+  subprocess trace used only the compiled self-test peer.
+- Nothing was installed, pushed, published, released, signed, or written to
+  WindowsApps/DPAPI. Reparse and rollover writes were confined to unique temp
+  roots.
+- No independent agent was used because the fix-round instruction prohibited
+  agents. Parent re-review remains the next gate.
