@@ -121,6 +121,41 @@ Invoke-CcodTest 'production setup destination inventory derives every nested dir
     }
 }
 
+Invoke-CcodTest 'production setup destination inventory rejects multiple Files sections' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-installer-multiple-files-sections-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $payload = Join-Path $root 'payload'
+        [IO.Directory]::CreateDirectory($payload) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $payload 'package.json'),'{}',[Text.UTF8Encoding]::new($false))
+        $innoPath = Join-Path $root 'MultipleFilesSections.iss'
+        $innoSource = @'
+[Setup]
+AppName=Fixture
+AppVersion=1.0.0
+DefaultDirName={app}
+[Files]
+Source: "fixture-a.txt"; DestDir: "{app}\first"; Flags: ignoreversion
+[Code]
+procedure Fixture();
+begin
+end;
+[Files]
+Source: "fixture-b.txt"; DestDir: "{app}\second"; Flags: ignoreversion
+'@
+        [IO.File]::WriteAllText($innoPath,$innoSource,[Text.UTF8Encoding]::new($false))
+        $output = Join-Path $root 'Inventory.iss'
+        $failure = $null
+        try {
+            & (Join-Path $repositoryRoot 'tools\New-InstallerDestinationInventory.ps1') -RepositoryRoot $repositoryRoot -PayloadRoot $payload -ProjectVersion '2.5.22' -InnoScriptPath $innoPath -OutputPath $output | Out-Null
+        } catch { $failure = $_ }
+        Assert-CcodTrue ($null -ne $failure) 'generator fails closed when the Inno source contains multiple Files sections'
+        Assert-CcodTrue ($failure.Exception.Message -cmatch 'exactly one \[Files\] section') 'multiple-section failure explains the structural contract'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath $output)) 'multiple Files sections produce no partial inventory artifact'
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
 function New-CcodActivationPayloadFixture {
     param([string]$Version = '2.5.22')
 

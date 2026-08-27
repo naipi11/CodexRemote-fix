@@ -33,9 +33,11 @@ function Add-CcodExpectedDirectory {
 }
 
 $lines = @(Get-Content -LiteralPath $inno -Encoding UTF8)
+$filesSectionCount = @($lines | Where-Object { $_ -match '^\s*\[Files\]\s*$' }).Count
+if ($filesSectionCount -ne 1) { throw "Setup destination inventory requires exactly one [Files] section; found $filesSectionCount." }
 $insideFiles = $false
 foreach ($line in $lines) {
-    if ($line -ceq '[Files]') { $insideFiles = $true; continue }
+    if ($line -match '^\s*\[Files\]\s*$') { $insideFiles = $true; continue }
     if ($insideFiles -and $line -match '^\[') { break }
     if (-not $insideFiles -or [string]::IsNullOrWhiteSpace($line)) { continue }
     $match = [regex]::Match($line,'^Source:\s*"(?<source>[^"]+)";\s*DestDir:\s*"(?<destination>[^"]+)";(?<tail>.*)$')
