@@ -794,7 +794,7 @@ function Complete-CcodSupervisorLifecycleTerminal {
     Invoke-CcodSupervisorAdapter $Adapters.AssertLifecycleFence @($HostState.Layout.InstallRoot,$HostState.LifecycleOwnership) 1|Out-Null
     Invoke-CcodSupervisorAdapter $Adapters.CompleteLifecycleRequest @($HostState.Layout.StateRoot,$request) 0
     $failureCode='CCOD_LIFECYCLE_ACTION_FAILED'
-    if($request.error -is [string] -and $request.error -cmatch '^CCOD_[A-Z0-9_]{1,91}$'){$failureCode=$request.error}
+    if($request.error -is [string] -and $request.error -cmatch '^CCOD_[A-Z0-9_]{1,91}\z'){$failureCode=$request.error}
     [void](Complete-CcodSupervisorLifecycleTrayAction $HostState $Adapters $request $successful $failureCode)
     if(-not$successful){$HostState.ConnectionState=$(if($null-ne$HostState.FailedSpecialProofKey){'RepairNeeded'}else{'Error'})}
     $HostState.ProtectionState='Running';$HostState.LifecycleRequest=$null

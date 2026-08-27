@@ -1447,6 +1447,25 @@ Invoke-CcodTest 'propagates a validated CloseFailed lifecycle error to its corre
     Assert-CcodEqual 'CCOD_CLOSE_UNPROVEN' $terminal.ErrorCode 'validated terminal lifecycle error is preserved exactly'
 }
 
+Invoke-CcodTest 'falls back for malformed terminal lifecycle errors' {
+    foreach($case in @(
+        [pscustomobject]@{Name='CRLF';Error="CCOD_CLOSE_UNPROVEN`r`n"},
+        [pscustomobject]@{Name='lowercase';Error='ccod_close_unproven'},
+        [pscustomobject]@{Name='overlength';Error=('CCOD_'+('A'*92))},
+        [pscustomobject]@{Name='terminal LF';Error="CCOD_CLOSE_UNPROVEN`n"}
+    )){
+        $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+        $hostState.ConnectionState='RepairNeeded';$hostState.Tray.CurrentRevision=[UInt64]13
+        $hostState.Tray.AcknowledgedPresentations['13']=[pscustomobject][ordered]@{RepairEnabled=$true;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true}
+        $action=[pscustomobject][ordered]@{ActionId=[guid]::NewGuid();Command='CheckAndRepair';Revision=[UInt64]13}
+        [void]@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)
+        $hostState.LifecycleRequest.phase='CloseFailed';$hostState.LifecycleRequest.error=$case.Error
+        Complete-CcodSupervisorLifecycleTerminal $hostState $fixture.Fake.Adapters
+        Assert-CcodEqual 2 $world.TrayActionResults.Count "$($case.Name) failure emits accepted and terminal correlated results"
+        Assert-CcodEqual 'CCOD_LIFECYCLE_ACTION_FAILED' $world.TrayActionResults[1].ErrorCode "$($case.Name) malformed terminal error retains the generic fallback"
+    }
+}
+
 Invoke-CcodTest 'authorizes an acknowledged displayed revision after a newer capable presentation is published' {
     $fixture=New-CcodTickFixture;$hostState=$fixture.Host
     $hostState.ConnectionState='RepairNeeded';$hostState.Tray.CurrentRevision=[UInt64]8
