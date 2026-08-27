@@ -142,7 +142,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/Lifecy
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/LifecycleCoordinator.SelfTest.ps1
 ```
 
-Expected: all pass with no warnings or incidental output.
+Expected: all pass with no incidental output and no warning introduced by Task 1. The repository's pre-existing `LifecycleCoordinator` import warning about unapproved verbs may remain recorded for the final release review; Task 1 does not change that module or warning surface.
 
 - [ ] **Step 8: Commit Task 1**
 
