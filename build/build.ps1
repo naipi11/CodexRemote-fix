@@ -116,18 +116,93 @@ function Assert-CcodBuildInstallerDestinationInventory {
     return $inventoryPath
 }
 
+function New-CcodBuildGeneratedInnoScript {
+    param(
+        [Parameter(Mandatory)][string]$TemplatePath,
+        [Parameter(Mandatory)][string]$InventoryPath,
+        [Parameter(Mandatory)][string]$OutputPath
+    )
+    $template = Assert-CcodBuildRegularFile -Path $TemplatePath -Kind 'Inno Setup template'
+    $inventory = Assert-CcodBuildInstallerDestinationInventory -Path $InventoryPath
+    $output = [IO.Path]::GetFullPath($OutputPath)
+    if ([IO.File]::Exists($output) -or [IO.Directory]::Exists($output)) {
+        throw "Refusing to overwrite generated Inno Setup script: $output"
+    }
+    $templateDirectory = [IO.Path]::GetFullPath((Split-Path $template -Parent)).TrimEnd('\')
+    $outputDirectory = [IO.Path]::GetFullPath((Split-Path $output -Parent)).TrimEnd('\')
+    if (-not $outputDirectory.Equals($templateDirectory,[StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetExtension($output) -cne '.iss') {
+        throw 'The generated Inno Setup script must be a sibling .iss file of its template.'
+    }
+
+    $marker = '// CCOD_INSTALLER_DESTINATION_INVENTORY'
+    $templateSource = [IO.File]::ReadAllText($template,[Text.UTF8Encoding]::new($false))
+    if ($templateSource -match '(?m)^\s*#\s*(?:include\b|\+)') {
+        throw 'The Inno Setup template must be include-free; external #include and #+ directives are not permitted.'
+    }
+    $markerCount = [regex]::Matches($templateSource,[regex]::Escape($marker)).Count
+    $markerLineCount = [regex]::Matches($templateSource,'(?m)^\s*// CCOD_INSTALLER_DESTINATION_INVENTORY\s*$').Count
+    if ($markerCount -ne 1 -or $markerLineCount -ne 1) {
+        throw "The Inno Setup template must contain exactly one inventory marker comment; found $markerCount."
+    }
+
+    $inventorySource = [IO.File]::ReadAllText($inventory,[Text.UTF8Encoding]::new($false)).TrimEnd("`r","`n")
+    $generatedSource = $templateSource.Replace($marker,$inventorySource)
+    if ($generatedSource.Contains($marker)) {
+        throw 'The generated Inno Setup script contains an unresolved inventory marker.'
+    }
+    if ($generatedSource -match '(?m)^\s*#\s*(?:include\b|\+)') {
+        throw 'The generated Inno Setup script contains an external #include or #+ directive.'
+    }
+
+    try {
+        Write-CcodBuildUtf8 -Path $output -Text $generatedSource
+        $writtenSource = [IO.File]::ReadAllText((Assert-CcodBuildRegularFile -Path $output -Kind 'Generated Inno Setup script'),[Text.UTF8Encoding]::new($false))
+        if (-not $writtenSource.Equals($generatedSource,[StringComparison]::Ordinal)) {
+            throw 'The generated Inno Setup script changed during write verification.'
+        }
+        return $output
+    } catch {
+        if ([IO.File]::Exists($output)) { Remove-Item -LiteralPath $output -Force -ErrorAction SilentlyContinue }
+        throw
+    }
+}
+
 function Invoke-CcodBuildInnoCompiler {
     param(
+        [Parameter(Mandatory)][string]$TemplatePath,
         [Parameter(Mandatory)][string]$InventoryPath,
         [Parameter(Mandatory)][string]$IsccPath,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments,
         [Parameter(Mandatory)][string]$SetupPath
     )
-    Assert-CcodBuildInstallerDestinationInventory -Path $InventoryPath | Out-Null
-    & $IsccPath @Arguments
-    $compilerExitCode = $LASTEXITCODE
-    if ($compilerExitCode -ne 0 -or -not (Test-Path -LiteralPath $SetupPath -PathType Leaf)) {
-        throw "Inno Setup compilation failed with exit code $compilerExitCode"
+    $template = Assert-CcodBuildRegularFile -Path $TemplatePath -Kind 'Inno Setup template'
+    $compiler = Assert-CcodBuildRegularFile -Path $IsccPath -Kind 'Inno Setup compiler'
+    $setup = [IO.Path]::GetFullPath($SetupPath)
+    if ([IO.File]::Exists($setup) -or [IO.Directory]::Exists($setup)) {
+        throw "Refusing to compile over an existing setup output: $setup"
+    }
+    $generatedScriptPath = Join-Path (Split-Path $template -Parent) ('.ccod-generated-setup-' + [guid]::NewGuid().ToString('N') + '.iss')
+    try {
+        $generatedScript = New-CcodBuildGeneratedInnoScript -TemplatePath $template -InventoryPath $InventoryPath -OutputPath $generatedScriptPath
+        $compilerArguments = @($Arguments) + @($generatedScript)
+        & $compiler @compilerArguments
+        $compilerExitCode = $LASTEXITCODE
+        if ($compilerExitCode -ne 0 -or -not (Test-Path -LiteralPath $setup -PathType Leaf)) {
+            throw "Inno Setup compilation failed with exit code $compilerExitCode"
+        }
+    } finally {
+        if ([IO.File]::Exists($generatedScriptPath)) {
+            $generatedFull = [IO.Path]::GetFullPath($generatedScriptPath)
+            $templateDirectory = [IO.Path]::GetFullPath((Split-Path $template -Parent)).TrimEnd('\') + '\'
+            $generatedItem = Get-Item -LiteralPath $generatedFull -Force -ErrorAction Stop
+            if (-not $generatedFull.StartsWith($templateDirectory,[StringComparison]::OrdinalIgnoreCase) -or
+                [IO.Path]::GetFileName($generatedFull) -cnotmatch '^\.ccod-generated-setup-[0-9a-f]{32}\.iss$' -or
+                (($generatedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                throw "Refusing to clean an unexpected generated Inno Setup path: $generatedFull"
+            }
+            Remove-Item -LiteralPath $generatedFull -Force -ErrorAction Stop
+        }
     }
 }
 
@@ -314,11 +389,9 @@ $isccArguments = @(
     "/DPortableArtifactDirectory=$portableArtifact",
     "/DInstallerPayloadDirectory=$installerPayloadDirectory",
     "/DInstallerPayloadManifestSha256=$installerPayloadManifestSha256",
-    "/DInstallerDestinationInventoryInclude=$installerDestinationInventoryPath",
-    "/O$dist\.",
-    $issPath
+    "/O$dist\."
 )
-Invoke-CcodBuildInnoCompiler -InventoryPath $installerDestinationInventoryPath -IsccPath $iscc -Arguments $isccArguments -SetupPath $setupExe
+Invoke-CcodBuildInnoCompiler -TemplatePath $issPath -InventoryPath $installerDestinationInventoryPath -IsccPath $iscc -Arguments $isccArguments -SetupPath $setupExe
 $setupHash = Get-CcodBuildFileSha256 -Path $setupExe
 Write-CcodBuildUtf8 -Path $setupChecksum -Text ("{0} *{1}" -f $setupHash,[IO.Path]::GetFileName($setupExe))
 $setupReleaseManifest = Join-Path $dist "CodexRemote-fix-$Version-setup-release-manifest.json"

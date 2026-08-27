@@ -11,9 +11,6 @@
 #ifndef InstallerPayloadManifestSha256
 #error InstallerPayloadManifestSha256 must be supplied by the release builder
 #endif
-#ifndef InstallerDestinationInventoryInclude
-#error InstallerDestinationInventoryInclude must be supplied by the release builder
-#endif
 AppId={{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}
 AppName=CodexRemote-fix
 AppVersion={#ProjectVersion}
@@ -99,7 +96,7 @@ Name: "{group}\Uninstall CodexRemote-fix"; Filename: "{app}\unins000.exe"; IconF
 Name: "{userdesktop}\CodexRemote-fix"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{localappdata}\CodexControlOtherDevices\bootstrap.ps1"" -InstallRoot ""{localappdata}\CodexControlOtherDevices"" -EntryMode Explicit"; WorkingDir: "{localappdata}\CodexControlOtherDevices"; IconFilename: "{app}\assets\CodexRemote-fix.ico"
 
 [Code]
-#include InstallerDestinationInventoryInclude
+// CCOD_INSTALLER_DESTINATION_INVENTORY
 const
   ACTIVATION_TIMEOUT_MILLISECONDS = 300000;
   FIRST_ACTIVATION_RECEIPT_TIMEOUT_MILLISECONDS = 90000;
