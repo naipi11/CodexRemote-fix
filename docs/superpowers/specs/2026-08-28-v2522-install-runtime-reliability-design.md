@@ -57,10 +57,13 @@ payload for the requested version.
 
 Build creates a one-time generated `.iss` from the checked-in template by
 replacing one fixed inventory marker with the verified destination-directory
-procedure. The template contains no external `#include` or `#+` directive;
-build rejects both spellings before ISCC runs. This avoids attempting to
-reimplement ISPP preprocessing while making the directory inventory and the
-exact source compiled by ISCC one artifact.
+procedure. The template accepts only the literal build directives required by
+the checked-in script (`#ifndef`, `#define`, `#error`, `#endif`); it rejects
+every other simple preprocessor directive, any line-spanning continuation, and
+all pragma directives before ISCC runs. This prohibits external inclusion and
+preprocessor-generated `[Files]` entries without reimplementing ISPP, while
+making the directory inventory and the exact source compiled by ISCC one
+artifact.
 
 ### 2. Bounded stable-tree acquisition
 

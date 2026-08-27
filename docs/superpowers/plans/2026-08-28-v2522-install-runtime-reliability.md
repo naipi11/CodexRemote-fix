@@ -104,7 +104,8 @@ fix: bind setup activation to immutable payload
 - The checked-in `.iss` contains exactly one inventory marker comment.
 - Build writes a temporary generated `.iss` by replacing that marker with the
   verified inventory procedure and invokes ISCC only on the generated file.
-- The template rejects all external `#include` and `#+` directives.
+- The template accepts only the required literal build directives and rejects
+  all external/line-spanned/pragma/generated-code preprocessor directives.
 
 - [ ] **Step 1: Write failing behavior tests**
 
@@ -114,7 +115,8 @@ $template = @'
 AppName=fixture
 [Files]
 Source: "first.txt"; DestDir: "{app}\first"
-#+ "extra.iss"
+# \
++ "extra.iss"
 '@
 Assert-CcodThrows {
   & $generator -RepositoryRoot $root -PayloadRoot $payload -ProjectVersion '2.5.22' `
@@ -123,30 +125,33 @@ Assert-CcodThrows {
 Assert-CcodFalse (Test-Path -LiteralPath $inventoryPath) 'include bypass produces no partial inventory'
 ```
 
-Add an actual ISCC test showing that the generated script compiles with its
-injected inventory, while a template with either include spelling is rejected
-before ISCC is launched.
+Add actual ISCC tests showing that the generated script compiles with its
+injected inventory, while templates with literal or line-spanned include,
+pragma, emit, and unknown preprocessor directives are rejected before ISCC is
+launched.
 
 - [ ] **Step 2: Run the focused test and confirm RED**
 
 Run: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/ReleaseWorkflow.SelfTest.ps1`
 
-Expected: the include-alias fixture is accepted before the new template
-boundary exists.
+Expected: the line-spanned include-alias fixture is accepted before the new
+template boundary exists.
 
 - [ ] **Step 3: Implement the generated include-free compiler input**
 
-Replace the source include with one unique marker. Build reads the checked-in
-template, refuses any `#include` or `#+` directive, substitutes the generated
-inventory text once, writes a GUID-named temporary `.iss`, validates that the
-result has no marker or external include, and passes that generated path to
-ISCC. Clean the temporary script in `finally`.
+Build reads the checked-in template, verifies every literal preprocessor line
+is one of the fixed required directives, rejects continuation characters and
+all other directives, substitutes the generated inventory text once, writes a
+GUID-named temporary `.iss`, validates that the result has no marker or unsafe
+preprocessor directive, and passes that generated path to ISCC. Clean the
+temporary script in `finally`, including when the compiler returns nonzero.
 
 - [ ] **Step 4: Run focused tests and prove GREEN**
 
 Run ReleaseWorkflow and the real ISCC fixture. Confirm the compiled setup
-source contains the expected injected procedure and arbitrary include aliases
-leave neither setup nor inventory output.
+source contains the expected injected procedure; literal and line-spanned
+include aliases plus other code-generating directives leave neither setup nor
+inventory output; a nonzero compiler also leaves no generated `.iss`.
 
 - [ ] **Step 5: Commit**
 
