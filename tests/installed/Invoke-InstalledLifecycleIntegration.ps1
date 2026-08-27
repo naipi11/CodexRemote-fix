@@ -17,6 +17,10 @@ $script:CcodInstalledLifecycleRestartScenarios = @(
     'FreshRestart','Upgrade','SlowLaunch','ManualLaunchResume','LanguageStress','RepairStates','SafeExit','SettingsUninstall','DirectUninstall'
 )
 $script:CcodInstalledLifecycleTaskName = 'Codex Control Other Devices Supervisor'
+$script:CcodInstalledLifecycleRepositoryRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+$script:CcodInstalledLifecyclePersistenceIoModule = Import-Module (Join-Path $script:CcodInstalledLifecycleRepositoryRoot 'src\persistence\modules\PersistenceIO.psm1') -Force -PassThru
+$script:CcodInstalledLifecycleStateStoreModule = Import-Module (Join-Path $script:CcodInstalledLifecycleRepositoryRoot 'src\persistence\modules\StateStore.psm1') -Force -PassThru
+$script:CcodInstalledLifecycleTransactionModule = Import-Module (Join-Path $script:CcodInstalledLifecycleRepositoryRoot 'src\persistence\modules\LifecycleTransaction.psm1') -Force -PassThru
 
 function Throw-CcodInstalledLifecycleError {
     param(
@@ -187,9 +191,52 @@ function ConvertTo-CcodInstalledLifecycleIdentities {
     return @($result | Sort-Object pid, creationTimeUtc)
 }
 
+function Test-CcodInstalledLifecycleExactProperties {
+    param($Value, [Parameter(Mandatory)][string[]]$Expected)
+    if ($null -eq $Value -or ($Value -isnot [pscustomobject] -and $Value -isnot [Collections.IDictionary])) { return $false }
+    $actual = if ($Value -is [Collections.IDictionary]) { @($Value.Keys | ForEach-Object { [string]$_ }) } else { @($Value.PSObject.Properties.Name) }
+    return $actual.Count -eq $Expected.Count -and ($actual -join "`0") -ceq ($Expected -join "`0")
+}
+
+function Test-CcodInstalledLifecyclePositiveInteger {
+    param($Value, [switch]$AllowZero)
+    if ($Value -isnot [byte] -and $Value -isnot [uint16] -and $Value -isnot [uint32] -and $Value -isnot [uint64] -and
+        $Value -isnot [int16] -and $Value -isnot [int32] -and $Value -isnot [int64]) { return $false }
+    return $Value -ge $(if ($AllowZero) { 0 } else { 1 })
+}
+
+function ConvertTo-CcodInstalledLifecycleNullableIdentity {
+    param($Identity, [Parameter(Mandatory)][string]$Kind)
+    if ($null -eq $Identity) { return $null }
+    $converted = @(ConvertTo-CcodInstalledLifecycleIdentities -Records @($Identity) -Kind $Kind)
+    if ($converted.Count -ne 1) { Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' "$Kind identity is malformed" $Identity }
+    return $converted[0]
+}
+
+function ConvertTo-CcodInstalledLifecycleReceiptFact {
+    param($Receipt)
+    if ($null -eq $Receipt) { return $null }
+    $fields = @('kind','origin','runtimeId','runtimeGeneration','phase')
+    if (-not (Test-CcodInstalledLifecycleExactProperties -Value $Receipt -Expected $fields) -or
+        $Receipt.kind -isnot [string] -or @('RestartAndRepair','CheckAndRepair','SafeExit') -cnotcontains $Receipt.kind -or
+        $Receipt.origin -isnot [string] -or @('Installer','Tray','ExplicitStart','Guardian') -cnotcontains $Receipt.origin -or
+        $Receipt.runtimeId -isnot [string] -or $Receipt.runtimeId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$' -or
+        -not (Test-CcodInstalledLifecyclePositiveInteger -Value $Receipt.runtimeGeneration) -or
+        $Receipt.phase -isnot [string] -or @('Completed','CloseFailed','OrdinaryLaunchFailed','OrdinaryObservationTimedOut','LaunchWindowExpired','RepairFailed','VerificationFailed','CancelledBeforeClose','SupersededByUpgrade') -cnotcontains $Receipt.phase) {
+        Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'Lifecycle receipt fact is malformed' $Receipt
+    }
+    return [pscustomobject][ordered]@{
+        kind = [string]$Receipt.kind
+        origin = [string]$Receipt.origin
+        runtimeId = [string]$Receipt.runtimeId
+        runtimeGeneration = [UInt64]$Receipt.runtimeGeneration
+        phase = [string]$Receipt.phase
+    }
+}
+
 function ConvertTo-CcodInstalledLifecycleFacts {
     param($Facts)
-    $expected = @('appPresent','activeRuntimeId','activeGeneration','runtimeManifestSha256','supervisor','trayHost','codex','taskState','statusPhase','transitionStage','aboutVersion','deviceKeyPresent','deviceKeySha256','shortcuts')
+    $expected = @('appPresent','activeRuntimeId','activeGeneration','runtimeManifestSha256','supervisor','trayHost','codex','taskState','statusPhase','statusRuntimeId','statusCodex','transitionStage','lifecycleReceipt','aboutVersion','deviceKeyPresent','deviceKeySha256','shortcuts')
     if ($null -eq $Facts -or ($Facts -isnot [pscustomobject] -and $Facts -isnot [Collections.IDictionary])) {
         Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'Machine facts are unavailable' $Facts
     }
@@ -202,6 +249,7 @@ function ConvertTo-CcodInstalledLifecycleFacts {
         ($null -ne $Facts.activeGeneration -and $Facts.activeGeneration -isnot [UInt64]) -or
         ($null -ne $Facts.runtimeManifestSha256 -and ($Facts.runtimeManifestSha256 -isnot [string] -or $Facts.runtimeManifestSha256 -cnotmatch '^[0-9a-f]{64}$')) -or
         ($null -ne $Facts.aboutVersion -and ($Facts.aboutVersion -isnot [string] -or $Facts.aboutVersion -cnotmatch '^\d+\.\d+\.\d+$')) -or
+        ($null -ne $Facts.statusRuntimeId -and ($Facts.statusRuntimeId -isnot [string] -or $Facts.statusRuntimeId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$')) -or
         ($null -ne $Facts.deviceKeySha256 -and ($Facts.deviceKeySha256 -isnot [string] -or $Facts.deviceKeySha256 -cnotmatch '^[0-9a-f]{64}$')) -or
         ($Facts.deviceKeyPresent -and $null -eq $Facts.deviceKeySha256) -or
         (-not $Facts.deviceKeyPresent -and $null -ne $Facts.deviceKeySha256) -or
@@ -219,7 +267,10 @@ function ConvertTo-CcodInstalledLifecycleFacts {
         codex = @(ConvertTo-CcodInstalledLifecycleIdentities -Records $Facts.codex -Kind 'Codex')
         taskState = [string]$Facts.taskState
         statusPhase = [string]$Facts.statusPhase
+        statusRuntimeId = $Facts.statusRuntimeId
+        statusCodex = ConvertTo-CcodInstalledLifecycleNullableIdentity -Identity $Facts.statusCodex -Kind 'Status Codex'
         transitionStage = [string]$Facts.transitionStage
+        lifecycleReceipt = ConvertTo-CcodInstalledLifecycleReceiptFact -Receipt $Facts.lifecycleReceipt
         aboutVersion = $Facts.aboutVersion
         deviceKeyPresent = [bool]$Facts.deviceKeyPresent
         deviceKeySha256 = $Facts.deviceKeySha256
@@ -232,6 +283,105 @@ function New-CcodInstalledLifecyclePhase {
     return [pscustomobject][ordered]@{ name = $Name; outcome = $Outcome }
 }
 
+function Read-CcodInstalledLifecycleStrictJson {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][int]$ExpectedSchema,
+        [Parameter(Mandatory)][string]$Kind
+    )
+    return & $script:CcodInstalledLifecyclePersistenceIoModule {
+        param($DocumentPath, $Schema, $DocumentKind)
+        Read-CcodStrictJson -Path $DocumentPath -ExpectedSchema $Schema -Kind $DocumentKind
+    } $Path $ExpectedSchema $Kind
+}
+
+function Read-CcodInstalledLifecycleActiveFact {
+    param([Parameter(Mandatory)][string]$InstallRoot)
+    $path = Join-Path $InstallRoot 'active.json'
+    if (-not [IO.File]::Exists($path)) { return $null }
+    $active = Read-CcodInstalledLifecycleStrictJson -Path $path -ExpectedSchema 2 -Kind 'installed active runtime'
+    if (-not (Test-CcodInstalledLifecycleExactProperties -Value $active -Expected @('schemaVersion','activeRuntime','previousRuntime','generation','updatedAtUtc')) -or
+        $active.schemaVersion -isnot [int] -or $active.schemaVersion -ne 2 -or
+        $active.activeRuntime -isnot [string] -or $active.activeRuntime -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$' -or
+        ($null -ne $active.previousRuntime -and ($active.previousRuntime -isnot [string] -or $active.previousRuntime -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$')) -or
+        -not (Test-CcodInstalledLifecyclePositiveInteger -Value $active.generation) -or
+        -not (Test-CcodInstalledLifecycleCanonicalUtc -Value $active.updatedAtUtc)) {
+        Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'Active runtime schema 2 is malformed' $path
+    }
+    return $active
+}
+
+function Read-CcodInstalledLifecycleStatusFact {
+    param([Parameter(Mandatory)][string]$StateRoot)
+    $path = Join-Path $StateRoot 'status.json'
+    if (-not [IO.File]::Exists($path)) { return $null }
+    $status = Read-CcodInstalledLifecycleStrictJson -Path $path -ExpectedSchema 1 -Kind 'installed status'
+    try {
+        & $script:CcodInstalledLifecycleStateStoreModule { param($Value) Assert-CcodStatusShape -Status $Value } $status
+    } catch {
+        Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'Status schema 1 is malformed' $path
+    }
+    return $status
+}
+
+function Read-CcodInstalledLifecycleTransitionFact {
+    param([Parameter(Mandatory)][string]$StateRoot)
+    $path = Join-Path $StateRoot 'transition.json'
+    if (-not [IO.File]::Exists($path)) { return $null }
+    $transition = Read-CcodInstalledLifecycleStrictJson -Path $path -ExpectedSchema 1 -Kind 'installed transition'
+    try {
+        & $script:CcodInstalledLifecycleStateStoreModule { param($Value) Assert-CcodTransitionShape -Transition $Value } $transition
+    } catch {
+        Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'Transition schema 1 is malformed' $path
+    }
+    return $transition
+}
+
+function Get-CcodInstalledLifecycleReceiptFact {
+    param([Parameter(Mandatory)][string]$StateRoot, [AllowNull()][string]$ActiveRuntimeId)
+    $directory = Join-Path $StateRoot 'lifecycle\receipts'
+    if (-not [IO.Directory]::Exists($directory)) { return $null }
+    $directoryItem = Get-Item -LiteralPath $directory -Force -ErrorAction Stop
+    if (-not $directoryItem.PSIsContainer -or (($directoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'Lifecycle receipt root is malformed' $directory
+    }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $candidates = [Collections.Generic.List[object]]::new()
+    foreach ($item in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop | Where-Object { $_.Name -like '*.json' })) {
+        if ($item.PSIsContainer -or $item -isnot [IO.FileInfo] -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'Lifecycle receipt entry is malformed' $item.FullName
+        }
+        $receipt = Read-CcodInstalledLifecycleStrictJson -Path $item.FullName -ExpectedSchema 1 -Kind 'installed lifecycle receipt'
+        try {
+            & $script:CcodInstalledLifecycleTransactionModule { param($Value) Assert-CcodLifecycleRequest -Request $Value } $receipt
+        } catch {
+            Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'Lifecycle receipt schema 1 is malformed' $item.FullName
+        }
+        if ($item.Name -cne ($receipt.transactionId + '.json') -or -not $seen.Add([string]$receipt.transactionId)) {
+            Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'Lifecycle receipts have a mismatched or duplicate identity' $item.FullName
+        }
+        if ($receipt.phase -cnotin @('Completed','CloseFailed','OrdinaryLaunchFailed','OrdinaryObservationTimedOut','LaunchWindowExpired','RepairFailed','VerificationFailed','CancelledBeforeClose','SupersededByUpgrade')) {
+            Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'Lifecycle receipt is not terminal' $item.FullName
+        }
+        if ($null -ne $ActiveRuntimeId -and $receipt.runtimeId -ceq $ActiveRuntimeId -and $receipt.origin -ceq 'Installer' -and $receipt.kind -ceq 'RestartAndRepair') {
+            $candidates.Add($receipt)
+        }
+    }
+    if ($candidates.Count -eq 0) { return $null }
+    $ordered = @($candidates | Sort-Object updatedAtUtc -Descending)
+    if ($ordered.Count -gt 1 -and $ordered[0].updatedAtUtc -ceq $ordered[1].updatedAtUtc) {
+        Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'Latest current-runtime installer lifecycle receipt is ambiguous' $directory
+    }
+    $latest = $ordered[0]
+    return [pscustomobject][ordered]@{
+        kind = [string]$latest.kind
+        origin = [string]$latest.origin
+        runtimeId = [string]$latest.runtimeId
+        runtimeGeneration = [UInt64]$latest.runtimeGeneration
+        phase = [string]$latest.phase
+    }
+}
+
 function Get-CcodInstalledLifecycleFacts {
     param([Parameter(Mandatory)][string]$InstallRoot)
     $root = [IO.Path]::GetFullPath($InstallRoot)
@@ -240,45 +390,33 @@ function Get-CcodInstalledLifecycleFacts {
     [UInt64]$activeGeneration = 0
     $runtimeManifestSha256 = $null
     $statusPhase = 'Unavailable'
+    $statusRuntimeId = $null
+    $statusCodex = $null
     $transitionStage = 'Unavailable'
-    $activePath = Join-Path $root 'active.json'
-    if ([IO.File]::Exists($activePath)) {
-        try {
-            $active = [IO.File]::ReadAllText($activePath) | ConvertFrom-Json -ErrorAction Stop
-            $generationProperty = $active.PSObject.Properties['generation']
-            $generation = [UInt64]0
-            $generationValid = $false
-            if ($null -ne $generationProperty -and $generationProperty.Value -is [ValueType]) {
-                try {
-                    $generation = [UInt64]$generationProperty.Value
-                    $generationValid = $generation -ge 1
-                } catch { $generationValid = $false }
+    $active = Read-CcodInstalledLifecycleActiveFact -InstallRoot $root
+    if ($null -ne $active) {
+        $activeRuntimeId = [string]$active.activeRuntime
+        $activeGeneration = [UInt64]$active.generation
+        $manifest = Join-Path (Join-Path (Join-Path $root 'runtime') $activeRuntimeId) 'manifest.json'
+        if ([IO.File]::Exists($manifest)) { $runtimeManifestSha256 = Get-CcodInstalledLifecycleHash -Path $manifest }
+    }
+    $stateRoot = Join-Path $root 'state'
+    $status = Read-CcodInstalledLifecycleStatusFact -StateRoot $stateRoot
+    if ($null -ne $status -and $null -ne $status.session) {
+        $statusPhase = [string]$status.session.sessionState
+        $statusRuntimeId = [string]$status.session.runtimeId
+        if ($null -ne $status.session.codex) {
+            $statusCodex = [pscustomobject][ordered]@{
+                pid = [int]$status.session.codex.pid
+                creationTimeUtc = [string]$status.session.codex.creationTimeUtc
             }
-            if ([int]$active.schemaVersion -eq 2 -and $active.activeRuntime -is [string] -and $active.activeRuntime -cmatch '^[A-Za-z0-9._-]{1,96}$' -and $generationValid) {
-                $activeRuntimeId = [string]$active.activeRuntime
-                $activeGeneration = $generation
-                $manifest = Join-Path (Join-Path (Join-Path $root 'runtime') $activeRuntimeId) 'manifest.json'
-                if ([IO.File]::Exists($manifest)) { $runtimeManifestSha256 = Get-CcodInstalledLifecycleHash -Path $manifest }
-            } else { $statusPhase = 'InvalidActivePointer' }
-        } catch { $statusPhase = 'InvalidActivePointer' }
+        }
     }
-    $statusPath = Join-Path (Join-Path $root 'state') 'status.json'
-    if ([IO.File]::Exists($statusPath)) {
-        try {
-            $status = [IO.File]::ReadAllText($statusPath) | ConvertFrom-Json -ErrorAction Stop
-            if ($null -ne $status.PSObject.Properties['phase'] -and $status.phase -is [string] -and $status.phase.Length -le 64) { $statusPhase = [string]$status.phase }
-            elseif ($statusPhase -ceq 'Unavailable') { $statusPhase = 'Present' }
-        } catch { $statusPhase = 'InvalidStatus' }
+    $transition = Read-CcodInstalledLifecycleTransitionFact -StateRoot $stateRoot
+    if ($null -ne $transition) {
+        $transitionStage = if ($null -eq $transition.activeTransaction) { 'Idle' } else { [string]$transition.activeTransaction.stage }
     }
-    $transitionPath = Join-Path (Join-Path $root 'state') 'transition.json'
-    if ([IO.File]::Exists($transitionPath)) {
-        try {
-            $transition = [IO.File]::ReadAllText($transitionPath) | ConvertFrom-Json -ErrorAction Stop
-            if ($null -eq $transition.PSObject.Properties['activeTransaction'] -or $null -eq $transition.activeTransaction) { $transitionStage = 'Idle' }
-            elseif ($null -ne $transition.activeTransaction.PSObject.Properties['stage'] -and $transition.activeTransaction.stage -is [string] -and $transition.activeTransaction.stage.Length -le 64) { $transitionStage = [string]$transition.activeTransaction.stage }
-            else { $transitionStage = 'InvalidTransition' }
-        } catch { $transitionStage = 'InvalidTransition' }
-    }
+    $lifecycleReceipt = Get-CcodInstalledLifecycleReceiptFact -StateRoot $stateRoot -ActiveRuntimeId $activeRuntimeId
     $taskState = 'Unknown'
     try {
         $matches = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -ceq $script:CcodInstalledLifecycleTaskName })
@@ -309,7 +447,10 @@ function Get-CcodInstalledLifecycleFacts {
         param($Process)
         [string]$Process.ExecutablePath -ieq $trayHostPath
     }
-    $codex = & $makeIdentities @('Codex.exe') { param($Process) $true }
+    $codex = & $makeIdentities @('ChatGPT.exe') {
+        param($Process)
+        ([string]$Process.CommandLine) -cnotmatch '(?i)(?:^|\s)--type='
+    }
     $aboutVersion = $null
     $packagePath = Join-Path $appRoot 'package.json'
     if ([IO.File]::Exists($packagePath)) {
@@ -335,7 +476,10 @@ function Get-CcodInstalledLifecycleFacts {
         codex = @($codex)
         taskState = $taskState
         statusPhase = $statusPhase
+        statusRuntimeId = $statusRuntimeId
+        statusCodex = $statusCodex
         transitionStage = $transitionStage
+        lifecycleReceipt = $lifecycleReceipt
         aboutVersion = $aboutVersion
         deviceKeyPresent = [bool]$deviceKeyPresent
         deviceKeySha256 = $deviceKeySha256
@@ -416,8 +560,21 @@ function Test-CcodInstalledLifecycleScenario {
         if ($Context.scenario -eq 'FreshLater' -and $BeforeFacts.codex.Count -gt 0) {
             $verified = $verified -and (Test-CcodInstalledLifecycleSameIdentitySet -Expected $BeforeFacts.codex -Actual $afterFacts.codex)
         }
-        if ($Context.scenario -eq 'FreshRestart' -and $BeforeFacts.codex.Count -gt 0) {
-            $verified = $verified -and $afterFacts.codex.Count -gt 0 -and -not (Test-CcodInstalledLifecycleSameIdentitySet -Expected $BeforeFacts.codex -Actual $afterFacts.codex)
+        if ($Context.scenario -eq 'FreshRestart') {
+            $verified = $verified -and
+                $afterFacts.codex.Count -eq 1 -and
+                $afterFacts.statusPhase -ceq 'Active' -and
+                $afterFacts.statusRuntimeId -ceq $afterFacts.activeRuntimeId -and
+                $null -ne $afterFacts.statusCodex -and
+                $afterFacts.statusCodex.pid -eq $afterFacts.codex[0].pid -and
+                $afterFacts.statusCodex.creationTimeUtc -ceq $afterFacts.codex[0].creationTimeUtc -and
+                $afterFacts.transitionStage -ceq 'Idle' -and
+                $null -ne $afterFacts.lifecycleReceipt -and
+                $afterFacts.lifecycleReceipt.kind -ceq 'RestartAndRepair' -and
+                $afterFacts.lifecycleReceipt.origin -ceq 'Installer' -and
+                $afterFacts.lifecycleReceipt.runtimeId -ceq $afterFacts.activeRuntimeId -and
+                [UInt64]$afterFacts.lifecycleReceipt.runtimeGeneration -eq [UInt64]$afterFacts.activeGeneration -and
+                $afterFacts.lifecycleReceipt.phase -ceq 'Completed'
         }
     }
     if (-not $verified) { $code = 'CCOD_INTEGRATION_OBSERVATION_UNPROVEN' }

@@ -30,18 +30,36 @@ function New-CcodHarnessCandidate {
 }
 
 function New-CcodHarnessFacts {
-    param([string]$Version = '2.5.0')
+    param(
+        [string]$Version = '2.5.0',
+        [string]$RuntimeId = 'runtime-1',
+        [int]$CodexPid = 102,
+        [string]$CodexCreationTimeUtc = '2026-08-24T00:00:02.0000000Z',
+        [string]$StatusRuntimeId = $RuntimeId,
+        [int]$StatusCodexPid = $CodexPid,
+        [string]$StatusCodexCreationTimeUtc = $CodexCreationTimeUtc,
+        [string]$ReceiptPhase = 'Completed'
+    )
     return [pscustomobject][ordered]@{
         appPresent = $true
-        activeRuntimeId = 'runtime-1'
+        activeRuntimeId = $RuntimeId
         activeGeneration = [UInt64]1
         runtimeManifestSha256 = ('a' * 64)
         supervisor = @([pscustomobject]@{ pid = 100; creationTimeUtc = '2026-08-24T00:00:00.0000000Z' })
         trayHost = @([pscustomobject]@{ pid = 101; creationTimeUtc = '2026-08-24T00:00:01.0000000Z' })
-        codex = @([pscustomobject]@{ pid = 102; creationTimeUtc = '2026-08-24T00:00:02.0000000Z' })
+        codex = @([pscustomobject]@{ pid = $CodexPid; creationTimeUtc = $CodexCreationTimeUtc })
         taskState = 'Ready'
         statusPhase = 'Active'
-        transitionStage = 'Completed'
+        statusRuntimeId = $StatusRuntimeId
+        statusCodex = [pscustomobject][ordered]@{ pid = $StatusCodexPid; creationTimeUtc = $StatusCodexCreationTimeUtc }
+        transitionStage = 'Idle'
+        lifecycleReceipt = [pscustomobject][ordered]@{
+            kind = 'RestartAndRepair'
+            origin = 'Installer'
+            runtimeId = $RuntimeId
+            runtimeGeneration = [UInt64]1
+            phase = $ReceiptPhase
+        }
         aboutVersion = $Version
         deviceKeyPresent = $true
         deviceKeySha256 = ('b' * 64)
@@ -50,6 +68,139 @@ function New-CcodHarnessFacts {
         token = 'do-not-store-this'
         userName = 'Alice'
         conversation = 'private conversation content must never enter evidence'
+    }
+}
+
+function Write-CcodHarnessJson {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Value)
+    $null = [IO.Directory]::CreateDirectory((Split-Path $Path -Parent))
+    [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 16 -Compress), [Text.UTF8Encoding]::new($false))
+}
+
+function New-CcodHarnessLifecycleReceipt {
+    param(
+        [Parameter(Mandatory)][string]$RuntimeId,
+        [Parameter(Mandatory)][UInt64]$RuntimeGeneration,
+        [Parameter(Mandatory)][string]$Phase,
+        [string]$TransactionId = '11111111-2222-3333-4444-555555555555',
+        [string]$UpdatedAtUtc = '2026-08-24T00:00:05.0000000Z'
+    )
+    return [ordered]@{
+        schemaVersion = 1
+        transactionId = $TransactionId
+        kind = 'RestartAndRepair'
+        origin = 'Installer'
+        runtimeId = $RuntimeId
+        runtimeGeneration = $RuntimeGeneration
+        leaseEpoch = [UInt64]9
+        ownerIdentity = [ordered]@{ pid = 700; creationTimeUtc = '2026-08-24T00:00:00.0000000Z' }
+        logonIdentity = [ordered]@{ authenticationId = '00000000:000003E7'; userSid = 'S-1-5-21-1-2-3-1001'; sessionId = 2 }
+        phase = $Phase
+        createdAtUtc = '2026-08-24T00:00:01.0000000Z'
+        updatedAtUtc = $UpdatedAtUtc
+        launchRequestedAtUtc = '2026-08-24T00:00:02.0000000Z'
+        manualLaunchExpiresAtUtc = $null
+        automaticLaunchAttempts = 1
+        error = if ($Phase -ceq 'Completed') { $null } else { 'CCOD_CLOSE_FAILED' }
+    }
+}
+
+function New-CcodHarnessInstalledStateFixture {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$ActiveRuntimeId,
+        [Parameter(Mandatory)][UInt64]$ActiveGeneration,
+        [Parameter(Mandatory)][string]$StatusRuntimeId,
+        [Parameter(Mandatory)][int]$StatusCodexPid,
+        [Parameter(Mandatory)][string]$StatusCodexCreationTimeUtc,
+        [Parameter(Mandatory)][string]$ReceiptPhase
+    )
+    $active = [ordered]@{
+        schemaVersion = 2
+        activeRuntime = $ActiveRuntimeId
+        previousRuntime = '2.5.19-old'
+        generation = $ActiveGeneration
+        updatedAtUtc = '2026-08-24T00:00:03.0000000Z'
+    }
+    $status = [ordered]@{
+        schemaVersion = 1
+        session = [ordered]@{
+            supervisorPid = 700
+            supervisorCreationTimeUtc = '2026-08-24T00:00:00.0000000Z'
+            sessionId = 'session-1'
+            runtimeId = $StatusRuntimeId
+            sessionState = 'Active'
+            codex = [ordered]@{
+                pid = $StatusCodexPid
+                creationTimeUtc = $StatusCodexCreationTimeUtc
+                packageFullName = 'OpenAI.Codex_1.0.0.0_x64__test'
+                packageVersion = '1.0.0.0'
+                appAsarSha256 = ('c' * 64)
+                mainPort = 41001
+                rendererPort = 41002
+                mainProbe = 'Closed'
+                rendererProbe = 'BridgeValid'
+            }
+        }
+    }
+    $transition = [ordered]@{ schemaVersion = 1; activeTransaction = $null }
+    $receipt = New-CcodHarnessLifecycleReceipt -RuntimeId $ActiveRuntimeId -RuntimeGeneration $ActiveGeneration -Phase $ReceiptPhase
+    Write-CcodHarnessJson -Path (Join-Path $Root 'active.json') -Value $active
+    $manifestPath = Join-Path (Join-Path (Join-Path $Root 'runtime') $ActiveRuntimeId) 'manifest.json'
+    Write-CcodHarnessJson -Path $manifestPath -Value ([ordered]@{ schemaVersion = 1; runtimeId = $ActiveRuntimeId })
+    Write-CcodHarnessJson -Path (Join-Path $Root 'state\status.json') -Value $status
+    Write-CcodHarnessJson -Path (Join-Path $Root 'state\transition.json') -Value $transition
+    Write-CcodHarnessJson -Path (Join-Path $Root ("state\lifecycle\receipts\{0}.json" -f $receipt.transactionId)) -Value $receipt
+}
+
+function Set-CcodHarnessProcessFixture {
+    param([object[]]$ChatGPT, [object[]]$Codex = @())
+    $script:CcodHarnessProcessFixture = [pscustomobject]@{ ChatGPT = @($ChatGPT); Codex = @($Codex) }
+    function global:Get-CimInstance {
+        param($ClassName, $Filter, $ErrorAction)
+        if ([string]$Filter -cmatch "Name = 'ChatGPT.exe'") { return @($script:CcodHarnessProcessFixture.ChatGPT) }
+        if ([string]$Filter -cmatch "Name = 'Codex.exe'") { return @($script:CcodHarnessProcessFixture.Codex) }
+        return @()
+    }
+    function global:Get-ScheduledTask {
+        param($ErrorAction)
+        return @([pscustomobject]@{ TaskName = 'Codex Control Other Devices Supervisor'; State = 'Ready' })
+    }
+}
+
+function Clear-CcodHarnessProcessFixture {
+    Remove-Item -LiteralPath Function:\Get-CimInstance -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath Function:\Get-ScheduledTask -Force -ErrorAction SilentlyContinue
+    $script:CcodHarnessProcessFixture = $null
+}
+
+function New-CcodHarnessCimProcess {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][int]$ProcessId,
+        [Parameter(Mandatory)][string]$CreationTimeUtc,
+        [Parameter(Mandatory)][string]$CommandLine,
+        [int]$ParentProcessId = 0
+    )
+    $created = [datetime]::ParseExact($CreationTimeUtc, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+    return [pscustomobject][ordered]@{
+        Name = $Name
+        ProcessId = $ProcessId
+        ParentProcessId = $ParentProcessId
+        CreationDate = [Management.ManagementDateTimeConverter]::ToDmtfDateTime($created)
+        CommandLine = $CommandLine
+        ExecutablePath = "C:\Program Files\WindowsApps\OpenAI.Codex\$Name"
+    }
+}
+
+function Invoke-CcodHarnessWithCapturedFacts {
+    param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)]$BeforeFacts, [Parameter(Mandatory)]$AfterFacts)
+    $original = ${function:Get-CcodInstalledLifecycleFacts}
+    try {
+        Set-Item -LiteralPath Function:\Get-CcodInstalledLifecycleFacts -Value ({ param($InstallRoot) return $AfterFacts }.GetNewClosure())
+        return Test-CcodInstalledLifecycleScenario -Context $Context -BeforeFacts $BeforeFacts -RunResult ([pscustomobject]@{ code = 'CCOD_INTEGRATION_OPERATOR_COMPLETED' })
+    } finally {
+        Set-Item -LiteralPath Function:\Get-CcodInstalledLifecycleFacts -Value $original
     }
 }
 
@@ -135,6 +286,142 @@ Invoke-CcodTest 'installed lifecycle harness exposes the guarded library interfa
     Assert-CcodTrue (Test-Path -LiteralPath $harnessPath -PathType Leaf) 'installed lifecycle harness exists'
     . $harnessPath -Library
     Assert-CcodTrue ($null -ne (Get-Command Invoke-CcodInstalledLifecycleIntegration -ErrorAction SilentlyContinue)) 'harness exports its invocation function when loaded as a library'
+}
+
+# Production mutation caught: FreshRestart ignores stale status and a current-runtime CloseFailed receipt.
+Invoke-CcodTest 'rejects FreshRestart when current active runtime has stale status and a CloseFailed installer receipt' {
+    . $harnessPath -Library
+    $before = New-CcodHarnessFacts -RuntimeId '2.5.19-old' -CodexPid 10664
+    $after = New-CcodHarnessFacts -RuntimeId '2.5.21-new' -CodexPid 13948 `
+        -StatusRuntimeId '2.5.19-old' -StatusCodexPid 10664 -ReceiptPhase 'CloseFailed'
+    $context = [pscustomobject]@{ scenario = 'FreshRestart'; expectedVersion = '2.5.0'; installRoot = 'C:\fixture' }
+    $verification = Invoke-CcodHarnessWithCapturedFacts -Context $context -BeforeFacts $before -AfterFacts $after
+    Assert-CcodEqual $false $verification.verified 'stale status and CloseFailed terminal state leave FreshRestart unverified'
+    Assert-CcodEqual 'CCOD_INTEGRATION_OBSERVATION_UNPROVEN' $verification.code 'rejection uses the stable observation code'
+}
+
+# Production mutation caught: querying Codex.exe instead of the Windows app root ChatGPT.exe.
+Invoke-CcodTest 'captures exactly the top-level ChatGPT root and excludes Electron type children' {
+    . $harnessPath -Library
+    $root = Join-Path $env:TEMP ('ccod-installed-capture-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $null = [IO.Directory]::CreateDirectory($root)
+        $created = '2026-08-24T00:00:04.0000000Z'
+        Set-CcodHarnessProcessFixture -ChatGPT @(
+            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13948 -CreationTimeUtc $created -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe"'),
+            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13949 -CreationTimeUtc '2026-08-24T00:00:04.1000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe" --type=renderer' -ParentProcessId 13948),
+            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13950 -CreationTimeUtc '2026-08-24T00:00:04.2000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe" --type=utility' -ParentProcessId 13948)
+        )
+        $facts = Get-CcodInstalledLifecycleFacts -InstallRoot $root
+        Assert-CcodEqual 1 $facts.codex.Count 'only one ordinary ChatGPT root is retained'
+        Assert-CcodEqual 13948 $facts.codex[0].pid 'the ordinary ChatGPT root identity is captured'
+        Assert-CcodEqual $created $facts.codex[0].creationTimeUtc 'the root creation time is canonical and retained'
+    } finally {
+        Clear-CcodHarnessProcessFixture
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'captures bounded current-runtime status transition and latest installer receipt facts from complete schemas' {
+    . $harnessPath -Library
+    $root = Join-Path $env:TEMP ('ccod-installed-state-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $null = [IO.Directory]::CreateDirectory($root)
+        New-CcodHarnessInstalledStateFixture -Root $root -ActiveRuntimeId '2.5.21-new' -ActiveGeneration ([UInt64]8) `
+            -StatusRuntimeId '2.5.19-old' -StatusCodexPid 10664 -StatusCodexCreationTimeUtc '2026-08-24T00:00:02.0000000Z' -ReceiptPhase 'CloseFailed'
+        Set-CcodHarnessProcessFixture -ChatGPT @(
+            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13948 -CreationTimeUtc '2026-08-24T00:00:04.0000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe"'),
+            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13949 -CreationTimeUtc '2026-08-24T00:00:04.1000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe" --type=renderer' -ParentProcessId 13948)
+        )
+        $facts = Get-CcodInstalledLifecycleFacts -InstallRoot $root
+        Assert-CcodEqual '2.5.21-new' $facts.activeRuntimeId 'active schema 2 supplies the current runtime'
+        Assert-CcodEqual 8 ([UInt64]$facts.activeGeneration) 'active schema 2 supplies the current generation'
+        Assert-CcodEqual 'Active' $facts.statusPhase 'complete status schema 1 supplies the session state'
+        Assert-CcodEqual '2.5.19-old' $facts.statusRuntimeId 'stale status runtime remains visible for correlation rejection'
+        Assert-CcodEqual 10664 $facts.statusCodex.pid 'stale status Codex identity remains visible for correlation rejection'
+        Assert-CcodEqual 'Idle' $facts.transitionStage 'null active transaction is captured as idle'
+        Assert-CcodEqual 'RestartAndRepair' $facts.lifecycleReceipt.kind 'receipt kind is bounded and retained'
+        Assert-CcodEqual 'Installer' $facts.lifecycleReceipt.origin 'receipt origin is bounded and retained'
+        Assert-CcodEqual '2.5.21-new' $facts.lifecycleReceipt.runtimeId 'latest receipt is bound to the active runtime'
+        Assert-CcodEqual 'CloseFailed' $facts.lifecycleReceipt.phase 'terminal receipt failure remains visible'
+        $serialized = $facts | ConvertTo-Json -Depth 16 -Compress
+        foreach ($forbidden in @('00000000:000003E7','S-1-5-21-1-2-3-1001','OpenAI.Codex_1.0.0.0_x64__test','41001','--type=renderer','C:\Program Files\WindowsApps')) {
+            Assert-CcodTrue (-not $serialized.Contains($forbidden)) "captured facts omit private receipt status and command-line data: $forbidden"
+        }
+    } finally {
+        Clear-CcodHarnessProcessFixture
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'selects only an unambiguous latest current-runtime installer restart receipt' {
+    . $harnessPath -Library
+    $root = Join-Path $env:TEMP ('ccod-installed-receipts-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $null = [IO.Directory]::CreateDirectory($root)
+        New-CcodHarnessInstalledStateFixture -Root $root -ActiveRuntimeId '2.5.21-new' -ActiveGeneration ([UInt64]8) `
+            -StatusRuntimeId '2.5.21-new' -StatusCodexPid 13948 -StatusCodexCreationTimeUtc '2026-08-24T00:00:04.0000000Z' -ReceiptPhase 'CloseFailed'
+        $completed = New-CcodHarnessLifecycleReceipt -RuntimeId '2.5.21-new' -RuntimeGeneration ([UInt64]8) -Phase 'Completed' `
+            -TransactionId '22222222-3333-4444-5555-666666666666' -UpdatedAtUtc '2026-08-24T00:00:06.0000000Z'
+        Write-CcodHarnessJson -Path (Join-Path $root ("state\lifecycle\receipts\{0}.json" -f $completed.transactionId)) -Value $completed
+        Set-CcodHarnessProcessFixture -ChatGPT @(
+            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13948 -CreationTimeUtc '2026-08-24T00:00:04.0000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe"')
+        )
+        $facts = Get-CcodInstalledLifecycleFacts -InstallRoot $root
+        Assert-CcodEqual 'Completed' $facts.lifecycleReceipt.phase 'strict receipt selection uses the unique latest updatedAtUtc'
+
+        $ambiguous = New-CcodHarnessLifecycleReceipt -RuntimeId '2.5.21-new' -RuntimeGeneration ([UInt64]8) -Phase 'CloseFailed' `
+            -TransactionId '33333333-4444-5555-6666-777777777777' -UpdatedAtUtc '2026-08-24T00:00:06.0000000Z'
+        Write-CcodHarnessJson -Path (Join-Path $root ("state\lifecycle\receipts\{0}.json" -f $ambiguous.transactionId)) -Value $ambiguous
+        Assert-CcodThrows { Get-CcodInstalledLifecycleFacts -InstallRoot $root } 'CCOD_INTEGRATION_FACTS_INVALID'
+    } finally {
+        Clear-CcodHarnessProcessFixture
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+# Production mutation caught: treating a Codex.exe-only observation as installed app process evidence.
+Invoke-CcodTest 'does not accept a Codex.exe-only fixture as Codex process evidence' {
+    . $harnessPath -Library
+    $root = Join-Path $env:TEMP ('ccod-installed-capture-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $null = [IO.Directory]::CreateDirectory($root)
+        Set-CcodHarnessProcessFixture -ChatGPT @() -Codex @(
+            (New-CcodHarnessCimProcess -Name 'Codex.exe' -ProcessId 10664 -CreationTimeUtc '2026-08-24T00:00:02.0000000Z' -CommandLine '"C:\Program Files\Codex.exe"')
+        )
+        $facts = Get-CcodInstalledLifecycleFacts -InstallRoot $root
+        Assert-CcodEqual 0 $facts.codex.Count 'Codex.exe is not the Windows app root and cannot satisfy process evidence'
+    } finally {
+        Clear-CcodHarnessProcessFixture
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'verifies FreshRestart only with one correlated ChatGPT root and Completed current-runtime installer receipt' {
+    . $harnessPath -Library
+    $root = Join-Path $env:TEMP ('ccod-installed-success-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $null = [IO.Directory]::CreateDirectory($root)
+        New-CcodHarnessInstalledStateFixture -Root $root -ActiveRuntimeId '2.5.21-new' -ActiveGeneration ([UInt64]8) `
+            -StatusRuntimeId '2.5.21-new' -StatusCodexPid 13948 -StatusCodexCreationTimeUtc '2026-08-24T00:00:04.0000000Z' -ReceiptPhase 'Completed'
+        Set-CcodHarnessProcessFixture -ChatGPT @(
+            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13948 -CreationTimeUtc '2026-08-24T00:00:04.0000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe"'),
+            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13949 -CreationTimeUtc '2026-08-24T00:00:04.1000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe" --type=renderer' -ParentProcessId 13948)
+        )
+        $after = Get-CcodInstalledLifecycleFacts -InstallRoot $root
+        $after.appPresent = $true
+        $after.aboutVersion = '2.5.0'
+        $after.deviceKeyPresent = $true
+        $after.deviceKeySha256 = ('b' * 64)
+        $before = New-CcodHarnessFacts -RuntimeId '2.5.19-old' -CodexPid 10664
+        $context = [pscustomobject]@{ scenario = 'FreshRestart'; expectedVersion = '2.5.0'; installRoot = $root }
+        $verification = Invoke-CcodHarnessWithCapturedFacts -Context $context -BeforeFacts $before -AfterFacts $after
+        Assert-CcodEqual $true $verification.verified 'fully correlated current runtime verifies FreshRestart'
+        Assert-CcodEqual 'CCOD_INTEGRATION_VERIFIED' $verification.code 'success retains the stable verification code'
+    } finally {
+        Clear-CcodHarnessProcessFixture
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
 }
 
 Invoke-CcodTest 'requires mutation and Codex-restart consent before any adapter or filesystem action' {
