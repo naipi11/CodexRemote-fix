@@ -308,3 +308,141 @@ lifecycle completion only after acknowledgement.
   or interactive product UI operation occurred.
 - No independent agent was used because this fix round explicitly prohibited
   agents. Parent integration review remains the next review gate.
+
+## Fix round 2: release pending actions through a host-side diagnostic gate
+
+Re-review found that fix round 1's suppression of the terminal ACK prevented
+generic feedback without a record, but permanently retained the corresponding
+HostTransport pending entry. Eight Supervisor-log failures could therefore fill
+the pending-action bound and disable later tray commands.
+
+Fix implementation commit: `3bdd575`
+(`fix: release tray actions after diagnostic failure`).
+
+### TDD and RED evidence
+
+Tests were changed before production code. The new transport regression
+required a typed terminal record and a diagnostic-writer HostTransport boundary.
+The focused transport compile failed with the expected missing production API:
+
+```text
+CS0246: TrayTerminalDiagnostic could not be found
+CS1729: HostTransport does not contain a constructor that takes 2 arguments
+CCOD_TRAYHOST_NATIVE_COMPILE_FAILED
+```
+
+The Supervisor correlation suite independently failed to compile its real
+native/transport bridge for the same missing type. This established that the
+repeated-failure recovery behavior did not exist.
+
+After the first implementation, a second behavioral test treated a missing
+writer as a persistence failure. It failed before the default was hardened:
+
+```text
+TrayHost transport self-test failed: System.InvalidOperationException
+missing diagnostic writer cannot authorize generic feedback
+```
+
+The default was then changed to fail closed for feedback while still consuming
+the authenticated terminal result.
+
+### Implementation
+
+`TrayTerminalDiagnostic` is a new internal strong type. Its constructor accepts
+only an existing `TrayCommand`, positive revision, terminal
+`TrayActionResultStatus`, and canonical result code. `Completed` maps to
+`CCOD_TRAY_ACTION_COMPLETED`; malformed failure values map to
+`CCOD_TRAY_ACTION_FAILED`. It cannot carry an action id, transaction id, path,
+token, exception, or arbitrary message.
+
+`TrayTerminalDiagnosticLog.TryAppend` writes exactly one fixed-format line:
+
+```text
+command=<enum> revision=<invariant UInt64> status=<terminal enum> code=<canonical CCOD code>
+```
+
+It returns `true` only after `File.AppendAllText` closes successfully and returns
+`false` without throwing on persistence failure. The native self-test writes to
+an isolated temporary file, verifies the line byte-for-byte, and verifies that
+an invalid file target returns `false`.
+
+Production `Program` derives a fixed current-user path under
+`LocalApplicationData\CodexControlOtherDevices\logs\trayhost-actions.log` and
+injects the typed writer into HostTransport. No path or arbitrary payload comes
+from the authenticated message, and no new pipe message, command, external
+control surface, or unauthenticated channel was added.
+
+HostTransport now processes a valid authenticated terminal result in this
+order while holding its existing correlation lock:
+
+1. require the exact pending action id and presentation revision;
+2. enforce lifecycle Accepted-before-Completed rules;
+3. build the typed terminal diagnostic from the pending command and result;
+4. attempt the injected local write;
+5. remove the pending action regardless of write success;
+6. enqueue About or generic failure feedback only when the write succeeded;
+7. return terminal acceptance so the authenticated reader does not treat a
+   consumed valid result as a protocol violation.
+
+If no writer exists or the writer returns/throws failure, no feedback is
+queued, but pending capacity is released. If the bounded feedback queue is
+already full, the additional terminal result is likewise consumed and its
+pending entry released; only the redundant UI item is suppressed.
+
+Supervisor again sends the authenticated terminal result after attempting its
+standard sanitized envelope log. This gives two safe cases:
+
+- Supervisor log succeeds: the standard timestamped local record already
+  exists, and TrayHost also gates feedback on its typed host receipt.
+- Supervisor log fails: `CCOD_SUPERVISOR_LOG_FAILED` remains in the cleanup
+  receipt, while the host receipt either persists before feedback or suppresses
+  feedback. In both cases the authenticated terminal result releases pending
+  capacity.
+
+The standard Supervisor envelope and its inclusive-field ruling were not
+changed.
+
+### Repeated failure and recovery proof
+
+The transport regression submits ten distinct authenticated failed actions
+while the diagnostic writer returns false. Every action registers, every exact
+terminal result is accepted, every pending entry is released, and zero generic
+feedback items are available. After switching the same writer to success, a new
+failed action registers and produces feedback, followed by a new command that
+registers and completes. The last typed record is asserted as exactly
+`OpenLogs`, revision 22, `Completed`, and `CCOD_TRAY_ACTION_COMPLETED`.
+
+The Supervisor end-to-end test repeats ten stale native-menu actions while both
+Supervisor and host diagnostic writes fail. The same real
+`TrayWindow -> NativeMenu -> HostTransport -> Supervisor ACK map -> result ACK`
+chain accepts every terminal result without invoking `OpenLogs` or producing
+feedback. After both writers recover and revision 2 is acknowledged, the next
+native command registers, reaches `OpenLogs` exactly once, and completes.
+
+### Fresh verification
+
+Fresh pre-commit verification results:
+
+```text
+TrayHost client: exit 0; 8 behavioral cases
+Supervisor: exit 0; 98 behavioral cases
+TrayHost transport: exit 0; 9 behavioral cases
+TrayHost native: exit 0; 16 behavioral cases
+TrayHost production compile/headless smoke: exit 0
+git diff --check: exit 0
+git diff --cached --check: exit 0
+```
+
+The production smoke compiles every checked-in TrayHost C# source, including
+the new diagnostic type, and runs only the existing no-UI headless path.
+
+### Fix-round scope and concerns
+
+- No authenticated wire field or result status changed.
+- No real Codex/ChatGPT or production interactive TrayHost process was started,
+  stopped, signaled, or controlled.
+- Nothing was installed, pushed, published, released, signed, or written to
+  WindowsApps/DPAPI. Runtime logging was tested only through an isolated temp
+  path; the production path was compiled but not exercised against user data.
+- No independent agent was used because this fix round explicitly prohibited
+  agents. Parent re-review remains the next gate.
