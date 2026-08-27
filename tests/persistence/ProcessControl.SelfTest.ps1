@@ -139,6 +139,14 @@ function New-CcodSpecialStatus {
     }
 }
 
+function Assert-CcodIdentityObservationThrows {
+    param([Parameter(Mandatory)][scriptblock]$Action, [Parameter(Mandatory)][string]$Message)
+
+    $threw = $false
+    try { & $Action | Out-Null } catch { $threw = $true }
+    Assert-CcodTrue $threw $Message
+}
+
 try {
     Invoke-CcodTest 'default process adapter recognizes exactly one Codex renderer target' {
         $module = Get-Module ProcessControl
@@ -194,6 +202,56 @@ try {
             Test-CcodNativeProcessQueryProvesExit -Failure $Failure -ProcessId 700 -GetProcess { param($Id) [pscustomobject][ordered]@{Outcome='Absent';Process=$null} }
         } $failure5
         Assert-CcodEqual $false $wrongError 'other native failures stay fail-closed even when the PID is absent'
+    }
+
+    Invoke-CcodTest 'observes absence same identity and PID reuse through one strict native query' {
+        $cases = @(
+            @{ Name='absent'; Native=$null; Want='Absent'; Creation=$null },
+            @{ Name='same'; Native=[pscustomobject][ordered]@{Pid=10664;CreationTimeUtc='2026-08-26T04:49:22.1551350Z';SessionId=1;UserSid='S-1-5-21-test';Path='C:\Program Files\WindowsApps\OpenAI.Codex_test\app\ChatGPT.exe';PackageFamilyName='OpenAI.Codex_test'}; Want='SameIdentity'; Creation='2026-08-26T04:49:22.1551350Z' },
+            @{ Name='reused'; Native=[pscustomobject][ordered]@{Pid=10664;CreationTimeUtc='2026-08-27T04:49:22.1551350Z';SessionId=1;UserSid='S-1-5-21-test';Path='C:\Program Files\WindowsApps\OpenAI.Codex_test\app\ChatGPT.exe';PackageFamilyName='OpenAI.Codex_test'}; Want='IdentityChanged'; Creation='2026-08-27T04:49:22.1551350Z' }
+        )
+        foreach ($case in $cases) {
+            $fixture = [pscustomobject]@{ Value=$case.Native }
+            $calls = [pscustomobject]@{ Count=0 }
+            try {
+                $result = Get-CcodProcessIdentityObservation -ProcessId 10664 -ExpectedCreationTimeUtc '2026-08-26T04:49:22.1551350Z' -Adapters @{
+                    GetNativeProcess = { param($ProcessId) [void]($calls.Count++); $fixture.Value }.GetNewClosure()
+                }
+            } catch { throw "$($case.Name) observation failed: $($_.Exception.Message)" }
+            Assert-CcodEqual 'Outcome,Pid,CreationTimeUtc' (($result.PSObject.Properties.Name) -join ',') "$($case.Name) observation exposes only the ordered identity contract"
+            Assert-CcodEqual $case.Want $result.Outcome "$($case.Name) outcome is hand-derived"
+            Assert-CcodEqual 10664 $result.Pid "$($case.Name) preserves the requested PID"
+            Assert-CcodEqual $case.Creation $result.CreationTimeUtc "$($case.Name) preserves only a proven native creation time"
+            Assert-CcodEqual 1 $calls.Count "$($case.Name) invokes exactly one native identity query"
+        }
+    }
+
+    Invoke-CcodTest 'rejects malformed failed or incidental native identity observations' {
+        $same = [pscustomobject][ordered]@{Pid=10664;CreationTimeUtc='2026-08-26T04:49:22.1551350Z';SessionId=1;UserSid='S-1-5-21-test';Path='C:\Program Files\WindowsApps\OpenAI.Codex_test\app\ChatGPT.exe';PackageFamilyName='OpenAI.Codex_test'}
+        $wrongPid = $same | ConvertTo-Json -Depth 4 | ConvertFrom-Json
+        $wrongPid.Pid = 10665
+        $noncanonical = $same | ConvertTo-Json -Depth 4 | ConvertFrom-Json
+        $noncanonical.CreationTimeUtc = '2026-08-26T04:49:22Z'
+        $extra = $same | ConvertTo-Json -Depth 4 | ConvertFrom-Json
+        $extra | Add-Member Extra 'unexpected'
+        $missing = $same | ConvertTo-Json -Depth 4 | ConvertFrom-Json
+        $missing.PSObject.Properties.Remove('UserSid')
+        foreach ($case in @(
+            @{ Name='access failure'; Query={ param($ProcessId) throw [UnauthorizedAccessException]::new('denied') } },
+            @{ Name='wrong PID'; Value=$wrongPid },
+            @{ Name='noncanonical creation time'; Value=$noncanonical },
+            @{ Name='extra native field'; Value=$extra },
+            @{ Name='missing native field'; Value=$missing },
+            @{ Name='success-stream diagnostic'; Query={ param($ProcessId) 'diagnostic'; $null } }
+        )) {
+            $query = if ($null -ne $case.Query) { $case.Query } else { $value=$case.Value; { param($ProcessId) $value }.GetNewClosure() }
+            Assert-CcodIdentityObservationThrows {
+                Get-CcodProcessIdentityObservation -ProcessId 10664 -ExpectedCreationTimeUtc '2026-08-26T04:49:22.1551350Z' -Adapters @{GetNativeProcess=$query}
+            } "$($case.Name) cannot be reported as native absence"
+        }
+        Assert-CcodIdentityObservationThrows {
+            Get-CcodProcessIdentityObservation -ProcessId 10664 -ExpectedCreationTimeUtc '2026-08-26T04:49:22Z' -Adapters @{GetNativeProcess={param($ProcessId)$null}}
+        } 'a noncanonical expected identity is rejected before absence can be reported'
     }
 } catch {
     throw

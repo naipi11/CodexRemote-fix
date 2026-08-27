@@ -325,6 +325,44 @@ function Get-CcodDefaultNativeProcess {
     }
 }
 
+function Get-CcodProcessIdentityObservation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateRange(1,2147483647)][int]$ProcessId,
+        [Parameter(Mandatory)][string]$ExpectedCreationTimeUtc,
+        [hashtable]$Adapters
+    )
+
+    if (-not (Test-CcodCanonicalUtcTimestamp -Value $ExpectedCreationTimeUtc)) {
+        throw [IO.InvalidDataException]::new('ExpectedCreationTimeUtc must be a canonical UTC timestamp.')
+    }
+    $adapter = Get-CcodProcessAdapters -Adapters $Adapters
+    $output = @(& $adapter.GetNativeProcess $ProcessId 2>&1)
+    if ($output.Count -eq 0 -or ($output.Count -eq 1 -and $null -eq $output[0])) {
+        return [pscustomobject][ordered]@{ Outcome='Absent'; Pid=$ProcessId; CreationTimeUtc=$null }
+    }
+    if ($output.Count -ne 1 -or $output[0] -is [Management.Automation.ErrorRecord]) {
+        throw [IO.InvalidDataException]::new('Native process identity query emitted an invalid result stream.')
+    }
+    $identity = $output[0]
+    if (-not (Test-CcodExactProperties -Value $identity -Names @('Pid','CreationTimeUtc','SessionId','UserSid','Path','PackageFamilyName')) -or
+        $identity.Pid -isnot [int] -or $identity.Pid -ne $ProcessId -or
+        -not (Test-CcodCanonicalUtcTimestamp -Value $identity.CreationTimeUtc) -or
+        $identity.SessionId -isnot [int] -or $identity.SessionId -lt 0 -or
+        $identity.UserSid -isnot [string] -or [string]::IsNullOrWhiteSpace($identity.UserSid) -or
+        $identity.Path -isnot [string] -or [string]::IsNullOrWhiteSpace($identity.Path) -or
+        ($null -ne $identity.PackageFamilyName -and
+            ($identity.PackageFamilyName -isnot [string] -or [string]::IsNullOrWhiteSpace($identity.PackageFamilyName)))) {
+        throw [IO.InvalidDataException]::new('Native process identity query returned a malformed receipt.')
+    }
+    $outcome = if ($identity.CreationTimeUtc -ceq $ExpectedCreationTimeUtc) { 'SameIdentity' } else { 'IdentityChanged' }
+    return [pscustomobject][ordered]@{
+        Outcome = $outcome
+        Pid = $ProcessId
+        CreationTimeUtc = [string]$identity.CreationTimeUtc
+    }
+}
+
 function Get-CcodProcessRendererProbe {
     param([int]$RendererPort, [hashtable]$Adapters)
     try {
@@ -1799,4 +1837,4 @@ function Start-CcodProcess {
     return New-CcodStartResult -Outcome 'Started' -Snapshot $null -Process $process
 }
 
-Export-ModuleMember -Function Get-CcodProcessSnapshot, Test-CcodProcessMatch, Get-CcodStalePackageProcessSnapshot, Get-CcodStalePackageRootResult, Get-CcodVerifiedProcessTree, Get-CcodVerifiedStaleProcessTree, Get-CcodTransactionProcessResult, Find-CcodTransactionProcess, Stop-CcodProcessIfMatch, Stop-CcodStaleProcessIfMatch, Request-CcodProcessGracefulCloseIfMatch, Request-CcodStaleProcessGracefulCloseIfMatch, Wait-CcodProcessExitIfMatch, Wait-CcodStaleProcessExitIfMatch, Start-CcodProcess, Request-CcodOrdinaryPackagedLaunch, Wait-CcodVerifiedOrdinaryRoot, Get-CcodAvailableLoopbackPort, Wait-CcodPortClosed
+Export-ModuleMember -Function Get-CcodProcessIdentityObservation, Get-CcodProcessSnapshot, Test-CcodProcessMatch, Get-CcodStalePackageProcessSnapshot, Get-CcodStalePackageRootResult, Get-CcodVerifiedProcessTree, Get-CcodVerifiedStaleProcessTree, Get-CcodTransactionProcessResult, Find-CcodTransactionProcess, Stop-CcodProcessIfMatch, Stop-CcodStaleProcessIfMatch, Request-CcodProcessGracefulCloseIfMatch, Request-CcodStaleProcessGracefulCloseIfMatch, Wait-CcodProcessExitIfMatch, Wait-CcodStaleProcessExitIfMatch, Start-CcodProcess, Request-CcodOrdinaryPackagedLaunch, Wait-CcodVerifiedOrdinaryRoot, Get-CcodAvailableLoopbackPort, Wait-CcodPortClosed
