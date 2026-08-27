@@ -273,7 +273,7 @@ git commit -m "test: require the real installed Codex lifecycle"
 
 ---
 
-### Task 4: Build, review, publish, and validate v2.5.21
+### Task 4: Prepare and validate the v2.5.21 release candidate
 
 **Files:**
 - Modify: `package.json`
@@ -285,7 +285,7 @@ git commit -m "test: require the real installed Codex lifecycle"
 
 **Interfaces:**
 - Consumes: Tasks 1–3 commits and existing release/build/checksum/provenance workflow.
-- Produces: official installer and EXE-entry portable ZIP for `v2.5.21`, both manifest-bound to the release commit.
+- Produces: one clean, tested `v2.5.21` release commit with synchronized metadata and concise documentation.
 
 - [ ] **Step 1: Bump version metadata and concise documentation**
 
@@ -308,23 +308,49 @@ npm test
 
 The live installed Supervisor holds the real user AccountTransition mutex, so Bootstrap validation must run in an isolated Windows identity/task environment or after a separately proven safe Supervisor stop/restart. A mutex-collision failure is not a pass and must not be suppressed.
 
-- [ ] **Step 4: Request independent review**
+- [ ] **Step 4: Commit any test-driven metadata correction**
+
+If validation exposes a metadata or documentation defect, write the failing release-contract test first, make only the minimal correction, rerun the covering test, and commit it before Task 4 review. Leave the worktree clean.
+
+---
+
+### Task 5: Review, build, publish, and reinstall v2.5.21
+
+**Files:**
+- No planned source edits; any final-review correction must be implemented in one reviewed fix wave with covering tests.
+
+**Interfaces:**
+- Consumes: the clean Task 4 release commit, all task reports/reviews, existing release workflow, Inno builder, portable builder, Defender validator, and installed lifecycle harness.
+- Produces: official installer and EXE-entry portable ZIP for `v2.5.21`, both manifest-bound to the release commit, plus current-computer installed evidence.
+
+- [ ] **Step 1: Request independent whole-branch review**
 
 Review the complete diff from `v2.5.20` through HEAD for process-identity safety, fence ordering, multiple-root rejection, diagnostics redaction, harness correctness, version metadata, and documentation scope. Resolve every P0/P1 and re-run covering tests.
 
-- [ ] **Step 5: Build and validate clean official artifacts**
+- [ ] **Step 2: Build and validate clean official artifacts**
 
 Build from a clean commit using the existing Inno/portable pipeline. Validate installer, ZIP, checksums, release manifest, payload manifest, TrayHost provenance, every archived payload file, EXE portable entry point, Defender scan, Zone metadata, and version resources.
 
-- [ ] **Step 6: Publish v2.5.21 and verify release readback**
+- [ ] **Step 3: Publish v2.5.21 and verify release readback**
 
 Push the reviewed release commit/tag through the existing GitHub Actions release workflow. Confirm all jobs pass, the release is neither draft nor prerelease, all expected assets exist, and downloaded official hashes match uploaded digests.
 
-- [ ] **Step 7: Install the official asset on the current computer**
+- [ ] **Step 4: Install the official asset on the current computer**
 
 Record the device-key SHA-256 before install, perform the full reinstall through the physical host boundary, verify active runtime `2.5.21-*`, current Supervisor and TrayHost paths, exact completed installer lifecycle receipt, real `ChatGPT.exe` top-level identity/status correlation, bridge validation, and unchanged device-key hash.
 
-- [ ] **Step 8: Validate the affected computer after reboot**
+---
+
+### Task 6: Validate the affected computer after reboot
+
+**Files:**
+- No repository edits unless the affected-machine evidence proves a new reproducible defect; any such defect starts a new RED/GREEN/review cycle before another release.
+
+**Interfaces:**
+- Consumes: official v2.5.21 installer, affected-machine process/status/receipt/log evidence, and a real remote device.
+- Produces: final acceptance evidence that the original stale-status failure is repaired across a Windows reboot.
+
+- [ ] **Step 1: Install, reboot, and verify the affected computer**
 
 Install the official `v2.5.21` asset on the affected computer, reboot Windows, and require:
 
