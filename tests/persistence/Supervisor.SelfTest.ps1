@@ -1566,6 +1566,67 @@ Invoke-CcodTest 'authorizes an acknowledged displayed revision after a newer cap
     Assert-CcodEqual 'Accepted' $result.Status 'the displayed and acknowledged revision remains action authority after a newer capable projection'
 }
 
+Invoke-CcodTest 'records an acknowledged OpenLogs terminal outcome after its handler and before result delivery' {
+    # Production mutation caught: omitting the sanitized terminal record, logging before the handler, or bypassing the revision-bound OpenLogs handler.
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $hostState.Tray.CurrentRevision=[UInt64]7
+    $enabled=[pscustomobject][ordered]@{RepairEnabled=$true;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true}
+    $hostState.Tray.AcknowledgedPresentations['7']=$enabled
+    $hostState.LastAcknowledgedPresentation=$enabled
+    $action=[pscustomobject][ordered]@{ActionId=[guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeee71';Command='OpenLogs';Revision=[UInt64]7}
+
+    $result=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)[0]
+
+    Assert-CcodEqual 'Completed' $result.Status 'acknowledged revision reaches the OpenLogs handler'
+    Assert-CcodEqual 1 @($world.Calls|Where-Object{$_ -eq 'Open:Logs'}).Count 'current acknowledged action invokes OpenLogs exactly once'
+    Assert-CcodEqual 1 $world.UiFailureRecords.Count 'terminal action writes exactly one local diagnostic record'
+    $record=$world.UiFailureRecords[0]
+    Assert-CcodEqual 'schemaVersion,timestampUtc,component,stage,code,outcome,command,revision,status' (@($record.PSObject.Properties.Name)-join ',') 'terminal diagnostic record is an exact sanitized schema'
+    Assert-CcodEqual 'Supervisor' $record.component 'terminal diagnostic identifies the authorizing component'
+    Assert-CcodEqual 'TrayAction' $record.stage 'terminal diagnostic uses the tray action stage'
+    Assert-CcodEqual 'CCOD_TRAY_ACTION_COMPLETED' $record.code 'successful terminal diagnostic uses a safe canonical code'
+    Assert-CcodEqual 'Completed' $record.outcome 'terminal diagnostic outcome is completed'
+    Assert-CcodEqual 'OpenLogs' $record.command 'terminal diagnostic preserves the exact command'
+    Assert-CcodEqual ([UInt64]7) $record.revision 'terminal diagnostic preserves the displayed presentation revision'
+    Assert-CcodEqual 'Completed' $record.status 'terminal diagnostic preserves the exact terminal status'
+    $calls=@($world.Calls)
+    Assert-CcodTrue ([Array]::IndexOf($calls,'Open:Logs') -lt [Array]::IndexOf($calls,'Log:CCOD_TRAY_ACTION_COMPLETED')) 'handler side effect precedes terminal logging'
+    Assert-CcodTrue ([Array]::IndexOf($calls,'Log:CCOD_TRAY_ACTION_COMPLETED') -lt [Array]::IndexOf($calls,'ActionResult:Completed')) 'terminal logging precedes host result delivery'
+}
+
+Invoke-CcodTest 'rejects and records an unacknowledged OpenLogs revision before any handler side effect' {
+    # Production mutation caught: authorizing an unacknowledged revision, invoking OpenLogs before the gate, or losing the stable stale diagnostic.
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $hostState.Tray.CurrentRevision=[UInt64]8
+    $action=[pscustomobject][ordered]@{ActionId=[guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeee81';Command='OpenLogs';Revision=[UInt64]8}
+
+    $result=@(Invoke-CcodSupervisorCommand $hostState $fixture.Fake.Adapters $action)[0]
+
+    Assert-CcodEqual 'Rejected' $result.Status 'unacknowledged revision is rejected'
+    Assert-CcodEqual 'CCOD_TRAY_ACTION_STALE' $result.ErrorCode 'unacknowledged revision returns the stable stale code'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_ -eq 'Open:Logs'}).Count 'stale revision is rejected before the OpenLogs handler'
+    Assert-CcodEqual 1 $world.UiFailureRecords.Count 'stale action writes exactly one local diagnostic record'
+    $record=$world.UiFailureRecords[0]
+    Assert-CcodEqual 'schemaVersion,timestampUtc,component,stage,code,outcome,command,revision,status' (@($record.PSObject.Properties.Name)-join ',') 'stale diagnostic record is an exact sanitized schema'
+    Assert-CcodEqual 'CCOD_TRAY_ACTION_STALE' $record.code 'stale diagnostic preserves the exact canonical code'
+    Assert-CcodEqual 'OpenLogs' $record.command 'stale diagnostic preserves the rejected command'
+    Assert-CcodEqual ([UInt64]8) $record.revision 'stale diagnostic preserves the unacknowledged revision'
+    Assert-CcodEqual 'Rejected' $record.status 'stale diagnostic preserves the rejected terminal status'
+    $calls=@($world.Calls)
+    Assert-CcodTrue ([Array]::IndexOf($calls,'Log:CCOD_TRAY_ACTION_STALE') -lt [Array]::IndexOf($calls,'ActionResult:Rejected')) 'stale diagnostic is written before generic failure feedback can be queued'
+}
+
+Invoke-CcodTest 'sanitizes a malformed terminal action code before local logging' {
+    # Production mutation caught: allowing a newline or other noncanonical text into the local terminal diagnostic record.
+    $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
+    $action=[pscustomobject][ordered]@{ActionId=[guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeee91';Command='OpenLogs';Revision=[UInt64]1}
+
+    [void](Send-CcodSupervisorTrayActionResult $hostState $fixture.Fake.Adapters $action Rejected "CCOD_INJECTED`n" $null)
+
+    Assert-CcodEqual 1 $world.UiFailureRecords.Count 'malformed terminal code still produces one safe diagnostic'
+    Assert-CcodEqual 'CCOD_TRAY_ACTION_FAILED' $world.UiFailureRecords[0].code 'malformed terminal code is replaced by the canonical fallback'
+}
+
 Invoke-CcodTest 'rejects an action revision that was published but never acknowledged as displayed' {
     $fixture=New-CcodTickFixture;$world=$fixture.Fake.World;$hostState=$fixture.Host
     $hostState.Tray.CurrentRevision=[UInt64]9

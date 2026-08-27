@@ -142,8 +142,8 @@ internal static class TrayHostTransportSelfTest
         AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(rejectedId, 20UL, TrayActionResultStatus.Rejected, "CCOD_TRAY_ACTION_UNAVAILABLE", null)), "correlated rejected result is accepted");
         AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(failedId, 20UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null)), "correlated failed result is accepted");
         TrayActionResult first; TrayActionResult second; TrayActionResult none;
-        AssertTrue(host.TryTakeFailedAction(out first) && first.ActionId == rejectedId && first.Status == TrayActionResultStatus.Rejected, "rejected result queues user feedback");
-        AssertTrue(host.TryTakeFailedAction(out second) && second.ActionId == failedId && second.Status == TrayActionResultStatus.Failed, "failed result queues user feedback");
+        AssertTrue(host.TryTakeFailedAction(out first) && first.ActionId == rejectedId && first.Revision == 20UL && first.Status == TrayActionResultStatus.Rejected && String.Equals(first.ErrorCode, "CCOD_TRAY_ACTION_UNAVAILABLE", StringComparison.Ordinal), "rejected result preserves its exact correlated terminal record before generic feedback");
+        AssertTrue(host.TryTakeFailedAction(out second) && second.ActionId == failedId && second.Revision == 20UL && second.Status == TrayActionResultStatus.Failed && String.Equals(second.ErrorCode, "CCOD_TRAY_ACTION_FAILED", StringComparison.Ordinal), "failed result preserves its exact correlated terminal record before generic feedback");
         AssertTrue(!host.TryTakeFailedAction(out none), "each terminal failure queues feedback exactly once");
         host.Dispose();
     }

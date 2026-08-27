@@ -1154,9 +1154,26 @@ function Throw-CcodSupervisorCommandError {
     throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new($Message),$Code,[Management.Automation.ErrorCategory]::InvalidData,$Target)
 }
 
+function Write-CcodSupervisorTrayActionTerminal {
+    param($HostState,[hashtable]$Adapters,$Action,[ValidateSet('Completed','Rejected','Failed')][string]$Status,[AllowNull()][string]$ErrorCode)
+    $code=if($Status-ceq'Completed'){'CCOD_TRAY_ACTION_COMPLETED'}elseif($ErrorCode-is[string]-and$ErrorCode-cmatch'^CCOD_[A-Z0-9_]{1,91}\z'){$ErrorCode}else{'CCOD_TRAY_ACTION_FAILED'}
+    try{
+        $now=Invoke-CcodSupervisorAdapter $Adapters.GetUtcNow @() 1
+        if($now-is[DateTimeOffset]){$timestamp=$now.UtcDateTime.ToString('o',[Globalization.CultureInfo]::InvariantCulture)}
+        elseif($now-is[DateTime]){$timestamp=$now.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)}
+        else{throw 'tray action clock is invalid'}
+        $record=[pscustomobject][ordered]@{
+            schemaVersion=1;timestampUtc=$timestamp;component='Supervisor';stage='TrayAction';code=$code;outcome=$Status
+            command=[string]$Action.Command;revision=[UInt64]$Action.Revision;status=$Status
+        }
+        Invoke-CcodSupervisorAdapter $Adapters.WriteLog @($record) 0
+    }catch{Add-CcodSupervisorCleanupCode $HostState.RuntimeCleanupCodes 'CCOD_SUPERVISOR_LOG_FAILED'}
+}
+
 function Send-CcodSupervisorTrayActionResult {
     param($HostState,[hashtable]$Adapters,$Action,[ValidateSet('Accepted','Completed','Rejected','Failed')][string]$Status,[AllowNull()][string]$ErrorCode,[AllowNull()][string]$TransactionId)
     $result=[pscustomobject][ordered]@{ActionId=$Action.ActionId;Revision=[UInt64]$Action.Revision;Status=$Status;ErrorCode=$ErrorCode;TransactionId=$TransactionId}
+    if($Status-cne'Accepted'){Write-CcodSupervisorTrayActionTerminal $HostState $Adapters $Action $Status $ErrorCode}
     try{
         $delivered=Invoke-CcodSupervisorAdapter $Adapters.SendTrayActionResult @($HostState.Tray,$result.ActionId,$result.Revision,$result.Status,$result.ErrorCode,$result.TransactionId) 1
         if($delivered-isnot[bool]-or-not$delivered){throw 'tray action result was not acknowledged'}
