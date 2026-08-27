@@ -174,6 +174,31 @@ function Assert-CcodLifecycleInstallPathSafe {
     return $candidate
 }
 
+function Assert-CcodLifecycleInstallTreeSafe {
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $tree = Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $Path
+    if (-not [IO.Directory]::Exists($tree)) { return $tree }
+    $prefix = $tree.TrimEnd('\') + '\'
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($tree)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($item in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)) {
+            $full = [IO.Path]::GetFullPath($item.FullName)
+            if (-not $full.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase) -or
+                ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Throw-CcodLifecycleError 'CCOD_INSTALL_REPARSE_PATH' 'Install tree contains a reparse point or escaped entry' $full
+            }
+            if ($item.PSIsContainer) { $pending.Push($full) }
+        }
+    }
+    return $tree
+}
+
 function Test-CcodLifecycleReparse {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
@@ -541,6 +566,10 @@ function Copy-CcodLifecycleStaging {
             if (-not $destination.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
                 Throw-CcodLifecycleError 'CCOD_INSTALL_STAGING_PATH_INVALID' 'Staging path escaped the staging root' $destination
             }
+            $destinationParent = Split-Path $destination -Parent
+            [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $destinationParent)
+            [IO.Directory]::CreateDirectory($destinationParent) | Out-Null
+            [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $destinationParent)
             [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $destination)
             & $Adapters.CopyFile $file.Source $destination
             [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $destination)
@@ -557,6 +586,7 @@ function Copy-CcodLifecycleStaging {
         if (-not [IO.File]::Exists($bootstrapSource)) {
             Throw-CcodLifecycleError 'CCOD_INSTALL_SOURCE_INCOMPLETE' 'The verified staging bootstrap script is missing' $bootstrapSource
         }
+        [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $bootstrapPath)
         & $Adapters.CopyFile $bootstrapSource $bootstrapPath
         [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $bootstrapPath)
         if ((Get-CcodLifecycleFileSha256 -Path $bootstrapPath) -cne (Get-CcodLifecycleFileSha256 -Path $bootstrapSource)) {
@@ -565,6 +595,7 @@ function Copy-CcodLifecycleStaging {
         $copiedStableBootstrap = $true
         $uninstallerSource = Join-Path $stagingDirectory 'Uninstall-CodexControlOtherDevices.ps1'
         if ([IO.File]::Exists($uninstallerSource)) {
+            [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $uninstallerPath)
             & $Adapters.CopyFile $uninstallerSource $uninstallerPath
             [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $uninstallerPath)
             if ((Get-CcodLifecycleFileSha256 -Path $uninstallerPath) -cne (Get-CcodLifecycleFileSha256 -Path $uninstallerSource)) {
@@ -575,13 +606,13 @@ function Copy-CcodLifecycleStaging {
         return $stagingDirectory
     } catch {
         if ([IO.Directory]::Exists($stagingDirectory)) {
-            try { [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $stagingDirectory); Remove-Item -LiteralPath $stagingDirectory -Recurse -Force -ErrorAction Stop } catch { }
+            try { [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $InstallRoot -Path $stagingDirectory); Remove-Item -LiteralPath $stagingDirectory -Recurse -Force -ErrorAction Stop } catch { }
         }
         if ($copiedStableBootstrap -and -not $bootstrapExistedBefore -and [IO.File]::Exists($bootstrapPath)) {
-            try { Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction Stop } catch { }
+            try { [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $bootstrapPath); Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction Stop } catch { }
         }
         if ($copiedStableUninstaller -and -not $uninstallerExistedBefore -and [IO.File]::Exists($uninstallerPath)) {
-            try { Remove-Item -LiteralPath $uninstallerPath -Force -ErrorAction Stop } catch { }
+            try { [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $uninstallerPath); Remove-Item -LiteralPath $uninstallerPath -Force -ErrorAction Stop } catch { }
         }
         $candidateId = ([string]$_.FullyQualifiedErrorId -split ',')[0]
         if ($candidateId -clike 'CCOD_INSTALL_*' -or $candidateId -clike 'CCOD_*') {
@@ -1422,6 +1453,10 @@ function Get-CcodLifecycleAdapters {
             [IO.Directory]::CreateDirectory((Split-Path $Destination -Parent)) | Out-Null
             [IO.File]::Copy($Source, $Destination, $true)
         }
+        NewRuntimeManifest = {
+            param($RuntimeDirectory, $ProjectVersion)
+            New-CcodRuntimeManifest -RuntimeDirectory $RuntimeDirectory -ProjectVersion $ProjectVersion
+        }
         WriteLog = {
             param($InstallRoot, $Record)
             $logDirectory = Join-Path $InstallRoot 'logs'
@@ -1664,6 +1699,7 @@ function Remove-CcodLifecycleOldRuntimes {
         if ($directory.Name -ceq $ActiveRuntimeId -or $directory.Name -ceq $PreviousRuntimeId) { continue }
         [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $directory.FullName)
         [void](Test-CcodLifecycleRemovePath -Root $InstallRoot -Path $directory.FullName)
+        [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $InstallRoot -Path $directory.FullName)
         Remove-Item -LiteralPath $directory.FullName -Recurse -Force -ErrorAction Stop
     }
 }
@@ -1820,12 +1856,15 @@ function Invoke-CcodInstall {
 
         Write-CcodInstallActivationPhase -Activation $activation -Phase 'InstallingRuntime' -RuntimeId $null -PreviousRuntimeId $(if ($upgrade) { [string]$existingPointer.activeRuntime } else { $null }) -ErrorCode $null -Adapters $adapters -InstallRoot $root | Out-Null
         $stagingDirectory = Copy-CcodLifecycleStaging -SourceRoot $sourceRoot -InstallRoot $root -Adapters $adapters -Files $files
-        $manifest = New-CcodRuntimeManifest -RuntimeDirectory $stagingDirectory -ProjectVersion $projectVersion
+        $manifest = & $adapters.NewRuntimeManifest $stagingDirectory $projectVersion
+        $stagingManifestPath = Join-Path $stagingDirectory 'manifest.json'
+        [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $root -Path $stagingManifestPath)
         [IO.File]::WriteAllText(
-            (Join-Path $stagingDirectory 'manifest.json'),
+            $stagingManifestPath,
             ($manifest | ConvertTo-Json -Depth 16),
             [Text.UTF8Encoding]::new($false)
         )
+        [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $root -Path $stagingManifestPath)
         $runtimeId = [string]$manifest.runtimeId
         $validation = Test-CcodRuntimeManifest -RuntimeDirectory $stagingDirectory -ExpectedRuntimeId $runtimeId
         if (-not $validation.Valid) {
@@ -1841,12 +1880,12 @@ function Invoke-CcodInstall {
                 Throw-CcodLifecycleError 'CCOD_INSTALL_RUNTIME_CONFLICT' 'An invalid runtime already occupies the target runtime id' $runtimeRoot
             }
             if ([IO.Directory]::Exists($stagingDirectory)) {
-                try { [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $root -Path $stagingDirectory); Remove-Item -LiteralPath $stagingDirectory -Recurse -Force -ErrorAction Stop } catch { }
+                try { [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $root -Path $stagingDirectory); Remove-Item -LiteralPath $stagingDirectory -Recurse -Force -ErrorAction Stop } catch { }
             }
         } else {
             [IO.Directory]::CreateDirectory($runtimeContainer) | Out-Null
             [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $root -Path $runtimeContainer)
-            [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $root -Path $stagingDirectory)
+            [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $root -Path $stagingDirectory)
             [IO.Directory]::Move($stagingDirectory, $runtimeRoot)
             [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $root -Path $runtimeRoot)
             $runtimeCreated = $true
@@ -1976,7 +2015,7 @@ function Invoke-CcodInstall {
             }
         }
         if (-not $pointerCommitted -and $runtimeCreated -and $null -ne $runtimeRoot -and [IO.Directory]::Exists($runtimeRoot)) {
-            try { [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $root -Path $runtimeRoot); Remove-Item -LiteralPath $runtimeRoot -Recurse -Force -ErrorAction Stop } catch { }
+            try { [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $root -Path $runtimeRoot); Remove-Item -LiteralPath $runtimeRoot -Recurse -Force -ErrorAction Stop } catch { }
         }
         if ($errorCode -cne 'CCOD_INSTALL_ACTIVATION_RECEIPT_FAILED') {
             try {
@@ -1996,11 +2035,11 @@ function Invoke-CcodInstall {
             try { & $adapters.ExitLifecycleOwnership $lifecycleOwnership | Out-Null } catch { }
         }
         if ($null -ne $stagingDirectory -and [IO.Directory]::Exists($stagingDirectory)) {
-            try { [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $root -Path $stagingDirectory); Remove-Item -LiteralPath $stagingDirectory -Recurse -Force -ErrorAction Stop } catch { }
+            try { [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $root -Path $stagingDirectory); Remove-Item -LiteralPath $stagingDirectory -Recurse -Force -ErrorAction Stop } catch { }
         }
         $stagingRoot = [IO.Path]::GetFullPath((Join-Path $root '.staging'))
         if ([IO.Directory]::Exists($stagingRoot) -and -not (Test-CcodLifecycleReparse -Path $stagingRoot)) {
-            try { [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $root -Path $stagingRoot); Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction Stop } catch { }
+            try { [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $root -Path $stagingRoot); Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction Stop } catch { }
         }
     }
 

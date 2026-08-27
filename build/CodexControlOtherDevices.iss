@@ -129,6 +129,42 @@ begin
      ((Attributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) = 0));
 end;
 
+function IsSafeExistingSetupTree(const DirectoryName: String): Boolean;
+var
+  Attributes: Cardinal;
+  FindRec: TFindRec;
+  ChildPath: String;
+begin
+  Result := IsSafeExistingPayloadDirectory(DirectoryName);
+  if not Result then Exit;
+  Attributes := GetFileAttributesW(DirectoryName);
+  if Attributes = CCOD_INVALID_FILE_ATTRIBUTES then Exit;
+  if FindFirst(AddBackslash(DirectoryName) + '*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+        begin
+          ChildPath := AddBackslash(DirectoryName) + FindRec.Name;
+          if (FindRec.Attributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) <> 0 then
+          begin
+            Result := False;
+            Exit;
+          end;
+          if ((FindRec.Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) and
+             (not IsSafeExistingSetupTree(ChildPath)) then
+          begin
+            Result := False;
+            Exit;
+          end;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   AppDirectory, PayloadDirectory, VersionDirectory: String;
@@ -137,7 +173,17 @@ begin
   AppDirectory := ExpandConstant('{app}');
   PayloadDirectory := ExpandConstant('{app}\payload');
   VersionDirectory := ExpandConstant('{app}\payload\{#ProjectVersion}');
-  if not IsSafeExistingPayloadDirectory(AppDirectory) or
+  if not IsSafeExistingSetupTree(AppDirectory) or
+     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\build')) or
+     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\bin')) or
+     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\.github')) or
+     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\.github\workflows')) or
+     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\assets')) or
+     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\assets\codexremote-fix')) or
+     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\docs')) or
+     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\src')) or
+     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\tests')) or
+     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\tools')) or
      not IsSafeExistingPayloadDirectory(PayloadDirectory) or
      not IsSafeExistingPayloadDirectory(VersionDirectory) then
     Result := 'CodexRemote-fix refused an unsafe existing payload directory.';

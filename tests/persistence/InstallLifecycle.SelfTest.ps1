@@ -840,6 +840,88 @@ $results += Invoke-CcodTest 'runtime junction is rejected before staging promoti
     }
 }
 
+$results += Invoke-CcodTest 'stable bootstrap leaf junction is rejected before copy' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $target = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source | Out-Null
+        [IO.Directory]::CreateDirectory($install) | Out-Null
+        [IO.Directory]::CreateDirectory($target) | Out-Null
+        $bootstrapLink = Join-Path $install 'bootstrap.ps1'
+        New-Item -ItemType Junction -Path $bootstrapLink -Target $target | Out-Null
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        Assert-CcodThrows { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters | Out-Null } 'CCOD_INSTALL_REPARSE_PATH'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath $target -Force).Count 'stable bootstrap junction target receives no bytes'
+    } finally {
+        $bootstrapLink = Join-Path $install 'bootstrap.ps1'
+        if (Test-Path -LiteralPath $bootstrapLink) { [IO.Directory]::Delete($bootstrapLink) }
+        foreach ($path in @($source,$install,$target,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+$results += Invoke-CcodTest 'runtime manifest leaf junction is rejected before write' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $target = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source | Out-Null
+        [IO.Directory]::CreateDirectory($target) | Out-Null
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        $fake = New-CcodLifecycleFake -NodePath $nodePath
+        $fake.Adapters.NewRuntimeManifest = {
+            param($RuntimeDirectory,$ProjectVersion)
+            $manifest = New-CcodRuntimeManifest -RuntimeDirectory $RuntimeDirectory -ProjectVersion $ProjectVersion
+            New-Item -ItemType Junction -Path (Join-Path $RuntimeDirectory 'manifest.json') -Target $target | Out-Null
+            return $manifest
+        }.GetNewClosure()
+        Assert-CcodThrows { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters | Out-Null } 'CCOD_INSTALL_REPARSE_PATH'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath $target -Force).Count 'runtime manifest junction target receives no bytes'
+    } finally {
+        foreach ($staging in @(Get-ChildItem -LiteralPath (Join-Path $install '.staging') -Directory -ErrorAction SilentlyContinue)) {
+            $link = Join-Path $staging.FullName 'manifest.json'
+            if (Test-Path -LiteralPath $link) { [IO.Directory]::Delete($link) }
+        }
+        foreach ($path in @($source,$install,$target,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+$results += Invoke-CcodTest 'staging cleanup refuses a nested junction after copy failure' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $target = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source | Out-Null
+        [IO.Directory]::CreateDirectory($target) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $target 'sentinel.txt'),'keep',[Text.UTF8Encoding]::new($false))
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        $fake = New-CcodLifecycleFake -NodePath $nodePath
+        $fake.World.CopyOverride = [pscustomobject]@{
+            Match = '*Supervisor.ps1'
+            Action = {
+                param($SourcePath,$DestinationPath)
+                $stagingDirectory = Split-Path (Split-Path (Split-Path $DestinationPath -Parent) -Parent) -Parent
+                [IO.Directory]::CreateDirectory($stagingDirectory) | Out-Null
+                New-Item -ItemType Junction -Path (Join-Path $stagingDirectory 'cleanup-escape') -Target $target | Out-Null
+                throw 'PRIVATE_COPY_FAILURE_AFTER_JUNCTION'
+            }.GetNewClosure()
+        }
+        Assert-CcodThrows { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters | Out-Null } 'CCOD_INSTALL_STAGING_FAILED'
+        $retained = @(Get-ChildItem -LiteralPath (Join-Path $install '.staging') -Directory -ErrorAction SilentlyContinue | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'cleanup-escape') })
+        Assert-CcodEqual 1 $retained.Count 'unsafe staging tree is retained instead of recursively deleted'
+        Assert-CcodEqual 'keep' ([IO.File]::ReadAllText((Join-Path $target 'sentinel.txt'))) 'cleanup never deletes through the nested junction'
+    } finally {
+        foreach ($staging in @(Get-ChildItem -LiteralPath (Join-Path $install '.staging') -Directory -ErrorAction SilentlyContinue)) {
+            $link = Join-Path $staging.FullName 'cleanup-escape'
+            if (Test-Path -LiteralPath $link) { [IO.Directory]::Delete($link) }
+        }
+        foreach ($path in @($source,$install,$target,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
 $results += Invoke-CcodTest 'payload manifest ancestry treats Windows root equality case-insensitively' {
     $source = New-CcodLifecycleTempRoot
     $install = New-CcodLifecycleTempRoot

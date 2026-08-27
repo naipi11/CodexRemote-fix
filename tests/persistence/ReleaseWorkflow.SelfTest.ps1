@@ -316,17 +316,25 @@ Invoke-CcodTest 'Inno exposes a pre-write payload-directory reparse gate' {
     $inno = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
     $helper = [regex]::Match($inno,'(?ms)^function IsSafeExistingPayloadDirectory\(.*?^end;')
     Assert-CcodTrue $helper.Success 'production Inno script exposes the directory predicate used before payload writes'
-    Assert-CcodTrue ($inno -cmatch '(?ms)^function PrepareToInstall\(var NeedsRestart: Boolean\): String;.*?IsSafeExistingPayloadDirectory') 'PrepareToInstall rejects unsafe app and payload directories before file copy'
+    $treeHelper = [regex]::Match($inno,'(?ms)^function IsSafeExistingSetupTree\(.*?^end;')
+    Assert-CcodTrue $treeHelper.Success 'production Inno script exposes a recursive destination-tree predicate'
+    Assert-CcodTrue ($inno -cmatch '(?ms)^function PrepareToInstall\(var NeedsRestart: Boolean\): String;.*?IsSafeExistingSetupTree') 'PrepareToInstall rejects unsafe nested setup destinations before file copy'
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-inno-reparse-harness-' + [guid]::NewGuid().ToString('N'))
     try {
         $normal = Join-Path $root 'normal'
         $target = Join-Path $root 'target'
         $junction = Join-Path $root 'junction'
         $missing = Join-Path $root 'missing'
+        $tree = Join-Path $root 'tree'
+        $nested = Join-Path $tree 'src\escape'
+        $fileDirectory = Join-Path $root 'file-as-directory'
         $resultPath = Join-Path $root 'result.txt'
         [IO.Directory]::CreateDirectory($normal) | Out-Null
         [IO.Directory]::CreateDirectory($target) | Out-Null
+        [IO.Directory]::CreateDirectory((Split-Path $nested -Parent)) | Out-Null
         New-Item -ItemType Junction -Path $junction -Target $target | Out-Null
+        New-Item -ItemType Junction -Path $nested -Target $target | Out-Null
+        [IO.File]::WriteAllText($fileDirectory,'not a directory',[Text.UTF8Encoding]::new($false))
         $harnessPath = Join-Path $root 'ReparseGate.iss'
         $harness = @"
 [Setup]
@@ -345,11 +353,14 @@ const
 function GetFileAttributesW(const FileName: String): Cardinal;
   external 'GetFileAttributesW@kernel32.dll stdcall';
 $($helper.Value)
+$($treeHelper.Value)
 function InitializeSetup(): Boolean;
 begin
   if IsSafeExistingPayloadDirectory('$($normal.Replace("'","''"))') and
      IsSafeExistingPayloadDirectory('$($missing.Replace("'","''"))') and
-     (not IsSafeExistingPayloadDirectory('$($junction.Replace("'","''"))')) then
+     (not IsSafeExistingPayloadDirectory('$($junction.Replace("'","''"))')) and
+     (not IsSafeExistingSetupTree('$($tree.Replace("'","''"))')) and
+     (not IsSafeExistingSetupTree('$($fileDirectory.Replace("'","''"))')) then
     SaveStringToFile('$($resultPath.Replace("'","''"))','pass',False);
   Result := False;
 end;
@@ -360,7 +371,7 @@ end;
         Assert-CcodEqual 0 $LASTEXITCODE "reparse predicate harness compiles: $($compileOutput -join ' ')"
         $process = Start-Process -FilePath (Join-Path $root 'ReparseGate.exe') -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-') -WindowStyle Hidden -Wait -PassThru
         try { $null = $process.ExitCode } finally { $process.Dispose() }
-        Assert-CcodEqual 'pass' ([IO.File]::ReadAllText($resultPath,[Text.UTF8Encoding]::new($false))) 'production predicate accepts absent/normal directories and rejects a junction'
+        Assert-CcodEqual 'pass' ([IO.File]::ReadAllText($resultPath,[Text.UTF8Encoding]::new($false))) 'production predicate rejects root/nested junctions and file-valued directory paths'
     } finally {
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
     }
