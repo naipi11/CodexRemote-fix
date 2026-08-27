@@ -80,6 +80,19 @@ Invoke-CcodTest 'release defender tool exposes manifest and scan functions witho
     Assert-CcodTrue ($null -ne (Get-Command Invoke-CcodReleaseDefenderCheck -ErrorAction SilentlyContinue)) 'Defender invocation is available'
 }
 
+Invoke-CcodTest 'setup build and activation bind one immutable versioned payload end to end' {
+    $build = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw -Encoding UTF8
+    $inno = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
+    $activation = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -Raw -Encoding UTF8
+    $installer = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Install-CodexControlOtherDevices.ps1') -Raw -Encoding UTF8
+
+    Assert-CcodTrue ($build -cmatch 'installer-payload\.manifest\.json' -and $build -cmatch 'schemaVersion\s*=\s*1\s+projectVersion\s*=\s*\$Version\s+files\s*=\s*\$payloadRecords') 'build emits the canonical ordered setup payload manifest'
+    Assert-CcodTrue ($inno -cmatch 'InstallerPayloadDirectory' -and $inno -cmatch 'DestDir:\s*"\{app\}\\payload\\\{#ProjectVersion\}"') 'Inno copies the immutable build payload into its exact version directory'
+    Assert-CcodTrue ($inno -cmatch "ExpandConstant\('\{app\}\\payload\\\{#ProjectVersion\}'\)" -and $inno -cmatch '-ExpectedVersion\s+"\{#ProjectVersion\}') 'Inno binds activation to its compiled payload version'
+    Assert-CcodTrue ($activation -cmatch '\[string\]\$ExpectedVersion' -and $activation -cmatch 'installer-payload\.manifest\.json') 'activation accepts and resolves the expected payload contract'
+    Assert-CcodTrue ($installer -cmatch '\[string\]\$ExpectedVersion' -and $installer -cmatch '\[string\]\$PayloadManifestPath' -and $installer -cmatch '-ExpectedVersion\s+\$ExpectedVersion' -and $installer -cmatch '-PayloadManifestPath\s+\$PayloadManifestPath') 'installer forwards the immutable payload contract to lifecycle activation'
+}
+
 Invoke-CcodTest 'release manifest binds the final asset names hashes version commit and timestamp' {
     . $defenderPath -Library
     $fixture = New-CcodReleaseFixture

@@ -363,6 +363,108 @@ function Get-CcodLifecycleSourceFiles {
     return @($files)
 }
 
+function Get-CcodLifecyclePayloadManifestFiles {
+    param(
+        [Parameter(Mandatory)][string]$SourceRoot,
+        [Parameter(Mandatory)][string]$ExpectedVersion,
+        [Parameter(Mandatory)][string]$PayloadManifestPath
+    )
+
+    if ($ExpectedVersion -cnotmatch '^\d+\.\d+\.\d+$') {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_INPUT_INVALID' 'ExpectedVersion must be a canonical three-part project version' $ExpectedVersion
+    }
+    $root = Get-CcodLifecycleCanonicalRoot -Path $SourceRoot -Kind 'Source root'
+    try { $manifestPath = [IO.Path]::GetFullPath($PayloadManifestPath) }
+    catch { Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' 'Payload manifest path could not be canonicalized' $PayloadManifestPath }
+    $prefix = $root.TrimEnd('\') + '\'
+    if (-not $manifestPath.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase) -or -not [IO.File]::Exists($manifestPath)) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' 'Payload manifest must be a file inside the source root' $manifestPath
+    }
+    $cursor = $manifestPath
+    while ($true) {
+        if (Test-CcodLifecycleReparse -Path $cursor) {
+            Throw-CcodLifecycleError 'CCOD_INSTALL_SOURCE_REPARSE' 'Payload manifest path contains a reparse point' $cursor
+        }
+        if ($cursor -ceq $root) { break }
+        $cursor = Split-Path $cursor -Parent
+        if ([string]::IsNullOrWhiteSpace($cursor)) {
+            Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' 'Payload manifest escaped the source root' $manifestPath
+        }
+    }
+    try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -ErrorAction Stop }
+    catch { Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' 'Payload manifest is not valid JSON' $manifestPath }
+    if ($manifest -isnot [pscustomobject]) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' 'Payload manifest must be one JSON object' $manifestPath
+    }
+    $properties = @($manifest.PSObject.Properties.Name)
+    $expectedProperties = @('schemaVersion','projectVersion','files')
+    if ($properties.Count -ne $expectedProperties.Count) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' 'Payload manifest fields are invalid' $manifestPath
+    }
+    for ($index = 0; $index -lt $expectedProperties.Count; $index++) {
+        if ($properties[$index] -cne $expectedProperties[$index]) {
+            Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' 'Payload manifest fields are not canonical' $manifestPath
+        }
+    }
+    if ($manifest.schemaVersion -isnot [int] -or $manifest.schemaVersion -ne 1 -or $manifest.projectVersion -isnot [string]) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' 'Payload manifest header is invalid' $manifestPath
+    }
+    if ($manifest.projectVersion -cne $ExpectedVersion) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_VERSION_MISMATCH' 'Payload manifest does not match the expected setup version' $manifestPath
+    }
+    $records = @($manifest.files)
+    if ($records.Count -eq 0) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' 'Payload manifest contains no source records' $manifestPath
+    }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $files = [Collections.Generic.List[object]]::new()
+    $previousPath = $null
+    foreach ($record in $records) {
+        if ($record -isnot [pscustomobject] -or
+            @($record.PSObject.Properties.Name).Count -ne 3 -or
+            @($record.PSObject.Properties.Name)[0] -cne 'path' -or
+            @($record.PSObject.Properties.Name)[1] -cne 'length' -or
+            @($record.PSObject.Properties.Name)[2] -cne 'sha256' -or
+            $record.path -isnot [string] -or $record.path -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$' -or
+            $record.path.Contains('//') -or $record.path.Contains('..') -or $record.path.Contains(':') -or $record.path.Contains('\') -or
+            $record.length -isnot [ValueType] -or [int64]$record.length -lt 0 -or
+            $record.sha256 -isnot [string] -or $record.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' 'Payload manifest file record is invalid' $manifestPath
+        }
+        if (($null -ne $previousPath -and [StringComparer]::Ordinal.Compare($previousPath,[string]$record.path) -ge 0) -or -not $seen.Add([string]$record.path)) {
+            Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' 'Payload manifest file records are not strictly ordered and unique' $manifestPath
+        }
+        $previousPath = [string]$record.path
+        $source = [IO.Path]::GetFullPath((Join-Path $root ($record.path.Replace('/','\'))))
+        if (-not $source.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase) -or -not [IO.File]::Exists($source)) {
+            Throw-CcodLifecycleError 'CCOD_INSTALL_SOURCE_INCOMPLETE' 'A manifest-listed source file is missing' $source
+        }
+        $cursor = $source
+        while ($true) {
+            if (Test-CcodLifecycleReparse -Path $cursor) {
+                Throw-CcodLifecycleError 'CCOD_INSTALL_SOURCE_REPARSE' 'A manifest-listed source path contains a reparse point' $cursor
+            }
+            if ($cursor -ceq $root) { break }
+            $cursor = Split-Path $cursor -Parent
+        }
+        $item = Get-Item -LiteralPath $source -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or (Test-CcodLifecycleAlternateDataStreams -Path $source)) {
+            Throw-CcodLifecycleError 'CCOD_INSTALL_SOURCE_INCOMPLETE' 'A manifest-listed source file is not a plain data-stream file' $source
+        }
+        if ([int64]$item.Length -ne [int64]$record.length -or
+            (Get-CcodLifecycleFileSha256 -Path $source) -cne [string]$record.sha256) {
+            Throw-CcodLifecycleError 'CCOD_INSTALL_FILE_HASH_MISMATCH' 'A manifest-listed source file failed immutable payload validation' $source
+        }
+        $files.Add([pscustomobject][ordered]@{
+            Relative = ([string]$record.path).Replace('/','\')
+            Source = $source
+            ExpectedLength = [int64]$record.length
+            ExpectedSha256 = [string]$record.sha256
+        })
+    }
+    return @($files)
+}
+
 function Copy-CcodLifecycleStaging {
     param(
         [Parameter(Mandatory)][string]$SourceRoot,
@@ -407,7 +509,7 @@ function Copy-CcodLifecycleStaging {
         }
         foreach ($file in $Files) {
             $destination = [IO.Path]::GetFullPath((Join-Path $stagingDirectory $file.Relative))
-            $expected = Get-CcodLifecycleFileSha256 -Path $file.Source
+            $expected = if ($null -ne $file.PSObject.Properties['ExpectedSha256']) { [string]$file.ExpectedSha256 } else { Get-CcodLifecycleFileSha256 -Path $file.Source }
             $actual = Get-CcodLifecycleFileSha256 -Path $destination
             if ($actual -cne $expected) {
                 Throw-CcodLifecycleError 'CCOD_INSTALL_FILE_HASH_MISMATCH' 'A staged runtime file failed its source hash comparison' $destination
@@ -1562,6 +1664,8 @@ function Invoke-CcodInstall {
         [switch]$RepairState,
         [switch]$DoNotStart,
         [string]$ActivationId,
+        [string]$ExpectedVersion,
+        [string]$PayloadManifestPath,
         [hashtable]$Adapters
     )
 
@@ -1586,6 +1690,13 @@ function Invoke-CcodInstall {
     if (-not [IO.Directory]::Exists($sourceRoot)) {
         Throw-CcodLifecycleError 'CCOD_INSTALL_SOURCE_MISSING' 'Source checkout does not exist' $sourceRoot
     }
+    $payloadBound = -not [string]::IsNullOrWhiteSpace($ExpectedVersion) -or -not [string]::IsNullOrWhiteSpace($PayloadManifestPath)
+    if ($payloadBound -and ([string]::IsNullOrWhiteSpace($ExpectedVersion) -or [string]::IsNullOrWhiteSpace($PayloadManifestPath))) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_INPUT_INVALID' 'ExpectedVersion and PayloadManifestPath must be supplied together' $null
+    }
+    $files = if ($payloadBound) {
+        @(Get-CcodLifecyclePayloadManifestFiles -SourceRoot $sourceRoot -ExpectedVersion $ExpectedVersion -PayloadManifestPath $PayloadManifestPath)
+    } else { $null }
     if (-not (& $adapters.ValidateSource $sourceRoot)) {
         Throw-CcodLifecycleError 'CCOD_INSTALL_SOURCE_INVALID' 'Source checkout failed hermetic validation' $sourceRoot
     }
@@ -1594,8 +1705,11 @@ function Invoke-CcodInstall {
         Throw-CcodLifecycleError 'CCOD_INSTALL_IDENTITY_INVALID' 'Current user identity is unavailable' $null
     }
     $projectVersion = & $adapters.GetProjectVersion $sourceRoot
+    if ($payloadBound -and [string]$projectVersion -cne $ExpectedVersion) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_VERSION_MISMATCH' 'Source package version does not match the expected setup version' $sourceRoot
+    }
     $nodeCandidates = @(Get-CcodLifecycleNodeCandidates -Adapters $adapters)
-    $files = @(Get-CcodLifecycleSourceFiles -SourceRoot $sourceRoot -RequireTrayHost)
+    if (-not $payloadBound) { $files = @(Get-CcodLifecycleSourceFiles -SourceRoot $sourceRoot -RequireTrayHost) }
 
     $existingPointer = $null
     $activePath = Join-Path $root 'active.json'
@@ -1729,6 +1843,13 @@ function Invoke-CcodInstall {
         if ($null -eq $readyProof -or $readyProof.SupervisorReady -isnot [bool] -or $readyProof.TrayReady -isnot [bool] -or
             -not $readyProof.SupervisorReady -or -not $readyProof.TrayReady) {
             Throw-CcodLifecycleError 'CCOD_INSTALL_NEW_RUNTIME_NOT_READY' 'The new Supervisor and authenticated TrayHost readiness were not proven' $null
+        }
+        $finalPointer = Read-CcodActiveRuntime -InstallRoot $root
+        $finalValidation = Test-CcodRuntimeManifest -RuntimeDirectory $runtimeRoot -ExpectedRuntimeId $runtimeId
+        $finalExpectedVersion = if ($payloadBound) { $ExpectedVersion } else { [string]$projectVersion }
+        if ($finalPointer.activeRuntime -cne $runtimeId -or [UInt64]$finalPointer.generation -ne [UInt64]$pointer.generation -or
+            -not $finalValidation.Valid -or [string]$finalValidation.Manifest.projectVersion -cne $finalExpectedVersion) {
+            Throw-CcodLifecycleError 'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN' 'The final active pointer and runtime version could not be revalidated' $runtimeRoot
         }
         Write-CcodInstallActivationPhase -Activation $activation -Phase 'Ready' -RuntimeId $runtimeId -PreviousRuntimeId $pointer.previousRuntime -ErrorCode $null -Adapters $adapters -InstallRoot $root | Out-Null
         if ($upgrade) {

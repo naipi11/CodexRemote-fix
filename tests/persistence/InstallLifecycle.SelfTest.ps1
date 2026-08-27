@@ -60,6 +60,34 @@ function New-CcodLifecycleSourceFixture {
     return $Root
 }
 
+function New-CcodLifecyclePayloadManifest {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$Version
+    )
+
+    $module = Get-Module InstallLifecycle
+    $sourceFiles = @(& $module { param($SourceRoot) Get-CcodLifecycleSourceFiles -SourceRoot $SourceRoot -RequireTrayHost } $Root)
+    $recordList = [Collections.Generic.List[object]]::new()
+    foreach ($sourceFile in $sourceFiles) {
+        $recordList.Add([pscustomobject][ordered]@{
+            path = ([string]$sourceFile.Relative).Replace('\','/')
+            length = [int64](Get-Item -LiteralPath $sourceFile.Source -Force).Length
+            sha256 = (Get-FileHash -LiteralPath $sourceFile.Source -Algorithm SHA256).Hash.ToLowerInvariant()
+        })
+    }
+    $comparison = [System.Comparison[object]]{ param($left,$right) [StringComparer]::Ordinal.Compare([string]$left.path,[string]$right.path) }
+    $recordList.Sort($comparison)
+    $records = @($recordList)
+    $manifestPath = Join-Path $Root 'installer-payload.manifest.json'
+    [IO.File]::WriteAllText(
+        $manifestPath,
+        ([ordered]@{ schemaVersion = 1; projectVersion = $Version; files = $records } | ConvertTo-Json -Depth 8),
+        [Text.UTF8Encoding]::new($false)
+    )
+    return $manifestPath
+}
+
 function New-CcodLifecycleFakeNode {
     param([Parameter(Mandatory)][string]$Root)
     New-Item -ItemType Directory -Path (Join-Path $Root 'node') -Force | Out-Null
@@ -636,6 +664,85 @@ $results += Invoke-CcodTest 'first install stages verifies activates task and pe
         Assert-CcodEqual '5770fe0f20f1623648a185cc7a0a99ff37b6aef6c07426ffc8a984493e0f2a2f' $chinese[0].sha256 'manifest hashes Chinese catalog'
     } finally {
         foreach ($path in @($source, $install, $nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+# Production mutation caught: accepting an old setup payload for a newer expected setup version and stopping the active runtime before rejecting it.
+$results += Invoke-CcodTest 'upgrade rejects a payload version mismatch before active-pointer or protection mutation' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.13' | Out-Null
+        $manifestPath = New-CcodLifecyclePayloadManifest -Root $source -Version '2.5.13'
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        $first = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
+        $oldRuntime = [string]$first.RuntimeId
+        $before = Read-CcodActiveRuntime -InstallRoot $install
+        $fake = New-CcodLifecycleFake -NodePath $nodePath
+
+        Assert-CcodThrows {
+            Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -ExpectedVersion '2.5.22' -PayloadManifestPath $manifestPath -Adapters $fake.Adapters | Out-Null
+        } 'CCOD_INSTALL_PAYLOAD_VERSION_MISMATCH'
+
+        $after = Read-CcodActiveRuntime -InstallRoot $install
+        Assert-CcodEqual $oldRuntime $after.activeRuntime 'old payload cannot replace the active runtime'
+        Assert-CcodEqual $before.generation $after.generation 'version mismatch cannot advance the active generation'
+        Assert-CcodEqual 0 $fake.World.ShutdownSignaled 'version mismatch cannot stop the existing protection'
+        Assert-CcodEqual 0 $fake.World.TaskInstalled 'version mismatch performs no task mutation'
+    } finally {
+        foreach ($path in @($source,$install,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+# Production mutation caught: rediscovering the payload directory after manifest validation and copying an unlisted leftover into the runtime.
+$results += Invoke-CcodTest 'matching payload stages only immutable manifest-listed records' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $manifestPath = New-CcodLifecyclePayloadManifest -Root $source -Version '2.5.22'
+        $stalePath = Join-Path $source 'src\runtime\stale-old-payload.js'
+        [IO.File]::WriteAllText($stalePath,"module.exports = 'stale';`n",[Text.UTF8Encoding]::new($false))
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+
+        $receipt = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -ExpectedVersion '2.5.22' -PayloadManifestPath $manifestPath -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
+
+        $runtimeRoot = Join-Path $install "runtime\$($receipt.RuntimeId)"
+        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $runtimeRoot 'src\runtime\stale-old-payload.js'))) 'unlisted stale source file is absent from the runtime'
+        $runtimeManifest = Test-CcodRuntimeManifest -RuntimeDirectory $runtimeRoot -ExpectedRuntimeId $receipt.RuntimeId
+        Assert-CcodEqual $true $runtimeManifest.Valid 'manifest-filtered runtime remains valid'
+        Assert-CcodEqual 0 @($runtimeManifest.Manifest.files | Where-Object { $_.path -ceq 'src/runtime/stale-old-payload.js' }).Count 'runtime manifest contains no unlisted stale record'
+    } finally {
+        foreach ($path in @($source,$install,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+# Production mutation caught: trusting readiness without rereading the active pointer and selected runtime manifest before the terminal Ready receipt.
+$results += Invoke-CcodTest 'payload-bound install rereads the active pointer after readiness before reporting Ready' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $manifestPath = New-CcodLifecyclePayloadManifest -Root $source -Version '2.5.22'
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        $first = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
+        $oldPointer = Read-CcodActiveRuntime -InstallRoot $install
+        $fake = New-CcodLifecycleFake -NodePath $nodePath
+        $fake.Adapters.WaitNewRuntimeReady = {
+            param($InstallRoot,$RuntimeId,$RuntimeGeneration,$Identity,$TaskStartedAtUtc,$TimeoutMilliseconds)
+            [IO.File]::WriteAllText((Join-Path $InstallRoot 'active.json'),($oldPointer | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+            [pscustomobject][ordered]@{ SupervisorReady = $true; TrayReady = $true }
+        }.GetNewClosure()
+
+        Assert-CcodThrows {
+            Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -ExpectedVersion '2.5.22' -PayloadManifestPath $manifestPath -Adapters $fake.Adapters | Out-Null
+        } 'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN'
+        Assert-CcodTrue ($fake.World.Phases -notcontains 'Ready') 'pointer drift after readiness cannot produce a Ready receipt'
+    } finally {
+        foreach ($path in @($source,$install,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
     }
 }
 

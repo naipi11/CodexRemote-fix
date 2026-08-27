@@ -5,6 +5,9 @@
 #ifndef PortableArtifactDirectory
 #define PortableArtifactDirectory SourcePath + "\generated\portable"
 #endif
+#ifndef InstallerPayloadDirectory
+#define InstallerPayloadDirectory SourcePath + "\.."
+#endif
 AppId={{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}
 AppName=CodexRemote-fix
 AppVersion={#ProjectVersion}
@@ -68,6 +71,7 @@ Source: "..\Reset-CodexControlOtherDevices.ps1"; DestDir: "{app}"; Flags: ignore
 Source: "..\Test-CodexControlOtherDevices.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Activate-CcodRemoteFix.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Prompt-CcodRestart.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#InstallerPayloadDirectory}\*"; DestDir: "{app}\payload\{#ProjectVersion}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [InstallDelete]
 Type: files; Name: "{userprograms}\Codex Control other devices\Codex Control other devices for Windows.lnk"
@@ -294,6 +298,8 @@ begin
   UpdateActivationStartingPresentation();
   Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
     ExpandConstant('{app}\Activate-CcodRemoteFix.ps1') + '" -AppRoot "' + ExpandConstant('{app}') +
+    '" -PayloadRoot "' + ExpandConstant('{app}\payload\{#ProjectVersion}') +
+    '" -ExpectedVersion "{#ProjectVersion}' +
     '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') +
     '" -ActivationId "' + ActivationId + '" -FirstReceiptTimeoutMilliseconds ' +
     IntToStr(FIRST_ACTIVATION_RECEIPT_TIMEOUT_MILLISECONDS) + ' -ActivationTimeoutMilliseconds ' +
@@ -312,6 +318,8 @@ begin
   end;
   Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
     ExpandConstant('{app}\Activate-CcodRemoteFix.ps1') + '" -AppRoot "' + ExpandConstant('{app}') +
+    '" -PayloadRoot "' + ExpandConstant('{app}\payload\{#ProjectVersion}') +
+    '" -ExpectedVersion "{#ProjectVersion}' +
     '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') +
     '" -ValidateReceiptWithTimeout -ValidationTimeoutMilliseconds ' + IntToStr(VALIDATION_TIMEOUT_MILLISECONDS) +
     ' -ActivationId "' + ActivationId + '"';

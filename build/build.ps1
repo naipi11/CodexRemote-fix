@@ -138,6 +138,7 @@ foreach ($path in @($bundle,$checksum,$provenance,$payloadManifestAsset,$release
 }
 
 $stageRoot = Join-Path $PSScriptRoot ('.portable-stage-' + [guid]::NewGuid().ToString('N'))
+$installerPayloadDirectory = Join-Path $PSScriptRoot ('.installer-payload-stage-' + [guid]::NewGuid().ToString('N'))
 try {
     [IO.Directory]::CreateDirectory($stageRoot) | Out-Null
     $payloadRoot = Join-Path $stageRoot 'payload'
@@ -186,6 +187,16 @@ try {
         Remove-Module -Name $lifecycleModule.Name -Force -ErrorAction SilentlyContinue
     }
     $payloadRecords = Get-CcodBuildPayloadRecords -PayloadRoot $payloadRoot
+    [IO.Directory]::CreateDirectory($installerPayloadDirectory) | Out-Null
+    foreach ($record in $payloadRecords) {
+        Copy-CcodBuildPayloadFile -Source (Join-Path $payloadRoot ([string]$record.path).Replace('/','\')) -PayloadRoot $installerPayloadDirectory -Relative ([string]$record.path)
+    }
+    $installerPayloadManifest = [ordered]@{
+        schemaVersion = 1
+        projectVersion = $Version
+        files = $payloadRecords
+    }
+    Write-CcodBuildUtf8 -Path (Join-Path $installerPayloadDirectory 'installer-payload.manifest.json') -Text (($installerPayloadManifest | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
     $payloadManifestPath = Join-Path $stageRoot 'payload-manifest.json'
     $payloadManifest = [ordered]@{
         schemaVersion = 1
@@ -257,7 +268,7 @@ $iscc = $isccCandidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -
 if (-not $iscc) { throw 'Inno Setup 6 (ISCC.exe) was not found. Install it with: winget install --id JRSoftware.InnoSetup --exact' }
 $issPath = Join-Path $PSScriptRoot 'CodexControlOtherDevices.iss'
 $portableArtifact = Join-Path $PSScriptRoot 'generated\portable'
-& $iscc "/DProjectVersion=$Version" "/DTrayHostArtifactDirectory=$trayHostArtifact" "/DPortableArtifactDirectory=$portableArtifact" "/O$dist\." $issPath
+& $iscc "/DProjectVersion=$Version" "/DTrayHostArtifactDirectory=$trayHostArtifact" "/DPortableArtifactDirectory=$portableArtifact" "/DInstallerPayloadDirectory=$installerPayloadDirectory" "/O$dist\." $issPath
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $setupExe -PathType Leaf)) {
     throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
 }
@@ -285,3 +296,13 @@ Write-Host ("  Setup:    {0}" -f $setupExe)
 Write-Host ("  SHA-256:  {0}" -f $setupChecksum)
 Write-Host ("  Manifest: {0}" -f $setupReleaseManifest)
 Write-Host ''
+
+if ([IO.Directory]::Exists($installerPayloadDirectory)) {
+    $installerPayloadFull = [IO.Path]::GetFullPath($installerPayloadDirectory)
+    $buildFull = [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\') + '\'
+    if ($installerPayloadFull.StartsWith($buildFull,[StringComparison]::OrdinalIgnoreCase) -and
+        [IO.Path]::GetFileName($installerPayloadFull).StartsWith('.installer-payload-stage-',[StringComparison]::Ordinal) -and
+        -not ((Get-Item -LiteralPath $installerPayloadFull -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Remove-Item -LiteralPath $installerPayloadFull -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}

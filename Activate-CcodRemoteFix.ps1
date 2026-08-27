@@ -2,6 +2,8 @@
 param(
     [Parameter(Mandatory)][string]$AppRoot,
     [Parameter(Mandatory)][string]$InstallRoot,
+    [string]$PayloadRoot,
+    [string]$ExpectedVersion,
     [string]$ActivationId,
     [switch]$ValidateReceiptOnly,
     [switch]$ValidateReceiptWithTimeout,
@@ -49,6 +51,59 @@ function Write-CcodActivationRecord {
         }
         [IO.File]::AppendAllText((Join-Path $directory 'post-install-activation.log'),(($record|ConvertTo-Json -Compress)+"`n"),[Text.UTF8Encoding]::new($false))
     } catch { }
+}
+
+function Assert-CcodActivationPayload {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$Version
+    )
+
+    if ($Version -cnotmatch '^\d+\.\d+\.\d+$') { throw 'CCOD_INSTALL_PAYLOAD_VERSION_MISMATCH' }
+    $payload = [IO.Path]::GetFullPath($Root)
+    $packagePath = Join-Path $payload 'package.json'
+    $manifestPath = Join-Path $payload 'installer-payload.manifest.json'
+    $modulePath = Join-Path $payload 'src\persistence\modules\InstallLifecycle.psm1'
+    if (-not [IO.File]::Exists($packagePath) -or -not [IO.File]::Exists($manifestPath) -or -not [IO.File]::Exists($modulePath)) {
+        throw 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID'
+    }
+    try { $package = Get-Content -LiteralPath $packagePath -Raw | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' }
+    if ($package.version -isnot [string] -or [string]$package.version -cne $Version) {
+        throw 'CCOD_INSTALL_PAYLOAD_VERSION_MISMATCH'
+    }
+    $module = Import-Module $modulePath -Force -PassThru
+    try {
+        & $module {
+            param($SourceRoot,$ExpectedVersion,$ManifestPath)
+            Get-CcodLifecyclePayloadManifestFiles -SourceRoot $SourceRoot -ExpectedVersion $ExpectedVersion -PayloadManifestPath $ManifestPath | Out-Null
+        } $payload $Version $manifestPath
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+    }
+    return $manifestPath
+}
+
+function Assert-CcodActivatedRuntimeVersion {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$RuntimeId,
+        [Parameter(Mandatory)][string]$Version,
+        [Parameter(Mandatory)][string]$RuntimeModulePath
+    )
+
+    $module = Import-Module $RuntimeModulePath -Force -PassThru
+    try {
+        $pointer = Read-CcodActiveRuntime -InstallRoot $Root
+        if ($pointer.activeRuntime -cne $RuntimeId) { throw 'CCOD_ACTIVATION_RUNTIME_VERSION_MISMATCH' }
+        $runtimeRoot = Join-Path (Join-Path $Root 'runtime') $RuntimeId
+        $validation = Test-CcodRuntimeManifest -RuntimeDirectory $runtimeRoot -ExpectedRuntimeId $RuntimeId
+        if (-not $validation.Valid -or [string]$validation.Manifest.projectVersion -cne $Version) {
+            throw 'CCOD_ACTIVATION_RUNTIME_VERSION_MISMATCH'
+        }
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Assert-CcodActivationReceiptPathSafe {
@@ -179,6 +234,9 @@ function Invoke-CcodOwnedInstallWorker {
             '-ActivationId',
             $ActivationId
         )
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedVersion)) {
+            $arguments += @('-ExpectedVersion',$ExpectedVersion,'-PayloadManifestPath',(Join-Path $PayloadRoot 'installer-payload.manifest.json'))
+        }
         $startInfo = [Diagnostics.ProcessStartInfo]::new()
         $startInfo.FileName = $PowerShellPath
         $startInfo.Arguments = (($arguments | ForEach-Object { ConvertTo-CcodNativeProcessArgument ([string]$_) }) -join ' ')
@@ -235,12 +293,15 @@ function Invoke-CcodBoundedReceiptValidator {
             $PSCommandPath,
             '-AppRoot',
             $AppRoot,
+            '-PayloadRoot',
+            $PayloadRoot,
             '-InstallRoot',
             $InstallRoot,
             '-ValidateReceiptOnly',
             '-ActivationId',
             $ActivationId
         )
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedVersion)) { $arguments += @('-ExpectedVersion',$ExpectedVersion) }
         $startInfo = [Diagnostics.ProcessStartInfo]::new()
         $startInfo.FileName = $hostExecutable
         $startInfo.Arguments = (($arguments | ForEach-Object { ConvertTo-CcodNativeProcessArgument ([string]$_) }) -join ' ')
@@ -286,6 +347,17 @@ function Show-CcodActivationFailure {
 }
 
 if ($ValidateReceiptOnly -and $ValidateReceiptWithTimeout) { Write-Error 'CCOD_ACTIVATION_VALIDATOR_MODE_INVALID' -ErrorAction Continue; exit 3 }
+if ([string]::IsNullOrWhiteSpace($PayloadRoot)) { $PayloadRoot = $AppRoot }
+$PayloadRoot = [IO.Path]::GetFullPath($PayloadRoot)
+if (-not [string]::IsNullOrWhiteSpace($ExpectedVersion)) {
+    try { $null = Assert-CcodActivationPayload -Root $PayloadRoot -Version $ExpectedVersion }
+    catch {
+        $candidate = ([string]$_.FullyQualifiedErrorId -split ',')[0]
+        $code = if ($candidate -cmatch '^CCOD_[A-Z0-9_]{1,96}$') { $candidate } elseif ($_.Exception.Message -cmatch '^CCOD_[A-Z0-9_]{1,96}$') { $Matches[0] } else { 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' }
+        Write-Error $code -ErrorAction Continue
+        exit 3
+    }
+}
 if ([string]::IsNullOrWhiteSpace($ActivationId)) {
     if ($ValidateReceiptOnly -or $ValidateReceiptWithTimeout) { Write-Error 'CCOD_ACTIVATION_ID_INVALID' -ErrorAction Continue; exit 3 }
     $ActivationId = [guid]::NewGuid().ToString('D')
@@ -299,7 +371,12 @@ if ($ValidateReceiptWithTimeout) {
 if ($ValidateReceiptOnly) {
     try {
         $terminalReceipt = Read-CcodTerminalActivationReceipt -Root ([IO.Path]::GetFullPath($InstallRoot)) -ExpectedActivationId $ActivationId
-        if ($terminalReceipt.phase -ceq 'Ready') { exit 0 }
+        if ($terminalReceipt.phase -ceq 'Ready') {
+            if (-not [string]::IsNullOrWhiteSpace($ExpectedVersion)) {
+                Assert-CcodActivatedRuntimeVersion -Root ([IO.Path]::GetFullPath($InstallRoot)) -RuntimeId ([string]$terminalReceipt.runtimeId) -Version $ExpectedVersion -RuntimeModulePath (Join-Path $PayloadRoot 'src\persistence\modules\RuntimeManifest.psm1')
+            }
+            exit 0
+        }
         if ($terminalReceipt.phase -ceq 'Failed') { exit 2 }
         throw 'CCOD_ACTIVATION_RECEIPT_NOT_READY'
     } catch {
@@ -313,7 +390,7 @@ $clock = [Diagnostics.Stopwatch]::StartNew()
 try {
     $root = [IO.Path]::GetFullPath($AppRoot)
     $stateRoot = [IO.Path]::GetFullPath($InstallRoot)
-    $installScript = Join-Path $root 'Install-CodexControlOtherDevices.ps1'
+    $installScript = Join-Path $PayloadRoot 'Install-CodexControlOtherDevices.ps1'
     if (-not [IO.File]::Exists($installScript)) { throw 'CCOD_ACTIVATION_INSTALL_SCRIPT_MISSING' }
     $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
     Write-CcodActivationRecord -Code 'STARTED' -DurationMilliseconds $clock.ElapsedMilliseconds
@@ -328,6 +405,9 @@ try {
         throw 'CCOD_ACTIVATION_RUNTIME_FAILED'
     }
     $activationReceipt = Read-CcodFinalActivationReceipt -Root $stateRoot -ExpectedActivationId $ActivationId
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedVersion)) {
+        Assert-CcodActivatedRuntimeVersion -Root $stateRoot -RuntimeId ([string]$activationReceipt.runtimeId) -Version $ExpectedVersion -RuntimeModulePath (Join-Path $PayloadRoot 'src\persistence\modules\RuntimeManifest.psm1')
+    }
     Write-CcodActivationRecord -Code 'RUNTIME_ACTIVATED' -DurationMilliseconds $clock.ElapsedMilliseconds
 } catch {
     $candidate = ([string]$_.FullyQualifiedErrorId -split ',')[0]
