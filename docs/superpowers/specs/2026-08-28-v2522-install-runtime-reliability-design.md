@@ -65,10 +65,18 @@ top-level root identity and a self-consistent tree.  If the root PID, creation
 time, session, SID, package family, executable path, command line mode, or
 recorded debug ports change, the operation remains fail-closed immediately.
 
-The wrapper is used only before a mutation starts.  Once a close transition is
-written, the existing per-member pre-stop, post-stop, and final identity checks
-remain strict.  Diagnostics classify the last stable failure boundary so a
-future support log can distinguish tree churn from an unsafe process identity.
+The wrapper is used before a mutation starts and for a transient rich snapshot
+read of an already verified member.  Once a close transition is written, the
+existing per-member pre-stop, post-stop, and final identity checks remain
+strict.  A `SameIdentity` result is required before retrying a null or
+mismatched rich snapshot; an absent or changed root remains fail-closed.
+
+The same bounded policy applies to Supervisor's `RemoteVerified` rebind: it
+may retry an indeterminate reread of the exact candidate root, but a different
+root, changed creation time, changed ports, or a malformed state read remains
+an immediate failed proof.  Diagnostics classify the last stable failure
+boundary so a future support log can distinguish tree churn from an unsafe
+process identity.
 
 ### 3. Tray action correlation and diagnostics
 

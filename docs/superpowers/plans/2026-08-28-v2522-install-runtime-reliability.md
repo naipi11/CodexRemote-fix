@@ -97,14 +97,19 @@ fix: bind setup activation to immutable payload
 **Files:**
 - Modify: `src/persistence/modules/ProcessControl.psm1`
 - Modify: `src/persistence/modules/SessionEngine.psm1`
+- Modify: `src/persistence/Supervisor.ps1`
 - Test: `tests/persistence/ProcessControl.SelfTest.ps1`
 - Test: `tests/persistence/SessionEngine.SelfTest.ps1`
+- Test: `tests/persistence/Supervisor.SelfTest.ps1`
 
 **Interfaces:**
 - Add `Get-CcodStableVerifiedProcessTree` that accepts a root snapshot,
   `StatusEvidence`, a fixed retry budget, and adapters.
 - It returns a verified tree only if every successful attempt preserves the
   original root identity; otherwise it returns no tree.
+- `Confirm-CcodSupervisorLifecycleProofCandidate` uses the same bounded
+  candidate-root rebind rule and records a stable failure reason without
+  granting a changed root any authority.
 
 - [ ] **Step 1: Write failing process-tree tests**
 
@@ -120,6 +125,11 @@ Assert-CcodEqual 2 $tree.Count 'one transient empty tree is retried without rela
 
 Add a companion test where the second root snapshot has a different creation
 time; it must return no tree and perform no close mutation.
+
+Add a Supervisor test where the first post-worker rebind sees no special root
+but the second sees the same candidate root; it must publish `RemoteVerified`.
+Add its counterpart where the second root has a different creation time; it
+must remain `CCOD_REMOTE_PROOF_REBIND_FAILED`.
 
 - [ ] **Step 2: Run focused tests and confirm RED**
 
@@ -138,9 +148,10 @@ pre-stop/post-stop/final proofs unchanged.
 
 - [ ] **Step 4: Run focused tests and prove GREEN**
 
-Run ProcessControl and SessionEngine self-tests.  Confirm child churn retries
-successfully, root drift remains fail-closed, and ordinary close tests still
-prove every stopped member.
+Run ProcessControl, SessionEngine, and Supervisor self-tests.  Confirm child
+churn retries successfully, a transient same-identity rebind succeeds, root
+drift remains fail-closed, and ordinary close tests still prove every stopped
+member.
 
 - [ ] **Step 5: Commit**
 
