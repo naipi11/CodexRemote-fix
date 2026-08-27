@@ -179,7 +179,7 @@ function New-CcodHarnessCimProcess {
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][int]$ProcessId,
         [Parameter(Mandatory)][string]$CreationTimeUtc,
-        [Parameter(Mandatory)][string]$CommandLine,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$CommandLine,
         [int]$ParentProcessId = 0
     )
     $created = [datetime]::ParseExact($CreationTimeUtc, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
@@ -310,7 +310,10 @@ Invoke-CcodTest 'captures exactly the top-level ChatGPT root and excludes Electr
         Set-CcodHarnessProcessFixture -ChatGPT @(
             (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13948 -CreationTimeUtc $created -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe"'),
             (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13949 -CreationTimeUtc '2026-08-24T00:00:04.1000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe" --type=renderer' -ParentProcessId 13948),
-            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13950 -CreationTimeUtc '2026-08-24T00:00:04.2000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe" --type=utility' -ParentProcessId 13948)
+            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13950 -CreationTimeUtc '2026-08-24T00:00:04.2000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe" --type=utility' -ParentProcessId 13948),
+            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13951 -CreationTimeUtc '2026-08-24T00:00:04.3000000Z' -CommandLine $null -ParentProcessId 13948),
+            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13952 -CreationTimeUtc '2026-08-24T00:00:04.4000000Z' -CommandLine '' -ParentProcessId 13948),
+            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13953 -CreationTimeUtc '2026-08-24T00:00:04.5000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe" "--type=renderer"' -ParentProcessId 13948)
         )
         $facts = Get-CcodInstalledLifecycleFacts -InstallRoot $root
         Assert-CcodEqual 1 $facts.codex.Count 'only one ordinary ChatGPT root is retained'
@@ -377,6 +380,119 @@ Invoke-CcodTest 'selects only an unambiguous latest current-runtime installer re
     } finally {
         Clear-CcodHarnessProcessFixture
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+# Production mutation caught: choosing latest by runtime before filtering the active generation.
+Invoke-CcodTest 'ignores a newer wrong-generation receipt when selecting the current-generation terminal result' {
+    . $harnessPath -Library
+    $root = Join-Path $env:TEMP ('ccod-installed-receipt-generation-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $null = [IO.Directory]::CreateDirectory($root)
+        New-CcodHarnessInstalledStateFixture -Root $root -ActiveRuntimeId '2.5.21-new' -ActiveGeneration ([UInt64]8) `
+            -StatusRuntimeId '2.5.21-new' -StatusCodexPid 13948 -StatusCodexCreationTimeUtc '2026-08-24T00:00:04.0000000Z' -ReceiptPhase 'Completed'
+        $wrongGeneration = New-CcodHarnessLifecycleReceipt -RuntimeId '2.5.21-new' -RuntimeGeneration ([UInt64]7) -Phase 'CloseFailed' `
+            -TransactionId '44444444-5555-6666-7777-888888888888' -UpdatedAtUtc '2026-08-24T00:00:07.0000000Z'
+        Write-CcodHarnessJson -Path (Join-Path $root ("state\lifecycle\receipts\{0}.json" -f $wrongGeneration.transactionId)) -Value $wrongGeneration
+        Set-CcodHarnessProcessFixture -ChatGPT @()
+        $facts = Get-CcodInstalledLifecycleFacts -InstallRoot $root
+        Assert-CcodEqual 8 ([UInt64]$facts.lifecycleReceipt.runtimeGeneration) 'receipt selection stays bound to the active generation'
+        Assert-CcodEqual 'Completed' $facts.lifecycleReceipt.phase 'newer stale-generation failure cannot mask current-generation completion'
+    } finally {
+        Clear-CcodHarnessProcessFixture
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'does not treat tied wrong-generation receipts as current-generation ambiguity' {
+    . $harnessPath -Library
+    $root = Join-Path $env:TEMP ('ccod-installed-receipt-generation-tie-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $null = [IO.Directory]::CreateDirectory($root)
+        New-CcodHarnessInstalledStateFixture -Root $root -ActiveRuntimeId '2.5.21-new' -ActiveGeneration ([UInt64]8) `
+            -StatusRuntimeId '2.5.21-new' -StatusCodexPid 13948 -StatusCodexCreationTimeUtc '2026-08-24T00:00:04.0000000Z' -ReceiptPhase 'Completed'
+        foreach ($record in @(
+            (New-CcodHarnessLifecycleReceipt -RuntimeId '2.5.21-new' -RuntimeGeneration ([UInt64]7) -Phase 'CloseFailed' -TransactionId '55555555-6666-7777-8888-999999999999' -UpdatedAtUtc '2026-08-24T00:00:07.0000000Z'),
+            (New-CcodHarnessLifecycleReceipt -RuntimeId '2.5.21-new' -RuntimeGeneration ([UInt64]7) -Phase 'RepairFailed' -TransactionId '66666666-7777-8888-9999-aaaaaaaaaaaa' -UpdatedAtUtc '2026-08-24T00:00:07.0000000Z')
+        )) {
+            Write-CcodHarnessJson -Path (Join-Path $root ("state\lifecycle\receipts\{0}.json" -f $record.transactionId)) -Value $record
+        }
+        Set-CcodHarnessProcessFixture -ChatGPT @()
+        $facts = Get-CcodInstalledLifecycleFacts -InstallRoot $root
+        Assert-CcodEqual 'Completed' $facts.lifecycleReceipt.phase 'only current-generation timestamps participate in ambiguity detection'
+    } finally {
+        Clear-CcodHarnessProcessFixture
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'fails closed on receipt filename duplicate-property and nonterminal boundaries' {
+    . $harnessPath -Library
+    foreach ($case in @('filename','duplicate-json','nonterminal')) {
+        $root = Join-Path $env:TEMP ("ccod-installed-receipt-$case-" + [guid]::NewGuid().ToString('N'))
+        try {
+            $null = [IO.Directory]::CreateDirectory($root)
+            New-CcodHarnessInstalledStateFixture -Root $root -ActiveRuntimeId '2.5.21-new' -ActiveGeneration ([UInt64]8) `
+                -StatusRuntimeId '2.5.21-new' -StatusCodexPid 13948 -StatusCodexCreationTimeUtc '2026-08-24T00:00:04.0000000Z' -ReceiptPhase 'Completed'
+            switch ($case) {
+                'filename' {
+                    $receipt = New-CcodHarnessLifecycleReceipt -RuntimeId '2.5.21-new' -RuntimeGeneration ([UInt64]8) -Phase 'Completed' `
+                        -TransactionId '77777777-8888-9999-aaaa-bbbbbbbbbbbb'
+                    Write-CcodHarnessJson -Path (Join-Path $root 'state\lifecycle\receipts\88888888-9999-aaaa-bbbb-cccccccccccc.json') -Value $receipt
+                    Assert-CcodThrows { Get-CcodInstalledLifecycleFacts -InstallRoot $root } 'CCOD_INTEGRATION_FACTS_INVALID'
+                }
+                'duplicate-json' {
+                    $path = Join-Path $root 'state\lifecycle\receipts\11111111-2222-3333-4444-555555555555.json'
+                    $json = [IO.File]::ReadAllText($path).Replace('"schemaVersion":1', '"schemaVersion":1,"schemaVersion":1')
+                    [IO.File]::WriteAllText($path, $json, [Text.UTF8Encoding]::new($false))
+                    Assert-CcodThrows { Get-CcodInstalledLifecycleFacts -InstallRoot $root } 'CCOD_STATE_MALFORMED'
+                }
+                'nonterminal' {
+                    $receipt = New-CcodHarnessLifecycleReceipt -RuntimeId '2.5.21-new' -RuntimeGeneration ([UInt64]8) -Phase 'Completed' `
+                        -TransactionId '99999999-aaaa-bbbb-cccc-dddddddddddd'
+                    $receipt.phase = 'Requested'
+                    Write-CcodHarnessJson -Path (Join-Path $root ("state\lifecycle\receipts\{0}.json" -f $receipt.transactionId)) -Value $receipt
+                    Assert-CcodThrows { Get-CcodInstalledLifecycleFacts -InstallRoot $root } 'CCOD_INTEGRATION_FACTS_INVALID'
+                }
+            }
+        } finally {
+            if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+        }
+    }
+}
+
+Invoke-CcodTest 'fails closed on malformed active status and transition schemas' {
+    . $harnessPath -Library
+    foreach ($case in @('active','status','transition')) {
+        $root = Join-Path $env:TEMP ("ccod-installed-state-$case-" + [guid]::NewGuid().ToString('N'))
+        try {
+            $null = [IO.Directory]::CreateDirectory($root)
+            New-CcodHarnessInstalledStateFixture -Root $root -ActiveRuntimeId '2.5.21-new' -ActiveGeneration ([UInt64]8) `
+                -StatusRuntimeId '2.5.21-new' -StatusCodexPid 13948 -StatusCodexCreationTimeUtc '2026-08-24T00:00:04.0000000Z' -ReceiptPhase 'Completed'
+            switch ($case) {
+                'active' {
+                    $path = Join-Path $root 'active.json'
+                    $value = [IO.File]::ReadAllText($path) | ConvertFrom-Json
+                    $value.generation = 'eight'
+                    Write-CcodHarnessJson -Path $path -Value $value
+                }
+                'status' {
+                    $path = Join-Path $root 'state\status.json'
+                    $value = [IO.File]::ReadAllText($path) | ConvertFrom-Json
+                    $value.session.codex.rendererProbe = 'Open'
+                    Write-CcodHarnessJson -Path $path -Value $value
+                }
+                'transition' {
+                    $path = Join-Path $root 'state\transition.json'
+                    $value = [IO.File]::ReadAllText($path) | ConvertFrom-Json
+                    $value.activeTransaction = [pscustomobject][ordered]@{}
+                    Write-CcodHarnessJson -Path $path -Value $value
+                }
+            }
+            Assert-CcodThrows { Get-CcodInstalledLifecycleFacts -InstallRoot $root } 'CCOD_INTEGRATION_FACTS_INVALID'
+        } finally {
+            if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+        }
     }
 }
 

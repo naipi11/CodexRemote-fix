@@ -338,7 +338,11 @@ function Read-CcodInstalledLifecycleTransitionFact {
 }
 
 function Get-CcodInstalledLifecycleReceiptFact {
-    param([Parameter(Mandatory)][string]$StateRoot, [AllowNull()][string]$ActiveRuntimeId)
+    param(
+        [Parameter(Mandatory)][string]$StateRoot,
+        [AllowNull()][string]$ActiveRuntimeId,
+        [UInt64]$ActiveGeneration
+    )
     $directory = Join-Path $StateRoot 'lifecycle\receipts'
     if (-not [IO.Directory]::Exists($directory)) { return $null }
     $directoryItem = Get-Item -LiteralPath $directory -Force -ErrorAction Stop
@@ -363,7 +367,9 @@ function Get-CcodInstalledLifecycleReceiptFact {
         if ($receipt.phase -cnotin @('Completed','CloseFailed','OrdinaryLaunchFailed','OrdinaryObservationTimedOut','LaunchWindowExpired','RepairFailed','VerificationFailed','CancelledBeforeClose','SupersededByUpgrade')) {
             Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'Lifecycle receipt is not terminal' $item.FullName
         }
-        if ($null -ne $ActiveRuntimeId -and $receipt.runtimeId -ceq $ActiveRuntimeId -and $receipt.origin -ceq 'Installer' -and $receipt.kind -ceq 'RestartAndRepair') {
+        if ($null -ne $ActiveRuntimeId -and $receipt.runtimeId -ceq $ActiveRuntimeId -and
+            [UInt64]$receipt.runtimeGeneration -eq $ActiveGeneration -and
+            $receipt.origin -ceq 'Installer' -and $receipt.kind -ceq 'RestartAndRepair') {
             $candidates.Add($receipt)
         }
     }
@@ -380,6 +386,62 @@ function Get-CcodInstalledLifecycleReceiptFact {
         runtimeGeneration = [UInt64]$latest.runtimeGeneration
         phase = [string]$latest.phase
     }
+}
+
+function Initialize-CcodInstalledLifecycleCommandLineParser {
+    if ($null -ne ('CcodInstalledLifecycleCommandLine' -as [type])) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class CcodInstalledLifecycleCommandLine
+{
+    [DllImport("shell32.dll", SetLastError = true)]
+    private static extern IntPtr CommandLineToArgvW(
+        [MarshalAs(UnmanagedType.LPWStr)] string commandLine,
+        out int argumentCount);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr memory);
+
+    public static string[] Parse(string commandLine)
+    {
+        int argumentCount;
+        IntPtr arguments = CommandLineToArgvW(commandLine, out argumentCount);
+        if (arguments == IntPtr.Zero || argumentCount < 1) return null;
+        try
+        {
+            string[] result = new string[argumentCount];
+            for (int index = 0; index < argumentCount; index++)
+            {
+                IntPtr value = Marshal.ReadIntPtr(arguments, index * IntPtr.Size);
+                result[index] = Marshal.PtrToStringUni(value);
+            }
+            return result;
+        }
+        finally
+        {
+            LocalFree(arguments);
+        }
+    }
+}
+'@
+}
+
+function Test-CcodInstalledLifecycleOrdinaryChatGptRoot {
+    param($Process)
+    if ($null -eq $Process -or $Process.CommandLine -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Process.CommandLine)) { return $false }
+    try {
+        Initialize-CcodInstalledLifecycleCommandLineParser
+        $arguments = @([CcodInstalledLifecycleCommandLine]::Parse([string]$Process.CommandLine))
+    } catch {
+        return $false
+    }
+    if ($arguments.Count -eq 0 -or @($arguments | Where-Object { $null -eq $_ -or $_ -isnot [string] }).Count -ne 0) { return $false }
+    foreach ($argument in $arguments) {
+        if ($argument.StartsWith('--type=', [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
+    return $true
 }
 
 function Get-CcodInstalledLifecycleFacts {
@@ -416,7 +478,7 @@ function Get-CcodInstalledLifecycleFacts {
     if ($null -ne $transition) {
         $transitionStage = if ($null -eq $transition.activeTransaction) { 'Idle' } else { [string]$transition.activeTransaction.stage }
     }
-    $lifecycleReceipt = Get-CcodInstalledLifecycleReceiptFact -StateRoot $stateRoot -ActiveRuntimeId $activeRuntimeId
+    $lifecycleReceipt = Get-CcodInstalledLifecycleReceiptFact -StateRoot $stateRoot -ActiveRuntimeId $activeRuntimeId -ActiveGeneration $activeGeneration
     $taskState = 'Unknown'
     try {
         $matches = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -ceq $script:CcodInstalledLifecycleTaskName })
@@ -449,7 +511,7 @@ function Get-CcodInstalledLifecycleFacts {
     }
     $codex = & $makeIdentities @('ChatGPT.exe') {
         param($Process)
-        ([string]$Process.CommandLine) -cnotmatch '(?i)(?:^|\s)--type='
+        Test-CcodInstalledLifecycleOrdinaryChatGptRoot -Process $Process
     }
     $aboutVersion = $null
     $packagePath = Join-Path $appRoot 'package.json'
