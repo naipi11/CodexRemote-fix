@@ -92,6 +92,68 @@ fixtures fail before active-pointer mutation.
 fix: bind setup activation to immutable payload
 ```
 
+### Task 1b: Compile an include-free generated setup script
+
+**Files:**
+- Modify: `build/build.ps1`
+- Modify: `build/CodexControlOtherDevices.iss`
+- Modify: `tools/New-InstallerDestinationInventory.ps1`
+- Test: `tests/persistence/ReleaseWorkflow.SelfTest.ps1`
+
+**Interfaces:**
+- The checked-in `.iss` contains exactly one inventory marker comment.
+- Build writes a temporary generated `.iss` by replacing that marker with the
+  verified inventory procedure and invokes ISCC only on the generated file.
+- The template rejects all external `#include` and `#+` directives.
+
+- [ ] **Step 1: Write failing behavior tests**
+
+```powershell
+$template = @'
+[Setup]
+AppName=fixture
+[Files]
+Source: "first.txt"; DestDir: "{app}\first"
+#+ "extra.iss"
+'@
+Assert-CcodThrows {
+  & $generator -RepositoryRoot $root -PayloadRoot $payload -ProjectVersion '2.5.22' `
+    -InnoScriptPath $templatePath -OutputPath $inventoryPath
+} 'include'
+Assert-CcodFalse (Test-Path -LiteralPath $inventoryPath) 'include bypass produces no partial inventory'
+```
+
+Add an actual ISCC test showing that the generated script compiles with its
+injected inventory, while a template with either include spelling is rejected
+before ISCC is launched.
+
+- [ ] **Step 2: Run the focused test and confirm RED**
+
+Run: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/ReleaseWorkflow.SelfTest.ps1`
+
+Expected: the include-alias fixture is accepted before the new template
+boundary exists.
+
+- [ ] **Step 3: Implement the generated include-free compiler input**
+
+Replace the source include with one unique marker. Build reads the checked-in
+template, refuses any `#include` or `#+` directive, substitutes the generated
+inventory text once, writes a GUID-named temporary `.iss`, validates that the
+result has no marker or external include, and passes that generated path to
+ISCC. Clean the temporary script in `finally`.
+
+- [ ] **Step 4: Run focused tests and prove GREEN**
+
+Run ReleaseWorkflow and the real ISCC fixture. Confirm the compiled setup
+source contains the expected injected procedure and arbitrary include aliases
+leave neither setup nor inventory output.
+
+- [ ] **Step 5: Commit**
+
+```text
+fix: compile include-free setup inventory
+```
+
 ### Task 2: Retry only transient Electron tree reads
 
 **Files:**
@@ -256,6 +318,8 @@ release: prepare CodexRemote-fix v2.5.22
 
 - Task 1 produces the immutable source/expected-version contract consumed by
   the new setup flow and release contract.
+- Task 1b removes the preprocessor include ambiguity from the Task 1 setup
+  source before any release compiler invocation.
 - Task 2 changes only pre-mutation tree acquisition and explicitly leaves all
   identity and post-stop checks strict.
 - Task 3 has no dependency on Task 2 and can be reviewed independently; its

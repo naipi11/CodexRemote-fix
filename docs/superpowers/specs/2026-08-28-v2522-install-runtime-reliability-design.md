@@ -55,6 +55,13 @@ This works for new users because the versioned payload directory is created
 from scratch, and for upgrades because an old app root cannot substitute its
 payload for the requested version.
 
+Build creates a one-time generated `.iss` from the checked-in template by
+replacing one fixed inventory marker with the verified destination-directory
+procedure. The template contains no external `#include` or `#+` directive;
+build rejects both spellings before ISCC runs. This avoids attempting to
+reimplement ISPP preprocessing while making the directory inventory and the
+exact source compiled by ISCC one artifact.
+
 ### 2. Bounded stable-tree acquisition
 
 Add a retry wrapper around verified Electron process-tree acquisition for
