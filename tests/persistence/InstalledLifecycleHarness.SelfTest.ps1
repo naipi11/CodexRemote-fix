@@ -350,6 +350,7 @@ Invoke-CcodTest 'normalizes only supported CIM creation-time evidence for comple
             [pscustomobject]@{ Name = 'null'; Value = $null },
             [pscustomobject]@{ Name = 'Unspecified DateTime'; Value = [DateTime]::SpecifyKind([DateTime]'2030-02-03T12:05:06', [DateTimeKind]::Unspecified) },
             [pscustomobject]@{ Name = 'malformed DMTF'; Value = '20300203120506.000000+08' },
+            [pscustomobject]@{ Name = 'lexically complete invalid DMTF'; Value = '20301303120506.000000+000' },
             [pscustomobject]@{ Name = 'integer'; Value = 1 },
             [pscustomobject]@{ Name = 'arbitrary string'; Value = 'not-a-dmtf-time' }
         )) {

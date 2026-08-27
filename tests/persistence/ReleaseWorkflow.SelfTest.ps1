@@ -239,7 +239,7 @@ Invoke-CcodTest '2.5.21 documentation matches the stable portable release, Defen
     Assert-CcodTrue ($releaseSection.Groups['body'].Value -match '(?m)^### English\s*$') 'v2.5.21 changelog has concise English release notes'
     Assert-CcodTrue ($releaseSection.Groups['body'].Value.Contains('stale-status recovery')) 'v2.5.21 changelog records stale-status repair'
     Assert-CcodTrue ($releaseSection.Groups['body'].Value.Contains('safe lifecycle diagnostics')) 'v2.5.21 changelog records exact safe diagnostics'
-    Assert-CcodTrue ($releaseSection.Groups['body'].Value.Contains('installed Supervisor and TrayHost lifecycle evidence')) 'v2.5.21 changelog records installed lifecycle validation'
+    Assert-CcodTrue (-not $releaseSection.Groups['body'].Value.Contains('installed Supervisor and TrayHost lifecycle evidence')) 'v2.5.21 changelog omits the unsupported Supervisor and TrayHost validation claim'
     $readme = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.md') -Raw
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start\s*\r?\n(?<body>.*?)(?=^## |\z)').Groups['body'].Value
     Assert-CcodTrue ($readme.Contains('v2.5.21 is the current stable release')) 'English README marks v2.5.21 stable without a version-by-version What''s new block'
