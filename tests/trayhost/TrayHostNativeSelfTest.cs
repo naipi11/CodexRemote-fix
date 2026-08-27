@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 
 internal sealed class FakeTrayPlatform : INativeTrayPlatform
@@ -224,6 +225,37 @@ internal static class TrayHostNativeSelfTest
         finally { try { Directory.Delete(root, true); } catch { } }
     }
 
+    private static void TestTerminalDiagnosticLogIsBoundedAndRejectsReparseComponents()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-bound-" + Guid.NewGuid().ToString("N"));
+        string target = Path.Combine(root, "target");
+        string junction = Path.Combine(root, "junction");
+        Directory.CreateDirectory(target);
+        string path = Path.Combine(target, "trayhost-actions.log");
+        try
+        {
+            string lastLine = String.Empty;
+            for (ulong revision = 1UL; revision <= 1400UL; revision++)
+            {
+                TrayTerminalDiagnostic record = new TrayTerminalDiagnostic(TrayCommand.OpenLogs, revision, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED");
+                AssertTrue(TrayTerminalDiagnosticLog.TryAppend(path, record), "bounded terminal diagnostic append succeeds");
+                lastLine = "command=OpenLogs revision=" + revision.ToString(System.Globalization.CultureInfo.InvariantCulture) + " status=Failed code=CCOD_TRAY_ACTION_FAILED" + Environment.NewLine;
+            }
+            FileInfo retained = new FileInfo(path);
+            AssertTrue(retained.Length <= TrayTerminalDiagnosticLog.MaximumBytes, "terminal diagnostic retention never exceeds its fixed byte bound");
+            AssertTrue(File.ReadAllText(path).EndsWith(lastLine, StringComparison.Ordinal), "deterministic rollover retains the complete latest terminal record");
+
+            ProcessStartInfo junctionInfo = new ProcessStartInfo {
+                FileName = Environment.GetEnvironmentVariable("ComSpec"),
+                Arguments = "/d /c mklink /J \"" + junction + "\" \"" + target + "\"",
+                UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true
+            };
+            using (Process junctionProcess = Process.Start(junctionInfo)) { junctionProcess.WaitForExit(); AssertTrue(junctionProcess.ExitCode == 0, "test junction is created"); }
+            AssertTrue(!TrayTerminalDiagnosticLog.TryAppend(Path.Combine(junction, "trayhost-actions.log"), new TrayTerminalDiagnostic(TrayCommand.OpenLogs, 1UL, TrayActionResultStatus.Rejected, "CCOD_TRAY_ACTION_STALE")), "terminal diagnostic rejects a reparse-point path component");
+        }
+        finally { try { if (Directory.Exists(junction)) { Directory.Delete(junction); } } catch { } try { Directory.Delete(root, true); } catch { } }
+    }
+
     private static void TestNoHimcFailureIsSafe()
     {
         FakeTrayPlatform platform = new FakeTrayPlatform();
@@ -304,12 +336,13 @@ internal static class TrayHostNativeSelfTest
             TestVerifiedAboutUsesTheAcknowledgedSnapshotVersion();
             TestActionFailureUsesTheAcknowledgedSnapshotStrings();
             TestTerminalDiagnosticLogIsSanitizedAndReportsPersistence();
+            TestTerminalDiagnosticLogIsBoundedAndRejectsReparseComponents();
             TestSimplifiedMenuAndExitConfirmation();
             TestNoHimcFailureIsSafe();
             TestShellRightClickNotificationMapping();
             TestRealNativePInvokeSurface();
             TestPostedWorkMessageDispatchesToItsOwnerWindow();
-            Console.WriteLine("TrayHost native self-tests passed: 16");
+            Console.WriteLine("TrayHost native self-tests passed: 17");
             return 0;
         }
         catch (Exception error)

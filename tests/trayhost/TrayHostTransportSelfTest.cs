@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Threading;
 
 internal static class TrayHostTransportSelfTest
 {
@@ -198,6 +200,42 @@ internal static class TrayHostTransportSelfTest
         host.Dispose();
     }
 
+    private static void TestBlockingTerminalWriterRunsOutsideCorrelationLock()
+    {
+        ManualResetEvent writerEntered = new ManualResetEvent(false);
+        ManualResetEvent releaseWriter = new ManualResetEvent(false);
+        bool first = true;
+        HostTransport host = new HostTransport(null, delegate(TrayTerminalDiagnostic record)
+        {
+            if (first) { first = false; writerEntered.Set(); releaseWriter.WaitOne(TimeSpan.FromSeconds(3)); }
+            return true;
+        });
+        Guid blockedId = Guid.NewGuid();
+        AssertTrue(host.TryRegisterAction(new TrayHostAction(blockedId, TrayCommand.OpenLogs, 24UL)), "blocking-writer action registers");
+        bool acknowledged = false;
+        Thread acknowledgement = new Thread((ThreadStart)delegate { acknowledged = host.TryAcknowledgeAction(new TrayActionResult(blockedId, 24UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null)); });
+        acknowledgement.IsBackground = true;
+        acknowledgement.Start();
+        try
+        {
+            AssertTrue(writerEntered.WaitOne(TimeSpan.FromSeconds(2)), "terminal writer enters deterministically");
+            Guid concurrentId = Guid.NewGuid();
+            Stopwatch registration = Stopwatch.StartNew();
+            bool registered = host.TryRegisterAction(new TrayHostAction(concurrentId, TrayCommand.OpenLogs, 24UL));
+            registration.Stop();
+            AssertTrue(registered && registration.Elapsed < TimeSpan.FromMilliseconds(250), "blocking terminal I/O cannot hold the correlation lock or pending capacity");
+            releaseWriter.Set();
+            AssertTrue(acknowledgement.Join(TimeSpan.FromSeconds(2)) && acknowledged, "terminal acknowledgement completes after the writer is released");
+            AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(concurrentId, 24UL, TrayActionResultStatus.Completed, null, null)), "concurrent action remains independently completable");
+        }
+        finally
+        {
+            releaseWriter.Set();
+            if (acknowledgement.IsAlive) { acknowledgement.Join(TimeSpan.FromSeconds(2)); }
+            writerEntered.Dispose(); releaseWriter.Dispose(); host.Dispose();
+        }
+    }
+
     public static int Main(string[] args)
     {
         try
@@ -211,7 +249,8 @@ internal static class TrayHostTransportSelfTest
             TestRejectedAndFailedActionsQueueUserFeedback();
             TestUndisplayedActionFailureFeedbackIsBounded();
             TestTerminalDiagnosticFailureNeverStrandsPendingActions();
-            Console.WriteLine("TrayHost transport self-tests passed: 9");
+            TestBlockingTerminalWriterRunsOutsideCorrelationLock();
+            Console.WriteLine("TrayHost transport self-tests passed: 10");
             return 0;
         }
         catch (Exception error)

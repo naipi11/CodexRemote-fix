@@ -90,10 +90,11 @@ internal sealed class HostTransport : IDisposable
     internal bool TryAcknowledgeAction(TrayActionResult result)
     {
         if (result == null) { return false; }
+        PendingAction pending;
+        TrayTerminalDiagnostic diagnostic;
         lock (_gate)
         {
             if (_disposed) { return false; }
-            PendingAction pending;
             if (!_pendingActions.TryGetValue(result.ActionId, out pending) || pending.Action.Revision != result.Revision) { return false; }
             if (result.Status == TrayActionResultStatus.Accepted)
             {
@@ -103,14 +104,19 @@ internal sealed class HostTransport : IDisposable
             }
             if (result.Status != TrayActionResultStatus.Completed && result.Status != TrayActionResultStatus.Rejected && result.Status != TrayActionResultStatus.Failed) { return false; }
             if (result.Status == TrayActionResultStatus.Completed && TrayCommandPolicy.RequiresAcceptedBeforeCompleted(pending.Action.Command) && !pending.Accepted) { return false; }
-            bool recorded = false;
-            Func<TrayTerminalDiagnostic, bool> writer = _writeTerminalDiagnostic;
-            if (writer != null)
-            {
-                try { recorded = writer(new TrayTerminalDiagnostic(pending.Action.Command, result.Revision, result.Status, result.ErrorCode)); }
-                catch { recorded = false; }
-            }
+            diagnostic = new TrayTerminalDiagnostic(pending.Action.Command, result.Revision, result.Status, result.ErrorCode);
             _pendingActions.Remove(result.ActionId);
+        }
+        bool recorded = false;
+        Func<TrayTerminalDiagnostic, bool> writer = _writeTerminalDiagnostic;
+        if (writer != null)
+        {
+            try { recorded = writer(diagnostic); }
+            catch { recorded = false; }
+        }
+        lock (_gate)
+        {
+            if (_disposed) { return true; }
             if (recorded && result.Status == TrayActionResultStatus.Completed && pending.Action.Command == TrayCommand.ShowAbout) { _completedAbout.Enqueue(result); }
             if (recorded && (result.Status == TrayActionResultStatus.Rejected || result.Status == TrayActionResultStatus.Failed) && _failedActions.Count < 8) { _failedActions.Enqueue(result); }
             return true;

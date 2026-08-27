@@ -35,12 +35,20 @@ $parentClientFiles=@(
     (Join-Path $repositoryRoot 'src\trayhost\JobObject.cs'),
     (Join-Path $repositoryRoot 'src\trayhost\TrayHostParentClient.cs')
 )
+$programTraceFiles=@(
+    (Join-Path $repositoryRoot 'src\trayhost\NativeMethods.cs'),
+    (Join-Path $repositoryRoot 'src\trayhost\InputModeGuard.cs'),
+    (Join-Path $repositoryRoot 'src\trayhost\NativeMenu.cs'),
+    (Join-Path $repositoryRoot 'src\trayhost\TrayWindow.cs'),
+    (Join-Path $repositoryRoot 'src\trayhost\TrayHostApplication.cs'),
+    (Join-Path $repositoryRoot 'src\trayhost\Program.cs')
+)
 $testPath=if($ProtocolOnly){Join-Path $repositoryRoot 'tests\trayhost\TrayHostProtocolSelfTest.cs'}elseif($NativeOnly){Join-Path $repositoryRoot 'tests\trayhost\TrayHostNativeSelfTest.cs'}elseif($TransportOnly){Join-Path $repositoryRoot 'tests\trayhost\TrayHostTransportSelfTest.cs'}else{Join-Path $repositoryRoot 'tests\trayhost\TrayHostParentClientSelfTest.cs'}
 $requiredFiles=@($protocolPath,$presentationPath,$testPath)
 if($ProtocolOnly){$requiredFiles+=$protocolSupportFiles}
 if($NativeOnly){$requiredFiles+=$nativeFiles+$transportFiles}
 if($TransportOnly){$requiredFiles+=$transportFiles}
-if($ParentClientOnly){$requiredFiles+=$transportFiles+$parentClientFiles}
+if($ParentClientOnly){$requiredFiles+=$transportFiles+$parentClientFiles+$programTraceFiles}
 if($ProductionOnly){$requiredFiles+=(Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'src\trayhost') -Filter '*.cs' -File | ForEach-Object FullName)}
 if($requiredFiles|Where-Object{ -not(Test-Path -LiteralPath $_ -PathType Leaf)}){throw 'CCOD_TRAYHOST_SOURCE_MISSING'}
 Import-Module (Join-Path $repositoryRoot 'build\TrayHostReferencePack.psm1') -Force
@@ -62,11 +70,15 @@ try{
         if($ProtocolOnly){$args+=$protocolSupportFiles}
         if($NativeOnly){$args+=$nativeFiles+$transportFiles}
         if($TransportOnly){$args+=$transportFiles}
-        if($ParentClientOnly){$args+=$transportFiles+$parentClientFiles}
+        if($ParentClientOnly){$args+=$transportFiles+$parentClientFiles+$programTraceFiles}
     }
     $args+=$testPath
     & $compiler @args
     if($LASTEXITCODE -ne 0){if($ProtocolOnly){throw 'CCOD_TRAYHOST_PROTOCOL_COMPILE_FAILED'}elseif($ProductionOnly){throw 'CCOD_TRAYHOST_PRODUCTION_COMPILE_FAILED'}else{throw 'CCOD_TRAYHOST_NATIVE_COMPILE_FAILED'}}
     if($ProductionOnly){& $outputPath '--headless-smoke'}else{& $outputPath}
     if($LASTEXITCODE -ne 0){if($ProtocolOnly){throw 'CCOD_TRAYHOST_PROTOCOL_TEST_FAILED'}elseif($ProductionOnly){throw 'CCOD_TRAYHOST_HEADLESS_SMOKE_FAILED'}else{throw 'CCOD_TRAYHOST_NATIVE_TEST_FAILED'}}
+    if($ParentClientOnly){
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repositoryRoot 'tests\persistence\TrayHostProductionTrace.SelfTest.ps1') -AssemblyPath $outputPath
+        if($LASTEXITCODE -ne 0){throw 'CCOD_TRAYHOST_PRODUCTION_TRACE_FAILED'}
+    }
 }finally{if(Test-Path -LiteralPath $temporaryRoot){Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction SilentlyContinue}}

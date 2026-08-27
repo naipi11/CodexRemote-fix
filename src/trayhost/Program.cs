@@ -39,8 +39,8 @@ internal static class Program
         PresentationSnapshot initial = TrayHostWire.ReadPresentation(initialFrame.Payload);
         Win32TrayPlatform platform = new Win32TrayPlatform();
         TrayHostApplication application = null;
-        string terminalLogPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexControlOtherDevices", "logs", "trayhost-actions.log");
-        try { Directory.CreateDirectory(Path.GetDirectoryName(terminalLogPath)); } catch { }
+        string terminalLogPath;
+        if (!TrayTerminalDiagnosticLog.TryGetDefaultPath(out terminalLogPath)) { terminalLogPath = null; }
         HostTransport transport = new HostTransport(delegate { TrayHostApplication current = application; if (current != null) { current.PostWork(); } }, delegate(TrayTerminalDiagnostic record) { return TrayTerminalDiagnosticLog.TryAppend(terminalLogPath, record); });
         TrayWindow window = new TrayWindow(platform, transport.SetMenuOpen);
         bool shutdownRequested = false; bool shutdownSent = false; object stateGate = new object();
@@ -91,7 +91,7 @@ internal static class Program
                 {
                     ProtocolFrame frame = ProtocolCodec.ReadAuthenticated(input, ProtocolDirection.ParentToHost, epoch, inboundSequence++, keys.ParentToHost);
                     if (frame.MessageType == TrayHostMessageType.Presentation) { transport.TryAcceptPresentation(TrayHostWire.ReadPresentation(frame.Payload)); application.PostWork(); }
-                    else if (frame.MessageType == TrayHostMessageType.ActionResult) { if (!transport.TryAcknowledgeAction(TrayHostWire.ReadActionResult(frame.Payload))) { throw new ProtocolViolationException("action result is uncorrelated"); } application.PostWork(); }
+                    else if (frame.MessageType == TrayHostMessageType.ActionResult) { if (!TryDispatchAuthenticatedActionResult(transport, frame.Payload)) { throw new ProtocolViolationException("action result is uncorrelated"); } application.PostWork(); }
                     else if (frame.MessageType == TrayHostMessageType.Shutdown) { lock (stateGate) { shutdownRequested = true; } application.PostWork(); }
                     else if (frame.MessageType == TrayHostMessageType.Ping) { lock (WriteGate) { ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.Pong, epoch, outboundSequence++, frame.Payload), keys.HostToParent); } }
                 }
@@ -106,6 +106,12 @@ internal static class Program
     private static bool VerifyParentIdentity(int pid, long creation)
     {
         try { using (Process process = Process.GetProcessById(pid)) { return process.StartTime.ToFileTimeUtc() == creation; } } catch { return false; }
+    }
+
+    internal static bool TryDispatchAuthenticatedActionResult(HostTransport transport, byte[] payload)
+    {
+        if (transport == null || payload == null) { return false; }
+        return transport.TryAcknowledgeAction(TrayHostWire.ReadActionResult(payload));
     }
 
     private static int RunHeadlessSmoke()
