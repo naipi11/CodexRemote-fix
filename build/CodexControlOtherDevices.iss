@@ -11,6 +11,9 @@
 #ifndef InstallerPayloadManifestSha256
 #error InstallerPayloadManifestSha256 must be supplied by the release builder
 #endif
+#ifndef InstallerDestinationInventoryInclude
+#error InstallerDestinationInventoryInclude must be supplied by the release builder
+#endif
 AppId={{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}
 AppName=CodexRemote-fix
 AppVersion={#ProjectVersion}
@@ -75,6 +78,7 @@ Source: "..\Test-CodexControlOtherDevices.ps1"; DestDir: "{app}"; Flags: ignorev
 Source: "..\Activate-CcodRemoteFix.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Prompt-CcodRestart.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\tools\New-InstallerPayloadManifest.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "..\tools\New-InstallerDestinationInventory.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "{#InstallerPayloadDirectory}\*"; DestDir: "{app}\payload\{#ProjectVersion}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [InstallDelete]
@@ -95,6 +99,7 @@ Name: "{group}\Uninstall CodexRemote-fix"; Filename: "{app}\unins000.exe"; IconF
 Name: "{userdesktop}\CodexRemote-fix"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{localappdata}\CodexControlOtherDevices\bootstrap.ps1"" -InstallRoot ""{localappdata}\CodexControlOtherDevices"" -EntryMode Explicit"; WorkingDir: "{localappdata}\CodexControlOtherDevices"; IconFilename: "{app}\assets\CodexRemote-fix.ico"
 
 [Code]
+#include InstallerDestinationInventoryInclude
 const
   ACTIVATION_TIMEOUT_MILLISECONDS = 300000;
   FIRST_ACTIVATION_RECEIPT_TIMEOUT_MILLISECONDS = 90000;
@@ -165,27 +170,36 @@ begin
   end;
 end;
 
+function AreCcodExpectedSetupDirectoriesSafe(const AppDirectory: String): Boolean;
+var
+  Directories: TStringList;
+  Index: Integer;
+  Candidate: String;
+begin
+  Result := False;
+  Directories := TStringList.Create;
+  try
+    AddCcodExpectedSetupDirectories(Directories);
+    if Directories.Count = 0 then Exit;
+    for Index := 0 to Directories.Count - 1 do
+    begin
+      Candidate := AddBackslash(AppDirectory) + Directories[Index];
+      if not IsSafeExistingPayloadDirectory(Candidate) then Exit;
+    end;
+    Result := True;
+  finally
+    Directories.Free;
+  end;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
-  AppDirectory, PayloadDirectory, VersionDirectory: String;
+  AppDirectory: String;
 begin
   Result := '';
   AppDirectory := ExpandConstant('{app}');
-  PayloadDirectory := ExpandConstant('{app}\payload');
-  VersionDirectory := ExpandConstant('{app}\payload\{#ProjectVersion}');
   if not IsSafeExistingSetupTree(AppDirectory) or
-     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\build')) or
-     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\bin')) or
-     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\.github')) or
-     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\.github\workflows')) or
-     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\assets')) or
-     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\assets\codexremote-fix')) or
-     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\docs')) or
-     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\src')) or
-     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\tests')) or
-     not IsSafeExistingPayloadDirectory(ExpandConstant('{app}\tools')) or
-     not IsSafeExistingPayloadDirectory(PayloadDirectory) or
-     not IsSafeExistingPayloadDirectory(VersionDirectory) then
+     not AreCcodExpectedSetupDirectoriesSafe(AppDirectory) then
     Result := 'CodexRemote-fix refused an unsafe existing payload directory.';
 end;
 

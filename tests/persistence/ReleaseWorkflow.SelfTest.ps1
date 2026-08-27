@@ -104,6 +104,23 @@ Invoke-CcodTest 'production installer payload generator writes ordered version-b
     }
 }
 
+Invoke-CcodTest 'production setup destination inventory derives every nested directory from Inno sources and payload input' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-installer-directory-inventory-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $payload = Join-Path $root 'payload'
+        [IO.Directory]::CreateDirectory((Join-Path $payload 'src\persistence\modules')) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $payload 'src\persistence\modules\InstallLifecycle.psm1'),'fixture',[Text.UTF8Encoding]::new($false))
+        $output = Join-Path $root 'InstallerDestinationInventory.iss'
+        & (Join-Path $repositoryRoot 'tools\New-InstallerDestinationInventory.ps1') -RepositoryRoot $repositoryRoot -PayloadRoot $payload -ProjectVersion '2.5.22' -InnoScriptPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -OutputPath $output | Out-Null
+        $inventory = [IO.File]::ReadAllText($output,[Text.UTF8Encoding]::new($false))
+        foreach ($relative in @('src','src\persistence','src\persistence\modules','payload','payload\2.5.22','payload\2.5.22\src','payload\2.5.22\src\persistence','payload\2.5.22\src\persistence\modules')) {
+            Assert-CcodTrue ($inventory.Contains("Directories.Add('$relative');")) "generated setup inventory contains $relative"
+        }
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
 function New-CcodActivationPayloadFixture {
     param([string]$Version = '2.5.22')
 
@@ -138,7 +155,7 @@ function Invoke-CcodActivationVerifierFixture {
 }
 
 function Invoke-CcodInnoPayloadCompileFixture {
-    param([switch]$IncludePayloadDefines)
+    param([switch]$IncludePayloadDefines,[switch]$OmitDestinationInventory)
 
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-inno-payload-contract-' + [guid]::NewGuid().ToString('N'))
     $tray = Join-Path $root 'tray'
@@ -157,6 +174,8 @@ function Invoke-CcodInnoPayloadCompileFixture {
     $manifest = [ordered]@{schemaVersion=1;projectVersion='2.5.21';files=@([ordered]@{path='package.json';length=[int64](Get-Item -LiteralPath (Join-Path $payload 'package.json')).Length;sha256=$packageHash})}
     $manifestPath = Join-Path $payload 'installer-payload.manifest.json'
     [IO.File]::WriteAllText($manifestPath,($manifest|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    $inventoryPath = Join-Path $root 'InstallerDestinationInventory.iss'
+    & (Join-Path $repositoryRoot 'tools\New-InstallerDestinationInventory.ps1') -RepositoryRoot $repositoryRoot -PayloadRoot $payload -ProjectVersion '2.5.21' -InnoScriptPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -OutputPath $inventoryPath | Out-Null
     $iscc = @(
         (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
         (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
@@ -165,7 +184,9 @@ function Invoke-CcodInnoPayloadCompileFixture {
     if (-not $iscc) { throw 'Inno Setup 6 is required for the setup payload contract' }
     $arguments = @('/DProjectVersion=2.5.21',"/DTrayHostArtifactDirectory=$tray","/DPortableArtifactDirectory=$portable","/O$output\",(Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'))
     if ($IncludePayloadDefines) {
-        $arguments = @('/DProjectVersion=2.5.21',"/DTrayHostArtifactDirectory=$tray","/DPortableArtifactDirectory=$portable","/DInstallerPayloadDirectory=$payload","/DInstallerPayloadManifestSha256=$(Get-CcodTestFileSha256 -Path $manifestPath)","/O$output\",(Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'))
+        $arguments = @('/DProjectVersion=2.5.21',"/DTrayHostArtifactDirectory=$tray","/DPortableArtifactDirectory=$portable","/DInstallerPayloadDirectory=$payload","/DInstallerPayloadManifestSha256=$(Get-CcodTestFileSha256 -Path $manifestPath)")
+        if (-not $OmitDestinationInventory) { $arguments += "/DInstallerDestinationInventoryInclude=$inventoryPath" }
+        $arguments += @("/O$output\",(Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'))
     }
     $previousPreference = $ErrorActionPreference
     try {
@@ -182,7 +203,7 @@ Invoke-CcodTest 'setup build and activation bind one immutable versioned payload
     $activation = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -Raw -Encoding UTF8
     $installer = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Install-CodexControlOtherDevices.ps1') -Raw -Encoding UTF8
 
-    Assert-CcodTrue ($build -cmatch 'New-InstallerPayloadManifest\.ps1' -and $build -cmatch 'InstallerPayloadManifestSha256') 'build invokes the tested generator and binds its manifest hash into setup compilation'
+    Assert-CcodTrue ($build -cmatch 'New-InstallerPayloadManifest\.ps1' -and $build -cmatch 'New-InstallerDestinationInventory\.ps1' -and $build -cmatch 'InstallerPayloadManifestSha256' -and $build -cmatch 'InstallerDestinationInventoryInclude') 'build invokes the tested generators and binds their outputs into setup compilation'
     Assert-CcodTrue ($inno -cmatch 'InstallerPayloadDirectory' -and $inno -cmatch 'DestDir:\s*"\{app\}\\payload\\\{#ProjectVersion\}"') 'Inno copies the immutable build payload into its exact version directory'
     Assert-CcodTrue ($inno -cmatch "ExpandConstant\('\{app\}\\payload\\\{#ProjectVersion\}'\)" -and $inno -cmatch '-ExpectedVersion\s+"\{#ProjectVersion\}') 'Inno binds activation to its compiled payload version'
     Assert-CcodTrue ($activation -cmatch '\[string\]\$ExpectedVersion' -and $activation -cmatch '\[string\]\$ExpectedPayloadManifestSha256' -and $activation -cmatch 'installer-payload\.manifest\.json') 'activation accepts and resolves the expected payload contract'
@@ -306,7 +327,18 @@ Invoke-CcodTest 'Inno compile packages the explicit manifest-bound installer pay
     try {
         Assert-CcodEqual 0 $compile.ExitCode "explicit setup payload contract compiles: $($compile.Output)"
         Assert-CcodTrue (Test-Path -LiteralPath $compile.SetupPath -PathType Leaf) 'explicit payload compile produces the setup artifact'
-        Assert-CcodTrue ($compile.Output -cmatch 'installer-payload\.manifest\.json' -and $compile.Output -cmatch 'payload\\package\.json') 'compiler input trace contains the exact payload manifest and manifest-listed file'
+        Assert-CcodTrue ($compile.Output -cmatch 'InstallerDestinationInventory\.iss' -and $compile.Output -cmatch 'installer-payload\.manifest\.json' -and $compile.Output -cmatch 'payload\\package\.json') 'compiler input trace contains the destination inventory, payload manifest, and manifest-listed file'
+    } finally {
+        if (Test-Path -LiteralPath $compile.Root) { Remove-Item -LiteralPath $compile.Root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'Inno compile refuses a missing generated destination inventory' {
+    $compile = Invoke-CcodInnoPayloadCompileFixture -IncludePayloadDefines -OmitDestinationInventory
+    try {
+        Assert-CcodTrue ($compile.ExitCode -ne 0) 'setup compilation fails when only the destination inventory define is omitted'
+        Assert-CcodTrue ($compile.Output -cmatch 'InstallerDestinationInventoryInclude') 'compiler identifies the missing generated inventory define'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath $compile.SetupPath)) 'missing inventory define produces no setup artifact'
     } finally {
         if (Test-Path -LiteralPath $compile.Root) { Remove-Item -LiteralPath $compile.Root -Recurse -Force }
     }
@@ -318,7 +350,9 @@ Invoke-CcodTest 'Inno exposes a pre-write payload-directory reparse gate' {
     Assert-CcodTrue $helper.Success 'production Inno script exposes the directory predicate used before payload writes'
     $treeHelper = [regex]::Match($inno,'(?ms)^function IsSafeExistingSetupTree\(.*?^end;')
     Assert-CcodTrue $treeHelper.Success 'production Inno script exposes a recursive destination-tree predicate'
-    Assert-CcodTrue ($inno -cmatch '(?ms)^function PrepareToInstall\(var NeedsRestart: Boolean\): String;.*?IsSafeExistingSetupTree') 'PrepareToInstall rejects unsafe nested setup destinations before file copy'
+    $inventoryValidator = [regex]::Match($inno,'(?ms)^function AreCcodExpectedSetupDirectoriesSafe\(.*?^end;')
+    Assert-CcodTrue $inventoryValidator.Success 'production Inno script exposes a generated destination-inventory validator'
+    Assert-CcodTrue ($inno -cmatch 'InstallerDestinationInventoryInclude' -and $inno -cmatch '(?ms)^function PrepareToInstall\(var NeedsRestart: Boolean\): String;.*?AreCcodExpectedSetupDirectoriesSafe') 'PrepareToInstall consumes the compile-bound generated inventory before file copy'
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-inno-reparse-harness-' + [guid]::NewGuid().ToString('N'))
     try {
         $normal = Join-Path $root 'normal'
@@ -328,6 +362,12 @@ Invoke-CcodTest 'Inno exposes a pre-write payload-directory reparse gate' {
         $tree = Join-Path $root 'tree'
         $nested = Join-Path $tree 'src\escape'
         $fileDirectory = Join-Path $root 'file-as-directory'
+        $expectedFileRoot = Join-Path $root 'expected-file-root'
+        $expectedJunctionRoot = Join-Path $root 'expected-junction-root'
+        $normalExpectedRoot = Join-Path $root 'normal-expected-root'
+        $inventoryPayload = Join-Path $root 'inventory-payload'
+        $fileWriteMarker = Join-Path $expectedFileRoot 'payload-write-marker.txt'
+        $junctionWriteMarker = Join-Path $expectedJunctionRoot 'payload-write-marker.txt'
         $resultPath = Join-Path $root 'result.txt'
         [IO.Directory]::CreateDirectory($normal) | Out-Null
         [IO.Directory]::CreateDirectory($target) | Out-Null
@@ -335,6 +375,16 @@ Invoke-CcodTest 'Inno exposes a pre-write payload-directory reparse gate' {
         New-Item -ItemType Junction -Path $junction -Target $target | Out-Null
         New-Item -ItemType Junction -Path $nested -Target $target | Out-Null
         [IO.File]::WriteAllText($fileDirectory,'not a directory',[Text.UTF8Encoding]::new($false))
+        [IO.Directory]::CreateDirectory((Join-Path $expectedFileRoot 'src')) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $expectedFileRoot 'src\persistence'),'not a directory',[Text.UTF8Encoding]::new($false))
+        [IO.Directory]::CreateDirectory((Join-Path $expectedJunctionRoot 'payload\2.5.22\src')) | Out-Null
+        New-Item -ItemType Junction -Path (Join-Path $expectedJunctionRoot 'payload\2.5.22\src\persistence') -Target $target | Out-Null
+        [IO.Directory]::CreateDirectory($normalExpectedRoot) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $inventoryPayload 'src\persistence\modules')) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $inventoryPayload 'src\persistence\modules\InstallLifecycle.psm1'),'fixture',[Text.UTF8Encoding]::new($false))
+        $inventoryPath = Join-Path $root 'InventoryFixture.iss'
+        & (Join-Path $repositoryRoot 'tools\New-InstallerDestinationInventory.ps1') -RepositoryRoot $repositoryRoot -PayloadRoot $inventoryPayload -ProjectVersion '2.5.22' -InnoScriptPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -OutputPath $inventoryPath | Out-Null
+        $inventorySource = [IO.File]::ReadAllText($inventoryPath,[Text.UTF8Encoding]::new($false))
         $harnessPath = Join-Path $root 'ReparseGate.iss'
         $harness = @"
 [Setup]
@@ -354,13 +404,22 @@ function GetFileAttributesW(const FileName: String): Cardinal;
   external 'GetFileAttributesW@kernel32.dll stdcall';
 $($helper.Value)
 $($treeHelper.Value)
+$inventorySource
+$($inventoryValidator.Value)
 function InitializeSetup(): Boolean;
 begin
+  if AreCcodExpectedSetupDirectoriesSafe('$($expectedFileRoot.Replace("'","''"))') then
+    SaveStringToFile('$($fileWriteMarker.Replace("'","''"))','unsafe write',False);
+  if AreCcodExpectedSetupDirectoriesSafe('$($expectedJunctionRoot.Replace("'","''"))') then
+    SaveStringToFile('$($junctionWriteMarker.Replace("'","''"))','unsafe write',False);
   if IsSafeExistingPayloadDirectory('$($normal.Replace("'","''"))') and
      IsSafeExistingPayloadDirectory('$($missing.Replace("'","''"))') and
      (not IsSafeExistingPayloadDirectory('$($junction.Replace("'","''"))')) and
      (not IsSafeExistingSetupTree('$($tree.Replace("'","''"))')) and
-     (not IsSafeExistingSetupTree('$($fileDirectory.Replace("'","''"))')) then
+     (not IsSafeExistingSetupTree('$($fileDirectory.Replace("'","''"))')) and
+     AreCcodExpectedSetupDirectoriesSafe('$($normalExpectedRoot.Replace("'","''"))') and
+     (not AreCcodExpectedSetupDirectoriesSafe('$($expectedFileRoot.Replace("'","''"))')) and
+     (not AreCcodExpectedSetupDirectoriesSafe('$($expectedJunctionRoot.Replace("'","''"))')) then
     SaveStringToFile('$($resultPath.Replace("'","''"))','pass',False);
   Result := False;
 end;
@@ -372,6 +431,8 @@ end;
         $process = Start-Process -FilePath (Join-Path $root 'ReparseGate.exe') -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-') -WindowStyle Hidden -Wait -PassThru
         try { $null = $process.ExitCode } finally { $process.Dispose() }
         Assert-CcodEqual 'pass' ([IO.File]::ReadAllText($resultPath,[Text.UTF8Encoding]::new($false))) 'production predicate rejects root/nested junctions and file-valued directory paths'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath $fileWriteMarker)) 'nested file-as-directory is rejected before simulated payload writes'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath $junctionWriteMarker)) 'nested junction is rejected before simulated payload writes'
     } finally {
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
     }
