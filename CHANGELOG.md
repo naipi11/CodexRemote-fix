@@ -12,7 +12,7 @@ No unreleased changes.
 
 - Repaired stale-status recovery around one exact live Codex root, rejecting ambiguous roots and stale identity correlation.
 - Added exact, safe lifecycle diagnostics that explain rejected repair evidence without broad process actions.
-- Validated installed Supervisor and TrayHost lifecycle evidence against the real current Codex root.
+- Removed the prior claim about installed Supervisor and TrayHost lifecycle evidence, which the FreshRestart gate does not validate.
 
 ## v2.5.20
 

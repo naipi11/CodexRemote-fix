@@ -61,6 +61,33 @@ function Test-CcodInstalledLifecycleCanonicalUtc {
     return $parsed.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture) -ceq $Value
 }
 
+function ConvertTo-CcodInstalledLifecycleCreationTimeUtc {
+    param($Value)
+    $created = $null
+    if ($Value -is [datetime]) {
+        if ($Value.Kind -ne [DateTimeKind]::Local -and $Value.Kind -ne [DateTimeKind]::Utc) {
+            Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'An enumerated ChatGPT process has invalid creation-time evidence' $null
+        }
+        $created = $Value
+    } elseif ($Value -is [string]) {
+        if ($Value -cnotmatch '^\d{14}\.\d{6}[+-]\d{3}$') {
+            Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'An enumerated ChatGPT process has invalid creation-time evidence' $null
+        }
+        try {
+            $created = [Management.ManagementDateTimeConverter]::ToDateTime($Value)
+        } catch {
+            Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'An enumerated ChatGPT process has invalid creation-time evidence' $null
+        }
+    } else {
+        Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'An enumerated ChatGPT process has invalid creation-time evidence' $null
+    }
+    $canonical = $created.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    if (-not (Test-CcodInstalledLifecycleCanonicalUtc -Value $canonical)) {
+        Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'An enumerated ChatGPT process creation time is not canonical' $null
+    }
+    return $canonical
+}
+
 function Assert-CcodInstalledLifecycleRegularFile {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Kind)
     if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathRooted($Path)) {
@@ -477,15 +504,10 @@ function Get-CcodInstalledLifecycleChatGptIdentities {
     foreach($process in $processes){
         if($null -eq $process -or $process.PSObject.Properties['ProcessId'] -eq $null -or
            -not (Test-CcodInstalledLifecyclePositiveInteger -Value $process.ProcessId) -or [decimal]$process.ProcessId -gt [int]::MaxValue -or
-           $process.PSObject.Properties['CreationDate'] -eq $null -or $process.CreationDate -isnot [string] -or [string]::IsNullOrWhiteSpace($process.CreationDate)){
+           $process.PSObject.Properties['CreationDate'] -eq $null){
             Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'An enumerated ChatGPT process has invalid identity evidence' $null
         }
-        try{$created=[Management.ManagementDateTimeConverter]::ToDateTime([string]$process.CreationDate).ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)}catch{
-            Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'An enumerated ChatGPT process has invalid creation-time evidence' $null
-        }
-        if(-not (Test-CcodInstalledLifecycleCanonicalUtc -Value $created)){
-            Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'An enumerated ChatGPT process creation time is not canonical' $null
-        }
+        $created = ConvertTo-CcodInstalledLifecycleCreationTimeUtc -Value $process.CreationDate
         $classification=Get-CcodInstalledLifecycleChatGptClassification -Process $process
         if($classification -ceq 'Root'){$records.Add([pscustomobject][ordered]@{Pid=[int]$process.ProcessId;CreationTimeUtc=$created})}
     }

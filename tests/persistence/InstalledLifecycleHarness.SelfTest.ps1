@@ -323,6 +323,47 @@ Invoke-CcodTest 'captures exactly the top-level ChatGPT root and excludes Electr
     }
 }
 
+Invoke-CcodTest 'normalizes only supported CIM creation-time evidence for complete ChatGPT roots' {
+    . $harnessPath -Library
+    $root = Join-Path $env:TEMP ('ccod-installed-cim-creation-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $null = [IO.Directory]::CreateDirectory($root)
+        $commandLine = '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe"'
+        $local = [DateTime]::SpecifyKind([DateTime]'2030-02-03T12:05:06', [DateTimeKind]::Local)
+        $utc = [DateTime]::SpecifyKind([DateTime]'2030-02-03T12:05:06', [DateTimeKind]::Utc)
+        $dmtf = [Management.ManagementDateTimeConverter]::ToDmtfDateTime($utc)
+        $successCases = @(
+            [pscustomobject]@{ Name = 'Local DateTime'; Value = $local; Expected = $local.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture) },
+            [pscustomobject]@{ Name = 'Utc DateTime'; Value = $utc; Expected = $utc.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture) },
+            [pscustomobject]@{ Name = 'complete DMTF string'; Value = $dmtf; Expected = $utc.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+        )
+        foreach ($case in $successCases) {
+            $process = New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13948 -CreationTimeUtc '2026-08-24T00:00:04.0000000Z' -CommandLine $commandLine
+            $process.CreationDate = $case.Value
+            Set-CcodHarnessProcessFixture -ChatGPT @($process)
+            $facts = Get-CcodInstalledLifecycleFacts -InstallRoot $root
+            Assert-CcodEqual 1 $facts.codex.Count ("{0} keeps one root" -f $case.Name)
+            Assert-CcodEqual 13948 $facts.codex[0].pid ("{0} retains the root PID" -f $case.Name)
+            Assert-CcodEqual $case.Expected $facts.codex[0].creationTimeUtc ("{0} becomes canonical UTC" -f $case.Name)
+        }
+        foreach ($case in @(
+            [pscustomobject]@{ Name = 'null'; Value = $null },
+            [pscustomobject]@{ Name = 'Unspecified DateTime'; Value = [DateTime]::SpecifyKind([DateTime]'2030-02-03T12:05:06', [DateTimeKind]::Unspecified) },
+            [pscustomobject]@{ Name = 'malformed DMTF'; Value = '20300203120506.000000+08' },
+            [pscustomobject]@{ Name = 'integer'; Value = 1 },
+            [pscustomobject]@{ Name = 'arbitrary string'; Value = 'not-a-dmtf-time' }
+        )) {
+            $process = New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13948 -CreationTimeUtc '2026-08-24T00:00:04.0000000Z' -CommandLine $commandLine
+            $process.CreationDate = $case.Value
+            Set-CcodHarnessProcessFixture -ChatGPT @($process)
+            Assert-CcodThrows { Get-CcodInstalledLifecycleFacts -InstallRoot $root } 'CCOD_INTEGRATION_FACTS_INVALID'
+        }
+    } finally {
+        Clear-CcodHarnessProcessFixture
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
 Invoke-CcodTest 'fails closed when any enumerated ChatGPT process cannot be proven root or Electron child' {
     . $harnessPath -Library
     foreach($case in @('null command line','empty command line','unparsable command line','invalid creation time','zero PID','string PID','nonstring command line','missing command line')){
