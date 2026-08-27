@@ -204,18 +204,19 @@ try {
         Assert-CcodEqual $false $wrongError 'other native failures stay fail-closed even when the PID is absent'
     }
 
-    Invoke-CcodTest 'observes absence same identity and PID reuse through one strict native query' {
+    Invoke-CcodTest 'observes absence same identity and PID reuse through one minimal native PID and creation query' {
         $cases = @(
-            @{ Name='absent'; Native=$null; Want='Absent'; Creation=$null },
-            @{ Name='same'; Native=[pscustomobject][ordered]@{Pid=10664;CreationTimeUtc='2026-08-26T04:49:22.1551350Z';SessionId=1;UserSid='S-1-5-21-test';Path='C:\Program Files\WindowsApps\OpenAI.Codex_test\app\ChatGPT.exe';PackageFamilyName='OpenAI.Codex_test'}; Want='SameIdentity'; Creation='2026-08-26T04:49:22.1551350Z' },
-            @{ Name='reused'; Native=[pscustomobject][ordered]@{Pid=10664;CreationTimeUtc='2026-08-27T04:49:22.1551350Z';SessionId=1;UserSid='S-1-5-21-test';Path='C:\Program Files\WindowsApps\OpenAI.Codex_test\app\ChatGPT.exe';PackageFamilyName='OpenAI.Codex_test'}; Want='IdentityChanged'; Creation='2026-08-27T04:49:22.1551350Z' }
+            @{ Name='absent at handle-open boundary'; Native=[pscustomobject][ordered]@{Outcome='Absent';Pid=10664;CreationTimeUtc=$null}; Want='Absent'; Creation=$null },
+            @{ Name='same'; Native=[pscustomobject][ordered]@{Outcome='Found';Pid=10664;CreationTimeUtc='2026-08-26T04:49:22.1551350Z'}; Want='SameIdentity'; Creation='2026-08-26T04:49:22.1551350Z' },
+            @{ Name='reused'; Native=[pscustomobject][ordered]@{Outcome='Found';Pid=10664;CreationTimeUtc='2026-08-27T04:49:22.1551350Z'}; Want='IdentityChanged'; Creation='2026-08-27T04:49:22.1551350Z' }
         )
         foreach ($case in $cases) {
             $fixture = [pscustomobject]@{ Value=$case.Native }
             $calls = [pscustomobject]@{ Count=0 }
             try {
                 $result = Get-CcodProcessIdentityObservation -ProcessId 10664 -ExpectedCreationTimeUtc '2026-08-26T04:49:22.1551350Z' -Adapters @{
-                    GetNativeProcess = { param($ProcessId) [void]($calls.Count++); $fixture.Value }.GetNewClosure()
+                    GetMinimalNativeProcess = { param($ProcessId) [void]($calls.Count++); $fixture.Value }.GetNewClosure()
+                    GetNativeProcess = { throw 'rich path SID package query must not run for PID identity observation' }
                 }
             } catch { throw "$($case.Name) observation failed: $($_.Exception.Message)" }
             Assert-CcodEqual 'Outcome,Pid,CreationTimeUtc' (($result.PSObject.Properties.Name) -join ',') "$($case.Name) observation exposes only the ordered identity contract"
@@ -226,8 +227,8 @@ try {
         }
     }
 
-    Invoke-CcodTest 'rejects malformed failed or incidental native identity observations' {
-        $same = [pscustomobject][ordered]@{Pid=10664;CreationTimeUtc='2026-08-26T04:49:22.1551350Z';SessionId=1;UserSid='S-1-5-21-test';Path='C:\Program Files\WindowsApps\OpenAI.Codex_test\app\ChatGPT.exe';PackageFamilyName='OpenAI.Codex_test'}
+    Invoke-CcodTest 'rejects malformed failed or incidental minimal native identity observations' {
+        $same = [pscustomobject][ordered]@{Outcome='Found';Pid=10664;CreationTimeUtc='2026-08-26T04:49:22.1551350Z'}
         $wrongPid = $same | ConvertTo-Json -Depth 4 | ConvertFrom-Json
         $wrongPid.Pid = 10665
         $noncanonical = $same | ConvertTo-Json -Depth 4 | ConvertFrom-Json
@@ -235,9 +236,10 @@ try {
         $extra = $same | ConvertTo-Json -Depth 4 | ConvertFrom-Json
         $extra | Add-Member Extra 'unexpected'
         $missing = $same | ConvertTo-Json -Depth 4 | ConvertFrom-Json
-        $missing.PSObject.Properties.Remove('UserSid')
+        $missing.PSObject.Properties.Remove('CreationTimeUtc')
         foreach ($case in @(
             @{ Name='access failure'; Query={ param($ProcessId) throw [UnauthorizedAccessException]::new('denied') } },
+            @{ Name='post-handle GetProcessTimes error 87'; Query={ param($ProcessId) throw [ComponentModel.Win32Exception]::new(87) } },
             @{ Name='wrong PID'; Value=$wrongPid },
             @{ Name='noncanonical creation time'; Value=$noncanonical },
             @{ Name='extra native field'; Value=$extra },
@@ -246,11 +248,11 @@ try {
         )) {
             $query = if ($null -ne $case.Query) { $case.Query } else { $value=$case.Value; { param($ProcessId) $value }.GetNewClosure() }
             Assert-CcodIdentityObservationThrows {
-                Get-CcodProcessIdentityObservation -ProcessId 10664 -ExpectedCreationTimeUtc '2026-08-26T04:49:22.1551350Z' -Adapters @{GetNativeProcess=$query}
+                Get-CcodProcessIdentityObservation -ProcessId 10664 -ExpectedCreationTimeUtc '2026-08-26T04:49:22.1551350Z' -Adapters @{GetMinimalNativeProcess=$query;GetNativeProcess={throw 'rich query must not run'}}
             } "$($case.Name) cannot be reported as native absence"
         }
         Assert-CcodIdentityObservationThrows {
-            Get-CcodProcessIdentityObservation -ProcessId 10664 -ExpectedCreationTimeUtc '2026-08-26T04:49:22Z' -Adapters @{GetNativeProcess={param($ProcessId)$null}}
+            Get-CcodProcessIdentityObservation -ProcessId 10664 -ExpectedCreationTimeUtc '2026-08-26T04:49:22Z' -Adapters @{GetMinimalNativeProcess={param($ProcessId)[pscustomobject][ordered]@{Outcome='Absent';Pid=10664;CreationTimeUtc=$null}}}
         } 'a noncanonical expected identity is rejected before absence can be reported'
     }
 } catch {
@@ -351,6 +353,15 @@ try {
         Assert-CcodEqual 4596 $result.Snapshot.Pid 'the exact old root is retained'
         Assert-CcodEqual 6 $calls.Reads 'candidate identity is bracketed and reread before it can be closed'
 
+        $indeterminateAdapters = $oldAdapters.Clone()
+        $indeterminateAdapters.GetNativeProcess = {
+            param($ProcessId)
+            if ([int]$ProcessId -eq 4597) { return $null }
+            [pscustomobject]@{Pid=[int]$ProcessId;CreationTimeUtc='2026-08-02T00:00:00.0000000Z';SessionId=1;UserSid='S-1-5-21-test';Path=$oldPath;PackageFamilyName='OpenAI.Codex_2p2nqsd0c76g0'}
+        }.GetNewClosure()
+        $incompleteRoots = Get-CcodStalePackageRootResult -Package $current -ProcessIds @(4596,4597) -Adapters $indeterminateAdapters
+        Assert-CcodEqual 'Incomplete' $incompleteRoots.Outcome 'one visible root plus one unclassified enumerated PID cannot authorize stale-root adoption'
+
         $gracefulCalls=[pscustomobject]@{Close=0;Dispose=0};$fakeStaleProcess=[pscustomobject]@{Id=4596}
         $oldAdapters.GetGracefulCloseProcess={param($ProcessId)$fakeStaleProcess}.GetNewClosure()
         $oldAdapters.GetGracefulCloseCreationTimeUtc={param($Process)'2026-08-02T00:00:01.0000000Z'}
@@ -364,6 +375,35 @@ try {
         $oldAdapters.ListProcessIds={@(4596)}
         $staleTree=Get-CcodVerifiedStaleProcessTree -Root $result.Snapshot -Package $current -Adapters $oldAdapters
         Assert-CcodEqual '4596' (($staleTree|ForEach-Object Pid)-join ',') 'default stale-tree composition retains the exact raw root before any close'
+
+        $staleChildCommand='"' + $oldPath + '" --type=renderer'
+        $staleTreeReads=@{4596=0;4597=0}
+        $strictStaleTreeAdapters=$oldAdapters.Clone()
+        $strictStaleTreeAdapters.ListProcessIds={@(4596,4597)}
+        $strictStaleTreeAdapters.GetNativeProcess={
+            param($ProcessId)
+            $pidValue=[int]$ProcessId;$staleTreeReads[$pidValue]++
+            if($pidValue -eq 4597 -and $staleTreeReads[$pidValue] -gt 2){return $null}
+            [pscustomobject]@{Pid=$pidValue;CreationTimeUtc=if($pidValue -eq 4596){'2026-08-02T00:00:00.0000000Z'}else{'2026-08-02T00:00:01.0000000Z'};SessionId=1;UserSid='S-1-5-21-test';Path=$oldPath;PackageFamilyName='OpenAI.Codex_2p2nqsd0c76g0'}
+        }.GetNewClosure()
+        $strictStaleTreeAdapters.GetCimProcess={
+            param($ProcessId)
+            [pscustomobject]@{ProcessId=[uint32]$ProcessId;ParentProcessId=if([int]$ProcessId -eq 4596){[uint32]0}else{[uint32]4596};CommandLine=if([int]$ProcessId -eq 4596){$oldCommand}else{$staleChildCommand}}
+        }.GetNewClosure()
+        $strictStaleTreeAdapters.ParseCommandLine={param($CommandLine)if($CommandLine -ceq $oldCommand){$oldArgs}else{@($oldPath,'--type=renderer')}}.GetNewClosure()
+        $indeterminateStaleTree=@(Get-CcodVerifiedStaleProcessTree -Root $result.Snapshot -Package $current -Adapters $strictStaleTreeAdapters)
+        Assert-CcodEqual 0 $indeterminateStaleTree.Count 'one stale root plus one indeterminate reachable child cannot authorize a complete close tree'
+
+        $initialStaleTreeAdapters=$oldAdapters.Clone()
+        $initialStaleTreeAdapters.ListProcessIds={@(4596,4598)}
+        $initialStaleTreeAdapters.GetNativeProcess={
+            param($ProcessId)
+            if([int]$ProcessId -eq 4598){return $null}
+            [pscustomobject]@{Pid=4596;CreationTimeUtc='2026-08-02T00:00:00.0000000Z';SessionId=1;UserSid='S-1-5-21-test';Path=$oldPath;PackageFamilyName='OpenAI.Codex_2p2nqsd0c76g0'}
+        }.GetNewClosure()
+        $initialStaleTreeAdapters.GetMinimalNativeProcess={param($ProcessId)[pscustomobject][ordered]@{Outcome='Found';Pid=[int]$ProcessId;CreationTimeUtc=if([int]$ProcessId -eq 4596){'2026-08-02T00:00:00.0000000Z'}else{'2026-08-02T00:00:01.0000000Z'}}}
+        $initialIndeterminateStaleTree=@(Get-CcodVerifiedStaleProcessTree -Root $result.Snapshot -Package $current -Adapters $initialStaleTreeAdapters)
+        Assert-CcodEqual 0 $initialIndeterminateStaleTree.Count 'an initially indeterminate live stale-scope PID rejects the complete stale close tree'
 
         $currentRoot = New-CcodSnapshot -ProcessId 26700 -Path $current.ExecutablePath -Mode Unrelated -RendererPort 41003 -MainPort 41004 -CommandLine ('"' + $current.ExecutablePath + '" --remote-debugging-address=127.0.0.1 --remote-debugging-port=41003 --inspect=127.0.0.1:41004')
         $currentRoot.IsTopLevel = $true
@@ -609,6 +649,7 @@ try {
         $calls = [pscustomobject]@{ Stop = 0 }
         $exited = Stop-CcodProcessIfMatch -Expected $expected -Adapters @{
             GetProcess = { param($ProcessId) $null }
+            ObserveProcessIdentity = { param($ProcessId,$ExpectedCreationTimeUtc) [pscustomobject][ordered]@{Outcome='Absent';Pid=[int]$ProcessId;CreationTimeUtc=$null} }
             StopProcess = { $calls.Stop++; throw 'must not run' }.GetNewClosure()
         }
         Assert-CcodStopResultContract -Result $exited -Outcome SourceExited -Stopped $false -Snapshot $null -Message 'natural exit'
@@ -620,6 +661,20 @@ try {
         }
         Assert-CcodStopResultContract -Result $changed -Outcome IdentityChanged -Stopped $false -Snapshot $reused -Message 'PID reuse'
         Assert-CcodEqual 0 $calls.Stop 'dangerous boundary is unreachable without an exact reread'
+
+        foreach ($case in @(
+            @{Name='same identity after rich null';Observe={param($ProcessId,$ExpectedCreationTimeUtc)[pscustomobject][ordered]@{Outcome='SameIdentity';Pid=[int]$ProcessId;CreationTimeUtc=[string]$ExpectedCreationTimeUtc}}},
+            @{Name='indeterminate observer';Observe={param($ProcessId,$ExpectedCreationTimeUtc)throw 'native creation query failed'}}
+        )) {
+            $observer=$case.Observe
+            $unproven = Stop-CcodProcessIfMatch -Expected $expected -Adapters @{
+                GetProcess = { param($ProcessId,$StatusEvidence) $null }
+                ObserveProcessIdentity = $observer
+                StopProcess = { $calls.Stop++; throw 'must not run' }.GetNewClosure()
+            }
+            Assert-CcodStopResultContract -Result $unproven -Outcome StopUnconfirmed -Stopped $false -Snapshot $null -Message $case.Name
+        }
+        Assert-CcodEqual 0 $calls.Stop 'rich null never reaches the stop boundary without strict absence or reuse proof'
     }
 
     Invoke-CcodTest 'default graceful-close adapter rejects PID reuse on the same process object before signaling it' {
@@ -694,8 +749,16 @@ try {
         $exitedReceipt = Stop-CcodProcessIfMatch -Expected $expected -Adapters @{
             GetProcess = { param($ProcessId, $StatusEvidence) $expected }.GetNewClosure()
             StopProcess = { param($Snapshot, $TimeoutMilliseconds) [pscustomobject]@{ Outcome='ExitedBeforeStop'; StoppedByController=$false } }
+            ObserveProcessIdentity = { param($ProcessId,$ExpectedCreationTimeUtc) [pscustomobject][ordered]@{Outcome='Absent';Pid=[int]$ProcessId;CreationTimeUtc=$null} }
         }
         Assert-CcodStopResultContract -Result $exitedReceipt -Outcome SourceExited -Stopped $false -Snapshot $null -Message 'internal pre-stop exit'
+
+        $sameAfterReceipt = Stop-CcodProcessIfMatch -Expected $expected -Adapters @{
+            GetProcess = { param($ProcessId, $StatusEvidence) $expected }.GetNewClosure()
+            StopProcess = { param($Snapshot, $TimeoutMilliseconds) [pscustomobject]@{ Outcome='ExitedBeforeStop'; StoppedByController=$false } }
+            ObserveProcessIdentity = { param($ProcessId,$ExpectedCreationTimeUtc) [pscustomobject][ordered]@{Outcome='SameIdentity';Pid=[int]$ProcessId;CreationTimeUtc=[string]$ExpectedCreationTimeUtc} }
+        }
+        Assert-CcodStopResultContract -Result $sameAfterReceipt -Outcome StopUnconfirmed -Stopped $false -Snapshot $expected -Message 'post-handle exit receipt without strict exit proof'
     }
 
     Invoke-CcodTest 'distinguishes access denial and delayed exit' {
@@ -753,7 +816,24 @@ try {
         Assert-CcodTrue ($reads.Count -ge 10) 'included tree identities are reread before return'
     }
 
-    Invoke-CcodTest 'rejects a child older than its exact current parent and drops mutated rereads' {
+    Invoke-CcodTest 'rejects an initially indeterminate live current-scope tree member but ignores proven foreign scope' {
+        $root=New-CcodSnapshot
+        foreach($case in @(
+            @{Name='current scope';UserSid='S-1-5-21-test';Want=0},
+            @{Name='foreign scope';UserSid='S-1-5-21-other';Want=1}
+        )){
+            $sid=[string]$case.UserSid
+            $tree=@(Get-CcodVerifiedProcessTree -Root $root -Adapters @{
+                ListProcessIds={@(100,101)}
+                GetProcess={param($ProcessId,$StatusEvidence)if([int]$ProcessId -eq 100){$root}else{$null}}.GetNewClosure()
+                GetMinimalNativeProcess={param($ProcessId)[pscustomobject][ordered]@{Outcome='Found';Pid=[int]$ProcessId;CreationTimeUtc='2026-08-02T00:00:01.0000000Z'}}
+                GetNativeProcess={param($ProcessId)[pscustomobject][ordered]@{Pid=[int]$ProcessId;CreationTimeUtc='2026-08-02T00:00:01.0000000Z';SessionId=1;UserSid=$sid;Path='C:\Codex\ChatGPT.exe';PackageFamilyName='OpenAI.Codex_2p2nqsd0c76g0'}}.GetNewClosure()
+            })
+            Assert-CcodEqual $case.Want $tree.Count "$($case.Name) indeterminate PID is gated only by exact current scope"
+        }
+    }
+
+    Invoke-CcodTest 'rejects a child older than its exact current parent and rejects an indeterminate reachable reread' {
         $root = New-CcodSnapshot
         $reusedParent = New-CcodSnapshot -ProcessId 101 -CreationTimeUtc '2026-08-02T00:00:10.0000000Z' -ParentPid 100 -IsTopLevel $false -Mode Unrelated
         $staleChild = New-CcodSnapshot -ProcessId 102 -CreationTimeUtc '2026-08-02T00:00:05.0000000Z' -ParentPid 101 -IsTopLevel $false -Mode Unrelated
@@ -777,8 +857,21 @@ try {
                 $root
             }.GetNewClosure()
         })
-        Assert-CcodEqual '100' (($mutationTree.Pid | Sort-Object) -join ',') 'identity mutation on final reread removes the node'
+        Assert-CcodEqual '' (($mutationTree.Pid | Sort-Object) -join ',') 'identity mutation on a reachable final reread rejects the complete tree'
         Assert-CcodTrue ($counts[103] -ge 2) 'included child is actually reread'
+
+        $nullCounts = @{100=0;103=0}
+        $indeterminateTree = @(Get-CcodVerifiedProcessTree -Root $root -Adapters @{
+            ListProcessIds = { @(100,103) }
+            GetProcess = {
+                param($ProcessId,$StatusEvidence)
+                $nullCounts[[int]$ProcessId]++
+                if ([int]$ProcessId -eq 103 -and $nullCounts[103] -gt 1) { return $null }
+                if ([int]$ProcessId -eq 103) { return $stableChild }
+                $root
+            }.GetNewClosure()
+        })
+        Assert-CcodEqual 0 $indeterminateTree.Count 'one verified root plus one indeterminate reachable child cannot authorize a complete close tree'
     }
 
     Invoke-CcodTest 'passes status evidence while rereading a Special tree root' {

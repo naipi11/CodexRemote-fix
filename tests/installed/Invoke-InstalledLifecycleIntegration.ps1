@@ -444,6 +444,54 @@ function Test-CcodInstalledLifecycleOrdinaryChatGptRoot {
     return $true
 }
 
+function Get-CcodInstalledLifecycleChatGptClassification {
+    param($Process)
+    if ($null -eq $Process -or $Process.PSObject.Properties['Name'] -eq $null -or
+        $Process.Name -isnot [string] -or $Process.Name -cne 'ChatGPT.exe' -or
+        $Process.PSObject.Properties['CommandLine'] -eq $null -or $Process.CommandLine -isnot [string] -or
+        [string]::IsNullOrWhiteSpace([string]$Process.CommandLine)) {
+        Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'An enumerated ChatGPT process has unreadable command-line evidence' $null
+    }
+    try {
+        Initialize-CcodInstalledLifecycleCommandLineParser
+        $arguments=@([CcodInstalledLifecycleCommandLine]::Parse([string]$Process.CommandLine))
+    } catch {
+        Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'An enumerated ChatGPT process command line could not be parsed' $null
+    }
+    if($arguments.Count -lt 1 -or @($arguments|Where-Object{$_ -isnot [string] -or [string]::IsNullOrWhiteSpace($_)}).Count -ne 0 -or
+       [IO.Path]::GetFileName([string]$arguments[0]) -ine 'ChatGPT.exe'){
+        Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'An enumerated ChatGPT process command line is not a complete executable argv' $null
+    }
+    $typeArguments=@($arguments|Select-Object -Skip 1|Where-Object{$_.StartsWith('--type=',[StringComparison]::OrdinalIgnoreCase)})
+    if($typeArguments.Count -gt 1 -or ($typeArguments.Count -eq 1 -and $typeArguments[0].Length -le 7)){
+        Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'An enumerated ChatGPT process has an invalid Electron type argv' $null
+    }
+    return $(if($typeArguments.Count -eq 1){'Child'}else{'Root'})
+}
+
+function Get-CcodInstalledLifecycleChatGptIdentities {
+    $records=[Collections.Generic.List[object]]::new()
+    try{$processes=@(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'ChatGPT.exe'" -ErrorAction Stop)}catch{
+        Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'ChatGPT process enumeration failed' $null
+    }
+    foreach($process in $processes){
+        if($null -eq $process -or $process.PSObject.Properties['ProcessId'] -eq $null -or
+           -not (Test-CcodInstalledLifecyclePositiveInteger -Value $process.ProcessId) -or [decimal]$process.ProcessId -gt [int]::MaxValue -or
+           $process.PSObject.Properties['CreationDate'] -eq $null -or $process.CreationDate -isnot [string] -or [string]::IsNullOrWhiteSpace($process.CreationDate)){
+            Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'An enumerated ChatGPT process has invalid identity evidence' $null
+        }
+        try{$created=[Management.ManagementDateTimeConverter]::ToDateTime([string]$process.CreationDate).ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)}catch{
+            Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'An enumerated ChatGPT process has invalid creation-time evidence' $null
+        }
+        if(-not (Test-CcodInstalledLifecycleCanonicalUtc -Value $created)){
+            Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_FACTS_INVALID' 'An enumerated ChatGPT process creation time is not canonical' $null
+        }
+        $classification=Get-CcodInstalledLifecycleChatGptClassification -Process $process
+        if($classification -ceq 'Root'){$records.Add([pscustomobject][ordered]@{Pid=[int]$process.ProcessId;CreationTimeUtc=$created})}
+    }
+    return @($records)
+}
+
 function Get-CcodInstalledLifecycleFacts {
     param([Parameter(Mandatory)][string]$InstallRoot)
     $root = [IO.Path]::GetFullPath($InstallRoot)
@@ -509,10 +557,7 @@ function Get-CcodInstalledLifecycleFacts {
         param($Process)
         [string]$Process.ExecutablePath -ieq $trayHostPath
     }
-    $codex = & $makeIdentities @('ChatGPT.exe') {
-        param($Process)
-        Test-CcodInstalledLifecycleOrdinaryChatGptRoot -Process $Process
-    }
+    $codex = @(Get-CcodInstalledLifecycleChatGptIdentities)
     $aboutVersion = $null
     $packagePath = Join-Path $appRoot 'package.json'
     if ([IO.File]::Exists($packagePath)) {
@@ -623,8 +668,15 @@ function Test-CcodInstalledLifecycleScenario {
             $verified = $verified -and (Test-CcodInstalledLifecycleSameIdentitySet -Expected $BeforeFacts.codex -Actual $afterFacts.codex)
         }
         if ($Context.scenario -eq 'FreshRestart') {
+            $rootIdentityReplaced = $true
+            if ($BeforeFacts.codex.Count -gt 0) {
+                $rootIdentityReplaced = $afterFacts.codex.Count -eq 1 -and @($BeforeFacts.codex | Where-Object {
+                    $_.pid -eq $afterFacts.codex[0].pid -and $_.creationTimeUtc -ceq $afterFacts.codex[0].creationTimeUtc
+                }).Count -eq 0
+            }
             $verified = $verified -and
                 $afterFacts.codex.Count -eq 1 -and
+                $rootIdentityReplaced -and
                 $afterFacts.statusPhase -ceq 'Active' -and
                 $afterFacts.statusRuntimeId -ceq $afterFacts.activeRuntimeId -and
                 $null -ne $afterFacts.statusCodex -and

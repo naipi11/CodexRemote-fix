@@ -59,8 +59,9 @@ Invoke-CcodTest 'TrayHost build emits one source-auditable artifact and rejects 
         Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $artifact 'trayhost-build-provenance.json') -PathType Leaf) 'TrayHost provenance exists'
         $provenance=Get-Content -LiteralPath (Join-Path $artifact 'trayhost-build-provenance.json') -Raw|ConvertFrom-Json
         Assert-CcodEqual '2.5.21' ([string]$provenance.version) 'provenance version is exact'
-        $fileVersion=[Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $artifact 'CodexRemote.TrayHost.exe')).FileVersion
-        Assert-CcodEqual '2.5.21.0' ([string]$fileVersion) 'built TrayHost file version is release-aligned'
+        $fileVersion=[Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $artifact 'CodexRemote.TrayHost.exe'))
+        Assert-CcodEqual '2.5.21.0' ([string]$fileVersion.FileVersion) 'built TrayHost file version is release-aligned'
+        Assert-CcodEqual '2.5.21.0' ([string]$fileVersion.ProductVersion) 'built TrayHost product version is release-aligned'
         Assert-CcodTrue ([string]$provenance.gitCommit -cmatch '^[0-9a-f]{40}$') 'provenance records one canonical source commit'
         $provenanceTimestamp=[datetime]::MinValue
         Assert-CcodTrue ([datetime]::TryParse([string]$provenance.buildTimestampUtc,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$provenanceTimestamp)) 'provenance records a parseable build timestamp'

@@ -39,6 +39,46 @@ namespace Ccod.Persistence.Native {
         public string PackageFamilyName { get; set; }
     }
 
+    public sealed class ProcessCreationQueryResult {
+        public string Stage { get; set; }
+        public int Pid { get; set; }
+        public string CreationTimeUtc { get; set; }
+        public int ErrorCode { get; set; }
+    }
+
+    public static class ProcessCreationV1 {
+        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FILETIME { public uint Low; public uint High; }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint access, bool inheritHandle, int processId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetProcessTimes(IntPtr process, out FILETIME creation, out FILETIME exit, out FILETIME kernel, out FILETIME user);
+
+        private static ProcessCreationQueryResult Result(string stage, int pid, string creationTimeUtc, int errorCode) {
+            return new ProcessCreationQueryResult { Stage = stage, Pid = pid, CreationTimeUtc = creationTimeUtc, ErrorCode = errorCode };
+        }
+
+        public static ProcessCreationQueryResult Query(int processId) {
+            IntPtr process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, processId);
+            if (process == IntPtr.Zero) return Result("OpenProcessFailed", processId, null, Marshal.GetLastWin32Error());
+            try {
+                FILETIME creation, exit, kernel, user;
+                if (!GetProcessTimes(process, out creation, out exit, out kernel, out user)) {
+                    return Result("GetProcessTimesFailed", processId, null, Marshal.GetLastWin32Error());
+                }
+                long fileTime = ((long)creation.High << 32) | creation.Low;
+                return Result("Found", processId, DateTime.FromFileTimeUtc(fileTime).ToString("o"), 0);
+            } finally { CloseHandle(process); }
+        }
+    }
+
     public static class ProcessIdentityV1 {
         private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
         private const uint TOKEN_QUERY = 0x0008;
@@ -325,6 +365,34 @@ function Get-CcodDefaultNativeProcess {
     }
 }
 
+function Get-CcodDefaultMinimalNativeProcess {
+    param([Parameter(Mandatory)][ValidateRange(1,2147483647)][int]$ProcessId)
+
+    Initialize-CcodProcessNativeApi
+    $result = [Ccod.Persistence.Native.ProcessCreationV1]::Query($ProcessId)
+    if ($null -eq $result -or $result.Pid -ne $ProcessId -or $result.Stage -isnot [string] -or $result.ErrorCode -isnot [int]) {
+        throw [IO.InvalidDataException]::new('Minimal native process query returned a malformed receipt.')
+    }
+    switch -CaseSensitive ($result.Stage) {
+        'Found' {
+            if ($result.ErrorCode -ne 0 -or -not (Test-CcodCanonicalUtcTimestamp -Value $result.CreationTimeUtc)) {
+                throw [IO.InvalidDataException]::new('Minimal native process query returned malformed creation evidence.')
+            }
+            return [pscustomobject][ordered]@{Outcome='Found';Pid=$ProcessId;CreationTimeUtc=[string]$result.CreationTimeUtc}
+        }
+        'OpenProcessFailed' {
+            if ($result.ErrorCode -in @(87,1168) -and $null -eq $result.CreationTimeUtc) {
+                return [pscustomobject][ordered]@{Outcome='Absent';Pid=$ProcessId;CreationTimeUtc=$null}
+            }
+            throw [ComponentModel.Win32Exception]::new([int]$result.ErrorCode)
+        }
+        'GetProcessTimesFailed' {
+            throw [ComponentModel.Win32Exception]::new([int]$result.ErrorCode)
+        }
+        default { throw [IO.InvalidDataException]::new('Minimal native process query returned an unknown stage.') }
+    }
+}
+
 function Get-CcodProcessIdentityObservation {
     [CmdletBinding()]
     param(
@@ -337,23 +405,20 @@ function Get-CcodProcessIdentityObservation {
         throw [IO.InvalidDataException]::new('ExpectedCreationTimeUtc must be a canonical UTC timestamp.')
     }
     $adapter = Get-CcodProcessAdapters -Adapters $Adapters
-    $output = @(& $adapter.GetNativeProcess $ProcessId 2>&1)
-    if ($output.Count -eq 0 -or ($output.Count -eq 1 -and $null -eq $output[0])) {
-        return [pscustomobject][ordered]@{ Outcome='Absent'; Pid=$ProcessId; CreationTimeUtc=$null }
-    }
+    $output = @(& $adapter.GetMinimalNativeProcess $ProcessId 2>&1)
     if ($output.Count -ne 1 -or $output[0] -is [Management.Automation.ErrorRecord]) {
         throw [IO.InvalidDataException]::new('Native process identity query emitted an invalid result stream.')
     }
     $identity = $output[0]
-    if (-not (Test-CcodExactProperties -Value $identity -Names @('Pid','CreationTimeUtc','SessionId','UserSid','Path','PackageFamilyName')) -or
+    if (-not (Test-CcodExactProperties -Value $identity -Names @('Outcome','Pid','CreationTimeUtc')) -or
+        $identity.Outcome -isnot [string] -or @('Absent','Found') -cnotcontains $identity.Outcome -or
         $identity.Pid -isnot [int] -or $identity.Pid -ne $ProcessId -or
-        -not (Test-CcodCanonicalUtcTimestamp -Value $identity.CreationTimeUtc) -or
-        $identity.SessionId -isnot [int] -or $identity.SessionId -lt 0 -or
-        $identity.UserSid -isnot [string] -or [string]::IsNullOrWhiteSpace($identity.UserSid) -or
-        $identity.Path -isnot [string] -or [string]::IsNullOrWhiteSpace($identity.Path) -or
-        ($null -ne $identity.PackageFamilyName -and
-            ($identity.PackageFamilyName -isnot [string] -or [string]::IsNullOrWhiteSpace($identity.PackageFamilyName)))) {
+        ($identity.Outcome -ceq 'Absent' -and $null -ne $identity.CreationTimeUtc) -or
+        ($identity.Outcome -ceq 'Found' -and -not (Test-CcodCanonicalUtcTimestamp -Value $identity.CreationTimeUtc))) {
         throw [IO.InvalidDataException]::new('Native process identity query returned a malformed receipt.')
+    }
+    if ($identity.Outcome -ceq 'Absent') {
+        return [pscustomobject][ordered]@{ Outcome='Absent'; Pid=$ProcessId; CreationTimeUtc=$null }
     }
     $outcome = if ($identity.CreationTimeUtc -ceq $ExpectedCreationTimeUtc) { 'SameIdentity' } else { 'IdentityChanged' }
     return [pscustomobject][ordered]@{
@@ -390,6 +455,8 @@ function Get-CcodProcessAdapters {
         GetCurrentSessionId = { [Diagnostics.Process]::GetCurrentProcess().SessionId }
         GetCurrentUserSid = { [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
         GetNativeProcess = { param($ProcessId) Get-CcodDefaultNativeProcess -ProcessId $ProcessId }
+        GetMinimalNativeProcess = { param($ProcessId) Get-CcodDefaultMinimalNativeProcess -ProcessId $ProcessId }
+        ObserveProcessIdentity = { param($ProcessId,$ExpectedCreationTimeUtc) Get-CcodProcessIdentityObservation -ProcessId $ProcessId -ExpectedCreationTimeUtc $ExpectedCreationTimeUtc }
         GetCimProcess = {
             param($ProcessId)
             Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $([int]$ProcessId)" -ErrorAction Stop
@@ -943,10 +1010,25 @@ function Get-CcodStalePackageRootResult {
     if ($null -eq $parts) { return New-CcodStalePackageRootResult -Outcome Incomplete -Snapshot $null }
     $adapter = Get-CcodProcessAdapters -Adapters $Adapters
     $rawMode = $PSBoundParameters.ContainsKey('ProcessIds') -or -not $PSBoundParameters.ContainsKey('Snapshots')
+    $rawIncomplete = $false
     $observed = if ($rawMode) {
         $ids = if ($PSBoundParameters.ContainsKey('ProcessIds')) { @($ProcessIds) } else { @(& $adapter.ListProcessIds) }
-        @($ids | Sort-Object -Unique | ForEach-Object { Get-CcodStalePackageProcessSnapshot -ProcessId $_ -Package $Package -Adapter $adapter })
+        $rawSnapshots = [Collections.Generic.List[object]]::new()
+        foreach ($rawProcessId in @($ids | Sort-Object -Unique)) {
+            $convertedProcessId = ConvertTo-CcodProcessIdValue -Value $rawProcessId
+            if (-not $convertedProcessId.Valid) { $rawIncomplete = $true; continue }
+            try {
+                $snapshot = Get-CcodStalePackageProcessSnapshot -ProcessId $convertedProcessId.Value -Package $Package -Adapter $adapter
+            } catch {
+                $rawIncomplete = $true
+                continue
+            }
+            if ($null -eq $snapshot) { $rawIncomplete = $true; continue }
+            $rawSnapshots.Add($snapshot)
+        }
+        @($rawSnapshots.ToArray())
     } else { @($Snapshots) }
+    if ($rawIncomplete) { return New-CcodStalePackageRootResult -Outcome Incomplete -Snapshot $null }
     $currentSessionId = & $adapter.GetCurrentSessionId
     $currentUserSid = & $adapter.GetCurrentUserSid
     $suspicious = [Collections.Generic.List[object]]::new()
@@ -990,6 +1072,38 @@ function New-CcodStopResult {
     }
 }
 
+function Get-CcodStrictStopIdentityObservation {
+    param(
+        [Parameter(Mandatory)]$Expected,
+        [Parameter(Mandatory)][hashtable]$Adapter
+    )
+
+    if ($null -eq $Expected -or $Expected.Pid -isnot [int] -or $Expected.Pid -lt 1 -or
+        $Expected.CreationTimeUtc -isnot [string] -or -not (Test-CcodCanonicalUtcTimestamp -Value $Expected.CreationTimeUtc)) {
+        return $null
+    }
+    try { $output = @(& $Adapter.ObserveProcessIdentity ([int]$Expected.Pid) ([string]$Expected.CreationTimeUtc) 2>&1) } catch { return $null }
+    if ($output.Count -ne 1 -or $output[0] -is [Management.Automation.ErrorRecord]) { return $null }
+    $observation = $output[0]
+    if (-not (Test-CcodExactProperties -Value $observation -Names @('Outcome','Pid','CreationTimeUtc')) -or
+        $observation.Outcome -isnot [string] -or @('Absent','SameIdentity','IdentityChanged') -cnotcontains $observation.Outcome -or
+        $observation.Pid -isnot [int] -or $observation.Pid -ne $Expected.Pid) { return $null }
+    switch -CaseSensitive ($observation.Outcome) {
+        'Absent' { if ($null -ne $observation.CreationTimeUtc) { return $null } }
+        'SameIdentity' { if ($observation.CreationTimeUtc -isnot [string] -or $observation.CreationTimeUtc -cne $Expected.CreationTimeUtc) { return $null } }
+        'IdentityChanged' {
+            if ($observation.CreationTimeUtc -isnot [string] -or -not (Test-CcodCanonicalUtcTimestamp -Value $observation.CreationTimeUtc) -or
+                $observation.CreationTimeUtc -ceq $Expected.CreationTimeUtc) { return $null }
+        }
+    }
+    return $observation
+}
+
+function Test-CcodStrictStopExitObservation {
+    param($Observation)
+    return $null -ne $Observation -and @('Absent','IdentityChanged') -ccontains $Observation.Outcome
+}
+
 function Stop-CcodProcessIfMatch {
     [CmdletBinding()]
     param(
@@ -1001,7 +1115,11 @@ function Stop-CcodProcessIfMatch {
 
     $adapter = Get-CcodProcessAdapters -Adapters $Adapters
     $actual = & $adapter.GetProcess ([int]$Expected.Pid) $StatusEvidence
-    if ($null -eq $actual) { return New-CcodStopResult -Outcome 'SourceExited' -Snapshot $null }
+    if ($null -eq $actual) {
+        $observation = Get-CcodStrictStopIdentityObservation -Expected $Expected -Adapter $adapter
+        if (Test-CcodStrictStopExitObservation -Observation $observation) { return New-CcodStopResult -Outcome 'SourceExited' -Snapshot $null }
+        return New-CcodStopResult -Outcome 'StopUnconfirmed' -Snapshot $null
+    }
     if (-not (Test-CcodProcessMatch -Expected $Expected -Actual $actual)) {
         return New-CcodStopResult -Outcome 'IdentityChanged' -Snapshot $actual
     }
@@ -1026,7 +1144,11 @@ function Stop-CcodProcessIfMatch {
             }
             return New-CcodStopResult -Outcome 'StopUnconfirmed' -Snapshot $actual
         }
-        'ExitedBeforeStop' { return New-CcodStopResult -Outcome 'SourceExited' -Snapshot $null }
+        'ExitedBeforeStop' {
+            $observation = Get-CcodStrictStopIdentityObservation -Expected $Expected -Adapter $adapter
+            if (Test-CcodStrictStopExitObservation -Observation $observation) { return New-CcodStopResult -Outcome 'SourceExited' -Snapshot $null }
+            return New-CcodStopResult -Outcome 'StopUnconfirmed' -Snapshot $actual
+        }
         'IdentityChanged' { return New-CcodStopResult -Outcome 'IdentityChanged' -Snapshot $actual }
         'AccessDenied' { return New-CcodStopResult -Outcome 'StopUnconfirmed' -Snapshot $actual }
         'TimedOut' { return New-CcodStopResult -Outcome 'StopUnconfirmed' -Snapshot $actual }
@@ -1213,6 +1335,34 @@ function Get-CcodReachableProcessIds {
     return @($included)
 }
 
+function Test-CcodIndeterminateProcessBlocksVerifiedTree {
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [Parameter(Mandatory)]$Root,
+        [Parameter(Mandatory)][hashtable]$Adapter
+    )
+
+    try{$minimalOutput=@(& $Adapter.GetMinimalNativeProcess $ProcessId 2>&1)}catch{return $true}
+    if($minimalOutput.Count -ne 1 -or $minimalOutput[0] -is [Management.Automation.ErrorRecord]){return $true}
+    $minimal=$minimalOutput[0]
+    if(-not (Test-CcodExactProperties -Value $minimal -Names @('Outcome','Pid','CreationTimeUtc')) -or
+       $minimal.Outcome -isnot [string] -or @('Absent','Found') -cnotcontains $minimal.Outcome -or
+       $minimal.Pid -isnot [int] -or $minimal.Pid -ne $ProcessId){return $true}
+    if($minimal.Outcome -ceq 'Absent'){return $null -ne $minimal.CreationTimeUtc}
+    if(-not (Test-CcodCanonicalUtcTimestamp -Value $minimal.CreationTimeUtc)){return $true}
+    try{$nativeOutput=@(& $Adapter.GetNativeProcess $ProcessId 2>&1)}catch{return $true}
+    if($nativeOutput.Count -ne 1 -or $nativeOutput[0] -is [Management.Automation.ErrorRecord]){return $true}
+    $native=$nativeOutput[0]
+    if(-not (Test-CcodExactProperties -Value $native -Names @('Pid','CreationTimeUtc','SessionId','UserSid','Path','PackageFamilyName')) -or
+       $native.Pid -isnot [int] -or $native.Pid -ne $ProcessId -or $native.CreationTimeUtc -isnot [string] -or
+       $native.CreationTimeUtc -cne $minimal.CreationTimeUtc -or $native.SessionId -isnot [int] -or $native.SessionId -lt 0 -or
+       $native.UserSid -isnot [string] -or [string]::IsNullOrWhiteSpace($native.UserSid) -or
+       $native.Path -isnot [string] -or [string]::IsNullOrWhiteSpace($native.Path) -or
+       ($null -ne $native.PackageFamilyName -and ($native.PackageFamilyName -isnot [string] -or [string]::IsNullOrWhiteSpace($native.PackageFamilyName)))){return $true}
+    return $native.SessionId -eq $Root.SessionId -and $native.UserSid -ceq $Root.UserSid -and
+        (Test-CcodOrdinalIgnoreCase $native.Path $Root.Path) -and $native.PackageFamilyName -ceq $Root.PackageFamilyName
+}
+
 function Get-CcodVerifiedProcessTree {
     [CmdletBinding()]
     param(
@@ -1232,7 +1382,11 @@ function Get-CcodVerifiedProcessTree {
     foreach ($processId in @(& $adapter.ListProcessIds | Select-Object -Unique)) {
         if ($null -eq $processId -or [int]$processId -eq [int]$actualRoot.Pid) { continue }
         $candidate = & $adapter.GetProcess ([int]$processId) $null
-        if ($null -eq $candidate -or -not (Test-CcodSameProcessOwnerAndPackage -Root $actualRoot -Candidate $candidate)) { continue }
+        if ($null -eq $candidate) {
+            if(Test-CcodIndeterminateProcessBlocksVerifiedTree -ProcessId ([int]$processId) -Root $actualRoot -Adapter $adapter){return @()}
+            continue
+        }
+        if (-not (Test-CcodSameProcessOwnerAndPackage -Root $actualRoot -Candidate $candidate)) { continue }
         $candidateTime = ConvertTo-CcodDateTimeOffset -Value $candidate.CreationTimeUtc
         if ($null -eq $candidateTime -or $candidateTime -lt $rootTime) { continue }
         $verifiedByPid[[int]$candidate.Pid] = $candidate
@@ -1244,8 +1398,8 @@ function Get-CcodVerifiedProcessTree {
         $evidence = if ([int]$processId -eq [int]$actualRoot.Pid) { $StatusEvidence } else { $null }
         $current = & $adapter.GetProcess ([int]$processId) $evidence
         $previous = $verifiedByPid[[int]$processId]
-        if ($null -eq $current -or -not (Test-CcodProcessMatch -Expected $previous -Actual $current)) { continue }
-        if (-not (Test-CcodSameProcessOwnerAndPackage -Root $actualRoot -Candidate $current)) { continue }
+        if ($null -eq $current -or -not (Test-CcodProcessMatch -Expected $previous -Actual $current) -or
+            -not (Test-CcodSameProcessOwnerAndPackage -Root $actualRoot -Candidate $current)) { return @() }
         $rereadByPid[[int]$processId] = $current
     }
     if (-not $rereadByPid.ContainsKey([int]$actualRoot.Pid)) { return @() }
@@ -1271,7 +1425,11 @@ function Get-CcodVerifiedStaleProcessTree {
     foreach ($processId in @(& $adapter.ListProcessIds | Select-Object -Unique)) {
         if ($processId -isnot [int] -or $processId -eq [int]$actualRoot.Pid) { continue }
         $candidate = Get-CcodStalePackageProcessSnapshot -ProcessId $processId -Package $Package -Adapter $adapter
-        if ($null -eq $candidate -or -not (Test-CcodSameProcessOwnerAndPackage -Root $actualRoot -Candidate $candidate)) { continue }
+        if ($null -eq $candidate) {
+            if(Test-CcodIndeterminateProcessBlocksVerifiedTree -ProcessId $processId -Root $actualRoot -Adapter $adapter){return @()}
+            continue
+        }
+        if (-not (Test-CcodSameProcessOwnerAndPackage -Root $actualRoot -Candidate $candidate)) { continue }
         $candidateTime = ConvertTo-CcodDateTimeOffset -Value $candidate.CreationTimeUtc
         if ($null -eq $candidateTime -or $candidateTime -lt $rootTime) { continue }
         $verifiedByPid[[int]$candidate.Pid] = $candidate
@@ -1282,7 +1440,7 @@ function Get-CcodVerifiedStaleProcessTree {
         $current = Get-CcodStalePackageProcessSnapshot -ProcessId ([int]$processId) -Package $Package -Adapter $adapter
         $previous = $verifiedByPid[[int]$processId]
         if ($null -eq $current -or -not (Test-CcodProcessMatch -Expected $previous -Actual $current) -or
-            -not (Test-CcodSameProcessOwnerAndPackage -Root $actualRoot -Candidate $current)) { continue }
+            -not (Test-CcodSameProcessOwnerAndPackage -Root $actualRoot -Candidate $current)) { return @() }
         $rereadByPid[[int]$processId] = $current
     }
     if (-not $rereadByPid.ContainsKey([int]$actualRoot.Pid)) { return @() }

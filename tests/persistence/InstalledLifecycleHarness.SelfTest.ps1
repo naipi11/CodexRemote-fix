@@ -310,9 +310,7 @@ Invoke-CcodTest 'captures exactly the top-level ChatGPT root and excludes Electr
         Set-CcodHarnessProcessFixture -ChatGPT @(
             (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13948 -CreationTimeUtc $created -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe"'),
             (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13949 -CreationTimeUtc '2026-08-24T00:00:04.1000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe" --type=renderer' -ParentProcessId 13948),
-            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13950 -CreationTimeUtc '2026-08-24T00:00:04.2000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe" --type=utility' -ParentProcessId 13948),
-            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13951 -CreationTimeUtc '2026-08-24T00:00:04.3000000Z' -CommandLine $null -ParentProcessId 13948),
-            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13952 -CreationTimeUtc '2026-08-24T00:00:04.4000000Z' -CommandLine '' -ParentProcessId 13948),
+            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13950 -CreationTimeUtc '2026-08-24T00:00:04.2000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe" --TYPE=utility' -ParentProcessId 13948),
             (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13953 -CreationTimeUtc '2026-08-24T00:00:04.5000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe" "--type=renderer"' -ParentProcessId 13948)
         )
         $facts = Get-CcodInstalledLifecycleFacts -InstallRoot $root
@@ -322,6 +320,33 @@ Invoke-CcodTest 'captures exactly the top-level ChatGPT root and excludes Electr
     } finally {
         Clear-CcodHarnessProcessFixture
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'fails closed when any enumerated ChatGPT process cannot be proven root or Electron child' {
+    . $harnessPath -Library
+    foreach($case in @('null command line','empty command line','unparsable command line','invalid creation time','zero PID','string PID','nonstring command line','missing command line')){
+        $root=Join-Path $env:TEMP ("ccod-installed-indeterminate-$($case.Replace(' ','-'))-"+[guid]::NewGuid().ToString('N'))
+        try{
+            $null=[IO.Directory]::CreateDirectory($root)
+            $valid=New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13948 -CreationTimeUtc '2026-08-24T00:00:04.0000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe"'
+            $indeterminate=New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13949 -CreationTimeUtc '2026-08-24T00:00:04.1000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe" --type=renderer' -ParentProcessId 13948
+            switch($case){
+                'null command line'{$indeterminate.CommandLine=$null}
+                'empty command line'{$indeterminate.CommandLine=''}
+                'unparsable command line'{$indeterminate.CommandLine='   '}
+                'invalid creation time'{$indeterminate.CreationDate='not-a-dmtf-time'}
+                'zero PID'{$indeterminate.ProcessId=0}
+                'string PID'{$indeterminate.ProcessId='13949'}
+                'nonstring command line'{$indeterminate.CommandLine=42}
+                'missing command line'{$indeterminate.PSObject.Properties.Remove('CommandLine')}
+            }
+            Set-CcodHarnessProcessFixture -ChatGPT @($valid,$indeterminate)
+            Assert-CcodThrows {Get-CcodInstalledLifecycleFacts -InstallRoot $root} 'CCOD_INTEGRATION_FACTS_INVALID'
+        }finally{
+            Clear-CcodHarnessProcessFixture
+            if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}
+        }
     }
 }
 
@@ -534,6 +559,30 @@ Invoke-CcodTest 'verifies FreshRestart only with one correlated ChatGPT root and
         $verification = Invoke-CcodHarnessWithCapturedFacts -Context $context -BeforeFacts $before -AfterFacts $after
         Assert-CcodEqual $true $verification.verified 'fully correlated current runtime verifies FreshRestart'
         Assert-CcodEqual 'CCOD_INTEGRATION_VERIFIED' $verification.code 'success retains the stable verification code'
+    } finally {
+        Clear-CcodHarnessProcessFixture
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'rejects FreshRestart when the fully correlated after root is unchanged from before' {
+    . $harnessPath -Library
+    $root = Join-Path $env:TEMP ('ccod-installed-unchanged-root-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $null = [IO.Directory]::CreateDirectory($root)
+        $unchangedPid=13948;$unchangedCreation='2026-08-24T00:00:04.0000000Z'
+        New-CcodHarnessInstalledStateFixture -Root $root -ActiveRuntimeId '2.5.21-new' -ActiveGeneration ([UInt64]8) `
+            -StatusRuntimeId '2.5.21-new' -StatusCodexPid $unchangedPid -StatusCodexCreationTimeUtc $unchangedCreation -ReceiptPhase 'Completed'
+        Set-CcodHarnessProcessFixture -ChatGPT @(
+            (New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId $unchangedPid -CreationTimeUtc $unchangedCreation -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe"')
+        )
+        $after=Get-CcodInstalledLifecycleFacts -InstallRoot $root
+        $after.appPresent=$true;$after.aboutVersion='2.5.0';$after.deviceKeyPresent=$true;$after.deviceKeySha256=('b'*64)
+        $before=New-CcodHarnessFacts -RuntimeId '2.5.19-old' -CodexPid $unchangedPid -CodexCreationTimeUtc $unchangedCreation
+        $context=[pscustomobject]@{scenario='FreshRestart';expectedVersion='2.5.0';installRoot=$root}
+        $verification=Invoke-CcodHarnessWithCapturedFacts -Context $context -BeforeFacts $before -AfterFacts $after
+        Assert-CcodEqual $false $verification.verified 'FreshRestart requires the root identity to change even when status and receipt fully correlate'
+        Assert-CcodEqual 'CCOD_INTEGRATION_OBSERVATION_UNPROVEN' $verification.code 'unchanged root rejection uses the stable observation code'
     } finally {
         Clear-CcodHarnessProcessFixture
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }

@@ -12,7 +12,7 @@ No unreleased changes.
 
 - Repaired stale-status recovery around one exact live Codex root, rejecting ambiguous roots and stale identity correlation.
 - Added exact, safe lifecycle diagnostics that explain rejected repair evidence without broad process actions.
-- Validated installed Supervisor and TrayHost lifecycle evidence against the real current Codex root and renderer listener.
+- Validated installed Supervisor and TrayHost lifecycle evidence against the real current Codex root.
 
 ## v2.5.20
 
