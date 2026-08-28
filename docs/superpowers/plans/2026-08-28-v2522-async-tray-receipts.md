@@ -92,6 +92,7 @@ fix: pin tray terminal receipt storage
 - Create: `src/trayhost/TrayTerminalReceiptSink.cs`
 - Modify: `src/trayhost/HostTransport.cs`
 - Modify: `src/trayhost/Program.cs`
+- Modify: `src/trayhost/TrayHostApplication.cs`
 - Test: `tests/trayhost/TrayHostTransportSelfTest.cs`
 - Test: `tests/trayhost/TrayHostNativeSelfTest.cs`
 
@@ -121,11 +122,14 @@ receipt-sink API is unavailable.
 
 - [ ] **Step 3: Implement one worker and bounded UI completion**
 
-Separate correlation from receipt work.  The reader submits once and returns;
-only the single background writer calls the store.  On durable success it posts
-bounded About/failure work to the existing application context.  On admission,
-store, callback, queue, or disposal failure, consume the terminal result but
-show no feedback.  Do not alter the wire result or add a new message type.
+Separate correlation from receipt work. The reader submits once and returns;
+only the single background writer calls the store. On durable success it posts
+bounded tokened About/failure work to an internal STA message path separate from
+presentation/shutdown drains; no unrelated work message may make an unresolved
+receipt visible. Callback admission and disposal must be atomic: no durable
+callback begins after close. On admission, store, callback, queue, token-post,
+or disposal failure, consume the terminal result but show no feedback. Do not
+alter the wire result or add a new message type.
 
 - [ ] **Step 4: Run GREEN**
 

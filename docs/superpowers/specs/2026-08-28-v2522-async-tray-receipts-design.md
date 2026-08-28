@@ -54,9 +54,17 @@ replacement thread for a stuck write.
 After a durable write, the sink calls back into `HostTransport` with the
 in-memory receipt.  The transport enqueues a single bounded UI work item:
 completed About maps to About; rejected/failed maps to the existing generic
-failure dialog; all other completed commands map to no UI.  The callback posts
-work to the STA application context outside transport locks.  The UI queue is
-also bounded at eight shared items.
+failure dialog; all other completed commands map to no UI. Receipt UI uses an
+internal tokened work message, separate from presentation/shutdown drains. The
+transport makes a token visible only for a successful tokened post; ordinary
+work messages can never consume a receipt item while that post is unresolved.
+If the post fails, the item is retracted before any UI path can see it. The UI
+queue is also bounded at eight shared items.
+
+The sink claims callback admission under its close gate before invoking the
+durable callback. Once `Dispose` closes that gate, no new callback can begin;
+an already-started callback may finish, but the disposed transport refuses to
+publish UI work.
 
 ### 2. Pinned, bounded native receipt store
 
