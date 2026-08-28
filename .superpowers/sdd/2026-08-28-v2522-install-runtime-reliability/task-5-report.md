@@ -638,3 +638,100 @@ f1ee9b7 test: expose linked whole-install deletion
 No installer/build/release/install operation was performed in this narrow
 round. No real process was started or stopped, and no WindowsApps or DPAPI data
 was accessed.
+
+## Final remediation round 2 — pinned write boundaries and canonical provenance
+
+### Deterministic RED evidence
+
+Activation stage substitution used the real production function set extracted
+from `Activate-CcodRemoteFix.ps1`. A debugger barrier fired after the old stage
+pathname check and before the first verified leaf write. The barrier renamed
+the stage and replaced it with an outside junction:
+
+```text
+case=activation-pins-the-stage-directory-before-any-verified-leaf-write
+expected=[blocked]
+actual=[substituted]
+```
+
+The real compiled Inno harness retained the old preflight result, launched a
+concurrent PowerShell substitution attempt, and then simulated the Setup write:
+
+```text
+case=Inno-exposes-a-pre-write-payload-directory-reparse-gate
+expected concurrent attack=[blocked]
+actual=[substituted]
+```
+
+The Setup provenance fixture supplied canonical template, inventory, compiler,
+and payload files while its record used self-consistent false `111...`,
+`222...`, and `333...` hashes. The old validator accepted the record:
+
+```text
+case=Setup-provenance-rejects-self-consistent-wrong-canonical-build-input-hashes
+ASSERT_THROWS: expected CCOD_SETUP_PROVENANCE_INVALID
+```
+
+### Implementation
+
+- Activation now pins the app directory and atomically creates the stage and
+  every nested stage directory with relative `NtCreateFile(FILE_CREATE)`
+  handles. Each leaf transitions from its writer handle to identity/read pins,
+  is rehashed through the pinned read handle, and remains non-writable and
+  non-deletable through the child installer lifetime. All pins close in reverse
+  order before exact safe cleanup.
+- Inno retains a global native handle set from `PrepareToInstall` until the
+  start of `ssPostInstall`. Existing directories are opened with read/delete
+  access and no delete sharing; existing leaves are held with read/write
+  sharing but no delete sharing. The real harness proves the concurrent
+  directory rename/junction substitution is blocked while the legitimate
+  overwrite succeeds. `DeinitializeSetup` closes every pin on abort.
+- Setup provenance validation now requires the actual canonical Inno template,
+  generated destination inventory, ISCC executable, and installer payload
+  manifest paths. It compares real hashes, compiler version, payload length,
+  and payload file count rather than only checking SHA-256 text shape.
+- The exact Setup payload manifest and generated inventory are release-bound
+  assets. Build and publish validation use them with the repository template
+  and installed canonical ISCC path; release upload/read-back includes `.iss`.
+- README's historical Windows 11 validation line is explicitly qualified as
+  historical development evidence, not current v2.5.22 real-machine
+  acceptance.
+
+### GREEN evidence
+
+```text
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\ReleaseWorkflow.SelfTest.ps1
+exit 0
+Release workflow self-tests passed.
+  - original source-byte swap barrier passed
+  - activation stage substitution was blocked
+  - real compiled Inno concurrent substitution was blocked
+  - simulated legitimate Setup overwrite succeeded
+  - outside sentinel remained unchanged
+  - false canonical provenance hashes were rejected
+  - real ISCC fixture compilation passed
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\trayhost\Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly
+exit 0; 3 cases
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\trayhost\Invoke-TrayHostSelfTest.ps1 -NativeOnly
+exit 0; 25 cases
+
+PowerShell parser checks and git diff --check
+exit 0
+```
+
+Commits:
+
+```text
+2633509 test: expose activation stage substitution
+39e838f fix: pin activation stage write boundary
+7bdd78c test: expose setup write TOCTOU and provenance drift
+f5021b0 fix: pin setup writes and verify provenance inputs
+```
+
+No real installer, Codex, TrayHost, or Supervisor process was run or stopped.
+No build candidate was published, pushed, tagged, signed, or installed, and no
+WindowsApps or DPAPI data was accessed. Controlled aggregate validation, final
+candidate rebuild, complete branch review, and real-machine acceptance remain
+with the controller.
