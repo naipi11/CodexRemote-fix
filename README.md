@@ -86,7 +86,7 @@ The tray reports two independent, truthful status lines instead of inferring rea
 
 ## Releases
 
-Every tagged release ships a Windows setup installer and an EXE-entry portable ZIP with separate SHA-256 checksums and release manifests. The portable distribution publishes its payload manifest as an asset; Setup embeds and hash-binds its versioned `installer-payload-manifest.json`. For v2.5.22, download:
+Every tagged release ships a Windows setup installer and an EXE-entry portable ZIP with separate SHA-256 checksums and release manifests. The portable distribution publishes its payload manifest as an asset; Setup embeds and hash-binds its versioned `installer-payload.manifest.json`. For v2.5.22, download:
 
 - `CodexRemote-fix-2.5.22-setup.exe` and its checksum
 - `CodexRemote-fix-2.5.22-windows-x64.zip` and its checksum

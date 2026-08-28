@@ -1787,7 +1787,7 @@ Invoke-CcodTest '2.5.22 source metadata and documentation match the release cont
     Assert-CcodTrue ($quickStart.Contains('Microsoft Defender')) 'English Quick Start documents the local Defender gate'
     Assert-CcodTrue (-not $readme.Contains('\r\n')) 'English README contains no literal CRLF escape text'
     Assert-CcodTrue ($readme.Contains('The portable distribution publishes its payload manifest as an asset')) 'English README identifies the externally published portable payload manifest'
-    Assert-CcodTrue ($readme.Contains('Setup embeds and hash-binds its versioned `installer-payload-manifest.json`')) 'English README identifies the embedded hash-bound setup payload manifest'
+    Assert-CcodTrue ($readme.Contains('Setup embeds and hash-binds its versioned `installer-payload.manifest.json`')) 'English README identifies the embedded hash-bound setup payload manifest'
     Assert-CcodTrue (-not $readme.Contains('shared payload manifest')) 'English README does not claim setup and portable share one payload manifest'
     $readmeZh = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.zh-CN.md') -Raw -Encoding UTF8
     Assert-CcodTrue ($readmeZh -match 'v2\.5\.22 \u662F\u5F53\u524D\u7A33\u5B9A\u7248') 'Chinese README marks v2.5.22 stable'
@@ -1797,7 +1797,7 @@ Invoke-CcodTest '2.5.22 source metadata and documentation match the release cont
     Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix.exe')) 'Chinese Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($readmeZh.Contains('Microsoft Defender')) 'Chinese Quick Start documents the local Defender gate'
     Assert-CcodTrue ($readmeZh -match '\u4FBF\u643A\u53D1\u884C\u7248\u4F1A\u5916\u53D1\u81EA\u5DF1\u7684 payload manifest') 'Chinese README identifies the externally published portable payload manifest'
-    Assert-CcodTrue ($readmeZh -match 'Setup \u5219\u5185\u5D4C\u5E76\u4EE5\u54C8\u5E0C\u7ED1\u5B9A\u7248\u672C\u5316\u7684 `installer-payload-manifest\.json`') 'Chinese README identifies the embedded hash-bound setup payload manifest'
+    Assert-CcodTrue ($readmeZh -match 'Setup \u5219\u5185\u5D4C\u5E76\u4EE5\u54C8\u5E0C\u7ED1\u5B9A\u7248\u672C\u5316\u7684 `installer-payload\.manifest\.json`') 'Chinese README identifies the embedded hash-bound setup payload manifest'
     $technical = Get-Content -LiteralPath (Join-Path $repositoryRoot 'docs\TECHNICAL.md') -Raw
     Assert-CcodTrue ($technical.Contains('PortableUninstallFinalizer.ps1')) 'technical documentation records the staged portable finalizer'
     $security = Get-Content -LiteralPath (Join-Path $repositoryRoot 'SECURITY.md') -Raw

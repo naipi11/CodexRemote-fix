@@ -81,7 +81,7 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 ## 发布（Releases）
 
-每个带 tag 的发布都会附带 Windows 安装包和以 EXE 启动的便携 ZIP，并分别提供 SHA-256 校验文件与 release manifest。便携发行版会外发自己的 payload manifest；Setup 则内嵌并以哈希绑定版本化的 `installer-payload-manifest.json`。v2.5.22 提供：
+每个带 tag 的发布都会附带 Windows 安装包和以 EXE 启动的便携 ZIP，并分别提供 SHA-256 校验文件与 release manifest。便携发行版会外发自己的 payload manifest；Setup 则内嵌并以哈希绑定版本化的 `installer-payload.manifest.json`。v2.5.22 提供：
 
 - `CodexRemote-fix-2.5.22-setup.exe` 及其校验文件
 - `CodexRemote-fix-2.5.22-windows-x64.zip` 及其校验文件
