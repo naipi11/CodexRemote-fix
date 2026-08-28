@@ -228,6 +228,13 @@ fix: stabilize verified Electron process trees
 
 ### Task 4: Make tray action correlation testable and diagnosable
 
+> **Superseded for execution:** Task 4 reached an approved architectural
+> correction after three reviewed fix rounds.  Execute
+> `docs/superpowers/plans/2026-08-28-v2522-async-tray-receipts.md` before this
+> plan's Task 5.  Its receipt sink preserves this task's authenticated
+> correlation and generic-dialog constraints while making persistence bounded
+> and non-blocking.
+
 **Files:**
 - Modify: `src/persistence/modules/TrayHostClient.psm1`
 - Modify: `src/persistence/Supervisor.ps1`
