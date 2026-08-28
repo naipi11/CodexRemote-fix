@@ -210,4 +210,44 @@ function Invoke-CcodPortableLauncherBuild {
     }finally{if(Test-Path -LiteralPath $work){Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue}}
 }
 
-Export-ModuleMember -Function Invoke-CcodTrayHostBuild,Test-CcodTrayHostArtifact,Invoke-CcodPortableLauncherBuild
+function Test-CcodPortableLauncherArtifact {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$RepositoryRoot,[Parameter(Mandatory)][string]$Version,[Parameter(Mandatory)][string]$ArtifactDirectory,[string]$ExpectedGitCommit)
+    if($Version -notmatch '^\d+\.\d+\.\d+$'){throw 'CCOD_PORTABLE_LAUNCHER_VERSION_INVALID'}
+    $repo=[IO.Path]::GetFullPath($RepositoryRoot);$out=[IO.Path]::GetFullPath($ArtifactDirectory);Test-CcodTrayHostOutputDirectory $out
+    $versionContract=Assert-CcodNativeVersionContract -RepositoryRoot $repo -Version $Version -Component portable
+    $exe=Join-Path $out 'CodexRemote.Portable.exe';$config=Join-Path $out 'CodexRemote.Portable.exe.config';$provenancePath=Join-Path $out 'portable-launcher-provenance.json'
+    foreach($path in @($exe,$config,$provenancePath)){if(-not(Test-Path -LiteralPath $path -PathType Leaf)){throw 'CCOD_PORTABLE_LAUNCHER_ARTIFACT_MISSING'}}
+    try{$provenance=Get-Content -LiteralPath $provenancePath -Raw|ConvertFrom-Json}catch{throw 'CCOD_PORTABLE_LAUNCHER_PROVENANCE_INVALID'}
+    $commit=$provenance.PSObject.Properties['gitCommit'];$timestamp=$provenance.PSObject.Properties['buildTimestampUtc'];$compiler=$provenance.PSObject.Properties['compiler']
+    if([int]$provenance.schemaVersion -ne 1 -or [string]$provenance.product -cne 'CodexRemote-fix' -or
+        [string]$provenance.version -cne $Version -or [string]$provenance.targetFramework -cne 'net48' -or
+        [string]$provenance.referenceRoot -cne 'locked-net48' -or $null -eq $commit -or $null -eq $timestamp -or $null -eq $compiler -or
+        $commit.Value -isnot [string] -or $commit.Value -cnotmatch '^[0-9a-f]{40}$' -or
+        $timestamp.Value -isnot [string] -or -not(Test-CcodTrayHostCanonicalUtc $timestamp.Value) -or
+        (-not [string]::IsNullOrWhiteSpace($ExpectedGitCommit) -and $commit.Value -cne $ExpectedGitCommit) -or
+        [string]$compiler.Value.name -cne 'csc.exe' -or [string]$compiler.Value.sha256 -cnotmatch '^[0-9a-f]{64}$'){throw 'CCOD_PORTABLE_LAUNCHER_PROVENANCE_INVALID'}
+    $icon=Join-Path $repo 'assets\codexremote-fix\codexremote-fix.ico';$sourceConfig=Join-Path $versionContract.SourceRoot 'CodexRemote.Portable.exe.config'
+    foreach($required in @($icon,$sourceConfig)){if(-not(Test-Path -LiteralPath $required -PathType Leaf)){throw 'CCOD_PORTABLE_LAUNCHER_SOURCE_MISSING'}}
+    if([string]$provenance.artifactSha256 -cne (Get-CcodTrayHostHash $exe) -or
+        [string]$provenance.configArtifactSha256 -cne (Get-CcodTrayHostHash $config) -or
+        [string]$provenance.iconSha256 -cne (Get-CcodTrayHostHash $icon) -or
+        [string]$provenance.manifestSha256 -cne (Get-CcodTrayHostHash $versionContract.ManifestPath) -or
+        [string]$provenance.configSha256 -cne (Get-CcodTrayHostHash $sourceConfig)){throw 'CCOD_PORTABLE_LAUNCHER_ARTIFACT_TAMPERED'}
+    $expectedSources=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+    foreach($name in @('AssemblyInfo.cs','PortableLauncher.cs')){$expectedSources.Add($name,(Get-CcodTrayHostHash (Join-Path $versionContract.SourceRoot $name)))}
+    $sourceFilesProperty=$provenance.PSObject.Properties['sourceFiles'];$sourceRecords=if($null -eq $sourceFilesProperty){@()}else{@($sourceFilesProperty.Value)}
+    if($sourceRecords.Count -ne $expectedSources.Count){throw 'CCOD_PORTABLE_LAUNCHER_SOURCE_TAMPERED'}
+    $seenSources=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach($record in $sourceRecords){
+        if($null -eq $record){throw 'CCOD_PORTABLE_LAUNCHER_SOURCE_TAMPERED'}
+        $nameProperty=$record.PSObject.Properties['name'];$hashProperty=$record.PSObject.Properties['sha256']
+        if($null -eq $nameProperty -or $null -eq $hashProperty -or $nameProperty.Value -isnot [string] -or $hashProperty.Value -isnot [string]){throw 'CCOD_PORTABLE_LAUNCHER_SOURCE_TAMPERED'}
+        $name=[string]$nameProperty.Value;$hash=[string]$hashProperty.Value
+        if(-not $seenSources.Add($name) -or -not $expectedSources.ContainsKey($name) -or $hash -cnotmatch '^[0-9a-f]{64}$' -or $hash -cne $expectedSources[$name]){throw 'CCOD_PORTABLE_LAUNCHER_SOURCE_TAMPERED'}
+    }
+    Assert-CcodNativePeVersion -Path $exe -Version $Version -ErrorId 'CCOD_PORTABLE_LAUNCHER_ARTIFACT_VERSION_INVALID'
+    return [pscustomobject][ordered]@{Valid=$true;Executable=$exe;Version=$Version;GitCommit=[string]$commit.Value;Sha256=(Get-CcodTrayHostHash $exe)}
+}
+
+Export-ModuleMember -Function Invoke-CcodTrayHostBuild,Test-CcodTrayHostArtifact,Invoke-CcodPortableLauncherBuild,Test-CcodPortableLauncherArtifact

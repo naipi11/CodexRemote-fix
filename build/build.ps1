@@ -321,7 +321,9 @@ try {
         $relative = $runtimeFile.FullName.Substring($runtimeRoot.TrimEnd('\').Length + 1).Replace('\','/')
         Copy-CcodBuildPayloadFile -Source $runtimeFile.FullName -PayloadRoot $payloadRoot -Relative ('src/runtime/' + $relative)
     }
-    Invoke-CcodPortableLauncherBuild -RepositoryRoot $repoRoot -Version $Version -OutputDirectory (Join-Path $PSScriptRoot 'generated\portable') -GitCommit $gitCommit -BuildTimestampUtc $buildTimestampUtc | Out-Null
+    $portableArtifact = Join-Path $PSScriptRoot 'generated\portable'
+    Invoke-CcodPortableLauncherBuild -RepositoryRoot $repoRoot -Version $Version -OutputDirectory $portableArtifact -GitCommit $gitCommit -BuildTimestampUtc $buildTimestampUtc | Out-Null
+    Test-CcodPortableLauncherArtifact -RepositoryRoot $repoRoot -Version $Version -ArtifactDirectory $portableArtifact -ExpectedGitCommit $gitCommit | Out-Null
     foreach ($trayHostFile in @('CodexRemote.TrayHost.exe','CodexRemote.TrayHost.exe.config','trayhost-build-provenance.json')) {
         Copy-CcodBuildPayloadFile -Source (Join-Path $trayHostArtifact $trayHostFile) -PayloadRoot $payloadRoot -Relative ('bin/' + $trayHostFile)
     }
@@ -425,7 +427,6 @@ $isccCandidates = @(
 $iscc = $isccCandidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and [IO.File]::Exists($_) } | Select-Object -First 1
 if (-not $iscc) { throw 'Inno Setup 6 (ISCC.exe) was not found. Install it with: winget install --id JRSoftware.InnoSetup --exact' }
 $issPath = Join-Path $PSScriptRoot 'CodexControlOtherDevices.iss'
-$portableArtifact = Join-Path $PSScriptRoot 'generated\portable'
 $isccArguments = @(
     "/DProjectVersion=$Version",
     "/DTrayHostArtifactDirectory=$trayHostArtifact",

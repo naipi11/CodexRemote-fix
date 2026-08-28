@@ -38,7 +38,7 @@ if ([string]::IsNullOrWhiteSpace($english)) {
 }
 
 $version = $Tag.Substring(1)
-$notes = "# CodexRemote-fix $version`n`n$english`n"
+$notes = "$english`n"
 [IO.File]::WriteAllText($output,$notes,[Text.UTF8Encoding]::new($false))
 
 [pscustomobject][ordered]@{

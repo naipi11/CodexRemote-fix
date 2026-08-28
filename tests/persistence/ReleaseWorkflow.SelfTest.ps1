@@ -1749,13 +1749,18 @@ Invoke-CcodTest 'release notes extraction emits only the target release English 
         [IO.File]::WriteAllText($changelogPath,$fixture.Replace("`n","`r`n"),[Text.UTF8Encoding]::new($false))
         & (Join-Path $repositoryRoot 'tools\New-GitHubReleaseNotes.ps1') -ChangelogPath $changelogPath -Tag 'v2.5.22' -OutputPath $notesPath | Out-Null
         $actual = [IO.File]::ReadAllText($notesPath,[Text.UTF8Encoding]::new($false))
-        Assert-CcodEqual "# CodexRemote-fix 2.5.22`n`n- Target English note.`n- Second target English note.`n" $actual 'release body contains exactly the current target English notes'
+        Assert-CcodEqual "- Target English note.`n- Second target English note.`n" $actual 'release body contains exactly the current target English notes'
         foreach ($decoy in @('UNRELEASED_DECOY','NEWER_DECOY','CHINESE_DECOY','OLDER_DECOY')) {
             Assert-CcodTrue (-not $actual.Contains($decoy)) "release body excludes $decoy"
         }
     } finally {
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
     }
+}
+
+Invoke-CcodTest 'release build validates the portable launcher artifact before payload copy' {
+    $build = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
+    Assert-CcodTrue ($build -cmatch '(?s)Invoke-CcodPortableLauncherBuild.*?Test-CcodPortableLauncherArtifact.*?foreach \(\$portableFile in') 'portable build validates the generated artifact before copying it into the payload'
 }
 
 Invoke-CcodTest '2.5.22 source metadata and documentation match the release contract' {

@@ -210,3 +210,67 @@ the follow-up documentation HEAD without a fresh clean rebuild.
   repair, and Defender outcome remain outside this Task 5 local build scope.
 - Independent parent review remains required before any tag, push, publish,
   signing, or installation decision.
+
+## Fix round 1 — portable artifact verification and release-note body
+
+Independent review found two Important gaps: the freshly compiled portable
+launcher was copied into the payload without an artifact validator analogous to
+TrayHost, and the GitHub notes extractor synthesized an H1 instead of returning
+only the selected English section body.
+
+### RED evidence
+
+The portable regression was added before production code and called the wished-
+for validator against a real compiled launcher:
+
+```text
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\TrayHostBuild.SelfTest.ps1
+exit 1
+Test-CcodPortableLauncherArtifact is not recognized
+```
+
+The release-note expectation was independently changed to the exact English
+body with one LF, producing:
+
+```text
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\ReleaseWorkflow.SelfTest.ps1
+exit 1
+expected=[- Target English note.\n- Second target English note.\n]
+actual=[# CodexRemote-fix 2.5.22\n\n- Target English note.\n- Second target English note.\n]
+```
+
+### Implementation
+
+`Test-CcodPortableLauncherArtifact` now revalidates:
+
+- requested version against package, portable AssemblyInfo, and the portable
+  Windows manifest;
+- PE FileVersion and ProductVersion;
+- schema/product/version/framework/reference-pack, exact commit, and canonical
+  timestamp provenance;
+- exact `PortableLauncher.cs` and `AssemblyInfo.cs` source name/hash set;
+- icon, manifest, source config, executable, and artifact config hashes.
+
+`build/build.ps1` invokes that validator immediately after portable compilation
+and before the first portable EXE/config/provenance copy into the payload. The
+tamper regression changes commit, timestamp, every required hash class, source
+hashes, and a fully aligned false static/provenance version whose PE remains
+2.5.22.0.
+
+`New-GitHubReleaseNotes.ps1` now writes only the normalized target English body
+with exactly one trailing LF. The GitHub release title remains the workflow's
+separate `gh release create/edit --title` responsibility.
+
+### GREEN evidence and boundary
+
+```text
+TrayHostBuild.SelfTest.ps1
+  exit 0; 8 cases including portable validator tamper coverage
+
+ReleaseWorkflow.SelfTest.ps1
+  exit 0; English-body-only extraction and build-before-copy validator order
+```
+
+No formal release build, installer execution, install, publish, push, tag,
+signing, or real Codex/UI operation was performed in this fix round. The final
+fresh clean release build remains gated on scoped independent re-review.

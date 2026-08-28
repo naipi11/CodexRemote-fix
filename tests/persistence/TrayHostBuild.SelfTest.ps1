@@ -205,6 +205,7 @@ Invoke-CcodTest 'TrayHost build embeds the product ICO instead of relying on a r
 Invoke-CcodTest 'portable launcher build emits a tamper-bound double-click entrypoint' {
     Import-Module (Join-Path $repositoryRoot 'build\TrayHostBuild.psm1') -Force
     $artifact = Join-Path $env:TEMP ('ccod-portable-launcher-artifact-' + [Guid]::NewGuid().ToString('N'))
+    $fixtureRoot = Join-Path $env:TEMP ('ccod-portable-launcher-repository-' + [Guid]::NewGuid().ToString('N'))
     try {
         $result = Invoke-CcodPortableLauncherBuild -RepositoryRoot $repositoryRoot -Version '2.5.22' -OutputDirectory $artifact
         Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $artifact 'CodexRemote.Portable.exe') -PathType Leaf) 'portable launcher executable exists'
@@ -219,8 +220,51 @@ Invoke-CcodTest 'portable launcher build emits a tamper-bound double-click entry
         Assert-CcodTrue (@($provenance.sourceFiles.name) -ccontains 'AssemblyInfo.cs') 'portable launcher provenance includes assembly metadata'
         $validated = (Get-FileHash -LiteralPath (Join-Path $artifact 'CodexRemote.Portable.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
         Assert-CcodEqual $validated ([string]$provenance.artifactSha256) 'portable launcher artifact binds its executable hash'
+        $currentCommit = (& git -C $repositoryRoot rev-parse HEAD).Trim().ToLowerInvariant()
+        $artifactValidation = Test-CcodPortableLauncherArtifact -RepositoryRoot $repositoryRoot -Version '2.5.22' -ArtifactDirectory $artifact -ExpectedGitCommit $currentCommit
+        Assert-CcodEqual $currentCommit ([string]$artifactValidation.GitCommit) 'portable artifact validator binds the expected source commit'
+
+        $provenancePath = Join-Path $artifact 'portable-launcher-provenance.json'
+        $baselineJson = [IO.File]::ReadAllText($provenancePath,[Text.UTF8Encoding]::new($false))
+        $mutations = @(
+            [pscustomobject]@{ Name='commit'; Error='CCOD_PORTABLE_LAUNCHER_PROVENANCE_INVALID'; Apply={param($record)$record.gitCommit='d'*40} },
+            [pscustomobject]@{ Name='timestamp'; Error='CCOD_PORTABLE_LAUNCHER_PROVENANCE_INVALID'; Apply={param($record)$record.buildTimestampUtc='not-canonical'} },
+            [pscustomobject]@{ Name='source hash'; Error='CCOD_PORTABLE_LAUNCHER_SOURCE_TAMPERED'; Apply={param($record)$record.sourceFiles[0].sha256='0'*64} },
+            [pscustomobject]@{ Name='icon hash'; Error='CCOD_PORTABLE_LAUNCHER_ARTIFACT_TAMPERED'; Apply={param($record)$record.iconSha256='0'*64} },
+            [pscustomobject]@{ Name='manifest hash'; Error='CCOD_PORTABLE_LAUNCHER_ARTIFACT_TAMPERED'; Apply={param($record)$record.manifestSha256='0'*64} },
+            [pscustomobject]@{ Name='source config hash'; Error='CCOD_PORTABLE_LAUNCHER_ARTIFACT_TAMPERED'; Apply={param($record)$record.configSha256='0'*64} },
+            [pscustomobject]@{ Name='executable hash'; Error='CCOD_PORTABLE_LAUNCHER_ARTIFACT_TAMPERED'; Apply={param($record)$record.artifactSha256='0'*64} },
+            [pscustomobject]@{ Name='artifact config hash'; Error='CCOD_PORTABLE_LAUNCHER_ARTIFACT_TAMPERED'; Apply={param($record)$record.configArtifactSha256='0'*64} }
+        )
+        foreach ($mutationCase in $mutations) {
+            $mutated = $baselineJson | ConvertFrom-Json
+            & ([scriptblock]$mutationCase.Apply) $mutated
+            [IO.File]::WriteAllText($provenancePath,($mutated | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+            try {
+                Assert-CcodThrows { Test-CcodPortableLauncherArtifact -RepositoryRoot $repositoryRoot -Version '2.5.22' -ArtifactDirectory $artifact -ExpectedGitCommit $currentCommit | Out-Null } ([string]$mutationCase.Error)
+            } finally {
+                [IO.File]::WriteAllText($provenancePath,$baselineJson,[Text.UTF8Encoding]::new($false))
+            }
+        }
+
+        [IO.Directory]::CreateDirectory((Join-Path $fixtureRoot 'src')) | Out-Null
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'src\portable') -Destination (Join-Path $fixtureRoot 'src\portable') -Recurse
+        [IO.Directory]::CreateDirectory((Join-Path $fixtureRoot 'assets\codexremote-fix')) | Out-Null
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'assets\codexremote-fix\codexremote-fix.ico') -Destination (Join-Path $fixtureRoot 'assets\codexremote-fix\codexremote-fix.ico')
+        [IO.File]::WriteAllText((Join-Path $fixtureRoot 'package.json'),'{"version":"9.9.9"}',[Text.UTF8Encoding]::new($false))
+        $assemblyPath = Join-Path $fixtureRoot 'src\portable\AssemblyInfo.cs'
+        [IO.File]::WriteAllText($assemblyPath,([IO.File]::ReadAllText($assemblyPath,[Text.UTF8Encoding]::new($false)).Replace('2.5.22.0','9.9.9.0')),[Text.UTF8Encoding]::new($false))
+        $manifestPath = Join-Path $fixtureRoot 'src\portable\CodexRemote.Portable.manifest'
+        [IO.File]::WriteAllText($manifestPath,([IO.File]::ReadAllText($manifestPath,[Text.UTF8Encoding]::new($false)).Replace('2.5.22.0','9.9.9.0')),[Text.UTF8Encoding]::new($false))
+        $falseVersion = $baselineJson | ConvertFrom-Json
+        $falseVersion.version = '9.9.9'
+        @($falseVersion.sourceFiles | Where-Object { $_.name -ceq 'AssemblyInfo.cs' })[0].sha256 = Get-CcodTestFileSha256 -Path $assemblyPath
+        $falseVersion.manifestSha256 = Get-CcodTestFileSha256 -Path $manifestPath
+        [IO.File]::WriteAllText($provenancePath,($falseVersion | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows { Test-CcodPortableLauncherArtifact -RepositoryRoot $fixtureRoot -Version '9.9.9' -ArtifactDirectory $artifact -ExpectedGitCommit $currentCommit | Out-Null } 'CCOD_PORTABLE_LAUNCHER_ARTIFACT_VERSION_INVALID'
     } finally {
         if (Test-Path -LiteralPath $artifact) { Remove-Item -LiteralPath $artifact -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $fixtureRoot) { Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
 
