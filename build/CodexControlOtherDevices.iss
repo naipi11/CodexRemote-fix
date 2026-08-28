@@ -56,6 +56,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
 Source: "{#SetupProvenancePath}"; DestDir: "{app}"; DestName: "setup-provenance.json"; Flags: dontcopy
+Source: "{#InstallerPayloadDirectory}\installer-payload.manifest.json"; DestDir: "{app}"; DestName: "setup-input-payload-manifest.json"; Flags: dontcopy
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.zh-CN.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
@@ -121,11 +122,13 @@ const
   CCOD_FILE_ATTRIBUTE_DIRECTORY = $00000010;
   CCOD_FILE_ATTRIBUTE_REPARSE_POINT = $00000400;
   CCOD_FILE_READ_ATTRIBUTES = $00000080;
+  CCOD_DELETE_ACCESS = $00010000;
   CCOD_FILE_SHARE_READ = $00000001;
   CCOD_FILE_SHARE_WRITE = $00000002;
   CCOD_FILE_SHARE_DELETE = $00000004;
   CCOD_OPEN_EXISTING = 3;
   CCOD_FILE_FLAG_OPEN_REPARSE_POINT = $00200000;
+  CCOD_FILE_FLAG_BACKUP_SEMANTICS = $02000000;
   CCOD_INVALID_FILE_ATTRIBUTES = $FFFFFFFF;
   CCOD_INVALID_HANDLE_VALUE = -1;
   CCOD_ERROR_HANDLE_EOF = 38;
@@ -278,6 +281,161 @@ begin
   end;
 end;
 
+// CCOD_SETUP_PIN_BEGIN
+var
+  CcodSetupPinHandles: array of Integer;
+
+procedure AddCcodSetupPin(Handle: Integer);
+var
+  Count: Integer;
+begin
+  Count := GetArrayLength(CcodSetupPinHandles);
+  SetArrayLength(CcodSetupPinHandles, Count + 1);
+  CcodSetupPinHandles[Count] := Handle;
+end;
+
+procedure CloseCcodSetupPins();
+var
+  Index: Integer;
+begin
+  for Index := GetArrayLength(CcodSetupPinHandles) - 1 downto 0 do
+    if CcodSetupPinHandles[Index] <> CCOD_INVALID_HANDLE_VALUE then
+      CloseHandle(CcodSetupPinHandles[Index]);
+  SetArrayLength(CcodSetupPinHandles, 0);
+end;
+
+function PinCcodExistingSetupDirectory(const DirectoryName: String): Boolean;
+var
+  Attributes: Cardinal;
+  DirectoryHandle: Integer;
+  Information: TCcodByHandleFileInformation;
+begin
+  Result := False;
+  Attributes := GetFileAttributesW(DirectoryName);
+  if Attributes = CCOD_INVALID_FILE_ATTRIBUTES then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if ((Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) = 0) or
+     ((Attributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then Exit;
+  DirectoryHandle := CreateFileW(DirectoryName, CCOD_FILE_READ_ATTRIBUTES or CCOD_DELETE_ACCESS,
+    CCOD_FILE_SHARE_READ or CCOD_FILE_SHARE_WRITE, 0, CCOD_OPEN_EXISTING,
+    CCOD_FILE_FLAG_BACKUP_SEMANTICS or CCOD_FILE_FLAG_OPEN_REPARSE_POINT, 0);
+  if DirectoryHandle = CCOD_INVALID_HANDLE_VALUE then Exit;
+  if (not GetFileInformationByHandle(DirectoryHandle, Information)) or
+     ((Information.FileAttributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) = 0) or
+     ((Information.FileAttributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
+  begin
+    CloseHandle(DirectoryHandle);
+    Exit;
+  end;
+  Attributes := GetFileAttributesW(DirectoryName);
+  if (Attributes = CCOD_INVALID_FILE_ATTRIBUTES) or
+     ((Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) = 0) or
+     ((Attributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
+  begin
+    CloseHandle(DirectoryHandle);
+    Exit;
+  end;
+  AddCcodSetupPin(DirectoryHandle);
+  Result := True;
+end;
+
+function PinCcodExistingSetupLeaf(const FileName: String): Boolean;
+var
+  Attributes: Cardinal;
+  FileHandle: Integer;
+  Information: TCcodByHandleFileInformation;
+begin
+  Result := False;
+  if not IsSafeExistingSetupLeaf(FileName) then Exit;
+  FileHandle := CreateFileW(FileName, CCOD_FILE_READ_ATTRIBUTES,
+    CCOD_FILE_SHARE_READ or CCOD_FILE_SHARE_WRITE, 0, CCOD_OPEN_EXISTING,
+    CCOD_FILE_FLAG_OPEN_REPARSE_POINT, 0);
+  if FileHandle = CCOD_INVALID_HANDLE_VALUE then Exit;
+  if (not GetFileInformationByHandle(FileHandle, Information)) or
+     (Information.NumberOfLinks <> 1) or
+     ((Information.FileAttributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) or
+     ((Information.FileAttributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) <> 0) or
+     (not HasOnlyDefaultDataStream(FileName)) then
+  begin
+    CloseHandle(FileHandle);
+    Exit;
+  end;
+  Attributes := GetFileAttributesW(FileName);
+  if (Attributes = CCOD_INVALID_FILE_ATTRIBUTES) or
+     ((Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) or
+     ((Attributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
+  begin
+    CloseHandle(FileHandle);
+    Exit;
+  end;
+  AddCcodSetupPin(FileHandle);
+  Result := True;
+end;
+
+function PinCcodExistingSetupTree(const DirectoryName: String): Boolean;
+var
+  Attributes: Cardinal;
+  FindRec: TFindRec;
+  ChildPath: String;
+begin
+  Result := PinCcodExistingSetupDirectory(DirectoryName);
+  if not Result then Exit;
+  Attributes := GetFileAttributesW(DirectoryName);
+  if Attributes = CCOD_INVALID_FILE_ATTRIBUTES then Exit;
+  if FindFirst(AddBackslash(DirectoryName) + '*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+        begin
+          ChildPath := AddBackslash(DirectoryName) + FindRec.Name;
+          if ((FindRec.Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) then
+          begin
+            if not PinCcodExistingSetupTree(ChildPath) then
+            begin
+              Result := False;
+              Exit;
+            end;
+          end
+          else if not PinCcodExistingSetupLeaf(ChildPath) then
+          begin
+            Result := False;
+            Exit;
+          end;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
+function PinCcodExpectedSetupDirectories(const AppDirectory: String): Boolean;
+var
+  Directories: TStringList;
+  Index: Integer;
+  Candidate: String;
+begin
+  Result := False;
+  Directories := TStringList.Create;
+  try
+    AddCcodExpectedSetupDirectories(Directories);
+    if Directories.Count = 0 then Exit;
+    for Index := 0 to Directories.Count - 1 do
+    begin
+      Candidate := AddBackslash(AppDirectory) + Directories[Index];
+      if not PinCcodExistingSetupDirectory(Candidate) then Exit;
+    end;
+    Result := True;
+  finally
+    Directories.Free;
+  end;
+end;
+// CCOD_SETUP_PIN_END
+
 function AreCcodExpectedSetupDirectoriesSafe(const AppDirectory: String): Boolean;
 var
   Directories: TStringList;
@@ -305,10 +463,15 @@ var
   AppDirectory: String;
 begin
   Result := '';
+  CloseCcodSetupPins();
   AppDirectory := ExpandConstant('{app}');
   if not IsSafeExistingSetupTree(AppDirectory) or
      not AreCcodExpectedSetupDirectoriesSafe(AppDirectory) then
-    Result := 'CodexRemote-fix refused an unsafe existing payload directory.';
+    Result := 'CodexRemote-fix refused an unsafe existing payload directory.'
+  else if not PinCcodExistingSetupTree(AppDirectory) or
+          not PinCcodExpectedSetupDirectories(AppDirectory) then
+    Result := 'CodexRemote-fix could not retain the safe Setup write boundary.';
+  if Result <> '' then CloseCcodSetupPins();
 end;
 
 function NewActivationId(): String;
@@ -488,6 +651,7 @@ var
 begin
   if CurStep <> ssPostInstall then
     Exit;
+  CloseCcodSetupPins();
   ActivationId := NewActivationId();
   ReceiptPath := ExpandConstant('{localappdata}\CodexControlOtherDevices\state\post-install-activation.json');
   RefuseStaleActivationReceipt(ReceiptPath);
@@ -545,6 +709,11 @@ begin
         SuppressibleMsgBox('Codex restart was not submitted. Restart Codex manually when convenient.', mbInformation, MB_OK, IDOK);
     end;
   end;
+end;
+
+procedure DeinitializeSetup();
+begin
+  CloseCcodSetupPins();
 end;
 
 function IsCanonicalUninstallTransactionId(const Value: String): Boolean;

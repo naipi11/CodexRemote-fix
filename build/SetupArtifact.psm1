@@ -153,9 +153,21 @@ function Test-CcodSetupBuildProvenance {
         [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$ExpectedVersion,
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedGitCommit,
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedPayloadManifestSha256,
-        [string]$ExpectedBuildTimestampUtc
+        [string]$ExpectedBuildTimestampUtc,
+        [Parameter(Mandatory)][string]$InnoTemplatePath,
+        [Parameter(Mandatory)][string]$DestinationInventoryPath,
+        [Parameter(Mandatory)][string]$CompilerPath,
+        [Parameter(Mandatory)][string]$PayloadManifestPath
     )
     $path = Assert-CcodSetupRegularFile -Path $ProvenancePath -Kind 'Setup provenance'
+    $template = Assert-CcodSetupRegularFile -Path $InnoTemplatePath -Kind 'Inno template'
+    $inventory = Assert-CcodSetupRegularFile -Path $DestinationInventoryPath -Kind 'Destination inventory'
+    $compiler = Assert-CcodSetupRegularFile -Path $CompilerPath -Kind 'Inno compiler'
+    $payload = Assert-CcodSetupRegularFile -Path $PayloadManifestPath -Kind 'Installer payload manifest'
+    try { $payloadRaw = [IO.File]::ReadAllText($payload,[Text.UTF8Encoding]::new($false)); $payloadRecord = $payloadRaw | ConvertFrom-Json -ErrorAction Stop }
+    catch { Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Canonical installer payload manifest is invalid' $payload }
+    $actualPayloadHash = Get-CcodSetupArtifactHash -Path $payload
+    $actualCompilerVersion = ([string][Diagnostics.FileVersionInfo]::GetVersionInfo($compiler).FileVersion).Trim()
     try { $raw = [IO.File]::ReadAllText($path,[Text.UTF8Encoding]::new($false)); $record = $raw | ConvertFrom-Json -ErrorAction Stop }
     catch { Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Setup provenance is invalid JSON' $path }
     $timestampMatches = [regex]::Matches($raw,'"buildTimestampUtc"\s*:\s*"(?<value>[^"\\]+)"')
@@ -166,19 +178,20 @@ function Test-CcodSetupBuildProvenance {
         $record.version -isnot [string] -or $record.version -cne $ExpectedVersion -or $record.gitCommit -isnot [string] -or $record.gitCommit -cne $ExpectedGitCommit -or
         -not (Test-CcodSetupCanonicalUtc $timestampText) -or
         (-not [string]::IsNullOrWhiteSpace($ExpectedBuildTimestampUtc) -and $timestampText -cne $ExpectedBuildTimestampUtc) -or
-        $record.payloadManifest.sha256 -isnot [string] -or $record.payloadManifest.sha256 -cne $ExpectedPayloadManifestSha256 -or
+        $record.payloadManifest.sha256 -isnot [string] -or $record.payloadManifest.sha256 -cne $ExpectedPayloadManifestSha256 -or $record.payloadManifest.sha256 -cne $actualPayloadHash -or
         $record.payloadManifest.name -isnot [string] -or $record.payloadManifest.name -cne 'installer-payload.manifest.json' -or
-        [int64]$record.payloadManifest.length -le 0 -or [int]$record.payloadManifest.fileCount -le 0 -or
+        [int64]$record.payloadManifest.length -ne [int64](Get-Item -LiteralPath $payload -Force).Length -or
+        [int]$record.payloadManifest.fileCount -ne [int]@($payloadRecord.files).Count -or
         $record.peContract.fileVersion -isnot [string] -or $record.peContract.fileVersion -cne "$ExpectedVersion.0" -or
         $record.peContract.productVersion -isnot [string] -or $record.peContract.productVersion -cne "$ExpectedVersion.0" -or
         $record.peContract.productName -isnot [string] -or $record.peContract.productName -cne 'CodexRemote-fix' -or
         $record.peContract.fileDescription -isnot [string] -or $record.peContract.fileDescription -cne (Get-CcodSetupDescription -Version $ExpectedVersion) -or
         $record.peContract.companyName -isnot [string] -or $record.peContract.companyName -cne $ExpectedGitCommit -or
         $record.peContract.legalCopyright -isnot [string] -or $record.peContract.legalCopyright -cne $ExpectedPayloadManifestSha256 -or
-        $record.buildInputs.innoTemplateSha256 -isnot [string] -or $record.buildInputs.innoTemplateSha256 -cnotmatch '^[0-9a-f]{64}$' -or
-        $record.buildInputs.destinationInventorySha256 -isnot [string] -or $record.buildInputs.destinationInventorySha256 -cnotmatch '^[0-9a-f]{64}$' -or
-        $record.buildInputs.compilerSha256 -isnot [string] -or $record.buildInputs.compilerSha256 -cnotmatch '^[0-9a-f]{64}$' -or
-        $record.buildInputs.compilerFileVersion -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$record.buildInputs.compilerFileVersion)) {
+        $record.buildInputs.innoTemplateSha256 -isnot [string] -or $record.buildInputs.innoTemplateSha256 -cne (Get-CcodSetupArtifactHash -Path $template) -or
+        $record.buildInputs.destinationInventorySha256 -isnot [string] -or $record.buildInputs.destinationInventorySha256 -cne (Get-CcodSetupArtifactHash -Path $inventory) -or
+        $record.buildInputs.compilerSha256 -isnot [string] -or $record.buildInputs.compilerSha256 -cne (Get-CcodSetupArtifactHash -Path $compiler) -or
+        $record.buildInputs.compilerFileVersion -isnot [string] -or ([string]$record.buildInputs.compilerFileVersion).Trim() -cne $actualCompilerVersion) {
         Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Setup provenance is not exactly bound to the release contract' $path
     }
     return $record

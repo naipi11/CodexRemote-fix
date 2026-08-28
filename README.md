@@ -62,8 +62,8 @@ The current portable bundle, checksum, release manifest, and payload manifest ar
 Before replacing a portable build, use its installed `Uninstall-CodexControlOtherDevices.ps1`;
 settings and the DPAPI device-key store stay in place.
 
-Verified on Windows 11 · Codex Desktop `26.820.7780.0` · Node.js `22.23.1`:
-the hidden controller tab, restart-and-repair recovery, and persistent remote connection are working.
+Historical development checks used Windows 11, Codex Desktop `26.820.7780.0`,
+and Node.js `22.23.1`; they are not current v2.5.22 real-machine acceptance.
 
 ## Everyday use
 

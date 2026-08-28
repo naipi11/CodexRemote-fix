@@ -487,7 +487,9 @@ function Test-CcodReleaseAssetManifest {
         "CodexRemote-fix-$ExpectedVersion-setup.exe",
         "CodexRemote-fix-$ExpectedVersion-setup.exe.sha256.txt",
         "CodexRemote-fix-$ExpectedVersion-trayhost-provenance.json",
-        "CodexRemote-fix-$ExpectedVersion-setup-provenance.json"
+        "CodexRemote-fix-$ExpectedVersion-setup-provenance.json",
+        "CodexRemote-fix-$ExpectedVersion-setup-payload-manifest.json",
+        "CodexRemote-fix-$ExpectedVersion-setup-destination-inventory.iss"
     )
     if ($assets.Count -ne $expectedNames.Count) { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Release manifest does not bind the exact required asset set' $manifestFile }
     $assetHashes = @{}
@@ -542,7 +544,15 @@ function Test-CcodReleaseAssetManifest {
         $setupRecord = $setupRaw | ConvertFrom-Json -ErrorAction Stop
         $payloadHash = [string]$setupRecord.payloadManifest.sha256
         if ($payloadHash -cnotmatch '^[0-9a-f]{64}$') { throw 'payload hash' }
-        Test-CcodSetupBuildProvenance -ProvenancePath $setupProvenancePath -ExpectedVersion $ExpectedVersion -ExpectedGitCommit ([string]$manifest.gitCommit) -ExpectedPayloadManifestSha256 $payloadHash -ExpectedBuildTimestampUtc $manifestTimestamp | Out-Null
+        $repositoryRoot = Split-Path $PSScriptRoot -Parent
+        $innoTemplatePath = Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'
+        $compiler = @(
+            (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and [IO.File]::Exists($_) } | Select-Object -First 1
+        if ($null -eq $compiler) { throw 'canonical ISCC compiler missing' }
+        Test-CcodSetupBuildProvenance -ProvenancePath $setupProvenancePath -ExpectedVersion $ExpectedVersion -ExpectedGitCommit ([string]$manifest.gitCommit) -ExpectedPayloadManifestSha256 $payloadHash -ExpectedBuildTimestampUtc $manifestTimestamp -InnoTemplatePath $innoTemplatePath -DestinationInventoryPath (Join-Path $directory $expectedNames[5]) -CompilerPath $compiler -PayloadManifestPath (Join-Path $directory $expectedNames[4]) | Out-Null
         Test-CcodSetupArtifact -SetupPath $installer -ExpectedVersion $ExpectedVersion -ExpectedGitCommit ([string]$manifest.gitCommit) -ExpectedPayloadManifestSha256 $payloadHash | Out-Null
     } catch {
         Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' ('Setup provenance or final PE contract is invalid: ' + $_.Exception.Message) $setupProvenancePath
@@ -556,6 +566,8 @@ function Test-CcodReleaseAssetManifest {
         InstallerName = $expectedNames[0]
         PayloadManifestSha256 = $payloadHash
         SetupProvenanceName = $expectedNames[3]
+        SetupPayloadInputName = $expectedNames[4]
+        SetupInventoryInputName = $expectedNames[5]
     }
 }
 

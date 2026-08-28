@@ -331,8 +331,10 @@ $releaseManifest = Join-Path $dist "CodexRemote-fix-$Version-release-manifest.js
 $setupExe = Join-Path $dist "CodexRemote-fix-$Version-setup.exe"
 $setupChecksum = "$setupExe.sha256.txt"
 $setupProvenance = Join-Path $dist "CodexRemote-fix-$Version-setup-provenance.json"
+$setupPayloadInput = Join-Path $dist "CodexRemote-fix-$Version-setup-payload-manifest.json"
+$setupInventoryInput = Join-Path $dist "CodexRemote-fix-$Version-setup-destination-inventory.iss"
 $setupReleaseManifest = Join-Path $dist "CodexRemote-fix-$Version-setup-release-manifest.json"
-foreach ($path in @($bundle,$checksum,$provenance,$payloadManifestAsset,$releaseManifest,$setupExe,$setupChecksum,$setupProvenance,$setupReleaseManifest)) {
+foreach ($path in @($bundle,$checksum,$provenance,$payloadManifestAsset,$releaseManifest,$setupExe,$setupChecksum,$setupProvenance,$setupPayloadInput,$setupInventoryInput,$setupReleaseManifest)) {
     if ([IO.File]::Exists($path) -or [IO.Directory]::Exists($path)) { throw "Refusing to overwrite immutable release output: $path" }
 }
 
@@ -481,8 +483,10 @@ $iscc = $isccCandidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -
 if (-not $iscc) { throw 'Inno Setup 6 (ISCC.exe) was not found. Install it with: winget install --id JRSoftware.InnoSetup --exact' }
 $issPath = Join-Path $PSScriptRoot 'CodexControlOtherDevices.iss'
 Import-Module (Join-Path $PSScriptRoot 'SetupArtifact.psm1') -Force
+[IO.File]::Copy((Assert-CcodBuildRegularFile -Path $installerPayloadManifestPath -Kind 'Installer payload manifest'),$setupPayloadInput,$false)
+[IO.File]::Copy((Assert-CcodBuildRegularFile -Path $installerDestinationInventoryPath -Kind 'Installer destination inventory'),$setupInventoryInput,$false)
 $setupProvenanceRecord = New-CcodSetupBuildProvenance -Version $Version -GitCommit $gitCommit -BuildTimestampUtc $buildTimestampUtc -PayloadManifestPath $installerPayloadManifestPath -InnoTemplatePath $issPath -DestinationInventoryPath $installerDestinationInventoryPath -CompilerPath $iscc -OutputPath $setupProvenance
-Test-CcodSetupBuildProvenance -ProvenancePath $setupProvenance -ExpectedVersion $Version -ExpectedGitCommit $gitCommit -ExpectedPayloadManifestSha256 $installerPayloadManifestSha256 -ExpectedBuildTimestampUtc $buildTimestampUtc | Out-Null
+Test-CcodSetupBuildProvenance -ProvenancePath $setupProvenance -ExpectedVersion $Version -ExpectedGitCommit $gitCommit -ExpectedPayloadManifestSha256 $installerPayloadManifestSha256 -ExpectedBuildTimestampUtc $buildTimestampUtc -InnoTemplatePath $issPath -DestinationInventoryPath $installerDestinationInventoryPath -CompilerPath $iscc -PayloadManifestPath $installerPayloadManifestPath | Out-Null
 $isccArguments = @(
     "/DProjectVersion=$Version",
     "/DTrayHostArtifactDirectory=$trayHostArtifact",
@@ -507,7 +511,9 @@ $setupRecord = [ordered]@{
         [ordered]@{ name = [IO.Path]::GetFileName($setupExe); sha256 = $setupHash },
         [ordered]@{ name = [IO.Path]::GetFileName($setupChecksum); sha256 = Get-CcodBuildFileSha256 -Path $setupChecksum },
         [ordered]@{ name = [IO.Path]::GetFileName($provenance); sha256 = Get-CcodBuildFileSha256 -Path $provenance },
-        [ordered]@{ name = [IO.Path]::GetFileName($setupProvenance); sha256 = Get-CcodBuildFileSha256 -Path $setupProvenance }
+        [ordered]@{ name = [IO.Path]::GetFileName($setupProvenance); sha256 = Get-CcodBuildFileSha256 -Path $setupProvenance },
+        [ordered]@{ name = [IO.Path]::GetFileName($setupPayloadInput); sha256 = Get-CcodBuildFileSha256 -Path $setupPayloadInput },
+        [ordered]@{ name = [IO.Path]::GetFileName($setupInventoryInput); sha256 = Get-CcodBuildFileSha256 -Path $setupInventoryInput }
     )
 }
 Write-CcodBuildUtf8 -Path $setupReleaseManifest -Text (($setupRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
