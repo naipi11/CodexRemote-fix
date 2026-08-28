@@ -274,3 +274,37 @@ ReleaseWorkflow.SelfTest.ps1
 No formal release build, installer execution, install, publish, push, tag,
 signing, or real Codex/UI operation was performed in this fix round. The final
 fresh clean release build remains gated on scoped independent re-review.
+
+## Fix round 2 — CRLF-stable release-note fixture
+
+Final-candidate validation on a clean CRLF checkout exposed a test portability
+defect. The fixture already contained CRLF, but the test blindly replaced every
+LF with CRLF, producing CRCRLF. The real extractor then correctly rejected the
+malformed heading boundary:
+
+```text
+ReleaseWorkflow.SelfTest.ps1
+exit 1
+CCOD_RELEASE_NOTES_RELEASE_SECTION_INVALID
+```
+
+A focused local reproduction independently confirmed the old expression:
+
+```text
+CRCRLF_REPRODUCED=True
+```
+
+The fixture now normalizes CRLF and lone CR to LF before converting LF to CRLF.
+This preserves the intended CRLF-input coverage on LF, CRLF, and mixed-line-
+ending checkouts without changing production extraction behavior.
+
+Fresh GREEN evidence:
+
+```text
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\ReleaseWorkflow.SelfTest.ps1
+exit 0
+Release workflow self-tests passed.
+```
+
+No build, installer execution, install, publish, push, tag, or signing occurred
+in this fix round.

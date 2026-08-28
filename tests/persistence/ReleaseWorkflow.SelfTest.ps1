@@ -1746,7 +1746,8 @@ Invoke-CcodTest 'release notes extraction emits only the target release English 
 
 - OLDER_DECOY
 '@
-        [IO.File]::WriteAllText($changelogPath,$fixture.Replace("`n","`r`n"),[Text.UTF8Encoding]::new($false))
+        $fixtureCrlf = $fixture.Replace("`r`n","`n").Replace("`r","`n").Replace("`n","`r`n")
+        [IO.File]::WriteAllText($changelogPath,$fixtureCrlf,[Text.UTF8Encoding]::new($false))
         & (Join-Path $repositoryRoot 'tools\New-GitHubReleaseNotes.ps1') -ChangelogPath $changelogPath -Tag 'v2.5.22' -OutputPath $notesPath | Out-Null
         $actual = [IO.File]::ReadAllText($notesPath,[Text.UTF8Encoding]::new($false))
         Assert-CcodEqual "- Target English note.`n- Second target English note.`n" $actual 'release body contains exactly the current target English notes'
