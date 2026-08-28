@@ -86,6 +86,242 @@ function Open-CcodActivationLockedBytes {
     }
 }
 
+function Initialize-CcodActivationStageNative {
+    if ($null -ne ('CcodActivationStageNative' -as [type])) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class CcodActivationStageNative
+{
+    private const uint FILE_READ_DATA = 0x00000001;
+    private const uint FILE_LIST_DIRECTORY = 0x00000001;
+    private const uint FILE_READ_ATTRIBUTES = 0x00000080;
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint GENERIC_WRITE = 0x40000000;
+    private const uint SYNCHRONIZE = 0x00100000;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint FILE_OPEN = 0x00000001;
+    private const uint FILE_CREATE = 0x00000002;
+    private const uint FILE_DIRECTORY_FILE = 0x00000001;
+    private const uint FILE_NON_DIRECTORY_FILE = 0x00000040;
+    private const uint FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020;
+    private const uint FILE_OPEN_REPARSE_POINT = 0x00200000;
+    private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+    private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+    private const uint OPEN_EXISTING = 3;
+    private const uint OBJ_CASE_INSENSITIVE = 0x00000040;
+    private const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+    private const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct UNICODE_STRING
+    {
+        public ushort Length;
+        public ushort MaximumLength;
+        public IntPtr Buffer;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct OBJECT_ATTRIBUTES
+    {
+        public int Length;
+        public IntPtr RootDirectory;
+        public IntPtr ObjectName;
+        public uint Attributes;
+        public IntPtr SecurityDescriptor;
+        public IntPtr SecurityQualityOfService;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_STATUS_BLOCK
+    {
+        public IntPtr Status;
+        public UIntPtr Information;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILETIME
+    {
+        public uint Low;
+        public uint High;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public FILETIME CreationTime;
+        public FILETIME LastAccessTime;
+        public FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security,
+        uint creation, uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out BY_HANDLE_FILE_INFORMATION information);
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtCreateFile(out IntPtr fileHandle, uint desiredAccess,
+        ref OBJECT_ATTRIBUTES objectAttributes, out IO_STATUS_BLOCK ioStatusBlock, IntPtr allocationSize,
+        uint fileAttributes, uint shareAccess, uint createDisposition, uint createOptions,
+        IntPtr eaBuffer, uint eaLength);
+
+    private static void ValidateLeaf(string name)
+    {
+        if (String.IsNullOrWhiteSpace(name) || name == "." || name == ".." || name.IndexOf('\\') >= 0 || name.IndexOf('/') >= 0)
+            throw new ArgumentException("Relative stage leaf is invalid", "name");
+    }
+
+    private static SafeFileHandle OpenRelative(SafeFileHandle parent, string name, uint access, uint share,
+        uint disposition, uint options)
+    {
+        ValidateLeaf(name);
+        if (parent == null || parent.IsInvalid || parent.IsClosed) throw new ArgumentException("Parent directory pin is invalid", "parent");
+        IntPtr nameBuffer = IntPtr.Zero;
+        IntPtr unicodePointer = IntPtr.Zero;
+        try
+        {
+            nameBuffer = Marshal.StringToHGlobalUni(name);
+            UNICODE_STRING unicode = new UNICODE_STRING();
+            unicode.Length = checked((ushort)(name.Length * 2));
+            unicode.MaximumLength = checked((ushort)((name.Length + 1) * 2));
+            unicode.Buffer = nameBuffer;
+            unicodePointer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));
+            Marshal.StructureToPtr(unicode, unicodePointer, false);
+            OBJECT_ATTRIBUTES attributes = new OBJECT_ATTRIBUTES();
+            attributes.Length = Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES));
+            attributes.RootDirectory = parent.DangerousGetHandle();
+            attributes.ObjectName = unicodePointer;
+            attributes.Attributes = OBJ_CASE_INSENSITIVE;
+            IO_STATUS_BLOCK statusBlock;
+            IntPtr rawHandle;
+            int status = NtCreateFile(out rawHandle, access, ref attributes, out statusBlock, IntPtr.Zero,
+                0, share, disposition, options | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+                IntPtr.Zero, 0);
+            if (status < 0 || rawHandle == IntPtr.Zero || rawHandle == new IntPtr(-1))
+                throw new InvalidOperationException("NtCreateFile failed: 0x" + unchecked((uint)status).ToString("x8"));
+            return new SafeFileHandle(rawHandle, true);
+        }
+        finally
+        {
+            if (unicodePointer != IntPtr.Zero) Marshal.FreeHGlobal(unicodePointer);
+            if (nameBuffer != IntPtr.Zero) Marshal.FreeHGlobal(nameBuffer);
+        }
+    }
+
+    public static SafeFileHandle OpenExistingDirectory(string path)
+    {
+        SafeFileHandle handle = CreateFileW(path, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+        if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+        BY_HANDLE_FILE_INFORMATION information;
+        if (!GetFileInformationByHandle(handle, out information) ||
+            (information.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+            (information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+        {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            if (error != 0) throw new Win32Exception(error);
+            throw new InvalidOperationException("Existing stage parent is not a plain directory");
+        }
+        return handle;
+    }
+
+    public static SafeFileHandle CreateDirectoryRelative(SafeFileHandle parent, string name)
+    {
+        return OpenRelative(parent, name, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_CREATE, FILE_DIRECTORY_FILE);
+    }
+
+    public static SafeFileHandle CreateLeafRelative(SafeFileHandle parent, string name)
+    {
+        return OpenRelative(parent, name, GENERIC_WRITE | SYNCHRONIZE,
+            FILE_SHARE_READ, FILE_CREATE, FILE_NON_DIRECTORY_FILE);
+    }
+
+    public static SafeFileHandle OpenLeafIdentityRelative(SafeFileHandle parent, string name)
+    {
+        return OpenRelative(parent, name, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN, FILE_NON_DIRECTORY_FILE);
+    }
+
+    public static SafeFileHandle OpenLeafReadRelative(SafeFileHandle parent, string name)
+    {
+        return OpenRelative(parent, name, GENERIC_READ | SYNCHRONIZE,
+            FILE_SHARE_READ, FILE_OPEN, FILE_NON_DIRECTORY_FILE);
+    }
+}
+'@
+}
+
+function Get-CcodActivationPinnedDirectory {
+    param(
+        [Parameter(Mandatory)][Collections.Generic.Dictionary[string,object]]$Directories,
+        [Parameter(Mandatory)][Collections.Generic.List[object]]$DirectoryPins,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RelativeDirectory
+    )
+    $normalized = $RelativeDirectory.Replace('/','\').Trim('\')
+    if ([string]::IsNullOrEmpty($normalized)) { return $Directories[''] }
+    $current = ''
+    $parent = $Directories['']
+    foreach ($segment in ($normalized -split '\\')) {
+        if ($segment -notmatch '^[A-Za-z0-9._-]+$' -or $segment -in @('.','..')) { throw 'CCOD_INSTALL_PAYLOAD_PATH_INVALID' }
+        $current = if ([string]::IsNullOrEmpty($current)) { $segment } else { "$current\$segment" }
+        if ($Directories.ContainsKey($current)) { $parent = $Directories[$current]; continue }
+        $created = [CcodActivationStageNative]::CreateDirectoryRelative($parent,[string]$segment)
+        $DirectoryPins.Add($created)
+        $Directories.Add($current,$created)
+        $parent = $created
+    }
+    return $parent
+}
+
+function Open-CcodActivationPinnedLeafBytes {
+    param(
+        [Parameter(Mandatory)]$ParentDirectory,
+        [Parameter(Mandatory)][string]$Leaf,
+        [Parameter(Mandatory)][byte[]]$Bytes
+    )
+    $writerHandle = $null
+    $identityHandle = $null
+    $writer = $null
+    try {
+        $writerHandle = [CcodActivationStageNative]::CreateLeafRelative($ParentDirectory,$Leaf)
+        $writer = [IO.FileStream]::new($writerHandle,[IO.FileAccess]::Write,65536,$false)
+        $writerHandle = $null
+        $writer.Write($Bytes,0,$Bytes.Length)
+        $writer.Flush($true)
+        $identityHandle = [CcodActivationStageNative]::OpenLeafIdentityRelative($ParentDirectory,$Leaf)
+        $writer.Dispose(); $writer = $null
+        $readHandle = [CcodActivationStageNative]::OpenLeafReadRelative($ParentDirectory,$Leaf)
+        $stream = [IO.FileStream]::new($readHandle,[IO.FileAccess]::Read,65536,$false)
+        $memory = [IO.MemoryStream]::new()
+        try { $stream.CopyTo($memory); $readBytes = $memory.ToArray() }
+        finally { $memory.Dispose() }
+        $identityHandle.Dispose(); $identityHandle = $null
+        return [pscustomobject]@{ Stream=$stream; Bytes=$readBytes }
+    } catch {
+        if ($null -ne $writer) { $writer.Dispose() }
+        elseif ($null -ne $writerHandle) { $writerHandle.Dispose() }
+        if ($null -ne $identityHandle) { $identityHandle.Dispose() }
+        throw
+    }
+}
+
 function Assert-CcodActivationNonReparsePath {
     param([Parameter(Mandatory)][string]$Root,[Parameter(Mandatory)][string]$Path)
     $canonicalRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\')
@@ -140,6 +376,10 @@ function Close-CcodActivationPayloadSeal {
     foreach ($stream in @($Seal.Streams)) {
         if ($null -ne $stream) { try { $stream.Dispose() } catch { } }
     }
+    $directoryPins = @($Seal.DirectoryPins)
+    for ($index=$directoryPins.Count-1;$index-ge0;$index--) {
+        if ($null -ne $directoryPins[$index]) { try { $directoryPins[$index].Dispose() } catch { } }
+    }
     Remove-CcodActivationPayloadStage -AppRoot $Seal.AppRoot -StageRoot $Seal.StageRoot
 }
 
@@ -168,6 +408,7 @@ function New-CcodActivationPayloadSeal {
     [void](Assert-CcodActivationNonReparsePath -Root $payload -Path $manifestPath)
     $sourceLocks = [Collections.Generic.List[object]]::new()
     $stageLocks = [Collections.Generic.List[object]]::new()
+    $stageDirectoryPins = [Collections.Generic.List[object]]::new()
     $stageRoot = Join-Path $app ('.activation-payload-stage-' + [guid]::NewGuid().ToString('N'))
     try {
         $manifestLock = Open-CcodActivationLockedBytes -Path $manifestPath -MaximumBytes 4194304
@@ -231,17 +472,23 @@ function New-CcodActivationPayloadSeal {
         catch { throw 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' }
         if ($packageSnapshot.Count -ne 1 -or $package.version -isnot [string] -or [string]$package.version -cne $Version) { throw 'CCOD_INSTALL_PAYLOAD_VERSION_MISMATCH' }
 
-        [IO.Directory]::CreateDirectory($stageRoot) | Out-Null
+        Initialize-CcodActivationStageNative
+        $appPin = [CcodActivationStageNative]::OpenExistingDirectory($app)
+        $stageDirectoryPins.Add($appPin)
+        $stageName = [IO.Path]::GetFileName($stageRoot)
+        $stagePin = [CcodActivationStageNative]::CreateDirectoryRelative($appPin,$stageName)
+        $stageDirectoryPins.Add($stagePin)
+        $directories = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+        $directories.Add('',$stagePin)
         [void](Assert-CcodActivationNonReparsePath -Root $app -Path $stageRoot)
         foreach ($snapshot in @($snapshots) + @([pscustomobject]@{Relative='installer-payload.manifest.json';Bytes=$manifestLock.Bytes;Sha256=$ExpectedManifestSha256})) {
             $destination = [IO.Path]::GetFullPath((Join-Path $stageRoot ([string]$snapshot.Relative).Replace('/','\')))
             $stagePrefix = $stageRoot.TrimEnd('\') + '\'
             if (-not $destination.StartsWith($stagePrefix,[StringComparison]::OrdinalIgnoreCase)) { throw 'CCOD_INSTALL_PAYLOAD_PATH_INVALID' }
-            [IO.Directory]::CreateDirectory((Split-Path $destination -Parent)) | Out-Null
-            $writer = [IO.File]::Open($destination,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
-            try { $writer.Write([byte[]]$snapshot.Bytes,0,([byte[]]$snapshot.Bytes).Length); $writer.Flush($true) } finally { $writer.Dispose() }
+            $relativeDirectory = [IO.Path]::GetDirectoryName(([string]$snapshot.Relative).Replace('/','\'))
+            $parentPin = Get-CcodActivationPinnedDirectory -Directories $directories -DirectoryPins $stageDirectoryPins -RelativeDirectory $relativeDirectory
+            $stageLock = Open-CcodActivationPinnedLeafBytes -ParentDirectory $parentPin -Leaf ([IO.Path]::GetFileName($destination)) -Bytes ([byte[]]$snapshot.Bytes)
             [void](Assert-CcodActivationNonReparsePath -Root $stageRoot -Path $destination)
-            $stageLock = Open-CcodActivationLockedBytes -Path $destination
             $stageLocks.Add($stageLock)
             if ((Get-CcodActivationBytesSha256 -Bytes $stageLock.Bytes) -cne [string]$snapshot.Sha256) { throw 'CCOD_INSTALL_FILE_HASH_MISMATCH' }
         }
@@ -251,9 +498,11 @@ function New-CcodActivationPayloadSeal {
             ManifestPath=Join-Path $stageRoot 'installer-payload.manifest.json'
             ManifestBytes=$manifestLock.Bytes
             Streams=@($stageLocks | ForEach-Object { $_.Stream })
+            DirectoryPins=@($stageDirectoryPins)
         }
     } catch {
         foreach ($locked in @($stageLocks)) { try { $locked.Stream.Dispose() } catch { } }
+        for ($pinIndex=$stageDirectoryPins.Count-1;$pinIndex-ge0;$pinIndex--) { try { $stageDirectoryPins[$pinIndex].Dispose() } catch { } }
         Remove-CcodActivationPayloadStage -AppRoot $app -StageRoot $stageRoot
         throw
     } finally {
