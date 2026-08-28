@@ -340,3 +340,232 @@ normal desktop environment retains the earlier real-Supervisor lifecycle mutex
 boundary. The parent will rerun the controlled isolated aggregate after scoped
 re-review. No build, installer execution, install, publish, push, tag, release,
 or signing occurred in this fix round.
+
+## Final security-fix wave — exact activation bytes, hard-link leaves, and Setup proof
+
+### Scope and safety boundary
+
+- Started from clean reviewed head `31fd365` in the named v2.5.22 worktree.
+- Preserved package/native version `2.5.22` / `2.5.22.0`, the authenticated
+  TrayHost protocol, receipt architecture, and existing CI/trace gates.
+- Did not execute an installer, install or upgrade the product, start or stop
+  real Codex/TrayHost/Supervisor/UI processes, publish, push, tag, sign, or
+  read/write WindowsApps or DPAPI device-key data.
+
+### RED evidence
+
+#### Exact activation bytes
+
+A real cross-process barrier supplied a test-only `powershell.exe` wrapper.
+The wrapper stopped after the activation parent verified the payload and before
+the child interpreter ran. The test then replaced the accepted manifest,
+installer, and lifecycle module. The old pathname flow returned success but
+proved that it parsed/executed the replacements:
+
+```text
+ReleaseWorkflow.SelfTest.ps1
+exit 1
+case=activation-executes-only-the-verified-manifest-installer-and-module-bytes-across-the-child-launch-barrier
+expected=[original:2.5.22]
+actual=[replacement:9.9.9]
+```
+
+No production test flag, environment switch, listener, or unauthenticated
+control input was added.
+
+#### Hard-linked install leaves
+
+The lifecycle regression created an outside sentinel and hard-linked each
+stable target leaf in turn. The old copy path did not reject either target:
+
+```text
+InstallLifecycle.SelfTest.ps1
+exit 1
+case=stable-bootstrap-and-public-uninstaller-reject-hard-linked-target-leaves-before-outside-bytes-change
+ASSERT_THROWS: expected CCOD_INSTALL_UNSAFE_LEAF
+```
+
+A separately compiled and safely executed Inno predicate fixture placed a hard
+link inside the existing Setup tree. The old `IsSafeExistingSetupTree` accepted
+the leaf, reached the simulated overwrite, and therefore did not write the
+fixture's success receipt (`result.txt` missing).
+
+#### Independent Setup artifact and provenance
+
+The real-ISCC artifact test was added before its validator:
+
+```text
+ReleaseWorkflow.SelfTest.ps1
+exit 1
+case=compiled-Setup-independently-binds-PE-versions-commit-and-activation-payload-manifest-hash
+ASSERT_TRUE: independent Setup artifact validator exists
+```
+
+After the validator API existed, the setup release fixture added the required
+setup-provenance asset before the release validator changed. The old validator
+then failed its exact asset contract, proving the provenance was not yet part
+of the accepted release:
+
+```text
+CCOD_RELEASE_MANIFEST_INVALID
+Release manifest does not bind the exact required asset set
+```
+
+#### Failure cleanup
+
+The cleanup regression injected a deterministic exception after creating the
+exact GUID-named installer payload stage and destination inventory. It first
+failed because the production finally scope did not exist:
+
+```text
+ASSERT_TRUE: build exposes its production temporary Setup scope
+```
+
+### Implementation contract
+
+#### Activation byte sealing
+
+- The activation parent opens the compile-bound manifest once, hashes and
+  parses the same byte array, and opens every current manifest record with
+  read-only/no-write/no-delete sharing.
+- It writes only those verified byte arrays into a unique sibling stage,
+  rehashes each staged leaf, and holds read handles for the entire child
+  lifetime. Original payload path replacement after the barrier cannot change
+  the child's inputs.
+- The child independently opens and holds the staged manifest/records, hashes
+  and parses the same manifest bytes, verifies exact version/package/file set,
+  and only then imports `InstallLifecycle.psm1`.
+- Lifecycle receives the accepted manifest as Base64 exact bytes plus the
+  expected SHA-256; it does not reopen the accepted manifest pathname for JSON
+  parsing. Existing final Ready pointer/runtime-manifest/version proof remains.
+
+#### Hard-link-safe leaves
+
+- Lifecycle now uses `CreateFileW` plus `GetFileInformationByHandle` and
+  requires `NumberOfLinks == 1`, regular/non-reparse shape, no alternate data
+  streams, and canonical install-root containment before/after copies.
+- Production copy writes a fresh same-directory temporary leaf and uses a
+  namespace replace/move, avoiding in-place mutation of an existing inode.
+- Stable `bootstrap.ps1`, the public uninstaller, staged runtime leaves,
+  runtime manifest, and recursively deleted install trees use the same leaf
+  contract.
+- Inno `PrepareToInstall` recursively checks every existing Setup leaf with
+  native handle link count plus stream enumeration before `[Files]` writes.
+
+#### Independent Setup artifact/provenance
+
+- `build/SetupArtifact.psm1` verifies final Setup PE `FileVersion` and
+  `ProductVersion` equal `<Version>.0`.
+- The final PE version resource independently binds product/version, the exact
+  40-hex source commit, and the exact 64-hex installer payload-manifest SHA-256.
+  The negative test reuses the same final EXE with a mismatched expected hash
+  and requires `CCOD_SETUP_PAYLOAD_BINDING_INVALID`; no textual binary scan is
+  claimed.
+- `CodexRemote-fix-2.5.22-setup-provenance.json` records canonical
+  version/commit/timestamp, payload manifest name/length/hash/file count, Inno
+  template and inventory hashes, ISCC hash/version, and the expected PE
+  resource contract. It is embedded as a `dontcopy` Setup source and published
+  as an explicit release asset.
+- The setup release manifest hash-binds Setup, checksum, TrayHost provenance,
+  and Setup provenance. `Test-CcodReleaseAssetManifest` revalidates provenance
+  plus the final PE and rejects asset or metadata tampering.
+- Provenance validation reads the raw canonical timestamp representation and
+  accepts the JSON integer types produced by both Windows PowerShell 5.1 and
+  pwsh 7.
+
+#### Cleanup and documentation
+
+- The installer payload stage and destination inventory now live inside one
+  exact `try/finally` scope. Cleanup requires the build-root parent, exact GUID
+  leaf pattern, expected file/directory kind, and a reparse-free tree.
+- README and README.zh-CN now call v2.5.22 a release candidate and explicitly
+  leave stable Windows acceptance pending real install/upgrade/reboot/repair/UI/
+  Defender evidence. No What's-new block was added.
+
+### GREEN and regression evidence
+
+```text
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\ReleaseWorkflow.SelfTest.ps1
+exit 0
+Release workflow self-tests passed.
+  includes real ISCC compilation, activation swap barrier, Inno hard-link
+  fixture, Setup PE positive/negative proof, failure cleanup, and release
+  provenance validation
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\trayhost\Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly
+exit 0; 3 production child-session trace cases
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\trayhost\Invoke-TrayHostSelfTest.ps1 -NativeOnly
+exit 0; 25 native fake-platform cases
+
+PowerShell AST parse of all modified .ps1/.psm1 files
+exit 0
+
+git diff --check
+exit 0
+```
+
+The lifecycle suite passed the new activation/hard-link cases and continued to
+the already documented live-Supervisor boundary. It was not reported green:
+
+```text
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\InstallLifecycle.SelfTest.ps1
+exit 1
+case=transactional-uninstall-reaches-ReadyForInno-only-after-recovery-protection-stop-task-proof-and-application-removal
+error=CCOD_LIFECYCLE_LEASE_TIMEOUT
+```
+
+No mutex bypass and no real Supervisor stop was attempted.
+
+### Clean-head build evidence
+
+Normal build from clean implementation head
+`1f4259f7003d29d1023a567d15c877c22dfabd6c`:
+
+```text
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File build\build.ps1 -Version 2.5.22
+exit 0
+TEMP_SETUP_INPUT_COUNT=0
+```
+
+Both Windows PowerShell 5.1 and pwsh 7 independently returned
+`portable=True` and `setup=True`. Setup FileVersion/ProductVersion were both
+`2.5.22.0`; portable/setup release manifests and Setup provenance all bound
+commit `1f4259f7003d29d1023a567d15c877c22dfabd6c`. The embedded activation
+payload-manifest SHA-256 was
+`e03753640f65f28aebdf46eb113f8ad26317169cbfc424e1629a6795c752a4f1`.
+
+Final retained build evidence hashes:
+
+```text
+CodexRemote-fix-2.5.22-windows-x64.zip
+  a70419842a2509ae2035e6890474b3e7258d5f64682edb8813d6782adc1c299b
+CodexRemote-fix-2.5.22-setup.exe
+  5f650bc187112a5256f5a5b5d37972a6400cfe6e32586956830458adfc6b53e9
+CodexRemote-fix-2.5.22-setup-provenance.json
+  8f0d1973b69d440ca8dad699bb9065b3030ea4f455d757fc5278e706f6cc76e9
+CodexRemote-fix-2.5.22-setup-release-manifest.json
+  559fa329221fcd092356119b8b4aa8bf4562afe173a432ca4251969db5c4a9e6
+```
+
+Two earlier ignored artifact sets were preserved rather than deleted at:
+
+```text
+C:\Users\33384\AppData\Local\Temp\ccod-v2522-pre-final-security-build-0ff1f869906848418dc15e9ef89d5375
+C:\Users\33384\AppData\Local\Temp\ccod-v2522-ca5a5f7-build-00f3b177a3974b02bee3fe3f99f2cbc0
+```
+
+### Commits and remaining acceptance boundary
+
+```text
+cb36d0b test: expose activation payload byte swap
+ed782ec fix: seal activation bytes and reject linked leaves
+ca5a5f7 fix: bind setup artifact provenance
+1f4259f fix: validate setup provenance across hosts
+```
+
+- The compiled installer was never executed. Generated assets are unsigned,
+  unpublished local evidence only.
+- Real setup install/upgrade, reboot, remote connection, About/language/logs,
+  repair, Defender, and controlled isolated aggregate acceptance remain
+  pending. README intentionally does not call v2.5.22 stable.
