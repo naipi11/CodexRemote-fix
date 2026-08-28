@@ -5,9 +5,10 @@ using System.IO;
 internal sealed class TrayHostApplication : IDisposable
 {
     private readonly TrayWindow _window;
-    private readonly Win32TrayPlatform _platform;
+    private readonly INativeTrayPlatform _platform;
     private readonly Action<TrayCommand, ulong> _command;
     private readonly Action _work;
+    private readonly Action<uint> _receiptWork;
     private readonly uint _taskbarCreated;
     private bool _exitRequested;
 
@@ -17,11 +18,16 @@ internal sealed class TrayHostApplication : IDisposable
         _window = window;
     }
 
-    internal TrayHostApplication(Win32TrayPlatform platform, TrayWindow window, Action<TrayCommand, ulong> command, Action work)
+    internal TrayHostApplication(INativeTrayPlatform platform, TrayWindow window, Action<TrayCommand, ulong> command, Action work)
+        : this(platform, window, command, work, null)
+    {
+    }
+
+    internal TrayHostApplication(INativeTrayPlatform platform, TrayWindow window, Action<TrayCommand, ulong> command, Action work, Action<uint> receiptWork)
     {
         if (platform == null) { throw new ArgumentNullException("platform"); }
         if (window == null) { throw new ArgumentNullException("window"); }
-        _platform = platform; _window = window; _command = command; _work = work; _taskbarCreated = (uint)Win32TrayPlatform.RegisterTaskbarCreatedMessage().ToInt64();
+        _platform = platform; _window = window; _command = command; _work = work; _receiptWork = receiptWork; _taskbarCreated = (uint)Win32TrayPlatform.RegisterTaskbarCreatedMessage().ToInt64();
         _platform.SetMessageHandler(HandleMessage);
     }
 
@@ -40,7 +46,8 @@ internal sealed class TrayHostApplication : IDisposable
         return 0;
     }
 
-    internal void PostWork() { if (_platform != null) { Win32TrayPlatform.PostToWindow(_window.OwnerHandle, TrayNativeConstants.WmApp + 2U); } }
+    internal void PostWork() { if (_platform != null && _window.OwnerHandle != IntPtr.Zero) { _platform.PostMessage(_window.OwnerHandle, TrayNativeConstants.WmApp + 2U, UIntPtr.Zero, IntPtr.Zero); } }
+    internal bool PostReceiptWork(uint token) { return token != 0U && _platform != null && _window.OwnerHandle != IntPtr.Zero && _platform.PostMessage(_window.OwnerHandle, TrayNativeConstants.WmApp + 3U, new UIntPtr(token), IntPtr.Zero); }
     internal void RequestExit()
     {
         if (_exitRequested) { return; }
@@ -52,6 +59,15 @@ internal sealed class TrayHostApplication : IDisposable
     internal static bool IsContextMenuEvent(uint message, IntPtr callbackData)
     {
         return IsContextMenuEvent(message, IntPtr.Zero, callbackData);
+    }
+
+    internal static bool TryDecodeReceiptWorkToken(uint message, IntPtr wParam, IntPtr lParam, out uint token)
+    {
+        token = 0U;
+        if (message != TrayNativeConstants.WmApp + 3U || lParam != IntPtr.Zero) { return false; }
+        ulong raw = IntPtr.Size == 4 ? unchecked((uint)wParam.ToInt32()) : unchecked((ulong)wParam.ToInt64());
+        if (raw == 0UL || raw > UInt32.MaxValue) { return false; }
+        token = unchecked((uint)raw); return true;
     }
 
     internal static bool IsContextMenuEvent(uint message, IntPtr wParam, IntPtr lParam)
@@ -74,6 +90,12 @@ internal sealed class TrayHostApplication : IDisposable
 
     private void HandleMessage(uint message, IntPtr wParam, IntPtr lParam)
     {
+        uint receiptToken;
+        if (TryDecodeReceiptWorkToken(message, wParam, lParam, out receiptToken))
+        {
+            Action<uint> receiptWork = _receiptWork; if (receiptWork != null) { receiptWork(receiptToken); }
+            return;
+        }
         if (message == TrayNativeConstants.WmApp + 2U)
         {
             Action work = _work; if (work != null) { work(); }

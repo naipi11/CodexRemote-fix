@@ -42,6 +42,11 @@ internal sealed class TrayTerminalReceiptSink : IDisposable
     private int _cleanupStarted;
     private bool _writerStarted;
     private bool _closed;
+    private bool _callbackClaimed;
+
+#if TRAYHOST_RECEIPT_SELF_TEST
+    internal static Action BeforeCallbackAdmissionForTesting;
+#endif
 
     internal TrayTerminalReceiptSink(Func<TrayTerminalDiagnostic, bool> writeDurably, Func<TrayTerminalReceipt, bool> publishDurable)
         : this(writeDurably, publishDurable, null)
@@ -129,10 +134,26 @@ internal sealed class TrayTerminalReceiptSink : IDisposable
                 bool durable = false;
                 try { durable = _writeDurably(receipt.Diagnostic); }
                 catch { durable = false; }
-                if (durable && !IsClosed())
+#if TRAYHOST_RECEIPT_SELF_TEST
+                if (durable)
+                {
+                    Action beforeCallbackAdmission = BeforeCallbackAdmissionForTesting;
+                    if (beforeCallbackAdmission != null) { try { beforeCallbackAdmission(); } catch { durable = false; } }
+                }
+#endif
+                bool callbackAdmitted = false;
+                if (durable)
+                {
+                    lock (_gate)
+                    {
+                        if (!_closed && !_callbackClaimed) { _callbackClaimed = true; callbackAdmitted = true; }
+                    }
+                }
+                if (callbackAdmitted)
                 {
                     try { _publishDurable(receipt); }
                     catch { }
+                    finally { lock (_gate) { _callbackClaimed = false; } }
                 }
                 lock (_gate)
                 {
@@ -151,11 +172,6 @@ internal sealed class TrayTerminalReceiptSink : IDisposable
             }
             CleanupAfterWriter();
         }
-    }
-
-    private bool IsClosed()
-    {
-        lock (_gate) { return _closed; }
     }
 
     private void CleanupAfterWriter()

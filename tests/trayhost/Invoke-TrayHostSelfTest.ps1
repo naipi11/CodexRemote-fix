@@ -64,6 +64,7 @@ try{
     $outputPath=Join-Path $temporaryRoot $outputName
     $args=@('/nologo','/noconfig','/nostdlib+','/target:exe','/platform:anycpu','/optimize+','/checked+','/warn:4','/warnaserror+',('/out:{0}' -f $outputPath),('/main:{0}' -f $mainType))
     if($NativeOnly){$args+='/define:TRAYHOST_SELF_TEST'}
+    if($TransportOnly){$args+='/define:TRAYHOST_RECEIPT_SELF_TEST'}
     foreach($leaf in @('mscorlib.dll','System.dll','System.Core.dll','System.Drawing.dll')){$args+=('/reference:'+ (Join-Path $reference.ReferenceRoot $leaf))}
     if($ProductionOnly){$args+=(Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'src\trayhost') -Filter '*.cs' -File | ForEach-Object FullName)}
     else

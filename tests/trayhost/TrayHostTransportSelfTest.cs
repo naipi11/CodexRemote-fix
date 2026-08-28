@@ -82,6 +82,30 @@ internal static class TrayHostTransportSelfTest
         }
     }
 
+    private sealed class ReceiptTokenInbox
+    {
+        private readonly object _gate = new object();
+        private readonly Queue<uint> _tokens = new Queue<uint>();
+
+        internal bool Post(uint token)
+        {
+            if (token == 0U) { return false; }
+            lock (_gate) { _tokens.Enqueue(token); }
+            return true;
+        }
+
+        internal bool TryTake(out uint token)
+        {
+            lock (_gate)
+            {
+                if (_tokens.Count == 0) { token = 0U; return false; }
+                token = _tokens.Dequeue(); return true;
+            }
+        }
+
+        internal int Count { get { lock (_gate) { return _tokens.Count; } } }
+    }
+
     private static void AssertTrue(bool value, string message)
     {
         if (!value) { throw new InvalidOperationException(message); }
@@ -135,6 +159,35 @@ internal static class TrayHostTransportSelfTest
     {
         AssertTrue(host.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.OpenLogs, revision)), message + " registers");
         return AcknowledgeTerminalQuickly(host, new TrayActionResult(actionId, revision, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null), message);
+    }
+
+    private static uint WaitForToken(ReceiptTokenInbox inbox, string message)
+    {
+        uint token = 0U;
+        WaitUntil(delegate { return inbox.TryTake(out token); }, 2000, message);
+        return token;
+    }
+
+    private static TrayActionResult TakeReceiptUi(HostTransport host, uint token, TrayTerminalReceiptUiKind expectedKind, string message)
+    {
+        TrayTerminalReceiptUiKind kind; TrayActionResult result;
+        AssertTrue(host.TryTakeReceiptUi(token, out kind, out result) && kind == expectedKind && result != null, message);
+        return result;
+    }
+
+    private static TrayActionResult WaitForPostedReceiptUi(HostTransport host, ReceiptTokenInbox inbox, TrayTerminalReceiptUiKind expectedKind, string message)
+    {
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            uint token = WaitForToken(inbox, message + " token post");
+            TrayTerminalReceiptUiKind kind; TrayActionResult result;
+            if (host.TryTakeReceiptUi(token, out kind, out result))
+            {
+                AssertTrue(kind == expectedKind && result != null, message);
+                return result;
+            }
+        }
+        throw new InvalidOperationException(message + " was never committed");
     }
 
     private static void TestParentLatestAndReservedControl()
@@ -244,8 +297,8 @@ internal static class TrayHostTransportSelfTest
         for (int stageIndex = 0; stageIndex < stages.Length; stageIndex++)
         {
             ControllableReceiptStore store = new ControllableReceiptStore(stages[stageIndex], 1, 1);
-            int uiSignals = 0;
-            HostTransport host = new HostTransport(delegate { Interlocked.Increment(ref uiSignals); });
+            ReceiptTokenInbox inbox = new ReceiptTokenInbox();
+            HostTransport host = new HostTransport(null, inbox.Post);
             TrayTerminalReceiptSink sink = new TrayTerminalReceiptSink(store.TryAppendDurably, host.TryPublishDurableReceipt);
             try
             {
@@ -265,14 +318,12 @@ internal static class TrayHostTransportSelfTest
                 AssertTrue(!host.TryAcknowledgeAction(new TrayActionResult(firstId, 24UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null), out duplicate), "current terminal action is removed before sink submission");
                 AssertTrue(!host.TryAcknowledgeAction(new TrayActionResult(followingId, 24UL, TrayActionResultStatus.Completed, null, null), out duplicate), "following terminal action is removed before sink submission");
                 TrayActionResult prematureFailure; TrayActionResult prematureAbout;
-                AssertTrue(!host.TryTakeFailedAction(out prematureFailure) && !host.TryTakeCompletedAbout(out prematureAbout) && Interlocked.CompareExchange(ref uiSignals, 0, 0) == 0, "blocked store exposes no generic or About UI work before durable success");
+                AssertTrue(!host.TryTakeFailedAction(out prematureFailure) && !host.TryTakeCompletedAbout(out prematureAbout) && inbox.Count == 0, "blocked store exposes no generic or About UI work before durable success");
 
                 store.Release();
-                WaitUntil(delegate { return Interlocked.CompareExchange(ref uiSignals, 0, 0) == 2; }, 2000, "both durable successes post exactly one work signal");
                 TrayActionResult firstUi; TrayActionResult followingUi; TrayActionResult none;
-                firstUi = null; followingUi = null;
-                WaitUntil(delegate { return host.TryTakeFailedAction(out firstUi); }, 2000, "first durable receipt becomes visible after its callback succeeds");
-                WaitUntil(delegate { return host.TryTakeCompletedAbout(out followingUi); }, 2000, "following durable About becomes visible after its callback succeeds");
+                firstUi = WaitForPostedReceiptUi(host, inbox, TrayTerminalReceiptUiKind.Failure, "first durable receipt becomes visible only through its exact token");
+                followingUi = WaitForPostedReceiptUi(host, inbox, TrayTerminalReceiptUiKind.About, "following durable About becomes visible only through its exact token");
                 AssertTrue(firstUi.ActionId == firstId, "first durable receipt publishes its exact generic-feedback item");
                 AssertTrue(followingUi.ActionId == followingId, "following durable receipt publishes its exact About item");
                 AssertTrue(!host.TryTakeFailedAction(out none), "durable callbacks publish no duplicate feedback");
@@ -362,11 +413,11 @@ internal static class TrayHostTransportSelfTest
     private static void TestStoreAndCallbackFailuresRecoverOnTheSameWriter()
     {
         ControllableReceiptStore store = new ControllableReceiptStore(ReceiptStoreBlockStage.DuringFlush, 0, 1, 1);
-        bool failCallback = true; int successfulSignals = 0;
-        HostTransport host = new HostTransport(delegate
+        bool failCallback = true; ReceiptTokenInbox inbox = new ReceiptTokenInbox();
+        HostTransport host = new HostTransport(null, delegate(uint token)
         {
             if (failCallback) { failCallback = false; throw new InvalidOperationException("intentional UI callback failure"); }
-            Interlocked.Increment(ref successfulSignals);
+            return inbox.Post(token);
         });
         TrayTerminalReceiptSink sink = new TrayTerminalReceiptSink(store.TryAppendDurably, host.TryPublishDurableReceipt);
         try
@@ -379,10 +430,9 @@ internal static class TrayHostTransportSelfTest
             TrayActionResult none;
             AssertTrue(!host.TryTakeFailedAction(out none), "blocked and not-yet-durable receipts expose no UI");
             store.Release();
-            WaitUntil(delegate { return store.CompletedCount == 3 && Interlocked.CompareExchange(ref successfulSignals, 0, 0) == 1; }, 3000, "same writer continues through store and callback failures to a later success");
+            WaitUntil(delegate { return store.CompletedCount == 3 && inbox.Count != 0; }, 3000, "same writer continues through store and callback failures to a later token post");
             TrayActionResult recovered; TrayActionResult extra;
-            recovered = null;
-            WaitUntil(delegate { return host.TryTakeFailedAction(out recovered); }, 2000, "later durable callback makes its recovered feedback visible");
+            recovered = WaitForPostedReceiptUi(host, inbox, TrayTerminalReceiptUiKind.Failure, "later durable callback makes its recovered feedback visible by token");
             AssertTrue(recovered.ActionId == recoveredId, "only the later durable callback publishes generic feedback");
             AssertTrue(!host.TryTakeFailedAction(out extra), "store and callback failures publish no latent UI");
             AssertTrue(store.WriterThreadCount == 1 && store.MaximumConcurrent == 1, "recovery keeps the original single writer instead of starting a replacement");
@@ -395,8 +445,8 @@ internal static class TrayHostTransportSelfTest
 
     private static void TestDurableReceiptTrustAndSharedUiBound()
     {
-        int signals = 0;
-        HostTransport host = new HostTransport(delegate { Interlocked.Increment(ref signals); });
+        ReceiptTokenInbox inbox = new ReceiptTokenInbox();
+        HostTransport host = new HostTransport(null, inbox.Post);
         HostTransport foreign = new HostTransport();
         try
         {
@@ -404,7 +454,7 @@ internal static class TrayHostTransportSelfTest
             AssertTrue(host.TryRegisterAction(new TrayHostAction(aboutId, TrayCommand.ShowAbout, 27UL)), "About action registers for durable authorization");
             TrayTerminalReceipt about = AcknowledgeTerminalQuickly(host, new TrayActionResult(aboutId, 27UL, TrayActionResultStatus.Completed, null, null), "About terminal result");
             TrayActionResult beforeDurable;
-            AssertTrue(!host.TryTakeCompletedAbout(out beforeDurable), "typed receipt alone cannot expose About UI before durable publication");
+            AssertTrue(!host.TryTakeCompletedAbout(out beforeDurable) && inbox.Count == 0, "typed receipt alone cannot expose About UI before durable publication");
             AssertTrue(!foreign.TryPublishDurableReceipt(about), "a different transport rejects a receipt it did not correlate");
             AssertTrue(host.TryPublishDurableReceipt(about), "originating transport accepts one explicit durable-success callback");
             AssertTrue(!host.TryPublishDurableReceipt(about), "the same durable receipt cannot publish twice");
@@ -422,12 +472,16 @@ internal static class TrayHostTransportSelfTest
             TrayTerminalReceipt noUi = AcknowledgeTerminalQuickly(host, new TrayActionResult(noUiId, 27UL, TrayActionResultStatus.Completed, null, null), "non-UI completion");
             AssertTrue(host.TryPublishDurableReceipt(noUi), "durable non-UI completion is consumed without UI capacity");
 
-            TrayActionResult aboutUi;
-            AssertTrue(host.TryTakeCompletedAbout(out aboutUi) && aboutUi.ActionId == aboutId, "durable About maps to one About UI item");
-            int failures = 0; TrayActionResult failed;
-            while (host.TryTakeFailedAction(out failed)) { failures++; }
+            AssertTrue(inbox.Count == 8, "only the eight admitted shared UI items receive token posts");
+            uint aboutToken; AssertTrue(inbox.TryTake(out aboutToken), "durable About token is retained");
+            TrayActionResult aboutUi = TakeReceiptUi(host, aboutToken, TrayTerminalReceiptUiKind.About, "durable About maps to one tokened About UI item");
+            AssertTrue(aboutUi.ActionId == aboutId, "durable About token retains its correlated action");
+            int failures = 0; uint failedToken;
+            while (inbox.TryTake(out failedToken))
+            {
+                TakeReceiptUi(host, failedToken, TrayTerminalReceiptUiKind.Failure, "durable failure token maps to generic UI"); failures++;
+            }
             AssertTrue(failures == 7, "About and generic failure share one eight-item UI bound");
-            AssertTrue(Interlocked.CompareExchange(ref signals, 0, 0) == 8, "only admitted UI items post application work");
         }
         finally { foreign.Dispose(); host.Dispose(); }
     }
@@ -436,8 +490,10 @@ internal static class TrayHostTransportSelfTest
     {
         ManualResetEvent callbackEntered = new ManualResetEvent(false);
         ManualResetEvent releaseCallback = new ManualResetEvent(false);
-        HostTransport host = new HostTransport(delegate
+        uint observedToken = 0U;
+        HostTransport host = new HostTransport(null, delegate(uint token)
         {
+            observedToken = token;
             callbackEntered.Set();
             releaseCallback.WaitOne();
             throw new InvalidOperationException("intentional UI callback failure");
@@ -449,14 +505,14 @@ internal static class TrayHostTransportSelfTest
             Thread publisher = new Thread((ThreadStart)delegate { published = host.TryPublishDurableReceipt(receipt); });
             publisher.IsBackground = true; publisher.Start();
             AssertTrue(callbackEntered.WaitOne(2000), "durable UI callback enters before failing");
-            TrayActionResult provisional = null; bool takeReturned = false; bool tookProvisional = true;
-            Thread taker = new Thread((ThreadStart)delegate { tookProvisional = host.TryTakeFailedAction(out provisional); takeReturned = true; });
+            TrayActionResult provisional = null; TrayTerminalReceiptUiKind provisionalKind = 0; bool takeReturned = false; bool tookProvisional = true;
+            Thread taker = new Thread((ThreadStart)delegate { tookProvisional = host.TryTakeReceiptUi(observedToken, out provisionalKind, out provisional); takeReturned = true; });
             taker.IsBackground = true; taker.Start();
             AssertTrue(taker.Join(250) && takeReturned && !tookProvisional && provisional == null, "provisional UI work returns immediately but remains unavailable while callback outcome is unknown");
             releaseCallback.Set();
             AssertTrue(publisher.Join(2000) && !published, "throwing durable callback reports publication failure");
-            TrayActionResult none;
-            AssertTrue(!host.TryTakeFailedAction(out none), "callback failure leaves no latent generic UI work");
+            TrayActionResult none; TrayTerminalReceiptUiKind noneKind;
+            AssertTrue(!host.TryTakeReceiptUi(observedToken, out noneKind, out none), "callback failure leaves no latent tokened generic UI work");
         }
         finally
         {
@@ -466,35 +522,31 @@ internal static class TrayHostTransportSelfTest
 
     private static void TestSuccessfulCallbackRepostsAfterAnEarlyUiProbe()
     {
-        ManualResetEvent callbackEntered = new ManualResetEvent(false);
-        ManualResetEvent releaseCallback = new ManualResetEvent(false);
-        int callbackCount = 0;
-        HostTransport host = new HostTransport(delegate
+        int callbackCount = 0; uint observedToken = 0U;
+        HostTransport host = null;
+        host = new HostTransport(null, delegate(uint token)
         {
+            observedToken = token;
             int call = Interlocked.Increment(ref callbackCount);
-            if (call == 1) { callbackEntered.Set(); releaseCallback.WaitOne(); }
+            if (call == 1)
+            {
+                TrayTerminalReceiptUiKind earlyKind; TrayActionResult earlyResult;
+                AssertTrue(!host.TryTakeReceiptUi(token, out earlyKind, out earlyResult), "early token dispatch cannot consume provisional feedback");
+            }
+            return true;
         });
         try
         {
             Guid actionId = Guid.NewGuid();
             TrayTerminalReceipt receipt = RegisterAndAcknowledgeFailure(host, actionId, 30UL, "early-probe durable action");
-            bool published = false;
-            Thread publisher = new Thread((ThreadStart)delegate { published = host.TryPublishDurableReceipt(receipt); });
-            publisher.IsBackground = true; publisher.Start();
-            AssertTrue(callbackEntered.WaitOne(2000), "first successful UI post is held before returning");
-            TrayActionResult early;
-            AssertTrue(!host.TryTakeFailedAction(out early), "work-message probe cannot consume provisional feedback");
-            releaseCallback.Set();
-            AssertTrue(publisher.Join(2000) && published, "durable publication succeeds after its first UI post returns");
+            AssertTrue(host.TryPublishDurableReceipt(receipt), "durable publication succeeds after one early token delivery retry");
             AssertTrue(Interlocked.CompareExchange(ref callbackCount, 0, 0) == 2, "an early work-message probe causes one replacement UI post");
-            TrayActionResult ready; TrayActionResult none;
-            AssertTrue(host.TryTakeFailedAction(out ready) && ready.ActionId == actionId, "replacement post observes the now-ready durable feedback");
-            AssertTrue(!host.TryTakeFailedAction(out none), "replacement posting never duplicates the UI item");
+            TrayActionResult ready = TakeReceiptUi(host, observedToken, TrayTerminalReceiptUiKind.Failure, "replacement token observes the now-committed durable feedback");
+            AssertTrue(ready.ActionId == actionId, "replacement token preserves the exact correlated action");
+            TrayActionResult none; TrayTerminalReceiptUiKind noneKind;
+            AssertTrue(!host.TryTakeReceiptUi(observedToken, out noneKind, out none), "replacement posting never duplicates the tokened UI item");
         }
-        finally
-        {
-            releaseCallback.Set(); host.Dispose(); callbackEntered.Dispose(); releaseCallback.Dispose();
-        }
+        finally { host.Dispose(); }
     }
 
     private static void TestReplacementCallbackFailureDropsReadyUiWork()
@@ -502,10 +554,18 @@ internal static class TrayHostTransportSelfTest
         ManualResetEvent callbackEntered = new ManualResetEvent(false);
         ManualResetEvent releaseCallback = new ManualResetEvent(false);
         int callbackCount = 0;
-        HostTransport host = new HostTransport(delegate
+        uint observedToken = 0U; HostTransport host = null;
+        host = new HostTransport(null, delegate(uint token)
         {
+            observedToken = token;
             int call = Interlocked.Increment(ref callbackCount);
-            if (call == 1) { callbackEntered.Set(); releaseCallback.WaitOne(); return; }
+            if (call == 1)
+            {
+                callbackEntered.Set(); releaseCallback.WaitOne();
+                TrayTerminalReceiptUiKind earlyKind; TrayActionResult earlyResult;
+                AssertTrue(!host.TryTakeReceiptUi(token, out earlyKind, out earlyResult), "replacement-failure early token cannot consume provisional feedback");
+                return true;
+            }
             throw new InvalidOperationException("intentional replacement UI callback failure");
         });
         try
@@ -515,17 +575,59 @@ internal static class TrayHostTransportSelfTest
             Thread publisher = new Thread((ThreadStart)delegate { published = host.TryPublishDurableReceipt(receipt); });
             publisher.IsBackground = true; publisher.Start();
             AssertTrue(callbackEntered.WaitOne(2000), "first UI post is held before replacement-failure probe");
-            TrayActionResult early;
-            AssertTrue(!host.TryTakeFailedAction(out early), "replacement-failure probe cannot consume provisional feedback");
             releaseCallback.Set();
             AssertTrue(publisher.Join(2000) && !published, "replacement callback failure reports publication failure");
-            TrayActionResult none;
-            AssertTrue(!host.TryTakeFailedAction(out none), "replacement callback failure removes the ready-but-unnotified UI item");
+            TrayActionResult none; TrayTerminalReceiptUiKind noneKind;
+            AssertTrue(!host.TryTakeReceiptUi(observedToken, out noneKind, out none), "replacement callback failure removes the uncommitted tokened UI item");
             AssertTrue(Interlocked.CompareExchange(ref callbackCount, 0, 0) == 2, "replacement callback is attempted exactly once");
         }
         finally
         {
             releaseCallback.Set(); host.Dispose(); callbackEntered.Dispose(); releaseCallback.Dispose();
+        }
+    }
+
+    private static void TestTokenedPostFailureNeverCommitsReceiptVisibility()
+    {
+        ManualResetEvent tokenCallbackEntered = new ManualResetEvent(false);
+        ManualResetEvent releaseTokenCallback = new ManualResetEvent(false);
+        int callbackCount = 0; int genericDialogs = 0; uint observedToken = 0U;
+        HostTransport host = null;
+        host = new HostTransport(null, delegate(uint token)
+        {
+            observedToken = token;
+            int call = Interlocked.Increment(ref callbackCount);
+            if (call == 1)
+            {
+                TrayTerminalReceiptUiKind earlyKind; TrayActionResult earlyResult;
+                AssertTrue(!host.TryTakeReceiptUi(token, out earlyKind, out earlyResult), "early token dispatch cannot consume an uncommitted receipt");
+                return true;
+            }
+            tokenCallbackEntered.Set();
+            releaseTokenCallback.WaitOne();
+            throw new InvalidOperationException("intentional token-post failure");
+        });
+        try
+        {
+            TrayTerminalReceipt receipt = RegisterAndAcknowledgeFailure(host, Guid.NewGuid(), 34UL, "token-post failure action");
+            bool published = true;
+            Thread publisher = new Thread((ThreadStart)delegate { published = host.TryPublishDurableReceipt(receipt); });
+            publisher.IsBackground = true; publisher.Start();
+            AssertTrue(tokenCallbackEntered.WaitOne(2000), "replacement token post is held before failure");
+
+            TrayTerminalReceiptUiKind ordinaryKind; TrayActionResult ordinaryResult;
+            if (host.TryTakeReceiptUi(0U, out ordinaryKind, out ordinaryResult)) { Interlocked.Increment(ref genericDialogs); }
+            AssertTrue(ordinaryResult == null && Interlocked.CompareExchange(ref genericDialogs, 0, 0) == 0, "ordinary no-token work cannot observe receipt UI while token post is unresolved");
+
+            releaseTokenCallback.Set();
+            AssertTrue(publisher.Join(2000) && !published, "failed replacement token post retracts the receipt");
+            TrayTerminalReceiptUiKind missingKind; TrayActionResult missingResult;
+            AssertTrue(observedToken != 0U && !host.TryTakeReceiptUi(observedToken, out missingKind, out missingResult) && missingResult == null, "failed token post leaves no exact-token receipt item");
+            AssertTrue(Interlocked.CompareExchange(ref genericDialogs, 0, 0) == 0, "failed token post produces no generic dialog");
+        }
+        finally
+        {
+            releaseTokenCallback.Set(); host.Dispose(); tokenCallbackEntered.Dispose(); releaseTokenCallback.Dispose();
         }
     }
 
@@ -565,6 +667,69 @@ internal static class TrayHostTransportSelfTest
         }
     }
 
+    private static void TestDisposeClosesCallbackAdmissionAfterDurableStoreReturn()
+    {
+        ManualResetEvent beforeAdmission = new ManualResetEvent(false);
+        ManualResetEvent releaseAdmission = new ManualResetEvent(false);
+        int callbackStarts = 0;
+        HostTransport host = new HostTransport();
+        TrayTerminalReceiptSink.BeforeCallbackAdmissionForTesting = delegate { beforeAdmission.Set(); releaseAdmission.WaitOne(); };
+        TrayTerminalReceiptSink sink = new TrayTerminalReceiptSink(
+            delegate(TrayTerminalDiagnostic record) { return true; },
+            delegate(TrayTerminalReceipt receipt) { Interlocked.Increment(ref callbackStarts); return host.TryPublishDurableReceipt(receipt); },
+            null);
+        try
+        {
+            TrayTerminalReceipt receipt = RegisterAndAcknowledgeFailure(host, Guid.NewGuid(), 33UL, "durable-to-callback dispose handoff action");
+            AssertTrue(sink.TrySubmit(receipt), "handoff receipt is admitted before its durable write");
+            AssertTrue(beforeAdmission.WaitOne(2000), "worker reaches the controlled handoff after durable store return and before callback begin");
+            Stopwatch disposal = Stopwatch.StartNew(); sink.Dispose(); disposal.Stop();
+            AssertReturnsQuickly(disposal, "dispose returns while the writer is held before callback admission");
+            releaseAdmission.Set();
+            sink.Dispose();
+            AssertTrue(Interlocked.CompareExchange(ref callbackStarts, 0, 0) == 0, "close gate prevents any new durable callback from starting after Dispose");
+            TrayActionResult none;
+            AssertTrue(!host.TryTakeFailedAction(out none), "post-close handoff cannot publish receipt UI");
+        }
+        finally
+        {
+            releaseAdmission.Set(); sink.Dispose(); TrayTerminalReceiptSink.BeforeCallbackAdmissionForTesting = null; host.Dispose(); beforeAdmission.Dispose(); releaseAdmission.Dispose();
+        }
+    }
+
+    private static void TestAlreadyStartedCallbackCannotPublishToDisposedTransport()
+    {
+        ManualResetEvent callbackStarted = new ManualResetEvent(false);
+        ManualResetEvent releaseCallback = new ManualResetEvent(false);
+        int tokenPosts = 0; bool callbackResult = true;
+        HostTransport host = new HostTransport(null, delegate(uint token) { Interlocked.Increment(ref tokenPosts); return true; });
+        TrayTerminalReceiptSink sink = new TrayTerminalReceiptSink(
+            delegate(TrayTerminalDiagnostic record) { return true; },
+            delegate(TrayTerminalReceipt receipt)
+            {
+                callbackStarted.Set();
+                releaseCallback.WaitOne();
+                callbackResult = host.TryPublishDurableReceipt(receipt);
+                return callbackResult;
+            });
+        try
+        {
+            TrayTerminalReceipt receipt = RegisterAndAcknowledgeFailure(host, Guid.NewGuid(), 35UL, "already-started callback disposal action");
+            AssertTrue(sink.TrySubmit(receipt), "already-started callback receipt is admitted");
+            AssertTrue(callbackStarted.WaitOne(2000), "durable callback starts before sink closure");
+            Stopwatch disposal = Stopwatch.StartNew(); sink.Dispose(); disposal.Stop();
+            AssertReturnsQuickly(disposal, "sink disposal remains bounded with one already-started callback");
+            host.Dispose();
+            releaseCallback.Set();
+            sink.Dispose();
+            AssertTrue(!callbackResult && Interlocked.CompareExchange(ref tokenPosts, 0, 0) == 0, "already-started callback cannot token-post receipt UI to a disposed transport");
+        }
+        finally
+        {
+            releaseCallback.Set(); sink.Dispose(); host.Dispose(); callbackStarted.Dispose(); releaseCallback.Dispose();
+        }
+    }
+
     public static int Main(string[] args)
     {
         try
@@ -582,7 +747,10 @@ internal static class TrayHostTransportSelfTest
             TestSuccessfulCallbackRepostsAfterAnEarlyUiProbe();
             TestReplacementCallbackFailureDropsReadyUiWork();
             TestDisposalReturnsWhileStoreIsHungAndSuppressesLateCallbacks();
-            Console.WriteLine("TrayHost transport self-tests passed: 13");
+            TestDisposeClosesCallbackAdmissionAfterDurableStoreReturn();
+            TestAlreadyStartedCallbackCannotPublishToDisposedTransport();
+            TestTokenedPostFailureNeverCommitsReceiptVisibility();
+            Console.WriteLine("TrayHost transport self-tests passed: 16");
             return 0;
         }
         catch (Exception error)

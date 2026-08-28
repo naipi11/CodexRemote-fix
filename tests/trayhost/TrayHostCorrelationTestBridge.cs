@@ -6,6 +6,7 @@ public sealed class TrayHostCorrelationTestBridge : IDisposable
     private sealed class Platform : INativeTrayPlatform
     {
         internal uint Selection;
+        public void SetMessageHandler(Action<uint, IntPtr, IntPtr> handler) { }
         public IntPtr CreateOwner() { return new IntPtr(10); }
         public IntPtr AssociateOwnerInputContext(IntPtr owner, IntPtr context) { return new IntPtr(20); }
         public IntPtr GetOwnerInputContext(IntPtr owner) { return IntPtr.Zero; }

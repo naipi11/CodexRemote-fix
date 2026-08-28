@@ -10,6 +10,7 @@ using System.Threading;
 
 internal sealed class FakeTrayPlatform : INativeTrayPlatform
 {
+    private Action<uint, IntPtr, IntPtr> _messageHandler;
     internal readonly List<string> Calls = new List<string>();
     internal bool ForegroundResult = true;
     internal bool ForegroundProof = true;
@@ -23,6 +24,13 @@ internal sealed class FakeTrayPlatform : INativeTrayPlatform
     internal readonly List<string> AppendedText = new List<string>();
     internal readonly List<uint> Commands = new List<uint>();
     internal bool ConfirmExitResult = true;
+    internal Func<IntPtr, uint, UIntPtr, IntPtr, bool> PostMessageBehavior;
+    internal readonly List<uint> PostedMessages = new List<uint>();
+    internal readonly List<UIntPtr> PostedWParams = new List<UIntPtr>();
+    internal readonly List<IntPtr> PostedLParams = new List<IntPtr>();
+
+    public void SetMessageHandler(Action<uint, IntPtr, IntPtr> handler) { _messageHandler = handler; }
+    internal void DispatchMessage(uint message, UIntPtr wParam, IntPtr lParam) { Action<uint, IntPtr, IntPtr> handler = _messageHandler; if (handler != null) { IntPtr raw = IntPtr.Size == 4 ? new IntPtr(unchecked((int)wParam.ToUInt32())) : new IntPtr(unchecked((long)wParam.ToUInt64())); handler(message, raw, lParam); } }
 
     public IntPtr CreateOwner() { Calls.Add("CreateOwner"); return new IntPtr(10); }
     public IntPtr AssociateOwnerInputContext(IntPtr owner, IntPtr context) { Calls.Add(context == IntPtr.Zero ? "Associate:null" : "Associate:restore"); return new IntPtr(20); }
@@ -42,7 +50,7 @@ internal sealed class FakeTrayPlatform : INativeTrayPlatform
     public bool SetForegroundWindow(IntPtr owner) { Calls.Add("SetForeground"); return ForegroundResult; }
     public IntPtr GetForegroundWindow() { Calls.Add("GetForeground"); return ForegroundProof ? new IntPtr(10) : new IntPtr(11); }
     public uint TrackPopupMenuEx(IntPtr menu, uint flags, int x, int y, IntPtr owner, IntPtr parameters) { Calls.Add("Track"); TrackCalls++; if (DuringTrack != null) { DuringTrack(); } return TrackResult; }
-    public bool PostMessage(IntPtr owner, uint message, UIntPtr wParam, IntPtr lParam) { Calls.Add("WM_NULL"); return true; }
+    public bool PostMessage(IntPtr owner, uint message, UIntPtr wParam, IntPtr lParam) { Calls.Add("WM_NULL"); PostedMessages.Add(message); PostedWParams.Add(wParam); PostedLParams.Add(lParam); Func<IntPtr, uint, UIntPtr, IntPtr, bool> behavior = PostMessageBehavior; return behavior == null || behavior(owner, message, wParam, lParam); }
     public bool SetNotificationFocus(ref TrayIconData icon) { Calls.Add("NIM_SETFOCUS"); return true; }
     public bool ShowMessageBox(IntPtr owner, string text, string caption) { MessageBoxes.Add(caption + "|" + text); Calls.Add("MessageBox"); return true; }
     public bool ConfirmExit(IntPtr owner, string text, string caption) { MessageBoxes.Add(caption + "|" + text); Calls.Add("ConfirmExit"); return ConfirmExitResult; }
@@ -309,27 +317,36 @@ internal static class TrayHostNativeSelfTest
         string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-native-feedback-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root); CreateCompatibilityParents(root);
         FakeTrayPlatform platform = new FakeTrayPlatform(); TrayWindow window = new TrayWindow(platform); window.Create(SnapshotV2(1));
-        HostTransport transport = new HostTransport();
+        TrayHostApplication application = null; HostTransport transport = null;
+        transport = new HostTransport(null, delegate(uint token) { return application != null && application.PostReceiptWork(token); });
+        Action<uint> receiptWork = delegate(uint token)
+        {
+            TrayTerminalReceiptUiKind kind; TrayActionResult feedback;
+            if (transport.TryTakeReceiptUi(token, out kind, out feedback) && kind == TrayTerminalReceiptUiKind.Failure) { window.ShowActionFailed(); }
+        };
+        application = new TrayHostApplication(platform, window, null, null, receiptWork);
         TrayTerminalDiagnosticStore store = TestStore(root, null, null);
-        TrayTerminalReceiptSink sink = new TrayTerminalReceiptSink(store.TryAppendDurably, transport.TryPublishDurableReceipt);
+        ManualResetEvent publicationCompleted = new ManualResetEvent(false);
+        TrayTerminalReceiptSink sink = new TrayTerminalReceiptSink(store.TryAppendDurably, delegate(TrayTerminalReceipt durableReceipt) { bool published = transport.TryPublishDurableReceipt(durableReceipt); publicationCompleted.Set(); return published; });
         try
         {
             Guid actionId = Guid.NewGuid(); TrayTerminalReceipt receipt;
             AssertTrue(transport.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.OpenLogs, 1UL)), "native durable-feedback action registers");
             AssertTrue(transport.TryAcknowledgeAction(new TrayActionResult(actionId, 1UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null), out receipt) && receipt != null, "native durable-feedback action returns one typed receipt");
             TrayActionResult feedback;
-            AssertTrue(!transport.TryTakeFailedAction(out feedback) && platform.MessageBoxes.Count == 0, "native generic feedback is unavailable before durable receipt success");
+            AssertTrue(!transport.TryTakeFailedAction(out feedback) && platform.PostedMessages.Count == 0 && platform.MessageBoxes.Count == 0, "native generic feedback is unavailable before durable receipt success");
             AssertTrue(sink.TrySubmit(receipt), "native receipt enters the asynchronous sink");
-            Stopwatch elapsed = Stopwatch.StartNew();
-            while (!transport.TryTakeFailedAction(out feedback) && elapsed.ElapsedMilliseconds < 3000L) { Thread.Sleep(5); }
-            AssertTrue(feedback != null && feedback.ActionId == actionId, "handle-pinned durable success authorizes the exact native feedback item");
-            window.ShowActionFailed();
+            AssertTrue(publicationCompleted.WaitOne(3000), "handle-pinned durable success completes receipt-token publication");
+            AssertTrue(platform.PostedMessages.Count == 1 && platform.PostedMessages[0] == TrayNativeConstants.WmApp + 3U && platform.PostedWParams[0] != UIntPtr.Zero, "handle-pinned durable success posts one exact receipt token to the native application");
+            AssertTrue(platform.MessageBoxes.Count == 0, "posted token does not display generic feedback before STA dispatch");
+            platform.DispatchMessage(platform.PostedMessages[0], platform.PostedWParams[0], platform.PostedLParams[0]);
             AssertTrue(platform.MessageBoxes.Count == 1, "durable native receipt displays generic feedback exactly once");
-            AssertTrue(!transport.TryTakeFailedAction(out feedback), "durable native feedback has no duplicate queue item");
+            platform.DispatchMessage(platform.PostedMessages[0], platform.PostedWParams[0], platform.PostedLParams[0]);
+            AssertTrue(platform.MessageBoxes.Count == 1 && !transport.TryTakeFailedAction(out feedback), "durable native feedback has no duplicate token or ordinary queue item");
         }
         finally
         {
-            sink.Dispose(); transport.Dispose(); window.Dispose(); store.Dispose(); try { Directory.Delete(root, true); } catch { }
+            sink.Dispose(); transport.Dispose(); application.Dispose(); store.Dispose(); publicationCompleted.Dispose(); try { Directory.Delete(root, true); } catch { }
         }
     }
 
@@ -626,6 +643,71 @@ internal static class TrayHostNativeSelfTest
         }
     }
 
+    private static void TestReceiptWorkMessageRequiresItsExactInternalToken()
+    {
+        uint token;
+        AssertTrue(!TrayHostApplication.TryDecodeReceiptWorkToken(TrayNativeConstants.WmApp + 2U, new IntPtr(41), IntPtr.Zero, out token), "ordinary work message never decodes a receipt token");
+        AssertTrue(!TrayHostApplication.TryDecodeReceiptWorkToken(TrayNativeConstants.WmApp + 3U, IntPtr.Zero, IntPtr.Zero, out token), "zero receipt token is rejected");
+        AssertTrue(!TrayHostApplication.TryDecodeReceiptWorkToken(TrayNativeConstants.WmApp + 3U, new IntPtr(41), new IntPtr(1), out token), "receipt message rejects unexpected lParam data");
+        AssertTrue(TrayHostApplication.TryDecodeReceiptWorkToken(TrayNativeConstants.WmApp + 3U, new IntPtr(41), IntPtr.Zero, out token) && token == 41U, "receipt-specific work message preserves its exact nonzero token");
+    }
+
+    private static void TestFailedTokenPostCannotLeakIntoOrdinaryApplicationWork()
+    {
+        FakeTrayPlatform platform = new FakeTrayPlatform(); TrayWindow window = new TrayWindow(platform); window.Create(SnapshotV2(1));
+        ManualResetEvent replacementPostEntered = new ManualResetEvent(false); ManualResetEvent releaseReplacementPost = new ManualResetEvent(false);
+        TrayHostApplication application = null; HostTransport transport = null;
+        int receiptPosts = 0; int ordinaryRuns = 0; uint observedToken = 0U; bool published = true;
+        try
+        {
+            transport = new HostTransport(null, delegate(uint token) { return application != null && application.PostReceiptWork(token); });
+            Action ordinaryWork = delegate
+            {
+                Interlocked.Increment(ref ordinaryRuns);
+                TrayActionResult ordinary;
+                if (transport.TryTakeFailedAction(out ordinary)) { window.ShowActionFailed(); }
+            };
+            Action<uint> receiptWork = delegate(uint token)
+            {
+                TrayTerminalReceiptUiKind kind; TrayActionResult receiptResult;
+                if (transport.TryTakeReceiptUi(token, out kind, out receiptResult) && kind == TrayTerminalReceiptUiKind.Failure) { window.ShowActionFailed(); }
+            };
+            application = new TrayHostApplication(platform, window, null, ordinaryWork, receiptWork);
+            platform.PostMessageBehavior = delegate(IntPtr owner, uint message, UIntPtr wParam, IntPtr lParam)
+            {
+                if (message == TrayNativeConstants.WmApp + 2U) { platform.DispatchMessage(message, wParam, lParam); return true; }
+                if (message != TrayNativeConstants.WmApp + 3U) { return true; }
+                observedToken = unchecked((uint)wParam.ToUInt64());
+                int call = Interlocked.Increment(ref receiptPosts);
+                if (call == 1) { platform.DispatchMessage(message, wParam, lParam); return true; }
+                replacementPostEntered.Set(); releaseReplacementPost.WaitOne();
+                throw new InvalidOperationException("intentional token-post failure");
+            };
+
+            Guid actionId = Guid.NewGuid(); TrayTerminalReceipt receipt;
+            AssertTrue(transport.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.OpenLogs, 1UL)), "token-race native action registers");
+            AssertTrue(transport.TryAcknowledgeAction(new TrayActionResult(actionId, 1UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null), out receipt) && receipt != null, "token-race native action returns one typed receipt");
+            Thread publisher = new Thread((ThreadStart)delegate { published = transport.TryPublishDurableReceipt(receipt); });
+            publisher.IsBackground = true; publisher.Start();
+            AssertTrue(replacementPostEntered.WaitOne(2000), "replacement receipt-token post is blocked before failure");
+
+            application.PostWork();
+            AssertTrue(Interlocked.CompareExchange(ref ordinaryRuns, 0, 0) == 1 && platform.MessageBoxes.Count == 0, "ordinary WmApp work cannot consume or display the unresolved receipt");
+            releaseReplacementPost.Set();
+            AssertTrue(publisher.Join(2000) && !published, "failed replacement token post reports publication failure");
+            AssertTrue(observedToken != 0U && Interlocked.CompareExchange(ref receiptPosts, 0, 0) == 2, "receipt path uses one exact token across its bounded replacement post");
+
+            platform.DispatchMessage(TrayNativeConstants.WmApp + 3U, new UIntPtr(observedToken), IntPtr.Zero);
+            TrayTerminalReceiptUiKind missingKind; TrayActionResult missingResult;
+            AssertTrue(!transport.TryTakeReceiptUi(observedToken, out missingKind, out missingResult) && platform.MessageBoxes.Count == 0, "failed token post retracts the receipt before stale token dispatch can show a generic dialog");
+        }
+        finally
+        {
+            releaseReplacementPost.Set(); if (transport != null) { transport.Dispose(); } if (application != null) { application.Dispose(); } else { window.Dispose(); }
+            replacementPostEntered.Dispose(); releaseReplacementPost.Dispose();
+        }
+    }
+
     public static int Main(string[] args)
     {
         try
@@ -653,7 +735,9 @@ internal static class TrayHostNativeSelfTest
             TestShellRightClickNotificationMapping();
             TestRealNativePInvokeSurface();
             TestPostedWorkMessageDispatchesToItsOwnerWindow();
-            Console.WriteLine("TrayHost native self-tests passed: 23");
+            TestReceiptWorkMessageRequiresItsExactInternalToken();
+            TestFailedTokenPostCannotLeakIntoOrdinaryApplicationWork();
+            Console.WriteLine("TrayHost native self-tests passed: 25");
             return 0;
         }
         catch (Exception error)

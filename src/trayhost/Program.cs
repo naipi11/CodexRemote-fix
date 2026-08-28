@@ -43,11 +43,7 @@ internal static class Program
         TrayTerminalDiagnosticStore terminalStore = new TrayTerminalDiagnosticStore();
         HostTransport transport = new HostTransport(
             delegate { TrayHostApplication current = application; if (current != null) { current.PostWork(); } },
-            delegate
-            {
-                TrayWindow current = window;
-                if (current == null || !Win32TrayPlatform.PostToWindow(current.OwnerHandle, TrayNativeConstants.WmApp + 2U)) { throw new InvalidOperationException("receipt UI callback failed"); }
-            });
+            delegate(uint token) { TrayHostApplication current = application; return current != null && current.PostReceiptWork(token); });
         TrayTerminalReceiptSink receiptSink = new TrayTerminalReceiptSink(terminalStore.TryAppendDurably, transport.TryPublishDurableReceipt, terminalStore.Dispose);
         window = new TrayWindow(platform, transport.SetMenuOpen);
         bool shutdownRequested = false; bool shutdownSent = false; object stateGate = new object();
@@ -69,10 +65,6 @@ internal static class Program
                     lock (WriteGate) { ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.PresentationAck, epoch, outboundSequence++, TrayHostWire.WriteRevision(next.Revision)), keys.HostToParent); }
                 }
             }
-            TrayActionResult about;
-            while (transport.TryTakeCompletedAbout(out about)) { window.ShowAbout(); }
-            TrayActionResult failed;
-            while (transport.TryTakeFailedAction(out failed)) { window.ShowActionFailed(); }
             bool shouldShutdown;
             lock (stateGate) { shouldShutdown = shutdownRequested && !shutdownSent; if (shouldShutdown) { shutdownSent = true; } }
             if (shouldShutdown)
@@ -82,8 +74,15 @@ internal static class Program
                 application.RequestExit();
             }
         };
+        Action<uint> receiptWork = delegate(uint token)
+        {
+            TrayTerminalReceiptUiKind kind; TrayActionResult receiptResult;
+            if (!transport.TryTakeReceiptUi(token, out kind, out receiptResult)) { return; }
+            if (kind == TrayTerminalReceiptUiKind.About) { window.ShowAbout(); }
+            else if (kind == TrayTerminalReceiptUiKind.Failure) { window.ShowActionFailed(); }
+        };
         window.CommandSelected += command;
-        application = new TrayHostApplication(platform, window, command, work);
+        application = new TrayHostApplication(platform, window, command, work, receiptWork);
         window.Create(initial);
         lock (WriteGate)
         {
@@ -107,7 +106,7 @@ internal static class Program
         })) { IsBackground = true, Name = "CodexRemote.TrayHost.Reader" };
         reader.Start();
         int result = application.Run();
-        receiptSink.Dispose(); application.Dispose(); transport.Dispose(); return result;
+        receiptSink.Dispose(); transport.Dispose(); application.Dispose(); return result;
     }
 
     private static bool VerifyParentIdentity(int pid, long creation)

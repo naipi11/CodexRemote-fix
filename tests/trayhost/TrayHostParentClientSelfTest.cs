@@ -8,6 +8,7 @@ using System.Threading;
 internal sealed class ProductionTraceTrayPlatform : INativeTrayPlatform
 {
     internal string Message;
+    public void SetMessageHandler(Action<uint, IntPtr, IntPtr> handler) { }
     public IntPtr CreateOwner() { return new IntPtr(10); }
     public IntPtr AssociateOwnerInputContext(IntPtr owner, IntPtr context) { return new IntPtr(20); }
     public IntPtr GetOwnerInputContext(IntPtr owner) { return IntPtr.Zero; }
