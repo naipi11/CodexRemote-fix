@@ -1803,6 +1803,7 @@ function Remove-CcodLifecycleInstallTree {
     if (Test-CcodLifecycleReparse -Path $root) {
         Throw-CcodLifecycleError 'CCOD_INSTALL_REPARSE_PATH' 'Install root is a reparse point' $root
     }
+    [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $root -Path $root)
     foreach ($item in Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop) {
         [void](Test-CcodLifecycleRemovePath -Root $root -Path $item.FullName)
     }
