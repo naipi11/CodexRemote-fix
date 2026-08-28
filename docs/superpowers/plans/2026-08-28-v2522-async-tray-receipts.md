@@ -66,11 +66,14 @@ does not own native handles or the barrier contract.
 
 - [ ] **Step 3: Implement the minimal handle-pinned store**
 
-Open directory components and the fixed leaf through `CreateFileW` safe
-handles.  Reject reparse, non-directory, non-file, multi-link, unexpected
-final-path, share, and handle-query failures before writes.  Keep handles while
-using `SetLength`, write, and `Flush(true)` for the 64-KiB rollover.  Do not
-re-resolve the leaf path for append or truncation.
+Open the existing LocalAppData/product/logs compatibility parents and the fixed
+leaf through `CreateFileW` safe handles.  Create only
+`logs\tray-receipts` as a protected current-user/SYSTEM/Administrators child,
+then reopen and validate its exact handle; legacy direct receipt leaves are
+never reused.  Reject reparse, non-directory, non-file, multi-link,
+unexpected-final-path, share, and handle-query failures before writes.  Keep
+handles while using `SetLength`, write, and `Flush(true)` for the 64-KiB
+rollover.  Do not re-resolve the leaf path for append or truncation.
 
 - [ ] **Step 4: Run GREEN**
 

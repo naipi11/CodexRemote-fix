@@ -61,14 +61,21 @@ also bounded at eight shared items.
 ### 2. Pinned, bounded native receipt store
 
 The store uses the fixed path
-`%LOCALAPPDATA%\CodexControlOtherDevices\logs\trayhost-actions.log`.  It opens
-the LocalAppData, product, and logs directories as native directory handles,
-with reparse-point opening flags and delete sharing denied, validates each
-opened handle as the expected non-reparse directory, and holds the directory
-chain while it opens the fixed leaf.  The leaf is opened through a native handle
-before any write; its handle must prove a regular, non-reparse, single-link file
-at the expected final path.  Writes and rollover occur only through that
-validated handle, never through a re-resolved pathname.
+`%LOCALAPPDATA%\CodexControlOtherDevices\logs\tray-receipts\trayhost-actions.log`.
+The existing product and `logs` directories are created by supported historical
+installations with normal inherited current-user ACLs, so they remain
+compatibility parents: the store opens and pins them as non-reparse directory
+handles but does not require them to have the receipt-private ACL.  Beneath the
+pinned `logs` handle it creates the fixed `tray-receipts` child with a protected
+current-user/SYSTEM/Administrators ACL, reopens and validates that exact child
+handle, and fails closed if an existing child does not match.  It never reuses
+the legacy direct `logs\trayhost-actions.log` leaf.
+
+The store holds the native directory chain with reparse-point opening flags and
+delete sharing denied while it opens the fixed leaf.  The leaf is opened through
+a native handle before any write; its handle must prove a regular, non-reparse,
+single-link file at the expected final path.  Writes and rollover occur only
+through that validated handle, never through a re-resolved pathname.
 
 The file is UTF-8 without a BOM and has a hard 64 KiB limit.  If adding a whole
 record would cross the limit, the validated handle is truncated and receives
