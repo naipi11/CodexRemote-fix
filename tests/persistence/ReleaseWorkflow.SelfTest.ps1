@@ -1035,8 +1035,39 @@ function New-CcodActivationPayloadFixture {
     $payloadRoot = Join-Path $appRoot "payload\$Version"
     [IO.Directory]::CreateDirectory((Join-Path $payloadRoot 'src\persistence\modules')) | Out-Null
     [IO.File]::WriteAllText((Join-Path $payloadRoot 'package.json'),([ordered]@{name='fixture';version=$Version}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText((Join-Path $payloadRoot 'Install-CodexControlOtherDevices.ps1'),'exit 0',[Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText((Join-Path $payloadRoot 'src\persistence\modules\InstallLifecycle.psm1'),'function Get-CcodLifecyclePayloadManifestFiles { @() }',[Text.UTF8Encoding]::new($false))
+    $installSource = @'
+param(
+    [string]$InstallRoot,
+    [switch]$EnableCandidateCompatibleUpdates,
+    [string]$ActivationId,
+    [string]$ExpectedVersion,
+    [string]$PayloadManifestPath,
+    [string]$ExpectedPayloadManifestSha256
+)
+$manifest = [IO.File]::ReadAllText($PayloadManifestPath,[Text.Encoding]::UTF8) | ConvertFrom-Json
+Import-Module (Join-Path $PSScriptRoot 'src\persistence\modules\InstallLifecycle.psm1') -Force
+Invoke-CcodFixtureInstall -InstallRoot $InstallRoot -ActivationId $ActivationId -ManifestVersion ([string]$manifest.projectVersion)
+exit 0
+'@
+    [IO.File]::WriteAllText((Join-Path $payloadRoot 'Install-CodexControlOtherDevices.ps1'),$installSource,[Text.UTF8Encoding]::new($false))
+    $lifecycleSource = @'
+function Invoke-CcodFixtureInstall {
+    param([string]$InstallRoot,[string]$ActivationId,[string]$ManifestVersion)
+    [IO.Directory]::CreateDirectory((Join-Path $InstallRoot 'state')) | Out-Null
+    [IO.File]::WriteAllText((Join-Path $InstallRoot 'activation-byte-marker.txt'),('original:' + $ManifestVersion),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $InstallRoot 'active.json'),'{"activeRuntime":"runtime-fixture"}',[Text.UTF8Encoding]::new($false))
+    $receipt=[ordered]@{schemaVersion=1;activationId=$ActivationId;phase='Ready';runtimeId='runtime-fixture';previousRuntimeId=$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=$true;errorCode=$null}
+    [IO.File]::WriteAllText((Join-Path $InstallRoot 'state\post-install-activation.json'),($receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+}
+Export-ModuleMember -Function Invoke-CcodFixtureInstall
+'@
+    [IO.File]::WriteAllText((Join-Path $payloadRoot 'src\persistence\modules\InstallLifecycle.psm1'),$lifecycleSource,[Text.UTF8Encoding]::new($false))
+    $runtimeManifestSource = @"
+function Read-CcodActiveRuntime { param([string]`$InstallRoot) Get-Content -LiteralPath (Join-Path `$InstallRoot 'active.json') -Raw | ConvertFrom-Json }
+function Test-CcodRuntimeManifest { param([string]`$RuntimeDirectory,[string]`$ExpectedRuntimeId) [pscustomobject]@{Valid=`$true;Manifest=[pscustomobject]@{projectVersion='$Version'}} }
+Export-ModuleMember -Function Read-CcodActiveRuntime,Test-CcodRuntimeManifest
+"@
+    [IO.File]::WriteAllText((Join-Path $payloadRoot 'src\persistence\modules\RuntimeManifest.psm1'),$runtimeManifestSource,[Text.UTF8Encoding]::new($false))
     $records = [Collections.Generic.List[object]]::new()
     foreach ($file in @(Get-ChildItem -LiteralPath $payloadRoot -File -Force -Recurse)) {
         $relative = $file.FullName.Substring($payloadRoot.TrimEnd('\').Length + 1).Replace('\','/')
@@ -1047,6 +1078,48 @@ function New-CcodActivationPayloadFixture {
     $manifestPath = Join-Path $payloadRoot 'installer-payload.manifest.json'
     [IO.File]::WriteAllText($manifestPath,([ordered]@{schemaVersion=1;projectVersion=$Version;files=@($records)}|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
     return [pscustomobject]@{AppRoot=$appRoot;PayloadRoot=$payloadRoot;ManifestPath=$manifestPath;ManifestSha256=Get-CcodTestFileSha256 -Path $manifestPath}
+}
+
+function New-CcodActivationBarrierHost {
+    param(
+        [Parameter(Mandatory)][string]$OutputDirectory,
+        [Parameter(Mandatory)][string]$ReadyPath,
+        [Parameter(Mandatory)][string]$ContinuePath,
+        [Parameter(Mandatory)][string]$RealPowerShellPath
+    )
+
+    [IO.Directory]::CreateDirectory($OutputDirectory) | Out-Null
+    $outputPath = Join-Path $OutputDirectory 'powershell.exe'
+    $source = @"
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Threading;
+public static class Program {
+  private static string Quote(string value) {
+    var result = new StringBuilder(); result.Append((char)34); int slashes = 0;
+    foreach (char character in value) {
+      if (character == (char)92) { slashes++; continue; }
+      if (character == (char)34) { result.Append(new string((char)92, (slashes * 2) + 1)); result.Append((char)34); slashes = 0; continue; }
+      if (slashes > 0) { result.Append(new string((char)92, slashes)); slashes = 0; }
+      result.Append(character);
+    }
+    if (slashes > 0) result.Append(new string((char)92, slashes * 2));
+    result.Append((char)34); return result.ToString();
+  }
+  public static int Main(string[] args) {
+    File.WriteAllText(@"$($ReadyPath.Replace('"','""'))", "ready", new UTF8Encoding(false));
+    var deadline = DateTime.UtcNow.AddSeconds(30);
+    while (!File.Exists(@"$($ContinuePath.Replace('"','""'))")) { if (DateTime.UtcNow >= deadline) return 124; Thread.Sleep(10); }
+    var info = new ProcessStartInfo(@"$($RealPowerShellPath.Replace('"','""'))", String.Join(" ", Array.ConvertAll(args, Quote)));
+    info.UseShellExecute = false; info.CreateNoWindow = true;
+    using (var process = Process.Start(info)) { process.WaitForExit(); return process.ExitCode; }
+  }
+}
+"@
+    Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $outputPath -OutputType ConsoleApplication
+    return $outputPath
 }
 
 function Invoke-CcodActivationVerifierFixture {
@@ -1139,6 +1212,84 @@ Invoke-CcodTest 'setup build and activation bind one immutable versioned payload
     Assert-CcodTrue ($inno -cmatch "ExpandConstant\('\{app\}\\payload\\\{#ProjectVersion\}'\)" -and $inno -cmatch '-ExpectedVersion\s+"\{#ProjectVersion\}') 'Inno binds activation to its compiled payload version'
     Assert-CcodTrue ($activation -cmatch '\[string\]\$ExpectedVersion' -and $activation -cmatch '\[string\]\$ExpectedPayloadManifestSha256' -and $activation -cmatch 'installer-payload\.manifest\.json') 'activation accepts and resolves the expected payload contract'
     Assert-CcodTrue ($installer -cmatch '\[string\]\$ExpectedVersion' -and $installer -cmatch '\[string\]\$PayloadManifestPath' -and $installer -cmatch '-ExpectedVersion\s+\$ExpectedVersion' -and $installer -cmatch '-PayloadManifestPath\s+\$PayloadManifestPath') 'installer forwards the immutable payload contract to lifecycle activation'
+}
+
+# Production mutation caught: reopening mutable payload paths after the parent accepted their manifest bytes.
+Invoke-CcodTest 'activation executes only the verified manifest installer and module bytes across the child-launch barrier' {
+    $fixture = New-CcodActivationPayloadFixture
+    $barrierRoot = Join-Path $fixture.AppRoot 'barrier-host'
+    $readyPath = Join-Path $fixture.AppRoot 'child-launch.ready'
+    $continuePath = Join-Path $fixture.AppRoot 'child-launch.continue'
+    $stdoutPath = Join-Path $fixture.AppRoot 'activation.stdout'
+    $stderrPath = Join-Path $fixture.AppRoot 'activation.stderr'
+    $process = $null
+    try {
+        $realPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $null = New-CcodActivationBarrierHost -OutputDirectory $barrierRoot -ReadyPath $readyPath -ContinuePath $continuePath -RealPowerShellPath $realPowerShell
+        $activationId = '77777777-6666-5555-4444-333333333333'
+        $arguments = @(
+            '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1'),
+            '-AppRoot',$fixture.AppRoot,'-InstallRoot',$fixture.AppRoot,'-PayloadRoot',$fixture.PayloadRoot,
+            '-ExpectedVersion','2.5.22','-ExpectedPayloadManifestSha256',$fixture.ManifestSha256,'-ActivationId',$activationId,
+            '-FirstReceiptTimeoutMilliseconds','30000','-ActivationTimeoutMilliseconds','30000'
+        )
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $realPowerShell
+        $startInfo.Arguments = (($arguments | ForEach-Object { '"' + ([string]$_).Replace('\','\').Replace('"','\"') + '"' }) -join ' ')
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.EnvironmentVariables['PATH'] = $barrierRoot + ';' + $env:PATH
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        Assert-CcodTrue $process.Start() 'activation fixture process starts'
+
+        $deadline = [DateTime]::UtcNow.AddSeconds(30)
+        while (-not [IO.File]::Exists($readyPath) -and [DateTime]::UtcNow -lt $deadline -and -not $process.HasExited) {
+            [Threading.Thread]::Sleep(10)
+        }
+        Assert-CcodTrue ([IO.File]::Exists($readyPath)) 'barrier proves parent payload verification completed before child execution'
+
+        $replacementInstallerMarker = Join-Path $fixture.AppRoot 'replacement-installer-executed.txt'
+        $replacementInstaller = @"
+param([string]`$InstallRoot,[switch]`$EnableCandidateCompatibleUpdates,[string]`$ActivationId,[string]`$ExpectedVersion,[string]`$PayloadManifestPath,[string]`$ExpectedPayloadManifestSha256)
+[IO.File]::WriteAllText('$($replacementInstallerMarker.Replace("'","''"))','executed',[Text.UTF8Encoding]::new(`$false))
+`$manifest=[IO.File]::ReadAllText(`$PayloadManifestPath,[Text.Encoding]::UTF8)|ConvertFrom-Json
+Import-Module (Join-Path `$PSScriptRoot 'src\persistence\modules\InstallLifecycle.psm1') -Force
+Invoke-CcodFixtureInstall -InstallRoot `$InstallRoot -ActivationId `$ActivationId -ManifestVersion ([string]`$manifest.projectVersion)
+exit 0
+"@
+        [IO.File]::WriteAllText((Join-Path $fixture.PayloadRoot 'Install-CodexControlOtherDevices.ps1'),$replacementInstaller,[Text.UTF8Encoding]::new($false))
+        $replacementModule = @'
+function Invoke-CcodFixtureInstall {
+    param([string]$InstallRoot,[string]$ActivationId,[string]$ManifestVersion)
+    [IO.Directory]::CreateDirectory((Join-Path $InstallRoot 'state')) | Out-Null
+    [IO.File]::WriteAllText((Join-Path $InstallRoot 'activation-byte-marker.txt'),('replacement:' + $ManifestVersion),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $InstallRoot 'active.json'),'{"activeRuntime":"runtime-fixture"}',[Text.UTF8Encoding]::new($false))
+    $receipt=[ordered]@{schemaVersion=1;activationId=$ActivationId;phase='Ready';runtimeId='runtime-fixture';previousRuntimeId=$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=$true;errorCode=$null}
+    [IO.File]::WriteAllText((Join-Path $InstallRoot 'state\post-install-activation.json'),($receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+}
+Export-ModuleMember -Function Invoke-CcodFixtureInstall
+'@
+        [IO.File]::WriteAllText((Join-Path $fixture.PayloadRoot 'src\persistence\modules\InstallLifecycle.psm1'),$replacementModule,[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($fixture.ManifestPath,'{"schemaVersion":1,"projectVersion":"9.9.9","files":[]}',[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($continuePath,'continue',[Text.UTF8Encoding]::new($false))
+
+        Assert-CcodTrue $process.WaitForExit(30000) 'activation fixture finishes within the bounded child deadline'
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        Assert-CcodEqual 0 ([int]$process.ExitCode) "verified fixture activation succeeds: $stdout $stderr"
+        Assert-CcodEqual 'original:2.5.22' ([IO.File]::ReadAllText((Join-Path $fixture.AppRoot 'activation-byte-marker.txt'),[Text.UTF8Encoding]::new($false))) 'child executes and parses only the original verified bytes'
+        Assert-CcodTrue (-not [IO.File]::Exists($replacementInstallerMarker)) 'post-verification installer replacement never executes'
+        Assert-CcodTrue (-not [IO.File]::Exists((Join-Path $fixture.AppRoot 'active.json.tmp'))) 'rejection or success leaves no uncommitted pointer sidecar'
+    } finally {
+        if ($null -ne $process) {
+            try { if (-not $process.HasExited) { $process.Kill(); [void]$process.WaitForExit(5000) } } catch { }
+            $process.Dispose()
+        }
+        if (Test-Path -LiteralPath $fixture.AppRoot) { Remove-Item -LiteralPath $fixture.AppRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 Invoke-CcodTest 'activation accepts a compile-bound installer manifest hash before payload verification' {
