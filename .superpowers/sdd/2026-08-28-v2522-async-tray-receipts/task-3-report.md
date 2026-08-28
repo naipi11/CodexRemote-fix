@@ -157,3 +157,71 @@ remains green.
   independent review remain later acceptance boundaries.
 - No real UI, Codex process, installer, installation, release, push, signing,
   or public operation was started by Task 3.
+
+## Fix round 1/5: ShutdownAck is not process-exit proof
+
+Independent review found that the first trace treated `ShutdownAck` as natural
+child termination. `TrayHostParentClient.ReaderLoop` enqueued `Exited` and set
+its stopped event immediately after reading the authenticated ACK, while
+`Dispose` subsequently terminated the child job. A child that wrote the ACK
+and then hung could therefore pass the trace before being force-killed.
+
+### Deterministic RED
+
+The trace runner now compiles a third temporary executable with a test-only
+`TRAYHOST_TRACE_HANG_AFTER_ACK` define. It uses the same child session,
+handshake, authenticated action/result, and shutdown wire. Its fake runtime
+records that the shared child session has written the shutdown ACK but
+deliberately does not return from its run loop. The PowerShell test retains the
+actual process identified by `TrayHostStartReceipt.HostPid` before `Dispose`
+and asserts that ACK alone cannot publish `Exited` or satisfy
+`WaitForStopped` while that process is still alive.
+
+Before the production fix, the required trace command exited 1 with the exact
+behavioral failure:
+
+```text
+ASSERT_EQUAL: ShutdownAck alone cannot satisfy WaitForStopped while the child is alive expected=[False] actual=[True]
+CCOD_TRAYHOST_PRODUCTION_TRACE_FAILED
+```
+
+### Production correction
+
+`TrayHostParentClient` now treats the authenticated ACK only as permission to
+wait for graceful termination. Its reader performs a bounded wait on the exact
+launched `Process` and requires exit code 0 before it enqueues `Exited` and
+signals stopped. A timeout, inaccessible process, or nonzero exit becomes the
+existing bounded `CCOD_TRAYHOST_TRANSPORT_FAILED` fault; `Dispose` may then use
+the existing job cleanup, but that cleanup can no longer masquerade as natural
+exit.
+
+The normal current and stale cases retain their child `Process` handles and
+independently require `WaitForExit(4000)` and exit code 0 before calling
+`Dispose`. The hung-after-ACK case requires a 250 ms stopped wait to return
+false, no `Exited` event, and a still-live child; after the bounded parent wait
+it requires the transport fault while the child remains live until explicit
+cleanup.
+
+No production CLI argument, listener, environment switch, external control
+surface, wire field, message type, or authentication rule was added or
+changed. The hang behavior and compile define exist only in the temporary
+test executable.
+
+### Fresh fix-round verification
+
+All covering commands ran after the correction and exited 0:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/TrayHostProductionTrace.SelfTest.ps1
+# TrayHost production child-session trace passed: 3
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ParentClientOnly
+# TrayHost parent-client self-tests passed: 4
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionOnly
+# complete production compile plus --headless-smoke, exit 0
+```
+
+`git diff --check` exited 0 with only the repository's expected LF-to-CRLF
+conversion notices. No real UI, Codex process, installer, release, install,
+signing, push, or public operation ran in this fix round.

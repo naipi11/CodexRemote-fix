@@ -2,16 +2,17 @@ param(
     [string]$AssemblyPath,
     [string]$CurrentTracePath,
     [string]$StaleTracePath,
+    [string]$HungTracePath,
     [string]$ProductionExePath
 )
 
 $ErrorActionPreference='Stop'
 $repositoryRoot=Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
-if([string]::IsNullOrEmpty($AssemblyPath)-and[string]::IsNullOrEmpty($CurrentTracePath)-and[string]::IsNullOrEmpty($StaleTracePath)-and[string]::IsNullOrEmpty($ProductionExePath)){
+if([string]::IsNullOrEmpty($AssemblyPath)-and[string]::IsNullOrEmpty($CurrentTracePath)-and[string]::IsNullOrEmpty($StaleTracePath)-and[string]::IsNullOrEmpty($HungTracePath)-and[string]::IsNullOrEmpty($ProductionExePath)){
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repositoryRoot 'tests\trayhost\Invoke-TrayHostSelfTest.ps1') -ProductionTraceOnly
     exit $LASTEXITCODE
 }
-foreach($path in @($AssemblyPath,$CurrentTracePath,$StaleTracePath,$ProductionExePath)){if([string]::IsNullOrEmpty($path)-or-not(Test-Path -LiteralPath $path -PathType Leaf)){throw 'CCOD_TRAYHOST_PRODUCTION_TRACE_INPUT_INVALID'}}
+foreach($path in @($AssemblyPath,$CurrentTracePath,$StaleTracePath,$HungTracePath,$ProductionExePath)){if([string]::IsNullOrEmpty($path)-or-not(Test-Path -LiteralPath $path -PathType Leaf)){throw 'CCOD_TRAYHOST_PRODUCTION_TRACE_INPUT_INVALID'}}
 
 . (Join-Path $PSScriptRoot 'TestSupport.ps1')
 [Reflection.Assembly]::LoadFrom([IO.Path]::GetFullPath($AssemblyPath))|Out-Null
@@ -59,11 +60,12 @@ function Wait-CcodProductionTraceWitness {
 function Invoke-CcodProductionTraceCase {
     param([string]$TracePath,[bool]$Stale)
     $client=[TrayHostProductionTraceFixture]::Start($TracePath)
+    $childProcess=$null
     try{
         $parentProcess=[Diagnostics.Process]::GetCurrentProcess()
         try{Assert-CcodTrue ($client.Receipt.HostPid-gt0-and$client.Receipt.HostPid-ne$parentProcess.Id) 'normal parent start launches a distinct child process'}finally{$parentProcess.Dispose()}
         $childProcess=[Diagnostics.Process]::GetProcessById($client.Receipt.HostPid)
-        try{Assert-CcodTrue ([string]::Equals([IO.Path]::GetFullPath($TracePath),[IO.Path]::GetFullPath($childProcess.MainModule.FileName),[StringComparison]::OrdinalIgnoreCase)) 'normal parent start launches the requested temporary trace executable'}finally{$childProcess.Dispose()}
+        Assert-CcodTrue ([string]::Equals([IO.Path]::GetFullPath($TracePath),[IO.Path]::GetFullPath($childProcess.MainModule.FileName),[StringComparison]::OrdinalIgnoreCase)) 'normal parent start launches the requested temporary trace executable'
         Assert-CcodEqual 'trace-runtime' $client.Receipt.RuntimeId 'real child handshake preserves the opaque runtime identity'
         $fixture=New-CcodProductionTraceContext $client;$context=$fixture.Context
         $hostState=New-CcodProductionTraceHostState $context $fixture.Enabled
@@ -121,16 +123,46 @@ function Invoke-CcodProductionTraceCase {
         Assert-CcodEqual 0 $context.CommandQueue.Count 'production trace emits no duplicate action'
         Assert-CcodTrue ([string]::IsNullOrEmpty($context.LastError)) 'production trace emits no remote fault'
         Assert-CcodTrue $client.BeginShutdown([ShutdownReason]::SupervisorExit,[UInt64]1) 'parent requests normal authenticated shutdown'
-        Assert-CcodTrue $client.WaitForStopped([TimeSpan]::FromSeconds(4)) 'child session returns an authenticated shutdown acknowledgement'
+        Assert-CcodTrue $client.WaitForStopped([TimeSpan]::FromSeconds(4)) 'parent observes graceful child termination'
+        Assert-CcodTrue $childProcess.WaitForExit(4000) 'graceful shutdown waits for the actual child process to exit naturally'
+        Assert-CcodEqual 0 ([int]$childProcess.ExitCode) 'graceful child process exits naturally with code zero before Dispose'
         Receive-CcodTrayHostEvents -Context $context
         Assert-CcodEqual $true $context.Exited 'TrayHostClient observes the normal child exit'
         Assert-CcodTrue ([string]::IsNullOrEmpty($context.LastError)) 'normal child shutdown has no fault'
         Assert-CcodEqual 0 $context.CommandQueue.Count 'normal child shutdown adds no extra action'
-    }finally{$client.Dispose()}
+    }finally{$client.Dispose();if($null-ne$childProcess){$childProcess.Dispose()}}
+}
+
+function Invoke-CcodHungAfterAckTraceCase {
+    param([string]$TracePath)
+    $client=[TrayHostProductionTraceFixture]::Start($TracePath)
+    $childProcess=$null
+    try{
+        $childProcess=[Diagnostics.Process]::GetProcessById($client.Receipt.HostPid)
+        $fixture=New-CcodProductionTraceContext $client;$context=$fixture.Context
+        $deadline=[DateTime]::UtcNow.AddSeconds(4)
+        while($context.CommandQueue.Count-eq0-and[DateTime]::UtcNow-lt$deadline){[void]$client.WaitForActivity([TimeSpan]::FromMilliseconds(25));Receive-CcodTrayHostEvents -Context $context}
+        Assert-CcodEqual 1 $context.CommandQueue.Count 'hung-after-ACK fixture reaches the authenticated action loop'
+        $action=$context.CommandQueue.Dequeue()
+        Assert-CcodTrue (Send-CcodTrayHostActionResult -Context $context -ActionId $action.ActionId -Revision $action.Revision -Status Completed -ErrorCode $null -TransactionId $null) 'hung-after-ACK fixture consumes its current action normally'
+        $witnessPath=[TrayHostProductionTraceFixture]::GetWitnessPath($TracePath)
+        [void](Wait-CcodProductionTraceWitness $witnessPath $context {param($Items)$Items-ccontains'publication accepted=true'})
+        Assert-CcodTrue $client.BeginShutdown([ShutdownReason]::SupervisorExit,[UInt64]1) 'hung-after-ACK fixture accepts authenticated shutdown'
+        [void](Wait-CcodProductionTraceWitness $witnessPath $context {param($Items)$Items-ccontains'shutdown-ack-written-exit-blocked'})
+        Assert-CcodEqual $false $client.WaitForStopped([TimeSpan]::FromMilliseconds(250)) 'ShutdownAck alone cannot satisfy WaitForStopped while the child is alive'
+        Receive-CcodTrayHostEvents -Context $context
+        Assert-CcodEqual $false $context.Exited 'ShutdownAck alone cannot publish an Exited event'
+        Assert-CcodEqual $false $childProcess.HasExited 'hung-after-ACK child remains observable and alive before Dispose cleanup'
+        Assert-CcodTrue $client.WaitForStopped([TimeSpan]::FromSeconds(3)) 'hung-after-ACK child reaches a bounded transport failure'
+        Receive-CcodTrayHostEvents -Context $context
+        Assert-CcodEqual 'CCOD_TRAYHOST_TRANSPORT_FAILED' $context.LastError 'hung-after-ACK child reports a fault instead of a normal exit'
+        Assert-CcodEqual $false $childProcess.HasExited 'transport failure does not masquerade a forced kill as natural child exit'
+    }finally{$client.Dispose();if($null-ne$childProcess){$childProcess.Dispose()}}
 }
 
 & $ProductionExePath '--production-trace-test-selector'
 Assert-CcodEqual 2 $LASTEXITCODE 'shipped Program.Main rejects the temporary trace selector'
 Invoke-CcodProductionTraceCase $CurrentTracePath $false
 Invoke-CcodProductionTraceCase $StaleTracePath $true
-Write-Host 'TrayHost production child-session trace passed: 2'
+Invoke-CcodHungAfterAckTraceCase $HungTracePath
+Write-Host 'TrayHost production child-session trace passed: 3'

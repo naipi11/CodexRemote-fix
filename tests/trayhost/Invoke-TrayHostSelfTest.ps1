@@ -58,6 +58,7 @@ try{
         $productionPath=Join-Path $temporaryRoot 'CodexRemote.TrayHost.exe'
         $currentTracePath=Join-Path $temporaryRoot 'TrayHostProductionTrace.Current.exe'
         $staleTracePath=Join-Path $temporaryRoot 'TrayHostProductionTrace.Stale.exe'
+        $hungTracePath=Join-Path $temporaryRoot 'TrayHostProductionTrace.HungAfterAck.exe'
         $compilerBase=@('/nologo','/noconfig','/nostdlib+','/target:exe','/platform:anycpu','/optimize+','/checked+','/warn:4','/warnaserror+')
         foreach($leaf in @('mscorlib.dll','System.dll','System.Core.dll','System.Drawing.dll')){$compilerBase+=('/reference:'+ (Join-Path $reference.ReferenceRoot $leaf))}
         & $compiler @compilerBase ('/out:'+ $productionPath) '/main:Program' @productionSources
@@ -66,7 +67,9 @@ try{
         if($LASTEXITCODE -ne 0){throw 'CCOD_TRAYHOST_PRODUCTION_TRACE_COMPILE_FAILED'}
         & $compiler @compilerBase '/define:TRAYHOST_TRACE_STALE' ('/out:'+ $staleTracePath) '/main:TrayHostProductionTraceMain' @productionSources $testPath
         if($LASTEXITCODE -ne 0){throw 'CCOD_TRAYHOST_PRODUCTION_TRACE_COMPILE_FAILED'}
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repositoryRoot 'tests\persistence\TrayHostProductionTrace.SelfTest.ps1') -AssemblyPath $currentTracePath -CurrentTracePath $currentTracePath -StaleTracePath $staleTracePath -ProductionExePath $productionPath
+        & $compiler @compilerBase '/define:TRAYHOST_TRACE_HANG_AFTER_ACK' ('/out:'+ $hungTracePath) '/main:TrayHostProductionTraceMain' @productionSources $testPath
+        if($LASTEXITCODE -ne 0){throw 'CCOD_TRAYHOST_PRODUCTION_TRACE_COMPILE_FAILED'}
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repositoryRoot 'tests\persistence\TrayHostProductionTrace.SelfTest.ps1') -AssemblyPath $currentTracePath -CurrentTracePath $currentTracePath -StaleTracePath $staleTracePath -HungTracePath $hungTracePath -ProductionExePath $productionPath
         if($LASTEXITCODE -ne 0){throw 'CCOD_TRAYHOST_PRODUCTION_TRACE_FAILED'}
         return
     }

@@ -52,7 +52,12 @@ internal static class TrayHostProductionTraceMain
 #else
             bool stale = false;
 #endif
-            using (ScriptedTraceRuntime runtime = new ScriptedTraceRuntime(witness, stale))
+#if TRAYHOST_TRACE_HANG_AFTER_ACK
+            bool hangAfterShutdownAck = true;
+#else
+            bool hangAfterShutdownAck = false;
+#endif
+            using (ScriptedTraceRuntime runtime = new ScriptedTraceRuntime(witness, stale, hangAfterShutdownAck))
             {
                 return TrayHostChildSession.Run(
                     Console.OpenStandardInput(),
@@ -85,6 +90,7 @@ internal sealed class ScriptedTraceRuntime : ITrayHostRuntime
 {
     private readonly TraceWitness _witness;
     private readonly bool _stale;
+    private readonly bool _hangAfterShutdownAck;
     private readonly ScriptedTracePlatform _platform;
     private TrayWindow _window;
     private TrayHostApplication _application;
@@ -92,12 +98,14 @@ internal sealed class ScriptedTraceRuntime : ITrayHostRuntime
     private bool _exitRequested;
     private bool _started;
     private bool _disposed;
+    private bool _blockedExitRecorded;
 
-    internal ScriptedTraceRuntime(TraceWitness witness, bool stale)
+    internal ScriptedTraceRuntime(TraceWitness witness, bool stale, bool hangAfterShutdownAck)
     {
         if (witness == null) { throw new ArgumentNullException("witness"); }
         _witness = witness;
         _stale = stale;
+        _hangAfterShutdownAck = hangAfterShutdownAck;
         _platform = new ScriptedTracePlatform(witness);
     }
 
@@ -124,6 +132,12 @@ internal sealed class ScriptedTraceRuntime : ITrayHostRuntime
 
     public void RequestExit()
     {
+        if (_hangAfterShutdownAck)
+        {
+            if (!_blockedExitRecorded) { _blockedExitRecorded = true; _witness.Append("shutdown-ack-written-exit-blocked"); }
+            _platform.Signal();
+            return;
+        }
         _exitRequested = true;
         _platform.Signal();
     }
