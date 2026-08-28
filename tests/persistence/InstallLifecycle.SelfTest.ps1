@@ -2946,16 +2946,16 @@ $results += Invoke-CcodTest 'README and release workflow publish current portabl
     Assert-CcodTrue ($readmeChinese -cmatch '\A(?s:<div align="center">.*?<h1>CodexRemote-fix</h1>)') 'Chinese README uses the centered public product heading'
 
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start[^\r\n]*\r?\n(.*?)(?=^## )').Groups[1].Value
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.21-setup\.exe') 'English Quick Start names the setup installer'
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.21-windows-x64\.zip') 'English Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.22-setup\.exe') 'English Quick Start names the setup installer'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.22-windows-x64\.zip') 'English Quick Start names the exact portable artifact'
     Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix\.exe') 'English Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($quickStart -cmatch '\.sha256\.txt') 'English Quick Start names the checksum artifact'
 
     $quickStartChineseMatch = [regex]::Match($readmeChinese, '(?ms)^## [^\r\n]+\r?\n(?:\r?\n)?(?=1\.[^\r\n]*\[Releases\])(.*?)(?=^## |\z)')
     Assert-CcodTrue $quickStartChineseMatch.Success 'Chinese README exposes a Quick Start section'
     $quickStartChinese = $quickStartChineseMatch.Groups[1].Value
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.21-setup\.exe') 'Chinese Quick Start names the setup installer'
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.21-windows-x64\.zip') 'Chinese Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.22-setup\.exe') 'Chinese Quick Start names the setup installer'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.22-windows-x64\.zip') 'Chinese Quick Start names the exact portable artifact'
     Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix\.exe') 'Chinese Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($quickStartChinese -cmatch '\.sha256\.txt') 'Chinese Quick Start names the checksum artifact'
 
@@ -2968,8 +2968,21 @@ $results += Invoke-CcodTest 'README and release workflow publish current portabl
     Assert-CcodTrue ($workflow -cmatch '(?m)^name: CodexRemote-fix release\r?$') 'release workflow uses public product branding'
     Assert-CcodTrue ($workflow -cmatch '(?m)^\s+name: CodexRemote-fix portable bundle\r?$') 'uploaded artifact uses public portable bundle branding'
     Assert-CcodTrue ($workflow -cmatch '--title "CodexRemote-fix \$version"') 'GitHub release title uses public product branding'
-    Assert-CcodTrue ($workflow -cmatch 'englishSection = \[regex\]::Match') 'GitHub release notes extract the English changelog section only'
-    Assert-CcodTrue ($workflow -cmatch 'has no English release section') 'release fails clearly when the English changelog section is missing'
+    Assert-CcodTrue ($workflow -cmatch 'tools\\New-GitHubReleaseNotes\.ps1''\) -ChangelogPath .*? -Tag \$tag -OutputPath \$notesPath') 'GitHub release notes use the behavior-tested target-English extractor'
+    Assert-CcodTrue ($workflow -cnotmatch 'englishSection\s*=\s*\[regex\]::Match') 'release workflow does not retain a second inline English extractor'
+    $notesTool = Join-Path $repositoryRoot 'tools\New-GitHubReleaseNotes.ps1'
+    Assert-CcodTrue (Test-Path -LiteralPath $notesTool -PathType Leaf) 'behavior-tested GitHub release notes extractor exists'
+    $notesFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('ccod-install-release-notes-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($notesFixtureRoot) | Out-Null
+        $missingEnglishChangelog = Join-Path $notesFixtureRoot 'CHANGELOG.md'
+        $notesOutput = Join-Path $notesFixtureRoot 'notes.md'
+        [IO.File]::WriteAllText($missingEnglishChangelog,"## v2.5.22`r`n`r`n### Simplified Chinese`r`n`r`n- fixture`r`n",[Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows { & $notesTool -ChangelogPath $missingEnglishChangelog -Tag 'v2.5.22' -OutputPath $notesOutput | Out-Null } 'CCOD_RELEASE_NOTES_ENGLISH_SECTION_INVALID'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath $notesOutput)) 'missing English notes cannot create a GitHub release body'
+    } finally {
+        if (Test-Path -LiteralPath $notesFixtureRoot) { Remove-Item -LiteralPath $notesFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 $results += Invoke-CcodTest 'installer carries the Inno contract needed by its self-validation' {

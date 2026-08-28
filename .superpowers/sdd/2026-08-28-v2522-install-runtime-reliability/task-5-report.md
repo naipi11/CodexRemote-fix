@@ -308,3 +308,35 @@ Release workflow self-tests passed.
 
 No build, installer execution, install, publish, push, tag, or signing occurred
 in this fix round.
+
+## Fix round 3 — current portable branding regression
+
+The final controlled isolated `npm test` reached
+`InstallLifecycle.SelfTest.ps1:2942` and produced the expected RED in
+`README and release workflow publish current portable-release branding`. The
+release-coupled regression still required v2.5.21 setup/ZIP names at lines
+2949/2950/2957/2958 and the retired inline
+`englishSection = [regex]::Match` implementation at lines 2971/2972.
+
+The regression now requires the v2.5.22 setup and portable asset names in both
+Quick Start sections. It preserves the public GitHub release title assertion,
+requires workflow use of `tools\New-GitHubReleaseNotes.ps1`, and rejects a
+second inline English extractor. The missing-English boundary is exercised
+against the real tool with a controlled changelog and requires
+`CCOD_RELEASE_NOTES_ENGLISH_SECTION_INVALID` with no notes output.
+
+Local bounded verification:
+
+```text
+PowerShell AST parse of InstallLifecycle.SelfTest.ps1
+  exit 0
+
+git diff --check
+  exit 0
+```
+
+The local full InstallLifecycle suite was not represented as GREEN because the
+normal desktop environment retains the earlier real-Supervisor lifecycle mutex
+boundary. The parent will rerun the controlled isolated aggregate after scoped
+re-review. No build, installer execution, install, publish, push, tag, release,
+or signing occurred in this fix round.
