@@ -913,6 +913,36 @@ $results += Invoke-CcodTest 'stable bootstrap and public uninstaller reject hard
     }
 }
 
+# Production mutation caught: recursive whole-install deletion bypassing the strict per-leaf hard-link contract.
+$results += Invoke-CcodTest 'whole-install deletion rejects a nested hard-link before removing any in-tree leaf' {
+    $install = New-CcodLifecycleTempRoot
+    $outside = New-CcodLifecycleTempRoot
+    try {
+        $nested = Join-Path $install 'runtime\nested'
+        [IO.Directory]::CreateDirectory($nested) | Out-Null
+        [IO.Directory]::CreateDirectory($outside) | Out-Null
+        $sentinel = Join-Path $outside 'outside-sentinel.txt'
+        $linkedLeaf = Join-Path $nested 'linked-state.json'
+        $ordinaryLeaf = Join-Path $install 'ordinary-state.json'
+        [IO.File]::WriteAllText($sentinel,'outside-original',[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($ordinaryLeaf,'ordinary-original',[Text.UTF8Encoding]::new($false))
+        New-Item -ItemType HardLink -Path $linkedLeaf -Target $sentinel | Out-Null
+
+        $caughtId = $null
+        try {
+            $module = Get-Module InstallLifecycle
+            & $module { param($Root) Remove-CcodLifecycleInstallTree -InstallRoot $Root -Adapters @{} } $install
+        } catch { $caughtId = ([string]$_.FullyQualifiedErrorId -split ',')[0] }
+
+        Assert-CcodEqual 'CCOD_INSTALL_UNSAFE_LEAF' $caughtId 'whole-install deletion rejects the nested hard-link before recursive removal'
+        Assert-CcodTrue ([IO.File]::Exists($linkedLeaf)) 'rejected delete retains the in-tree hard-link'
+        Assert-CcodEqual 'ordinary-original' ([IO.File]::ReadAllText($ordinaryLeaf,[Text.UTF8Encoding]::new($false))) 'preflight rejection retains other in-tree leaves'
+        Assert-CcodEqual 'outside-original' ([IO.File]::ReadAllText($sentinel,[Text.UTF8Encoding]::new($false))) 'preflight rejection retains outside sentinel bytes'
+    } finally {
+        foreach ($path in @($install,$outside)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue } }
+    }
+}
+
 $results += Invoke-CcodTest 'runtime manifest leaf junction is rejected before write' {
     $source = New-CcodLifecycleTempRoot
     $install = New-CcodLifecycleTempRoot
