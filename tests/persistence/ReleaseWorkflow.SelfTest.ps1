@@ -1279,7 +1279,8 @@ Invoke-CcodTest 'activation executes only the verified manifest installer and mo
         while (-not [IO.File]::Exists($readyPath) -and [DateTime]::UtcNow -lt $deadline -and -not $process.HasExited) {
             [Threading.Thread]::Sleep(10)
         }
-        Assert-CcodTrue ([IO.File]::Exists($readyPath)) 'barrier proves parent payload verification completed before child execution'
+        $barrierFailure = if ($process.HasExited) { $process.StandardOutput.ReadToEnd() + ' ' + $process.StandardError.ReadToEnd() } else { '' }
+        Assert-CcodTrue ([IO.File]::Exists($readyPath)) "barrier proves parent payload verification completed before child execution: $barrierFailure"
 
         $replacementInstallerMarker = Join-Path $fixture.AppRoot 'replacement-installer-executed.txt'
         $replacementInstaller = @"
@@ -1319,6 +1320,74 @@ Export-ModuleMember -Function Invoke-CcodFixtureInstall
             $process.Dispose()
         }
         if (Test-Path -LiteralPath $fixture.AppRoot) { Remove-Item -LiteralPath $fixture.AppRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# Production mutation caught: creating/checking the stage by pathname and allowing directory substitution before the first staged leaf write.
+Invoke-CcodTest 'activation pins the stage directory before any verified leaf write' {
+    $fixture = New-CcodActivationPayloadFixture
+    $libraryRoot = Join-Path $fixture.AppRoot 'activation-library'
+    $outside = Join-Path $fixture.AppRoot 'outside-stage-target'
+    $libraryPath = Join-Path $libraryRoot 'ActivationFunctions.psm1'
+    $module = $null
+    $breakpoint = $null
+    $seal = $null
+    $attack = [pscustomobject]@{ Attempted=$false; Outcome='not-run'; Stage=$null; Captured=$null }
+    try {
+        [IO.Directory]::CreateDirectory($libraryRoot) | Out-Null
+        [IO.Directory]::CreateDirectory($outside) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $outside 'outside-sentinel.txt'),'outside-original',[Text.UTF8Encoding]::new($false))
+        $tokens = $null; $parseErrors = $null
+        $activationAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1'),[ref]$tokens,[ref]$parseErrors)
+        Assert-CcodEqual 0 @($parseErrors).Count 'activation function library source parses before race fixture extraction'
+        $definitions = @($activationAst.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] } | ForEach-Object { $_.Extent.Text })
+        Assert-CcodTrue ($definitions.Count -gt 10) 'activation race fixture extracts the real production function set'
+        [IO.File]::WriteAllText($libraryPath,(($definitions -join "`r`n`r`n")+"`r`n"),[Text.UTF8Encoding]::new($false))
+        $module = Import-Module $libraryPath -Force -PassThru
+        $libraryLines = [IO.File]::ReadAllLines($libraryPath,[Text.UTF8Encoding]::new($false))
+        $barrierLines = @()
+        for ($index=0;$index-lt$libraryLines.Length;$index++) {
+            if ($libraryLines[$index] -cmatch '^\s*foreach \(\$snapshot in @\(\$snapshots\)') { $barrierLines += ($index + 1) }
+        }
+        Assert-CcodEqual 1 $barrierLines.Count 'activation stage write barrier is unique'
+        $appRoot = $fixture.AppRoot
+        $attackAction = {
+            if ($attack.Attempted) { return }
+            $attack.Attempted = $true
+            try {
+                $stages = @(Get-ChildItem -LiteralPath $appRoot -Directory -Force | Where-Object { $_.Name -cmatch '^\.activation-payload-stage-[0-9a-f]{32}$' })
+                if ($stages.Count -ne 1) { throw "expected one stage; found $($stages.Count)" }
+                $attack.Stage = [IO.Path]::GetFullPath($stages[0].FullName)
+                $expectedPrefix = [IO.Path]::GetFullPath($appRoot).TrimEnd('\') + '\'
+                if (-not $attack.Stage.StartsWith($expectedPrefix,[StringComparison]::OrdinalIgnoreCase)) { throw 'stage escaped fixture app root' }
+                $attack.Captured = $attack.Stage + '.captured'
+                [IO.Directory]::Move($attack.Stage,$attack.Captured)
+                New-Item -ItemType Junction -Path $attack.Stage -Target $outside | Out-Null
+                $attack.Outcome = 'substituted'
+            } catch { $attack.Outcome = 'blocked' }
+        }.GetNewClosure()
+        $breakpoint = Set-PSBreakpoint -Script $libraryPath -Line $barrierLines[0] -Action $attackAction
+        $caught = $null
+        try {
+            $seal = & $module {
+                param($AppRoot,$PayloadRoot,$ManifestSha)
+                New-CcodActivationPayloadSeal -AppRoot $AppRoot -Root $PayloadRoot -Version '2.5.22' -ExpectedManifestSha256 $ManifestSha
+            } $fixture.AppRoot $fixture.PayloadRoot $fixture.ManifestSha256
+        } catch { $caught = $_ }
+
+        Assert-CcodEqual 'blocked' $attack.Outcome 'stage directory substitution is blocked while the write boundary is pinned'
+        Assert-CcodTrue ($null -eq $caught -and $null -ne $seal) 'blocked substitution leaves the original verified stage usable'
+        Assert-CcodEqual 'outside-original' ([IO.File]::ReadAllText((Join-Path $outside 'outside-sentinel.txt'),[Text.UTF8Encoding]::new($false))) 'stage race cannot alter the outside sentinel'
+        Assert-CcodEqual 1 @(Get-ChildItem -LiteralPath $outside -File -Force -Recurse).Count 'stage race cannot redirect any verified leaf outside'
+    } finally {
+        if ($null -ne $breakpoint) { Remove-PSBreakpoint -Breakpoint $breakpoint -ErrorAction SilentlyContinue }
+        if ($null -ne $seal -and $null -ne $module) { try { & $module { param($Value) Close-CcodActivationPayloadSeal -Seal $Value } $seal } catch { } }
+        if ($null -ne $module) { Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue }
+        if ($null -ne $attack.Stage -and (Test-Path -LiteralPath $attack.Stage)) {
+            $stageItem = Get-Item -LiteralPath $attack.Stage -Force
+            if (($stageItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { [IO.Directory]::Delete($attack.Stage) }
+        }
+        foreach ($path in @($attack.Captured,$fixture.AppRoot)) { if ($null -ne $path -and (Test-Path -LiteralPath $path)) { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue } }
     }
 }
 
