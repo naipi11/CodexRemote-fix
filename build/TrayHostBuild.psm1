@@ -91,7 +91,22 @@ function Test-CcodTrayHostArtifact {
     if([int]$provenance.schemaVersion -ne 1 -or [string]$provenance.version -cne $Version -or [string]$provenance.targetFramework -cne 'net48' -or $null -eq $commit -or $null -eq $timestamp -or $commit.Value -isnot [string] -or $commit.Value -cnotmatch '^[0-9a-f]{40}$' -or $timestamp.Value -isnot [string] -or -not(Test-CcodTrayHostCanonicalUtc $timestamp.Value) -or (-not [string]::IsNullOrWhiteSpace($ExpectedGitCommit) -and $commit.Value -cne $ExpectedGitCommit)){throw 'CCOD_TRAYHOST_PROVENANCE_INVALID'}
     $icon=Join-Path $repo 'assets\codexremote-fix\codexremote-fix.ico'
     if([string]$provenance.artifactSha256 -cne (Get-CcodTrayHostHash $exe) -or [string]$provenance.configArtifactSha256 -cne (Get-CcodTrayHostHash $config) -or [string]$provenance.iconSha256 -cne (Get-CcodTrayHostHash $icon)){throw 'CCOD_TRAYHOST_ARTIFACT_TAMPERED'}
-    $sourceRoot=Join-Path $repo 'src\trayhost';foreach($record in @($provenance.sourceFiles)){ $source=Join-Path $sourceRoot ([string]$record.name);if(-not(Test-Path -LiteralPath $source -PathType Leaf) -or [string]$record.sha256 -cne (Get-CcodTrayHostHash $source)){throw 'CCOD_TRAYHOST_SOURCE_TAMPERED'} }
+    $sourceRoot=Join-Path $repo 'src\trayhost'
+    $currentSources=@(Get-ChildItem -LiteralPath $sourceRoot -Filter '*.cs' -File|Sort-Object Name)
+    $sourceFilesProperty=$provenance.PSObject.Properties['sourceFiles']
+    $sourceRecords=if($null -eq $sourceFilesProperty){@()}else{@($sourceFilesProperty.Value)}
+    if($sourceRecords.Count -ne $currentSources.Count){throw 'CCOD_TRAYHOST_SOURCE_TAMPERED'}
+    $expectedSources=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+    foreach($source in $currentSources){$expectedSources.Add($source.Name,(Get-CcodTrayHostHash $source.FullName))}
+    $seenSources=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach($record in $sourceRecords){
+        if($null -eq $record){throw 'CCOD_TRAYHOST_SOURCE_TAMPERED'}
+        $nameProperty=$record.PSObject.Properties['name'];$hashProperty=$record.PSObject.Properties['sha256']
+        if($null -eq $nameProperty -or $null -eq $hashProperty -or $nameProperty.Value -isnot [string] -or $hashProperty.Value -isnot [string]){throw 'CCOD_TRAYHOST_SOURCE_TAMPERED'}
+        $name=[string]$nameProperty.Value;$hash=[string]$hashProperty.Value
+        if(-not $seenSources.Add($name) -or -not $expectedSources.ContainsKey($name) -or $hash -cnotmatch '^[0-9a-f]{64}$' -or $hash -cne $expectedSources[$name]){throw 'CCOD_TRAYHOST_SOURCE_TAMPERED'}
+    }
+    if($seenSources.Count -ne $expectedSources.Count){throw 'CCOD_TRAYHOST_SOURCE_TAMPERED'}
     return [pscustomobject][ordered]@{Valid=$true;Executable=$exe;Version=$Version;GitCommit=[string]$commit.Value;Sha256=(Get-CcodTrayHostHash $exe)}
 }
 

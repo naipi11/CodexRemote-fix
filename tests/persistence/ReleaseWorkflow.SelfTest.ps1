@@ -4,6 +4,149 @@ $ErrorActionPreference = 'Stop'
 $repositoryRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $defenderPath = Join-Path $repositoryRoot 'tools\Test-ReleaseDefender.ps1'
 
+function ConvertFrom-CcodWorkflowScalar {
+    param([Parameter(Mandatory)][string]$Value)
+    $scalar = $Value.Trim()
+    if ($scalar.Length -ge 2 -and (($scalar[0] -ceq '"' -and $scalar[$scalar.Length - 1] -ceq '"') -or ($scalar[0] -ceq "'" -and $scalar[$scalar.Length - 1] -ceq "'"))) {
+        return $scalar.Substring(1, $scalar.Length - 2)
+    }
+    return $scalar
+}
+
+function Get-CcodWorkflowStructure {
+    param([Parameter(Mandatory)][string]$Path)
+    $jobs = [Collections.Generic.List[object]]::new()
+    $currentJob = $null
+    $currentStep = $null
+    $inJobs = $false
+    $inSteps = $false
+    $runBlock = $false
+    $runLines = [Collections.Generic.List[string]]::new()
+    $lines = [IO.File]::ReadAllLines($Path, [Text.UTF8Encoding]::new($false))
+    for ($index = 0; $index -lt $lines.Length; $index++) {
+        $line = $lines[$index]
+        if ($runBlock) {
+            if ([string]::IsNullOrWhiteSpace($line)) {
+                $runLines.Add('')
+                continue
+            }
+            if ($line -cmatch '^ {10,}') {
+                $runLines.Add($line.Substring(10))
+                continue
+            }
+            $currentStep.Run = $runLines -join "`n"
+            $runLines.Clear()
+            $runBlock = $false
+        }
+        if (-not $inJobs) {
+            if ($line -cmatch '^jobs:\s*(?:#.*)?$') { $inJobs = $true }
+            continue
+        }
+        if ($line -cmatch '^  (?<name>[A-Za-z0-9_-]+):\s*(?:#.*)?$') {
+            $currentJob = [pscustomobject]@{ Name = $Matches.name; Steps = [Collections.Generic.List[object]]::new() }
+            $jobs.Add($currentJob)
+            $currentStep = $null
+            $inSteps = $false
+            continue
+        }
+        if ($null -eq $currentJob) { continue }
+        if ($line -cmatch '^    steps:\s*(?:#.*)?$') {
+            $inSteps = $true
+            continue
+        }
+        if (-not $inSteps) { continue }
+        if ($line -cmatch '^      -(?:\s+(?<key>[A-Za-z][A-Za-z0-9_-]*):\s*(?<value>.*))?\s*$') {
+            $currentStep = [pscustomobject]@{ Name = ''; Shell = ''; Run = '' }
+            $currentJob.Steps.Add($currentStep)
+            $key = [string]$Matches.key
+            $value = [string]$Matches.value
+            if ($key -in @('name', 'shell', 'run')) {
+                if ($key -ceq 'run' -and $value.Trim() -in @('|', '|-', '|+')) {
+                    $runBlock = $true
+                    $runLines.Clear()
+                } else {
+                    $currentStep.$key = ConvertFrom-CcodWorkflowScalar $value
+                }
+            }
+            continue
+        }
+        if ($null -eq $currentStep) { continue }
+        if ($line -cmatch '^        (?<key>shell|run):\s*(?<value>.*)$') {
+            $key = $Matches.key
+            $value = $Matches.value.Trim()
+            if ($key -ceq 'run' -and $value -in @('|', '|-', '|+')) {
+                $runBlock = $true
+                $runLines.Clear()
+            } else {
+                $currentStep.$key = ConvertFrom-CcodWorkflowScalar $value
+            }
+        }
+    }
+    if ($runBlock) { $currentStep.Run = $runLines -join "`n" }
+    return [pscustomobject]@{ Jobs = @($jobs) }
+}
+
+function Test-CcodWorkflowStepInvokesBuild {
+    param([Parameter(Mandatory)]$Step)
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput([string]$Step.Run, [ref]$tokens, [ref]$parseErrors)
+    if (@($parseErrors).Count -ne 0) { throw 'CCOD_RELEASE_TRACE_GATE_INVALID' }
+    $commands = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] }, $true))
+    foreach ($command in $commands) {
+        $commandName = [string]$command.GetCommandName()
+        $elements = @($command.CommandElements | ForEach-Object { $_.Extent.Text })
+        if ($commandName.Replace('\', '/') -ceq './build/build.ps1' -and $elements -ccontains '-Version') { return $true }
+    }
+    return $false
+}
+
+function Test-CcodWorkflowStepInvokesProductionTrace {
+    param([Parameter(Mandatory)]$Step)
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput([string]$Step.Run, [ref]$tokens, [ref]$parseErrors)
+    if (@($parseErrors).Count -ne 0) { throw 'CCOD_RELEASE_TRACE_GATE_INVALID' }
+    $commands = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] }, $true))
+    foreach ($command in $commands) {
+        $commandName = [string]$command.GetCommandName()
+        $elements = @($command.CommandElements | ForEach-Object { $_.Extent.Text })
+        if ($commandName.Replace('\', '/') -ceq './tests/trayhost/Invoke-TrayHostSelfTest.ps1' -and $elements -ccontains '-ProductionTraceOnly') { return $true }
+    }
+    return $false
+}
+
+function Assert-CcodAuthenticatedTraceWorkflowContract {
+    param(
+        [Parameter(Mandatory)][string]$CiPath,
+        [Parameter(Mandatory)][string]$ReleasePath
+    )
+    $traceName = 'Run authenticated TrayHost production trace'
+    $traceRun = './tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly'
+    foreach ($target in @(
+        [pscustomobject]@{ Path = $CiPath; Job = 'validate'; RequireBuildOrder = $false },
+        [pscustomobject]@{ Path = $ReleasePath; Job = 'build'; RequireBuildOrder = $true }
+    )) {
+        $workflow = Get-CcodWorkflowStructure -Path $target.Path
+        $jobs = @($workflow.Jobs | Where-Object { $_.Name -ceq $target.Job })
+        if ($jobs.Count -ne 1) { throw 'CCOD_RELEASE_TRACE_GATE_INVALID' }
+        $allTraceSteps = @($workflow.Jobs | ForEach-Object { @($_.Steps) } | Where-Object { $_.Name -ceq $traceName })
+        $allTraceInvocationSteps = @($workflow.Jobs | ForEach-Object { @($_.Steps) } | Where-Object { Test-CcodWorkflowStepInvokesProductionTrace -Step $_ })
+        $traceSteps = @($jobs[0].Steps | Where-Object { $_.Name -ceq $traceName })
+        if ($allTraceSteps.Count -ne 1 -or $allTraceInvocationSteps.Count -ne 1 -or $traceSteps.Count -ne 1 -or $traceSteps[0].Shell -cne 'pwsh' -or $traceSteps[0].Run -cne $traceRun) {
+            throw 'CCOD_RELEASE_TRACE_GATE_INVALID'
+        }
+        if ($target.RequireBuildOrder) {
+            $buildIndexes = [Collections.Generic.List[int]]::new()
+            for ($stepIndex = 0; $stepIndex -lt $jobs[0].Steps.Count; $stepIndex++) {
+                if (Test-CcodWorkflowStepInvokesBuild -Step $jobs[0].Steps[$stepIndex]) { $buildIndexes.Add($stepIndex) }
+            }
+            $traceIndex = $jobs[0].Steps.IndexOf($traceSteps[0])
+            if ($buildIndexes.Count -ne 1 -or $traceIndex -lt 0 -or $traceIndex -ge $buildIndexes[0]) { throw 'CCOD_RELEASE_TRACE_GATE_INVALID' }
+        }
+    }
+}
+
 function New-CcodReleaseFixture {
     $root = Join-Path $env:TEMP ('ccod-release-workflow-' + [guid]::NewGuid().ToString('N'))
     $null = [IO.Directory]::CreateDirectory($root)
@@ -1330,6 +1473,173 @@ Invoke-CcodTest 'Defender gate requires Internet Zone before a custom scan and w
         Assert-CcodEqual 1 ([int]$capture.Value.detectionCount) 'detection receipt counts only the newly observed detection'
     } finally {
         if (Test-Path -LiteralPath $fixture.Root) { Remove-Item -LiteralPath $fixture.Root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'TrayHost artifact validation requires the exact compiled source name and hash set' {
+    Import-Module (Join-Path $repositoryRoot 'build\TrayHostBuild.psm1') -Force
+    $artifact = Join-Path ([IO.Path]::GetTempPath()) ('ccod-trayhost-provenance-fixture-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($artifact) | Out-Null
+        $executable = Join-Path $artifact 'CodexRemote.TrayHost.exe'
+        $config = Join-Path $artifact 'CodexRemote.TrayHost.exe.config'
+        $provenancePath = Join-Path $artifact 'trayhost-build-provenance.json'
+        [IO.File]::WriteAllBytes($executable, [byte[]](7, 5, 2, 2, 1))
+        [IO.File]::WriteAllText($config, '<configuration/>', [Text.UTF8Encoding]::new($false))
+        $sourceRoot = Join-Path $repositoryRoot 'src\trayhost'
+        $sourceRecords = @(Get-ChildItem -LiteralPath $sourceRoot -Filter '*.cs' -File | Sort-Object Name | ForEach-Object {
+            [ordered]@{ name = $_.Name; sha256 = Get-CcodTestFileSha256 -Path $_.FullName }
+        })
+        Assert-CcodTrue (@($sourceRecords.name) -ccontains 'TrayHostChildSession.cs') 'release provenance fixture includes the shared production child session'
+        Assert-CcodTrue (@($sourceRecords.name) -ccontains 'WindowsTrayHostRuntime.cs') 'release provenance fixture includes the production Windows runtime adapter'
+        $commit = 'c' * 40
+        $baseline = [ordered]@{
+            schemaVersion = 1
+            product = 'CodexRemote-fix'
+            version = '2.5.21'
+            gitCommit = $commit
+            buildTimestampUtc = '2026-08-28T00:00:00.0000000Z'
+            targetFramework = 'net48'
+            sourceFiles = $sourceRecords
+            iconSha256 = Get-CcodTestFileSha256 -Path (Join-Path $repositoryRoot 'assets\codexremote-fix\codexremote-fix.ico')
+            artifactSha256 = Get-CcodTestFileSha256 -Path $executable
+            configArtifactSha256 = Get-CcodTestFileSha256 -Path $config
+        }
+        $baselineJson = $baseline | ConvertTo-Json -Depth 8
+        [IO.File]::WriteAllText($provenancePath, $baselineJson, [Text.UTF8Encoding]::new($false))
+        Test-CcodTrayHostArtifact -RepositoryRoot $repositoryRoot -Version '2.5.21' -ArtifactDirectory $artifact -ExpectedGitCommit $commit | Out-Null
+        $mutations = @(
+            [pscustomobject]@{ Name = 'missing shared child session'; Apply = { param($record) $record.sourceFiles = @($record.sourceFiles | Where-Object { $_.name -cne 'TrayHostChildSession.cs' }) } },
+            [pscustomobject]@{ Name = 'duplicate shared child session'; Apply = { param($record) $child = @($record.sourceFiles | Where-Object { $_.name -ceq 'TrayHostChildSession.cs' })[0]; $record.sourceFiles = @($record.sourceFiles | Where-Object { $_.name -cne 'WindowsTrayHostRuntime.cs' }) + @([pscustomobject]@{ name = $child.name; sha256 = $child.sha256 }) } },
+            [pscustomobject]@{ Name = 'different source name set'; Apply = { param($record) $child = @($record.sourceFiles | Where-Object { $_.name -ceq 'TrayHostChildSession.cs' })[0]; $child.name = 'TrayHostChildSession-copy.cs' } },
+            [pscustomobject]@{ Name = 'Windows runtime source hash mismatch'; Apply = { param($record) $runtime = @($record.sourceFiles | Where-Object { $_.name -ceq 'WindowsTrayHostRuntime.cs' })[0]; $runtime.sha256 = '0' * 64 } }
+        )
+        foreach ($mutationCase in $mutations) {
+            $mutated = $baselineJson | ConvertFrom-Json
+            $applyMutation = [scriptblock]$mutationCase.Apply
+            & $applyMutation $mutated
+            [IO.File]::WriteAllText($provenancePath, ($mutated | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+            Assert-CcodThrows {
+                Test-CcodTrayHostArtifact -RepositoryRoot $repositoryRoot -Version '2.5.21' -ArtifactDirectory $artifact -ExpectedGitCommit $commit | Out-Null
+            } 'CCOD_TRAYHOST_SOURCE_TAMPERED'
+        }
+    } finally {
+        if (Test-Path -LiteralPath $artifact) { Remove-Item -LiteralPath $artifact -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Invoke-CcodTest 'CI and release build jobs uniquely gate asset production on the authenticated TrayHost trace' {
+    Assert-CcodAuthenticatedTraceWorkflowContract `
+        -CiPath (Join-Path $repositoryRoot '.github\workflows\ci.yml') `
+        -ReleasePath (Join-Path $repositoryRoot '.github\workflows\release.yml')
+}
+
+Invoke-CcodTest 'authenticated trace workflow gate rejects comments wrong jobs duplicates and post-build placement' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-trace-workflow-fixtures-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        $ciPath = Join-Path $root 'ci.yml'
+        $releasePath = Join-Path $root 'release.yml'
+        $validCi = @'
+name: fixture CI
+jobs:
+  validate:
+    steps:
+      - name: Run authenticated TrayHost production trace
+        shell: pwsh
+        run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly
+'@
+        $validRelease = @'
+name: fixture release
+jobs:
+  build:
+    steps:
+      - name: Run authenticated TrayHost production trace
+        shell: pwsh
+        run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly
+      - name: Build assets
+        shell: pwsh
+        run: |
+          $version = '2.5.21'
+          ./build/build.ps1 -Version $version
+  publish:
+    steps:
+      - name: Publish fixture
+        shell: pwsh
+        run: Write-Output publish
+'@
+        [IO.File]::WriteAllText($ciPath, $validCi, [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($releasePath, $validRelease, [Text.UTF8Encoding]::new($false))
+        Assert-CcodAuthenticatedTraceWorkflowContract -CiPath $ciPath -ReleasePath $releasePath
+        $invalidFixtures = @(
+            [pscustomobject]@{ Name = 'comment-only CI decoy'; Ci = @'
+name: fixture CI
+jobs:
+  validate:
+    steps:
+      # - name: Run authenticated TrayHost production trace
+      #   shell: pwsh
+      #   run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly
+      - name: Validate
+        shell: pwsh
+        run: Write-Output validate
+'@; Release = $validRelease },
+            [pscustomobject]@{ Name = 'release publish-job decoy'; Ci = $validCi; Release = @'
+name: fixture release
+jobs:
+  build:
+    steps:
+      - name: Build assets
+        shell: pwsh
+        run: ./build/build.ps1 -Version 2.5.21
+  publish:
+    steps:
+      - name: Run authenticated TrayHost production trace
+        shell: pwsh
+        run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly
+'@ },
+            [pscustomobject]@{ Name = 'post-build release gate'; Ci = $validCi; Release = @'
+name: fixture release
+jobs:
+  build:
+    steps:
+      - name: Build assets
+        shell: pwsh
+        run: ./build/build.ps1 -Version 2.5.21
+      - name: Run authenticated TrayHost production trace
+        shell: pwsh
+        run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly
+'@ },
+            [pscustomobject]@{ Name = 'anonymous pre-build release step'; Ci = $validCi; Release = @'
+name: fixture release
+jobs:
+  build:
+    steps:
+      - run: ./build/build.ps1 -Version 2.5.21
+      - name: Run authenticated TrayHost production trace
+        shell: pwsh
+        run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly
+'@ },
+            [pscustomobject]@{ Name = 'duplicate CI gate'; Ci = $validCi + "`n" + @'
+      - name: Run authenticated TrayHost production trace
+        shell: pwsh
+        run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly
+'@; Release = $validRelease },
+            [pscustomobject]@{ Name = 'different-name duplicate CI trace invocation'; Ci = $validCi + "`n" + @'
+      - name: Trace alias
+        shell: pwsh
+        run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly
+'@; Release = $validRelease }
+        )
+        foreach ($fixture in $invalidFixtures) {
+            [IO.File]::WriteAllText($ciPath, [string]$fixture.Ci, [Text.UTF8Encoding]::new($false))
+            [IO.File]::WriteAllText($releasePath, [string]$fixture.Release, [Text.UTF8Encoding]::new($false))
+            Assert-CcodThrows {
+                Assert-CcodAuthenticatedTraceWorkflowContract -CiPath $ciPath -ReleasePath $releasePath
+            } 'CCOD_RELEASE_TRACE_GATE_INVALID'
+        }
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
 

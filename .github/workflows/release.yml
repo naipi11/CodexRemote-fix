@@ -65,6 +65,10 @@ jobs:
         shell: pwsh
         run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionOnly
 
+      - name: Run authenticated TrayHost production trace
+        shell: pwsh
+        run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly
+
       - name: Build CodexRemote-fix portable bundle
         shell: pwsh
         env:

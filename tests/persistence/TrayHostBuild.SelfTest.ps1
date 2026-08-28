@@ -75,6 +75,29 @@ Invoke-CcodTest 'TrayHost build emits one source-auditable artifact and rejects 
         $currentCommit=(& git -C $repositoryRoot rev-parse HEAD).Trim().ToLowerInvariant()
         $validated=Test-CcodTrayHostArtifact -RepositoryRoot $repositoryRoot -Version '2.5.21' -ArtifactDirectory $artifact -ExpectedGitCommit $currentCommit
         Assert-CcodEqual $currentCommit ([string]$validated.GitCommit) 'artifact validation binds the current source commit when requested'
+        $expectedSourceNames=@(Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'src\trayhost') -Filter '*.cs' -File|Sort-Object Name|ForEach-Object Name)
+        Assert-CcodEqual ($expectedSourceNames -join ',') (@($provenance.sourceFiles.name) -join ',') 'built provenance records the exact compiled TrayHost source set in canonical order'
+        Assert-CcodTrue ($expectedSourceNames -ccontains 'TrayHostChildSession.cs') 'compiled source provenance includes the shared production child session'
+        Assert-CcodTrue ($expectedSourceNames -ccontains 'WindowsTrayHostRuntime.cs') 'compiled source provenance includes the production Windows runtime adapter'
+        $provenancePath=Join-Path $artifact 'trayhost-build-provenance.json'
+        $baselineJson=[IO.File]::ReadAllText($provenancePath,[Text.UTF8Encoding]::new($false))
+        $mutations=@(
+            [pscustomobject]@{Name='missing shared child session';Apply={param($record)$record.sourceFiles=@($record.sourceFiles|Where-Object{$_.name -cne 'TrayHostChildSession.cs'})}},
+            [pscustomobject]@{Name='duplicate shared child session';Apply={param($record)$child=@($record.sourceFiles|Where-Object{$_.name -ceq 'TrayHostChildSession.cs'})[0];$record.sourceFiles=@($record.sourceFiles|Where-Object{$_.name -cne 'WindowsTrayHostRuntime.cs'})+@([pscustomobject]@{name=$child.name;sha256=$child.sha256})}},
+            [pscustomobject]@{Name='different source name set';Apply={param($record)$child=@($record.sourceFiles|Where-Object{$_.name -ceq 'TrayHostChildSession.cs'})[0];$child.name='TrayHostChildSession-copy.cs'}},
+            [pscustomobject]@{Name='Windows runtime source hash mismatch';Apply={param($record)$runtime=@($record.sourceFiles|Where-Object{$_.name -ceq 'WindowsTrayHostRuntime.cs'})[0];$runtime.sha256='0'*64}}
+        )
+        foreach($mutationCase in $mutations){
+            $mutated=$baselineJson|ConvertFrom-Json
+            $applyMutation=[scriptblock]$mutationCase.Apply
+            & $applyMutation $mutated
+            [IO.File]::WriteAllText($provenancePath,($mutated|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+            try{
+                Assert-CcodThrows { Test-CcodTrayHostArtifact -RepositoryRoot $repositoryRoot -Version '2.5.21' -ArtifactDirectory $artifact -ExpectedGitCommit $currentCommit|Out-Null } 'CCOD_TRAYHOST_SOURCE_TAMPERED'
+            }finally{
+                [IO.File]::WriteAllText($provenancePath,$baselineJson,[Text.UTF8Encoding]::new($false))
+            }
+        }
         $tampered=Join-Path $artifact 'CodexRemote.TrayHost.exe.config'; Add-Content -LiteralPath $tampered -Value 'x'
         $threw=$false; try{Test-CcodTrayHostArtifact -RepositoryRoot $repositoryRoot -Version '2.5.21' -ArtifactDirectory $artifact|Out-Null}catch{$threw=$true}
         Assert-CcodTrue $threw 'tampered artifact is rejected'

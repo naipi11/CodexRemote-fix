@@ -49,3 +49,7 @@ jobs:
       - name: Run production TrayHost smoke test
         shell: pwsh
         run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionOnly
+
+      - name: Run authenticated TrayHost production trace
+        shell: pwsh
+        run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly
