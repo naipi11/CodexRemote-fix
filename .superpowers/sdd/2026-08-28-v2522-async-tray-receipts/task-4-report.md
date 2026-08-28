@@ -20,10 +20,11 @@ CLI, authentication, installer, version metadata, or installed runtime.
   hashes the enumerated current sources first, stores them in an ordinal
   dictionary, and validates records against that bounded set.
 
-Implementation commit:
+Implementation commits:
 
 ```text
 1743de6 test: gate release on tray receipt trace
+f0e388e fix: reject bypassed tray trace gates
 ```
 
 ## TDD RED evidence
@@ -71,9 +72,11 @@ exited 0 and all four provenance mutations were rejected.
 - `ReleaseWorkflow.SelfTest.ps1` parses job and step indentation rather than
   searching the whole file. It parses each PowerShell `run` body into an AST,
   counts the real trace/build commands, and compares their step indexes.
-- Controlled negative YAML fixtures reject a comment-only decoy, a trace in
-  `publish`, a post-build trace, an anonymous pre-build command, duplicate
-  named steps, and a duplicate trace invocation under a different name.
+- Controlled negative YAML fixtures reject nonempty `if` and
+  `continue-on-error` modifiers, a comment-only decoy, a trace in `publish`, a
+  post-build trace, an anonymous pre-build command, duplicate named steps, and
+  a duplicate trace invocation under a different name. Explicitly empty or
+  absent execution modifiers remain acceptable.
 
 The checked-in workflows each had one trace name and one exact trace run value
 at final review.
@@ -103,7 +106,7 @@ SHA-256 values.
 | `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/ReleaseWorkflow.SelfTest.ps1` | RED 1: exit 1, missing workflow gate (`CCOD_RELEASE_TRACE_GATE_INVALID`). |
 | same ReleaseWorkflow command after workflow change | exit 0. |
 | same ReleaseWorkflow command after provenance test, before verifier change | RED 2: exit 1, missing source record was wrongly accepted (`ASSERT_THROWS`). |
-| final same ReleaseWorkflow command | exit 0; release workflow self-tests passed, including structural decoys and provenance mutations. |
+| final same ReleaseWorkflow command | exit 0; release workflow self-tests passed, including execution-modifier bypasses, structural decoys, and provenance mutations. |
 | `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/TrayHostBuild.SelfTest.ps1` | exit 0; six build/provenance cases passed against a real compiled artifact. |
 | `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly` | exit 0; `TrayHost production child-session trace passed: 3`. |
 | `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/InstalledLifecycleHarness.SelfTest.ps1` | exit 0; 20 controlled adapter/temp-root scenarios passed. |
@@ -113,7 +116,51 @@ SHA-256 values.
 | `node.exe tests/PackageCheckerSelfTest.mjs` | exit 0. |
 | `git diff --check` | exit 0; only the repository's existing LF-to-CRLF warnings. |
 
-### Full Persistence/Validate isolation boundary
+## Fix round 1/5: execution modifiers cannot bypass the trace gate
+
+Independent review found that the first workflow structure retained only
+`Name`, `Shell`, and `Run`. A required trace step could therefore keep every
+checked field while adding `if: ${{ false }}` or
+`continue-on-error: true`; the former skips the trace and the latter tolerates
+its failure.
+
+Two deterministic temporary YAML fixtures were added before changing the
+parser or contract. Running the required command:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/ReleaseWorkflow.SelfTest.ps1
+```
+
+exited 1 after the real workflow and all preceding release/provenance checks
+passed:
+
+```text
+CCOD_SELFTEST_FAILED case=authenticated-trace-workflow-gate-rejects-comments-wrong-jobs-duplicates-and-post-build-placement error=ASSERT_THROWS
+ASSERT_THROWS: expected CCOD_RELEASE_TRACE_GATE_INVALID
+```
+
+This was the expected RED: the old contract accepted the first conditional
+trace fixture. The step model now retains `If` and `ContinueOnError` from both
+inline and following YAML keys. The exact required trace step must have both
+values empty; any nonempty literal or expression fails with
+`CCOD_RELEASE_TRACE_GATE_INVALID`. A positive fixture proves explicitly empty
+modifiers remain accepted, while the existing valid workflow proves absence
+remains accepted.
+
+Fresh fix-round verification on the final implementation tree:
+
+| Command | Result |
+| --- | --- |
+| `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/ReleaseWorkflow.SelfTest.ps1` | exit 0; both execution-modifier bypass fixtures rejected and all release checks passed. |
+| `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/TrayHostBuild.SelfTest.ps1` | exit 0; six build/provenance cases passed. |
+| `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly` | exit 0; production child-session trace passed 3 cases. |
+
+Fix-round scope was limited to
+`tests/persistence/ReleaseWorkflow.SelfTest.ps1`; no workflow production step,
+TrayHost CLI, wire, authentication, build/provenance implementation, live
+Supervisor, or controlled isolation harness was changed or invoked.
+
+## Full Persistence/Validate isolation boundary
 
 The direct, non-npm aggregate command was attempted once:
 
