@@ -158,12 +158,14 @@ function Test-CcodSetupBuildProvenance {
     $path = Assert-CcodSetupRegularFile -Path $ProvenancePath -Kind 'Setup provenance'
     try { $raw = [IO.File]::ReadAllText($path,[Text.UTF8Encoding]::new($false)); $record = $raw | ConvertFrom-Json -ErrorAction Stop }
     catch { Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Setup provenance is invalid JSON' $path }
+    $timestampMatches = [regex]::Matches($raw,'"buildTimestampUtc"\s*:\s*"(?<value>[^"\\]+)"')
+    $timestampText = if ($timestampMatches.Count -eq 1) { [string]$timestampMatches[0].Groups['value'].Value } else { $null }
     $fields = @('schemaVersion','product','version','gitCommit','buildTimestampUtc','payloadManifest','buildInputs','peContract')
     if ($record -isnot [pscustomobject] -or ((@($record.PSObject.Properties.Name | Sort-Object) -join '|') -cne (@($fields | Sort-Object) -join '|')) -or
-        $record.schemaVersion -isnot [int] -or $record.schemaVersion -ne 1 -or $record.product -isnot [string] -or $record.product -cne 'CodexRemote-fix' -or
+        ($record.schemaVersion -isnot [int] -and $record.schemaVersion -isnot [long]) -or [int64]$record.schemaVersion -ne 1 -or $record.product -isnot [string] -or $record.product -cne 'CodexRemote-fix' -or
         $record.version -isnot [string] -or $record.version -cne $ExpectedVersion -or $record.gitCommit -isnot [string] -or $record.gitCommit -cne $ExpectedGitCommit -or
-        -not (Test-CcodSetupCanonicalUtc ([string]$record.buildTimestampUtc)) -or
-        (-not [string]::IsNullOrWhiteSpace($ExpectedBuildTimestampUtc) -and [string]$record.buildTimestampUtc -cne $ExpectedBuildTimestampUtc) -or
+        -not (Test-CcodSetupCanonicalUtc $timestampText) -or
+        (-not [string]::IsNullOrWhiteSpace($ExpectedBuildTimestampUtc) -and $timestampText -cne $ExpectedBuildTimestampUtc) -or
         $record.payloadManifest.sha256 -isnot [string] -or $record.payloadManifest.sha256 -cne $ExpectedPayloadManifestSha256 -or
         $record.payloadManifest.name -isnot [string] -or $record.payloadManifest.name -cne 'installer-payload.manifest.json' -or
         [int64]$record.payloadManifest.length -le 0 -or [int]$record.payloadManifest.fileCount -le 0 -or
