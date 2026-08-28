@@ -497,6 +497,38 @@ internal static class TrayHostTransportSelfTest
         }
     }
 
+    private static void TestReplacementCallbackFailureDropsReadyUiWork()
+    {
+        ManualResetEvent callbackEntered = new ManualResetEvent(false);
+        ManualResetEvent releaseCallback = new ManualResetEvent(false);
+        int callbackCount = 0;
+        HostTransport host = new HostTransport(delegate
+        {
+            int call = Interlocked.Increment(ref callbackCount);
+            if (call == 1) { callbackEntered.Set(); releaseCallback.WaitOne(); return; }
+            throw new InvalidOperationException("intentional replacement UI callback failure");
+        });
+        try
+        {
+            TrayTerminalReceipt receipt = RegisterAndAcknowledgeFailure(host, Guid.NewGuid(), 31UL, "replacement-callback failure action");
+            bool published = true;
+            Thread publisher = new Thread((ThreadStart)delegate { published = host.TryPublishDurableReceipt(receipt); });
+            publisher.IsBackground = true; publisher.Start();
+            AssertTrue(callbackEntered.WaitOne(2000), "first UI post is held before replacement-failure probe");
+            TrayActionResult early;
+            AssertTrue(!host.TryTakeFailedAction(out early), "replacement-failure probe cannot consume provisional feedback");
+            releaseCallback.Set();
+            AssertTrue(publisher.Join(2000) && !published, "replacement callback failure reports publication failure");
+            TrayActionResult none;
+            AssertTrue(!host.TryTakeFailedAction(out none), "replacement callback failure removes the ready-but-unnotified UI item");
+            AssertTrue(Interlocked.CompareExchange(ref callbackCount, 0, 0) == 2, "replacement callback is attempted exactly once");
+        }
+        finally
+        {
+            releaseCallback.Set(); host.Dispose(); callbackEntered.Dispose(); releaseCallback.Dispose();
+        }
+    }
+
     private static void TestDisposalReturnsWhileStoreIsHungAndSuppressesLateCallbacks()
     {
         ControllableReceiptStore store = new ControllableReceiptStore(ReceiptStoreBlockStage.BeforeOpen, 1);
@@ -548,8 +580,9 @@ internal static class TrayHostTransportSelfTest
             TestDurableReceiptTrustAndSharedUiBound();
             TestFailingCallbackNeverExposesProvisionalUiWork();
             TestSuccessfulCallbackRepostsAfterAnEarlyUiProbe();
+            TestReplacementCallbackFailureDropsReadyUiWork();
             TestDisposalReturnsWhileStoreIsHungAndSuppressesLateCallbacks();
-            Console.WriteLine("TrayHost transport self-tests passed: 12");
+            Console.WriteLine("TrayHost transport self-tests passed: 13");
             return 0;
         }
         catch (Exception error)

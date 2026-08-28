@@ -157,7 +157,15 @@ internal sealed class HostTransport : IDisposable
             repost = work.ProbeObserved;
             work.ProbeObserved = false;
         }
-        if (repost) { try { receiptReady(); } catch { } }
+        if (repost)
+        {
+            try { receiptReady(); }
+            catch
+            {
+                DropUiWork(work);
+                return false;
+            }
+        }
         return true;
     }
 
