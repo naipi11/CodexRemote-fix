@@ -166,7 +166,12 @@ function New-CcodReleaseFixture {
     $null = [IO.Directory]::CreateDirectory($root)
     $installer = Join-Path $root 'CodexRemote-fix-2.5.0-setup.exe'
     $commit = 'a' * 40
-    $payloadHash = 'd' * 64
+    $payloadInput = Join-Path $root 'CodexRemote-fix-2.5.0-setup-payload-manifest.json'
+    $inventoryInput = Join-Path $root 'CodexRemote-fix-2.5.0-setup-destination-inventory.iss'
+    $payloadInputRecord = [ordered]@{schemaVersion=1;projectVersion='2.5.0';files=@([ordered]@{path='package.json';length=[int64]1;sha256=('d'*64)})}
+    [IO.File]::WriteAllText($payloadInput,($payloadInputRecord|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($inventoryInput,"procedure AddCcodExpectedSetupDirectories(Directories: TStrings);`r`nbegin`r`nend;`r`n",[Text.UTF8Encoding]::new($false))
+    $payloadHash = Get-CcodTestFileSha256 -Path $payloadInput
     $typeName = 'SetupFixture' + [guid]::NewGuid().ToString('N')
     $setupSource = @"
 using System.Reflection;
@@ -189,17 +194,22 @@ public static class $typeName { public static int Main() { return 0; } }
     $setupProvenance = Join-Path $root 'CodexRemote-fix-2.5.0-setup-provenance.json'
     $setupProvenanceRecord = [ordered]@{
         schemaVersion=1;product='CodexRemote-fix';version='2.5.0';gitCommit=$commit;buildTimestampUtc='2026-08-24T00:00:00.0000000Z'
-        payloadManifest=[ordered]@{name='installer-payload.manifest.json';length=[int64]123;sha256=$payloadHash;fileCount=3}
-        buildInputs=[ordered]@{innoTemplateSha256=('1'*64);destinationInventorySha256=('2'*64);compilerSha256=('3'*64);compilerFileVersion='6.7.3.0'}
+        payloadManifest=[ordered]@{name='installer-payload.manifest.json';length=[int64](Get-Item -LiteralPath $payloadInput).Length;sha256=$payloadHash;fileCount=1}
+        buildInputs=[ordered]@{innoTemplateSha256=$(Get-CcodTestFileSha256 -Path (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'));destinationInventorySha256=$(Get-CcodTestFileSha256 -Path $inventoryInput);compilerSha256='PLACEHOLDER';compilerFileVersion='PLACEHOLDER'}
         peContract=[ordered]@{fileVersion='2.5.0.0';productVersion='2.5.0.0';productName='CodexRemote-fix';fileDescription='CCODSETUP 2.5.0';companyName=$commit;legalCopyright=$payloadHash}
     }
+    $iscc = @((Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),(Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),(Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')) | Where-Object { $_ -and [IO.File]::Exists($_) } | Select-Object -First 1
+    $setupProvenanceRecord.buildInputs.compilerSha256 = Get-CcodTestFileSha256 -Path $iscc
+    $setupProvenanceRecord.buildInputs.compilerFileVersion = [string]([Diagnostics.FileVersionInfo]::GetVersionInfo($iscc).FileVersion)
     [IO.File]::WriteAllText($setupProvenance,(($setupProvenanceRecord|ConvertTo-Json -Depth 8)+"`n"),[Text.UTF8Encoding]::new($false))
     $manifest = Join-Path $root 'CodexRemote-fix-2.5.0-setup-release-manifest.json'
     $assets = @(
         [ordered]@{ name = [IO.Path]::GetFileName($installer); sha256 = $installerHash },
         [ordered]@{ name = [IO.Path]::GetFileName($checksum); sha256 = Get-CcodTestFileSha256 -Path $checksum },
         [ordered]@{ name = [IO.Path]::GetFileName($trayHost); sha256 = Get-CcodTestFileSha256 -Path $trayHost },
-        [ordered]@{ name = [IO.Path]::GetFileName($setupProvenance); sha256 = Get-CcodTestFileSha256 -Path $setupProvenance }
+        [ordered]@{ name = [IO.Path]::GetFileName($setupProvenance); sha256 = Get-CcodTestFileSha256 -Path $setupProvenance },
+        [ordered]@{ name = [IO.Path]::GetFileName($payloadInput); sha256 = Get-CcodTestFileSha256 -Path $payloadInput },
+        [ordered]@{ name = [IO.Path]::GetFileName($inventoryInput); sha256 = Get-CcodTestFileSha256 -Path $inventoryInput }
     )
     $record = [ordered]@{
         schemaVersion = 1
@@ -210,7 +220,7 @@ public static class $typeName { public static int Main() { return 0; } }
         assets = $assets
     }
     [IO.File]::WriteAllText($manifest, ($record | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
-    return [pscustomobject]@{ Root = $root; Installer = $installer; Checksum = $checksum; TrayHost = $trayHost; SetupProvenance = $setupProvenance; Manifest = $manifest; PayloadManifestSha256 = $payloadHash }
+    return [pscustomobject]@{ Root = $root; Installer = $installer; Checksum = $checksum; TrayHost = $trayHost; SetupProvenance = $setupProvenance; PayloadInput=$payloadInput;InventoryInput=$inventoryInput; Manifest = $manifest; PayloadManifestSha256 = $payloadHash }
 }
 
 function New-CcodPortableReleaseFixture {
@@ -1536,6 +1546,46 @@ Invoke-CcodTest 'compiled Setup independently binds PE versions commit and activ
     }
 }
 
+# Production mutation caught: accepting self-consistent but false Setup build-input hashes without comparing canonical files.
+Invoke-CcodTest 'Setup provenance rejects self-consistent wrong canonical build input hashes' {
+    Import-Module (Join-Path $repositoryRoot 'build\SetupArtifact.psm1') -Force
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-setup-provenance-inputs-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        $template = Join-Path $root 'CodexControlOtherDevices.iss'
+        $inventory = Join-Path $root 'InstallerDestinationInventory.iss'
+        $compiler = Join-Path $root 'ISCC.exe'
+        $payload = Join-Path $root 'installer-payload.manifest.json'
+        $provenance = Join-Path $root 'setup-provenance.json'
+        [IO.File]::WriteAllText($template,'canonical-template',[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($inventory,'canonical-inventory',[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllBytes($compiler,[byte[]](1,2,3,4,5,6,7,8))
+        $payloadRecord = [ordered]@{schemaVersion=1;projectVersion='2.5.22';files=@([ordered]@{path='package.json';length=[int64]1;sha256=('a'*64)})}
+        [IO.File]::WriteAllText($payload,($payloadRecord|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+        $payloadHash = Get-CcodTestFileSha256 -Path $payload
+        $commit = 'b' * 40
+        $timestamp = '2026-08-28T00:00:00.0000000Z'
+        $record = [ordered]@{
+            schemaVersion=1;product='CodexRemote-fix';version='2.5.22';gitCommit=$commit;buildTimestampUtc=$timestamp
+            payloadManifest=[ordered]@{name='installer-payload.manifest.json';length=[int64](Get-Item -LiteralPath $payload).Length;sha256=$payloadHash;fileCount=1}
+            buildInputs=[ordered]@{innoTemplateSha256=('1'*64);destinationInventorySha256=('2'*64);compilerSha256=('3'*64);compilerFileVersion='0.0.0.0'}
+            peContract=[ordered]@{fileVersion='2.5.22.0';productVersion='2.5.22.0';productName='CodexRemote-fix';fileDescription='CCODSETUP 2.5.22';companyName=$commit;legalCopyright=$payloadHash}
+        }
+        [IO.File]::WriteAllText($provenance,(($record|ConvertTo-Json -Depth 8)+"`n"),[Text.UTF8Encoding]::new($false))
+
+        Assert-CcodThrows {
+            $validator = Get-Command Test-CcodSetupBuildProvenance
+            if ($validator.Parameters.ContainsKey('InnoTemplatePath')) {
+                Test-CcodSetupBuildProvenance -ProvenancePath $provenance -ExpectedVersion '2.5.22' -ExpectedGitCommit $commit -ExpectedPayloadManifestSha256 $payloadHash -ExpectedBuildTimestampUtc $timestamp -InnoTemplatePath $template -DestinationInventoryPath $inventory -CompilerPath $compiler -PayloadManifestPath $payload | Out-Null
+            } else {
+                Test-CcodSetupBuildProvenance -ProvenancePath $provenance -ExpectedVersion '2.5.22' -ExpectedGitCommit $commit -ExpectedPayloadManifestSha256 $payloadHash -ExpectedBuildTimestampUtc $timestamp | Out-Null
+            }
+        } 'CCOD_SETUP_PROVENANCE_INVALID'
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
 # Production mutation caught: cleaning payload stage/inventory only after a successful Setup build.
 Invoke-CcodTest 'build temporary Setup inputs are cleaned from the exact finally boundary after failure' {
     . (Join-Path $repositoryRoot 'build\build.ps1') -Library
@@ -1581,6 +1631,16 @@ Invoke-CcodTest 'Inno exposes a pre-write payload-directory reparse gate' {
     Assert-CcodTrue $treeHelper.Success 'production Inno script exposes a recursive destination-tree predicate'
     $inventoryValidator = [regex]::Match($inno,'(?ms)^function AreCcodExpectedSetupDirectoriesSafe\(.*?^end;')
     Assert-CcodTrue $inventoryValidator.Success 'production Inno script exposes a generated destination-inventory validator'
+    $pinBlockMatch = [regex]::Match($inno,'(?ms)^// CCOD_SETUP_PIN_BEGIN\s*$\r?\n(?<body>.*?)^// CCOD_SETUP_PIN_END\s*$')
+    $pinBlock = if ($pinBlockMatch.Success) { $pinBlockMatch.Groups['body'].Value } else { @'
+function PinCcodExistingSetupTree(const DirectoryName: String): Boolean;
+begin
+  Result := IsSafeExistingSetupTree(DirectoryName);
+end;
+procedure CloseCcodSetupPins();
+begin
+end;
+'@ }
     Assert-CcodTrue ($inno -cmatch '(?m)^// CCOD_INSTALLER_DESTINATION_INVENTORY\s*$' -and $inno -cmatch '(?ms)^function PrepareToInstall\(var NeedsRestart: Boolean\): String;.*?AreCcodExpectedSetupDirectoriesSafe') 'PrepareToInstall consumes the generated inventory injected at the unique marker before file copy'
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-inno-reparse-harness-' + [guid]::NewGuid().ToString('N'))
     try {
@@ -1601,6 +1661,12 @@ Invoke-CcodTest 'Inno exposes a pre-write payload-directory reparse gate' {
         $fileWriteMarker = Join-Path $expectedFileRoot 'payload-write-marker.txt'
         $junctionWriteMarker = Join-Path $expectedJunctionRoot 'payload-write-marker.txt'
         $resultPath = Join-Path $root 'result.txt'
+        $concurrentTarget = Join-Path $root 'concurrent-target'
+        $concurrentMoved = Join-Path $root 'concurrent-target-moved'
+        $concurrentOutside = Join-Path $root 'concurrent-outside'
+        $attackScript = Join-Path $root 'Invoke-ConcurrentSubstitution.ps1'
+        $attackResult = Join-Path $root 'concurrent-attack.txt'
+        $pinWriteResult = Join-Path $root 'concurrent-write.txt'
         [IO.Directory]::CreateDirectory($normal) | Out-Null
         [IO.Directory]::CreateDirectory($target) | Out-Null
         [IO.Directory]::CreateDirectory((Split-Path $nested -Parent)) | Out-Null
@@ -1615,6 +1681,23 @@ Invoke-CcodTest 'Inno exposes a pre-write payload-directory reparse gate' {
         [IO.Directory]::CreateDirectory($hardLinkTree) | Out-Null
         [IO.File]::WriteAllText($outsideHardLink,'outside-original',[Text.UTF8Encoding]::new($false))
         New-Item -ItemType HardLink -Path $hardLinkLeaf -Target $outsideHardLink | Out-Null
+        [IO.Directory]::CreateDirectory($concurrentTarget) | Out-Null
+        [IO.Directory]::CreateDirectory($concurrentOutside) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $concurrentTarget 'payload.txt'),'target-original',[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $concurrentOutside 'payload.txt'),'outside-original',[Text.UTF8Encoding]::new($false))
+        $attackSource = @'
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Target,[Parameter(Mandatory)][string]$Moved,[Parameter(Mandatory)][string]$Outside,[Parameter(Mandatory)][string]$ResultPath)
+$ErrorActionPreference='Stop'
+try {
+    Move-Item -LiteralPath $Target -Destination $Moved -ErrorAction Stop
+    New-Item -ItemType Junction -Path $Target -Target $Outside -ErrorAction Stop | Out-Null
+    [IO.File]::WriteAllText($ResultPath,'substituted',[Text.UTF8Encoding]::new($false))
+} catch {
+    [IO.File]::WriteAllText($ResultPath,'blocked',[Text.UTF8Encoding]::new($false))
+}
+'@
+        [IO.File]::WriteAllText($attackScript,$attackSource,[Text.UTF8Encoding]::new($false))
         [IO.Directory]::CreateDirectory((Join-Path $inventoryPayload 'src\persistence\modules')) | Out-Null
         [IO.File]::WriteAllText((Join-Path $inventoryPayload 'src\persistence\modules\InstallLifecycle.psm1'),'fixture',[Text.UTF8Encoding]::new($false))
         $inventoryPath = Join-Path $root 'InventoryFixture.iss'
@@ -1635,11 +1718,13 @@ const
   CCOD_FILE_ATTRIBUTE_DIRECTORY = `$00000010;
   CCOD_FILE_ATTRIBUTE_REPARSE_POINT = `$00000400;
   CCOD_FILE_READ_ATTRIBUTES = `$00000080;
+  CCOD_DELETE_ACCESS = `$00010000;
   CCOD_FILE_SHARE_READ = `$00000001;
   CCOD_FILE_SHARE_WRITE = `$00000002;
   CCOD_FILE_SHARE_DELETE = `$00000004;
   CCOD_OPEN_EXISTING = 3;
   CCOD_FILE_FLAG_OPEN_REPARSE_POINT = `$00200000;
+  CCOD_FILE_FLAG_BACKUP_SEMANTICS = `$02000000;
   CCOD_INVALID_FILE_ATTRIBUTES = `$FFFFFFFF;
   CCOD_INVALID_HANDLE_VALUE = -1;
   CCOD_ERROR_HANDLE_EOF = 38;
@@ -1691,7 +1776,11 @@ $($leafHelper.Value)
 $($treeHelper.Value)
 $inventorySource
 $($inventoryValidator.Value)
+$pinBlock
 function InitializeSetup(): Boolean;
+var
+  AttackResultCode: Integer;
+  AttackParameters: String;
 begin
   if AreCcodExpectedSetupDirectoriesSafe('$($expectedFileRoot.Replace("'","''"))') then
     SaveStringToFile('$($fileWriteMarker.Replace("'","''"))','unsafe write',False);
@@ -1699,6 +1788,23 @@ begin
     SaveStringToFile('$($junctionWriteMarker.Replace("'","''"))','unsafe write',False);
   if IsSafeExistingSetupTree('$($hardLinkTree.Replace("'","''"))') then
     SaveStringToFile('$($hardLinkLeaf.Replace("'","''"))','unsafe overwrite',False);
+  if PinCcodExistingSetupTree('$($concurrentTarget.Replace("'","''"))') then
+  begin
+    AttackParameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
+      '$($attackScript.Replace("'","''"))' + '" -Target "' + '$($concurrentTarget.Replace("'","''"))' +
+      '" -Moved "' + '$($concurrentMoved.Replace("'","''"))' + '" -Outside "' +
+      '$($concurrentOutside.Replace("'","''"))' + '" -ResultPath "' + '$($attackResult.Replace("'","''"))' + '"';
+    if (not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), AttackParameters,
+      '', SW_HIDE, ewWaitUntilTerminated, AttackResultCode)) or (AttackResultCode <> 0) then
+      SaveStringToFile('$($attackResult.Replace("'","''"))','attacker-failed',False);
+    if SaveStringToFile('$((Join-Path $concurrentTarget 'payload.txt').Replace("'","''"))','setup-write',False) then
+      SaveStringToFile('$($pinWriteResult.Replace("'","''"))','write-ok',False)
+    else
+      SaveStringToFile('$($pinWriteResult.Replace("'","''"))','write-failed',False);
+    CloseCcodSetupPins();
+  end
+  else
+    SaveStringToFile('$($pinWriteResult.Replace("'","''"))','pin-failed',False);
   if IsSafeExistingPayloadDirectory('$($normal.Replace("'","''"))') and
      IsSafeExistingPayloadDirectory('$($missing.Replace("'","''"))') and
      (not IsSafeExistingPayloadDirectory('$($junction.Replace("'","''"))')) and
@@ -1711,6 +1817,10 @@ begin
     SaveStringToFile('$($resultPath.Replace("'","''"))','pass',False);
   Result := False;
 end;
+procedure DeinitializeSetup();
+begin
+  CloseCcodSetupPins();
+end;
 "@
         [IO.File]::WriteAllText($harnessPath,$harness,[Text.UTF8Encoding]::new($false))
         $iscc = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'
@@ -1722,7 +1832,15 @@ end;
         Assert-CcodTrue (-not (Test-Path -LiteralPath $fileWriteMarker)) 'nested file-as-directory is rejected before simulated payload writes'
         Assert-CcodTrue (-not (Test-Path -LiteralPath $junctionWriteMarker)) 'nested junction is rejected before simulated payload writes'
         Assert-CcodEqual 'outside-original' ([IO.File]::ReadAllText($outsideHardLink,[Text.UTF8Encoding]::new($false))) 'hard-linked setup leaf is rejected before simulated outside overwrite'
+        Assert-CcodEqual 'blocked' ([IO.File]::ReadAllText($attackResult,[Text.UTF8Encoding]::new($false))) 'concurrent directory substitution is blocked after Setup preflight'
+        Assert-CcodEqual 'write-ok' ([IO.File]::ReadAllText($pinWriteResult,[Text.UTF8Encoding]::new($false))) 'retained pins still allow the legitimate Setup overwrite'
+        Assert-CcodEqual 'outside-original' ([IO.File]::ReadAllText((Join-Path $concurrentOutside 'payload.txt'),[Text.UTF8Encoding]::new($false))) 'concurrent substitution cannot redirect Setup bytes to the outside sentinel'
+        Assert-CcodEqual 'setup-write' ([IO.File]::ReadAllText((Join-Path $concurrentTarget 'payload.txt'),[Text.UTF8Encoding]::new($false))) 'simulated Setup write reaches the pinned destination identity'
     } finally {
+        if (Test-Path -LiteralPath $concurrentTarget) {
+            $concurrentItem = Get-Item -LiteralPath $concurrentTarget -Force
+            if (($concurrentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { [IO.Directory]::Delete($concurrentTarget) }
+        }
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
     }
 }
