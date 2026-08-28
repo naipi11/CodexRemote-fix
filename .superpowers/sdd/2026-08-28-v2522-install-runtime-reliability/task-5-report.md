@@ -569,3 +569,72 @@ ca5a5f7 fix: bind setup artifact provenance
 - Real setup install/upgrade, reboot, remote connection, About/language/logs,
   repair, Defender, and controlled isolated aggregate acceptance remain
   pending. README intentionally does not call v2.5.22 stable.
+
+## Final security fix round 1 — whole-install delete leaf preflight
+
+Scoped re-review found that `Remove-CcodLifecycleInstallTree` did not consume
+the strict recursive tree predicate. It checked only each top-level child's
+path/reparse ancestry and then called `Remove-Item -Recurse`, so a nested hard
+link bypassed the already implemented regular/non-reparse/no-ADS/single-link
+leaf contract.
+
+### RED
+
+The regression created an ordinary in-tree file plus a nested hard link to an
+outside sentinel, then invoked the real private whole-install delete function:
+
+```text
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\InstallLifecycle.SelfTest.ps1
+exit 1
+case=whole-install-deletion-rejects-a-nested-hard-link-before-removing-any-in-tree-leaf
+expected=[CCOD_INSTALL_UNSAFE_LEAF]
+actual=[]
+```
+
+The empty error id proves the old path accepted the hard link and completed
+recursive deletion instead of failing closed.
+
+### GREEN implementation and evidence
+
+`Remove-CcodLifecycleInstallTree` now calls
+`Assert-CcodLifecycleInstallTreeSafe -InstallRoot $root -Path $root` before
+enumerating or deleting anything. That existing predicate walks every nested
+leaf and applies the native link-count, ADS, regular-file, reparse, and root
+containment checks. Therefore a failing leaf is detected before either the
+hard-link name or any ordinary in-tree leaf is removed.
+
+The full lifecycle suite passed the new regression and advanced to the same
+later live-Supervisor boundary; it is still not represented as aggregate
+GREEN:
+
+```text
+InstallLifecycle.SelfTest.ps1
+new whole-install hard-link case passed
+later exit 1
+case=transactional-uninstall-reaches-ReadyForInno-only-after-recovery-protection-stop-task-proof-and-application-removal
+error=CCOD_LIFECYCLE_LEASE_TIMEOUT
+```
+
+Additional fresh verification:
+
+```text
+ReleaseWorkflow.SelfTest.ps1
+exit 0; real ISCC and release workflow self-tests passed
+
+PowerShell AST parse of modified module/test
+exit 0
+
+git diff --check
+exit 0
+```
+
+Commits:
+
+```text
+f1ee9b7 test: expose linked whole-install deletion
+1a4abec fix: preflight whole-install tree deletion
+```
+
+No installer/build/release/install operation was performed in this narrow
+round. No real process was started or stopped, and no WindowsApps or DPAPI data
+was accessed.
