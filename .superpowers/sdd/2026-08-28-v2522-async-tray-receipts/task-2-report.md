@@ -266,3 +266,94 @@ counted as production-trace acceptance here.
   Admission and pending-action capacity remain bounded and responsive.
 - No installer, installed Codex process, real tray UI, push, release, install,
   signing, or public operation was run.
+
+## Fix round 1/5: tokened STA visibility and atomic callback admission
+
+Review found two remaining races in the first Task 2 implementation:
+
+1. A receipt became consumable before its replacement UI-post callback had
+   returned successfully. An unrelated ordinary `WmApp+2` drain could display
+   the item before a later callback failure attempted to retract it.
+2. The sink checked `_closed` and then invoked the durable callback separately.
+   `Dispose` could close and return in that gap before a new callback began.
+
+### Implementation
+
+- `HostTransport` now assigns each bounded receipt UI item one nonzero,
+  process-randomized `uint` token and keeps the item uncommitted while its
+  token-post callback is unresolved.
+- Receipt UI lives in one token-keyed eight-item map shared by About and
+  failure. Ordinary no-token drains always return no item; only
+  `TryTakeReceiptUi(exactToken, ...)` can consume a committed receipt.
+- An early exact-token delivery records an observation without exposing UI.
+  The transport permits one bounded replacement post while the item remains
+  uncommitted. A false/throwing post, a second early delivery, disposal, or an
+  invalid token retracts the item before any UI result is returned.
+- `TrayHostApplication` owns internal `WmApp+3` receipt-token posting and
+  decoding. `WmApp+2` remains exclusively the presentation/shutdown work path.
+  The pipe protocol, CLI inputs, authenticated message types, and wire fields
+  are unchanged.
+- `Program` removed receipt drains from ordinary work and maps only an exact
+  `WmApp+3` token to About or generic failure. Shutdown closes the sink, then
+  disposes the transport before destroying the window.
+- `TrayTerminalReceiptSink` now sets an explicit `_callbackClaimed` state under
+  the same `_gate` used by `Dispose`, before invoking the callback, and clears
+  it in `finally`. Once close wins the gate, no new callback claim succeeds.
+  An already-started callback may finish, but a disposed transport rejects its
+  token publication.
+- The callback-handoff barrier is compiled only into the temporary
+  `TRAYHOST_RECEIPT_SELF_TEST` TransportOnly executable. No production test
+  selector, environment switch, listener, or external control was added.
+
+### TDD RED evidence
+
+The existing shared-drain race was first captured behaviorally. Before the
+tokened path, TransportOnly exited `1` with:
+
+```text
+TrayHost transport self-test failed: System.InvalidOperationException
+ordinary work cannot expose or display receipt UI while the replacement callback is unresolved
+CCOD_TRAYHOST_NATIVE_TEST_FAILED
+```
+
+The durable-return/callback-begin handoff was then blocked deterministically.
+Before atomic callback admission, TransportOnly exited `1` with:
+
+```text
+TrayHost transport self-test failed: System.InvalidOperationException
+close gate prevents any new durable callback from starting after Dispose
+CCOD_TRAYHOST_NATIVE_TEST_FAILED
+```
+
+The desired token APIs were also written before implementation. TransportOnly
+then failed compilation because the token-aware callback,
+`TrayTerminalReceiptUiKind`, and `TryTakeReceiptUi` did not exist; NativeOnly
+failed because `TrayHostApplication.TryDecodeReceiptWorkToken` did not exist.
+
+The final deterministic NativeOnly race delivers the first `WmApp+3` token
+before its post returns, blocks the replacement token post, concurrently
+dispatches ordinary `WmApp+2`, then throws the token callback. It asserts zero
+generic dialogs before and after stale-token replay.
+
+### Fresh GREEN and stability evidence
+
+All commands below were run after the final source/test change:
+
+```text
+TransportOnly: 10 consecutive runs, each exit 0, TrayHost transport self-tests passed: 16
+NativeOnly:     5 consecutive runs, each exit 0, TrayHost native self-tests passed: 25
+ProductionOnly: exit 0, complete production compile plus --headless-smoke, no output
+ProtocolOnly:   exit 0, TrayHost protocol self-tests passed: 11
+git diff --check: exit 0; only repository LF-to-CRLF conversion notices
+```
+
+### Commit and remaining boundary
+
+- `85882890202f420479728a9ed1532f2085b970c8` —
+  `fix: seal tray receipt dispatch races`
+
+Task 3 still owns the shared child-session/authenticated production trace and
+the legacy Supervisor correlation-bridge migration; neither is claimed by this
+fix round. Task 4 release gating also remains deferred. No installer, installed
+Codex process, real tray UI, push, release, signing, install, or public operation
+was run.
