@@ -10,15 +10,15 @@ No unreleased changes.
 
 ### English
 
-- Bound Setup activation to the requested version and a hash-verified installer payload manifest, then revalidated the active runtime before reporting Ready.
-- Restricted Setup compilation to one generated, inventoried input and rejected unapproved preprocessor constructs before ISCC runs.
+- Bound Setup activation to the exact verified manifest, installer, and module bytes across child launch, then revalidated the selected runtime before reporting Ready.
+- Rejected hard-linked install leaves before writes and added independent Setup PE/provenance validation for version, commit, and the activation payload-manifest hash.
 - Added bounded same-root process-tree rereads while preserving strict root and per-process identity checks during close and remote rebind.
 - Correlated native tray actions with the acknowledged presentation revision and durable, bounded terminal diagnostics; stale actions now produce a sanitized support code.
 
 ### 简体中文
 
-- 将 Setup 激活绑定到请求版本和经哈希校验的安装载荷 manifest，并在报告 Ready 前重新校验活动 runtime。
-- Setup 只编译一份已清点目录的生成输入；任何未获准的预处理构造都会在 ISCC 运行前被拒绝。
+- 将 Setup 激活绑定到跨子进程启动仍保持不变的 manifest、installer 与 module 精确字节，并在报告 Ready 前重新校验所选 runtime。
+- 在写入前拒绝安装目录中的硬链接叶子，并独立校验 Setup PE/构建 provenance 所绑定的版本、commit 与激活 payload-manifest 哈希。
 - 为同一根进程加入有界 process-tree 重读，同时在关闭和远程重绑定时继续严格校验根进程与每个成员的身份。
 - 将原生托盘操作绑定到已确认的 presentation revision 和持久、有界的终态诊断；过期操作会记录清理后的支持代码。
 

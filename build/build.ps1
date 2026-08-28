@@ -130,6 +130,10 @@ function Assert-CcodBuildInnoPreprocessorLines {
         '#error InstallerPayloadDirectory must be supplied by the release builder',
         '#ifndef InstallerPayloadManifestSha256',
         '#error InstallerPayloadManifestSha256 must be supplied by the release builder',
+        '#ifndef SetupGitCommit',
+        '#error SetupGitCommit must be supplied by the release builder',
+        '#ifndef SetupProvenancePath',
+        '#error SetupProvenancePath must be supplied by the release builder',
         '#endif'
     )
     $allowedInlineConstructs = @(
@@ -137,7 +141,9 @@ function Assert-CcodBuildInnoPreprocessorLines {
         '{#TrayHostArtifactDirectory}',
         '{#PortableArtifactDirectory}',
         '{#InstallerPayloadDirectory}',
-        '{#InstallerPayloadManifestSha256}'
+        '{#InstallerPayloadManifestSha256}',
+        '{#SetupGitCommit}',
+        '{#SetupProvenancePath}'
     )
     for ($lineIndex = 0; $lineIndex -lt $Lines.Count; $lineIndex++) {
         $line = [string]$Lines[$lineIndex]
@@ -249,6 +255,50 @@ function Invoke-CcodBuildInnoCompiler {
     }
 }
 
+function Remove-CcodBuildTemporarySetupInput {
+    param(
+        [Parameter(Mandatory)][string]$BuildRoot,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('PayloadDirectory','DestinationInventory')][string]$Kind
+    )
+    $root = [IO.Path]::GetFullPath($BuildRoot).TrimEnd('\')
+    $candidate = [IO.Path]::GetFullPath($Path)
+    $parent = [IO.Path]::GetFullPath((Split-Path $candidate -Parent)).TrimEnd('\')
+    $leaf = [IO.Path]::GetFileName($candidate)
+    $expectedPattern = if ($Kind -ceq 'PayloadDirectory') { '^\.installer-payload-stage-[0-9a-f]{32}$' } else { '^\.installer-destination-inventory-[0-9a-f]{32}\.iss$' }
+    if (-not $parent.Equals($root,[StringComparison]::OrdinalIgnoreCase) -or $leaf -cnotmatch $expectedPattern) {
+        throw "Refusing to clean an unexpected temporary Setup input: $candidate"
+    }
+    if ($Kind -ceq 'PayloadDirectory') {
+        if (-not [IO.Directory]::Exists($candidate)) { return }
+        $rootItem = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+        if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Refusing to clean a reparse Setup payload stage: $candidate" }
+        foreach ($item in @(Get-ChildItem -LiteralPath $candidate -Force -Recurse -ErrorAction Stop)) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Refusing to clean a Setup payload stage containing a reparse point: $($item.FullName)" }
+        }
+        Remove-Item -LiteralPath $candidate -Recurse -Force -ErrorAction Stop
+        return
+    }
+    if (-not [IO.File]::Exists($candidate)) { return }
+    $inventory = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+    if ($inventory.PSIsContainer -or ($inventory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Refusing to clean an unsafe Setup destination inventory: $candidate" }
+    Remove-Item -LiteralPath $candidate -Force -ErrorAction Stop
+}
+
+function Invoke-CcodBuildTemporarySetupScope {
+    param(
+        [Parameter(Mandatory)][string]$BuildRoot,
+        [Parameter(Mandatory)][string]$InstallerPayloadDirectory,
+        [Parameter(Mandatory)][string]$DestinationInventoryPath,
+        [Parameter(Mandatory)][scriptblock]$Action
+    )
+    try { & $Action $InstallerPayloadDirectory $DestinationInventoryPath }
+    finally {
+        Remove-CcodBuildTemporarySetupInput -BuildRoot $BuildRoot -Path $InstallerPayloadDirectory -Kind PayloadDirectory
+        Remove-CcodBuildTemporarySetupInput -BuildRoot $BuildRoot -Path $DestinationInventoryPath -Kind DestinationInventory
+    }
+}
+
 if ($Library) { return }
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
@@ -280,13 +330,16 @@ $payloadManifestAsset = Join-Path $dist "CodexRemote-fix-$Version-payload-manife
 $releaseManifest = Join-Path $dist "CodexRemote-fix-$Version-release-manifest.json"
 $setupExe = Join-Path $dist "CodexRemote-fix-$Version-setup.exe"
 $setupChecksum = "$setupExe.sha256.txt"
-foreach ($path in @($bundle,$checksum,$provenance,$payloadManifestAsset,$releaseManifest,$setupExe,$setupChecksum)) {
+$setupProvenance = Join-Path $dist "CodexRemote-fix-$Version-setup-provenance.json"
+$setupReleaseManifest = Join-Path $dist "CodexRemote-fix-$Version-setup-release-manifest.json"
+foreach ($path in @($bundle,$checksum,$provenance,$payloadManifestAsset,$releaseManifest,$setupExe,$setupChecksum,$setupProvenance,$setupReleaseManifest)) {
     if ([IO.File]::Exists($path) -or [IO.Directory]::Exists($path)) { throw "Refusing to overwrite immutable release output: $path" }
 }
 
 $stageRoot = Join-Path $PSScriptRoot ('.portable-stage-' + [guid]::NewGuid().ToString('N'))
 $installerPayloadDirectory = Join-Path $PSScriptRoot ('.installer-payload-stage-' + [guid]::NewGuid().ToString('N'))
 $installerDestinationInventoryPath = Join-Path $PSScriptRoot ('.installer-destination-inventory-' + [guid]::NewGuid().ToString('N') + '.iss')
+Invoke-CcodBuildTemporarySetupScope -BuildRoot $PSScriptRoot -InstallerPayloadDirectory $installerPayloadDirectory -DestinationInventoryPath $installerDestinationInventoryPath -Action ({
 try {
     [IO.Directory]::CreateDirectory($stageRoot) | Out-Null
     $payloadRoot = Join-Path $stageRoot 'payload'
@@ -427,18 +480,23 @@ $isccCandidates = @(
 $iscc = $isccCandidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and [IO.File]::Exists($_) } | Select-Object -First 1
 if (-not $iscc) { throw 'Inno Setup 6 (ISCC.exe) was not found. Install it with: winget install --id JRSoftware.InnoSetup --exact' }
 $issPath = Join-Path $PSScriptRoot 'CodexControlOtherDevices.iss'
+Import-Module (Join-Path $PSScriptRoot 'SetupArtifact.psm1') -Force
+$setupProvenanceRecord = New-CcodSetupBuildProvenance -Version $Version -GitCommit $gitCommit -BuildTimestampUtc $buildTimestampUtc -PayloadManifestPath $installerPayloadManifestPath -InnoTemplatePath $issPath -DestinationInventoryPath $installerDestinationInventoryPath -CompilerPath $iscc -OutputPath $setupProvenance
+Test-CcodSetupBuildProvenance -ProvenancePath $setupProvenance -ExpectedVersion $Version -ExpectedGitCommit $gitCommit -ExpectedPayloadManifestSha256 $installerPayloadManifestSha256 -ExpectedBuildTimestampUtc $buildTimestampUtc | Out-Null
 $isccArguments = @(
     "/DProjectVersion=$Version",
     "/DTrayHostArtifactDirectory=$trayHostArtifact",
     "/DPortableArtifactDirectory=$portableArtifact",
     "/DInstallerPayloadDirectory=$installerPayloadDirectory",
     "/DInstallerPayloadManifestSha256=$installerPayloadManifestSha256",
+    "/DSetupGitCommit=$gitCommit",
+    "/DSetupProvenancePath=$setupProvenance",
     "/O$dist\."
 )
 Invoke-CcodBuildInnoCompiler -TemplatePath $issPath -InventoryPath $installerDestinationInventoryPath -IsccPath $iscc -Arguments $isccArguments -SetupPath $setupExe
-$setupHash = Get-CcodBuildFileSha256 -Path $setupExe
+$setupValidation = Test-CcodSetupArtifact -SetupPath $setupExe -ExpectedVersion $Version -ExpectedGitCommit $gitCommit -ExpectedPayloadManifestSha256 $installerPayloadManifestSha256
+$setupHash = [string]$setupValidation.Sha256
 Write-CcodBuildUtf8 -Path $setupChecksum -Text ("{0} *{1}" -f $setupHash,[IO.Path]::GetFileName($setupExe))
-$setupReleaseManifest = Join-Path $dist "CodexRemote-fix-$Version-setup-release-manifest.json"
 $setupRecord = [ordered]@{
     schemaVersion = 1
     product = 'CodexRemote-fix'
@@ -448,7 +506,8 @@ $setupRecord = [ordered]@{
     assets = @(
         [ordered]@{ name = [IO.Path]::GetFileName($setupExe); sha256 = $setupHash },
         [ordered]@{ name = [IO.Path]::GetFileName($setupChecksum); sha256 = Get-CcodBuildFileSha256 -Path $setupChecksum },
-        [ordered]@{ name = [IO.Path]::GetFileName($provenance); sha256 = Get-CcodBuildFileSha256 -Path $provenance }
+        [ordered]@{ name = [IO.Path]::GetFileName($provenance); sha256 = Get-CcodBuildFileSha256 -Path $provenance },
+        [ordered]@{ name = [IO.Path]::GetFileName($setupProvenance); sha256 = Get-CcodBuildFileSha256 -Path $setupProvenance }
     )
 }
 Write-CcodBuildUtf8 -Path $setupReleaseManifest -Text (($setupRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
@@ -458,24 +517,7 @@ Write-Host ''
 Write-Host 'Installer build completed:' -ForegroundColor Green
 Write-Host ("  Setup:    {0}" -f $setupExe)
 Write-Host ("  SHA-256:  {0}" -f $setupChecksum)
+Write-Host ("  Provenance: {0}" -f $setupProvenance)
 Write-Host ("  Manifest: {0}" -f $setupReleaseManifest)
 Write-Host ''
-
-if ([IO.Directory]::Exists($installerPayloadDirectory)) {
-    $installerPayloadFull = [IO.Path]::GetFullPath($installerPayloadDirectory)
-    $buildFull = [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\') + '\'
-    if ($installerPayloadFull.StartsWith($buildFull,[StringComparison]::OrdinalIgnoreCase) -and
-        [IO.Path]::GetFileName($installerPayloadFull).StartsWith('.installer-payload-stage-',[StringComparison]::Ordinal) -and
-        -not ((Get-Item -LiteralPath $installerPayloadFull -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-        Remove-Item -LiteralPath $installerPayloadFull -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-if ([IO.File]::Exists($installerDestinationInventoryPath)) {
-    $inventoryFull = [IO.Path]::GetFullPath($installerDestinationInventoryPath)
-    $buildFull = [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\') + '\'
-    if ($inventoryFull.StartsWith($buildFull,[StringComparison]::OrdinalIgnoreCase) -and
-        [IO.Path]::GetFileName($inventoryFull).StartsWith('.installer-destination-inventory-',[StringComparison]::Ordinal) -and
-        -not ((Get-Item -LiteralPath $inventoryFull -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-        Remove-Item -LiteralPath $inventoryFull -Force -ErrorAction SilentlyContinue
-    }
-}
+}.GetNewClosure())

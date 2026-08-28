@@ -11,6 +11,12 @@
 #ifndef InstallerPayloadManifestSha256
 #error InstallerPayloadManifestSha256 must be supplied by the release builder
 #endif
+#ifndef SetupGitCommit
+#error SetupGitCommit must be supplied by the release builder
+#endif
+#ifndef SetupProvenancePath
+#error SetupProvenancePath must be supplied by the release builder
+#endif
 AppId={{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}
 AppName=CodexRemote-fix
 AppVersion={#ProjectVersion}
@@ -20,6 +26,12 @@ AppPublisherURL=https://github.com/naipi11/CodexRemote-fix
 AppSupportURL=https://github.com/naipi11/CodexRemote-fix/issues
 AppUpdatesURL=https://github.com/naipi11/CodexRemote-fix/releases
 VersionInfoVersion={#ProjectVersion}.0
+VersionInfoTextVersion={#ProjectVersion}.0
+VersionInfoProductName=CodexRemote-fix
+VersionInfoProductTextVersion={#ProjectVersion}.0
+VersionInfoDescription=CCODSETUP {#ProjectVersion}
+VersionInfoCompany={#SetupGitCommit}
+VersionInfoCopyright={#InstallerPayloadManifestSha256}
 DefaultDirName={localappdata}\CodexControlOtherDevices-installer
 DefaultGroupName=CodexRemote-fix
 UsePreviousGroup=no
@@ -43,6 +55,7 @@ MinVersion=10.0.17763
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
+Source: "{#SetupProvenancePath}"; DestDir: "{app}"; DestName: "setup-provenance.json"; Flags: dontcopy
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.zh-CN.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
@@ -51,6 +64,7 @@ Source: "..\SECURITY.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\package.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\build\CodexControlOtherDevices.iss"; DestDir: "{app}\build"; Flags: ignoreversion
 Source: "..\build\build.ps1"; DestDir: "{app}\build"; Flags: ignoreversion
+Source: "..\build\SetupArtifact.psm1"; DestDir: "{app}\build"; Flags: ignoreversion
 Source: "..\build\build-trayhost.ps1"; DestDir: "{app}\build"; Flags: ignoreversion
 Source: "..\build\TrayHostBuild.psm1"; DestDir: "{app}\build"; Flags: ignoreversion
 Source: "..\build\TrayHostReferencePack.psm1"; DestDir: "{app}\build"; Flags: ignoreversion

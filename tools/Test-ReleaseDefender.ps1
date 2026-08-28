@@ -486,7 +486,8 @@ function Test-CcodReleaseAssetManifest {
     $expectedNames = @(
         "CodexRemote-fix-$ExpectedVersion-setup.exe",
         "CodexRemote-fix-$ExpectedVersion-setup.exe.sha256.txt",
-        "CodexRemote-fix-$ExpectedVersion-trayhost-provenance.json"
+        "CodexRemote-fix-$ExpectedVersion-trayhost-provenance.json",
+        "CodexRemote-fix-$ExpectedVersion-setup-provenance.json"
     )
     if ($assets.Count -ne $expectedNames.Count) { Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Release manifest does not bind the exact required asset set' $manifestFile }
     $assetHashes = @{}
@@ -530,6 +531,22 @@ function Test-CcodReleaseAssetManifest {
         $trayHostTimestampText -cne $manifestTimestamp) {
         Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'TrayHost provenance is not bound to the release version, source commit, and timestamp' $expectedNames[2]
     }
+    $setupProvenancePath = Join-Path $directory $expectedNames[3]
+    $setupArtifactModule = Join-Path (Split-Path $PSScriptRoot -Parent) 'build\SetupArtifact.psm1'
+    if (-not [IO.File]::Exists($setupArtifactModule)) {
+        Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' 'Setup artifact validator is missing' $setupArtifactModule
+    }
+    Import-Module $setupArtifactModule -Force
+    try {
+        $setupRaw = [IO.File]::ReadAllText($setupProvenancePath)
+        $setupRecord = $setupRaw | ConvertFrom-Json -ErrorAction Stop
+        $payloadHash = [string]$setupRecord.payloadManifest.sha256
+        if ($payloadHash -cnotmatch '^[0-9a-f]{64}$') { throw 'payload hash' }
+        Test-CcodSetupBuildProvenance -ProvenancePath $setupProvenancePath -ExpectedVersion $ExpectedVersion -ExpectedGitCommit ([string]$manifest.gitCommit) -ExpectedPayloadManifestSha256 $payloadHash -ExpectedBuildTimestampUtc $manifestTimestamp | Out-Null
+        Test-CcodSetupArtifact -SetupPath $installer -ExpectedVersion $ExpectedVersion -ExpectedGitCommit ([string]$manifest.gitCommit) -ExpectedPayloadManifestSha256 $payloadHash | Out-Null
+    } catch {
+        Throw-CcodReleaseDefenderError 'CCOD_RELEASE_MANIFEST_INVALID' ('Setup provenance or final PE contract is invalid: ' + $_.Exception.Message) $setupProvenancePath
+    }
     return [pscustomobject][ordered]@{
         Valid = $true
         Version = $ExpectedVersion
@@ -537,6 +554,8 @@ function Test-CcodReleaseAssetManifest {
         BuildTimestampUtc = $manifestTimestamp
         InstallerSha256 = [string]$assetHashes[$expectedNames[0]]
         InstallerName = $expectedNames[0]
+        PayloadManifestSha256 = $payloadHash
+        SetupProvenanceName = $expectedNames[3]
     }
 }
 

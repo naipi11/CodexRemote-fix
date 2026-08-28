@@ -16,7 +16,7 @@
 </p>
 
 > [!NOTE]
-> **Release status:** v2.5.22 is the current stable release. The setup installer and EXE-based portable ZIP are version- and manifest-bound release assets.
+> **Release status:** v2.5.22 is the current release candidate. Its setup installer and EXE-based portable ZIP are version- and manifest-bound; stable Windows acceptance still requires recorded install, upgrade, reboot, repair, UI, and Defender verification.
 
 CodexRemote-fix enables the UI that ships with Codex Desktop for Windows but is hidden by a runtime defect:
 

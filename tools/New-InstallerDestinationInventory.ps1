@@ -43,6 +43,10 @@ function Assert-CcodInstallerInnoPreprocessorLines {
         '#error InstallerPayloadDirectory must be supplied by the release builder',
         '#ifndef InstallerPayloadManifestSha256',
         '#error InstallerPayloadManifestSha256 must be supplied by the release builder',
+        '#ifndef SetupGitCommit',
+        '#error SetupGitCommit must be supplied by the release builder',
+        '#ifndef SetupProvenancePath',
+        '#error SetupProvenancePath must be supplied by the release builder',
         '#endif'
     )
     $allowedInlineConstructs = @(
@@ -50,7 +54,9 @@ function Assert-CcodInstallerInnoPreprocessorLines {
         '{#TrayHostArtifactDirectory}',
         '{#PortableArtifactDirectory}',
         '{#InstallerPayloadDirectory}',
-        '{#InstallerPayloadManifestSha256}'
+        '{#InstallerPayloadManifestSha256}',
+        '{#SetupGitCommit}',
+        '{#SetupProvenancePath}'
     )
     for ($lineIndex = 0; $lineIndex -lt $Lines.Count; $lineIndex++) {
         $line = [string]$Lines[$lineIndex]

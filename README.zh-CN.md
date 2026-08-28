@@ -16,7 +16,7 @@
 </p>
 
 > [!NOTE]
-> **发布状态：** v2.5.22 是当前稳定版。安装包与以 EXE 启动的便携 ZIP 都是绑定版本和 manifest 的发布资产。
+> **发布状态：** v2.5.22 是当前候选发布版。安装包与以 EXE 启动的便携 ZIP 都已绑定版本和 manifest；Windows 稳定版验收仍需记录安装、升级、重启、修复、UI 与 Defender 的实机验证结果。
 
 CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、但因运行时缺陷被隐藏的：
 

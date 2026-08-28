@@ -165,28 +165,52 @@ function New-CcodReleaseFixture {
     $root = Join-Path $env:TEMP ('ccod-release-workflow-' + [guid]::NewGuid().ToString('N'))
     $null = [IO.Directory]::CreateDirectory($root)
     $installer = Join-Path $root 'CodexRemote-fix-2.5.0-setup.exe'
-    [IO.File]::WriteAllBytes($installer, [byte[]](9,8,7,6,5,4,3,2,1))
+    $commit = 'a' * 40
+    $payloadHash = 'd' * 64
+    $typeName = 'SetupFixture' + [guid]::NewGuid().ToString('N')
+    $setupSource = @"
+using System.Reflection;
+[assembly: AssemblyVersion("2.5.0.0")]
+[assembly: AssemblyFileVersion("2.5.0.0")]
+[assembly: AssemblyInformationalVersion("2.5.0.0")]
+[assembly: AssemblyProduct("CodexRemote-fix")]
+[assembly: AssemblyTitle("CCODSETUP 2.5.0")]
+[assembly: AssemblyDescription("CCODSETUP 2.5.0")]
+[assembly: AssemblyCompany("$commit")]
+[assembly: AssemblyCopyright("$payloadHash")]
+public static class $typeName { public static int Main() { return 0; } }
+"@
+    Add-Type -TypeDefinition $setupSource -Language CSharp -OutputAssembly $installer -OutputType ConsoleApplication
     $checksum = "$installer.sha256.txt"
     $installerHash = Get-CcodTestFileSha256 -Path $installer
     [IO.File]::WriteAllText($checksum, ("{0} *{1}`r`n" -f $installerHash, [IO.Path]::GetFileName($installer)), [Text.UTF8Encoding]::new($false))
     $trayHost = Join-Path $root 'CodexRemote-fix-2.5.0-trayhost-provenance.json'
-    [IO.File]::WriteAllText($trayHost, ('{"schemaVersion":1,"product":"CodexRemote-fix","version":"2.5.0","gitCommit":"' + ('a' * 40) + '","buildTimestampUtc":"2026-08-24T00:00:00.0000000Z"}'), [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($trayHost, ('{"schemaVersion":1,"product":"CodexRemote-fix","version":"2.5.0","gitCommit":"' + $commit + '","buildTimestampUtc":"2026-08-24T00:00:00.0000000Z"}'), [Text.UTF8Encoding]::new($false))
+    $setupProvenance = Join-Path $root 'CodexRemote-fix-2.5.0-setup-provenance.json'
+    $setupProvenanceRecord = [ordered]@{
+        schemaVersion=1;product='CodexRemote-fix';version='2.5.0';gitCommit=$commit;buildTimestampUtc='2026-08-24T00:00:00.0000000Z'
+        payloadManifest=[ordered]@{name='installer-payload.manifest.json';length=[int64]123;sha256=$payloadHash;fileCount=3}
+        buildInputs=[ordered]@{innoTemplateSha256=('1'*64);destinationInventorySha256=('2'*64);compilerSha256=('3'*64);compilerFileVersion='6.7.3.0'}
+        peContract=[ordered]@{fileVersion='2.5.0.0';productVersion='2.5.0.0';productName='CodexRemote-fix';fileDescription='CCODSETUP 2.5.0';companyName=$commit;legalCopyright=$payloadHash}
+    }
+    [IO.File]::WriteAllText($setupProvenance,(($setupProvenanceRecord|ConvertTo-Json -Depth 8)+"`n"),[Text.UTF8Encoding]::new($false))
     $manifest = Join-Path $root 'CodexRemote-fix-2.5.0-setup-release-manifest.json'
     $assets = @(
         [ordered]@{ name = [IO.Path]::GetFileName($installer); sha256 = $installerHash },
         [ordered]@{ name = [IO.Path]::GetFileName($checksum); sha256 = Get-CcodTestFileSha256 -Path $checksum },
-        [ordered]@{ name = [IO.Path]::GetFileName($trayHost); sha256 = Get-CcodTestFileSha256 -Path $trayHost }
+        [ordered]@{ name = [IO.Path]::GetFileName($trayHost); sha256 = Get-CcodTestFileSha256 -Path $trayHost },
+        [ordered]@{ name = [IO.Path]::GetFileName($setupProvenance); sha256 = Get-CcodTestFileSha256 -Path $setupProvenance }
     )
     $record = [ordered]@{
         schemaVersion = 1
         product = 'CodexRemote-fix'
         version = '2.5.0'
-        gitCommit = ('a' * 40)
+        gitCommit = $commit
         buildTimestampUtc = '2026-08-24T00:00:00.0000000Z'
         assets = $assets
     }
     [IO.File]::WriteAllText($manifest, ($record | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
-    return [pscustomobject]@{ Root = $root; Installer = $installer; Checksum = $checksum; TrayHost = $trayHost; Manifest = $manifest }
+    return [pscustomobject]@{ Root = $root; Installer = $installer; Checksum = $checksum; TrayHost = $trayHost; SetupProvenance = $setupProvenance; Manifest = $manifest; PayloadManifestSha256 = $payloadHash }
 }
 
 function New-CcodPortableReleaseFixture {
@@ -1165,9 +1189,13 @@ function Invoke-CcodInnoPayloadCompileFixture {
         (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
     ) | Where-Object { $_ -and [IO.File]::Exists($_) } | Select-Object -First 1
     if (-not $iscc) { throw 'Inno Setup 6 is required for the setup payload contract' }
-    $arguments = @('/DProjectVersion=2.5.21',"/DTrayHostArtifactDirectory=$tray","/DPortableArtifactDirectory=$portable","/O$output\")
+    $payloadManifestSha256 = Get-CcodTestFileSha256 -Path $manifestPath
+    $setupGitCommit = 'c' * 40
+    $setupProvenancePath = Join-Path $root 'setup-provenance.json'
+    [IO.File]::WriteAllText($setupProvenancePath,'{}',[Text.UTF8Encoding]::new($false))
+    $arguments = @('/DProjectVersion=2.5.21',"/DTrayHostArtifactDirectory=$tray","/DPortableArtifactDirectory=$portable","/DSetupGitCommit=$setupGitCommit","/DSetupProvenancePath=$setupProvenancePath","/O$output\")
     if ($IncludePayloadDefines) {
-        $arguments = @('/DProjectVersion=2.5.21',"/DTrayHostArtifactDirectory=$tray","/DPortableArtifactDirectory=$portable","/DInstallerPayloadDirectory=$payload","/DInstallerPayloadManifestSha256=$(Get-CcodTestFileSha256 -Path $manifestPath)")
+        $arguments = @('/DProjectVersion=2.5.21',"/DTrayHostArtifactDirectory=$tray","/DPortableArtifactDirectory=$portable","/DInstallerPayloadDirectory=$payload","/DInstallerPayloadManifestSha256=$payloadManifestSha256","/DSetupGitCommit=$setupGitCommit","/DSetupProvenancePath=$setupProvenancePath")
         $arguments += "/O$output\"
     }
     . (Join-Path $repositoryRoot 'build\build.ps1') -Library
@@ -1198,6 +1226,8 @@ function Invoke-CcodInnoPayloadCompileFixture {
         SetupPath = (Join-Path $output 'CodexRemote-fix-2.5.21-setup.exe')
         GeneratedPath = $generatedPath
         GeneratedSource = $generatedSource
+        PayloadManifestSha256 = $payloadManifestSha256
+        SetupGitCommit = $setupGitCommit
     }
 }
 
@@ -1416,6 +1446,47 @@ Invoke-CcodTest 'Inno compile packages the explicit manifest-bound installer pay
     } finally {
         if (Test-Path -LiteralPath $compile.Root) { Remove-Item -LiteralPath $compile.Root -Recurse -Force }
     }
+}
+
+# Production mutation caught: trusting ISCC exit zero and a newly computed sidecar without inspecting the final PE contract.
+Invoke-CcodTest 'compiled Setup independently binds PE versions commit and activation payload manifest hash' {
+    $modulePath = Join-Path $repositoryRoot 'build\SetupArtifact.psm1'
+    Assert-CcodTrue (Test-Path -LiteralPath $modulePath -PathType Leaf) 'independent Setup artifact validator exists'
+    Import-Module $modulePath -Force
+    $compile = Invoke-CcodInnoPayloadCompileFixture -IncludePayloadDefines
+    try {
+        $validated = Test-CcodSetupArtifact -SetupPath $compile.SetupPath -ExpectedVersion '2.5.21' -ExpectedGitCommit $compile.SetupGitCommit -ExpectedPayloadManifestSha256 $compile.PayloadManifestSha256
+        Assert-CcodEqual $true ([bool]$validated.Valid) 'real ISCC Setup PE satisfies the independent version and payload contract'
+        Assert-CcodEqual '2.5.21.0' ([string]$validated.FileVersion) 'Setup PE FileVersion is exact'
+        Assert-CcodEqual '2.5.21.0' ([string]$validated.ProductVersion) 'Setup PE ProductVersion is exact'
+        Assert-CcodThrows {
+            Test-CcodSetupArtifact -SetupPath $compile.SetupPath -ExpectedVersion '2.5.21' -ExpectedGitCommit $compile.SetupGitCommit -ExpectedPayloadManifestSha256 ('0' * 64) | Out-Null
+        } 'CCOD_SETUP_PAYLOAD_BINDING_INVALID'
+    } finally {
+        if (Test-Path -LiteralPath $compile.Root) { Remove-Item -LiteralPath $compile.Root -Recurse -Force }
+    }
+}
+
+# Production mutation caught: cleaning payload stage/inventory only after a successful Setup build.
+Invoke-CcodTest 'build temporary Setup inputs are cleaned from the exact finally boundary after failure' {
+    . (Join-Path $repositoryRoot 'build\build.ps1') -Library
+    Assert-CcodTrue ($null -ne (Get-Command Invoke-CcodBuildTemporarySetupScope -ErrorAction SilentlyContinue)) 'build exposes its production temporary Setup scope'
+    $buildRoot = Join-Path $repositoryRoot 'build'
+    $payloadStage = Join-Path $buildRoot ('.installer-payload-stage-' + [guid]::NewGuid().ToString('N'))
+    $inventory = Join-Path $buildRoot ('.installer-destination-inventory-' + [guid]::NewGuid().ToString('N') + '.iss')
+    $fixturePayloadStage = $payloadStage
+    $fixtureInventory = $inventory
+    Assert-CcodThrows {
+        Invoke-CcodBuildTemporarySetupScope -BuildRoot $buildRoot -InstallerPayloadDirectory $fixturePayloadStage -DestinationInventoryPath $fixtureInventory -Action {
+            param($PayloadStagePath,$InventoryPath)
+            [IO.Directory]::CreateDirectory($PayloadStagePath) | Out-Null
+            [IO.File]::WriteAllText((Join-Path $PayloadStagePath 'fixture.txt'),'fixture',[Text.UTF8Encoding]::new($false))
+            [IO.File]::WriteAllText($InventoryPath,'fixture',[Text.UTF8Encoding]::new($false))
+            throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('fixture failure'),'CCOD_BUILD_FIXTURE_FAILURE',[Management.Automation.ErrorCategory]::OperationStopped,$null)
+        }
+    } 'CCOD_BUILD_FIXTURE_FAILURE'
+    Assert-CcodTrue (-not [IO.Directory]::Exists($payloadStage)) 'failed build leaves no installer payload stage'
+    Assert-CcodTrue (-not [IO.File]::Exists($inventory)) 'failed build leaves no destination inventory'
 }
 
 Invoke-CcodTest 'Inno compile refuses a missing generated destination inventory' {
@@ -1999,7 +2070,7 @@ Invoke-CcodTest '2.5.22 source metadata and documentation match the release cont
     Assert-CcodTrue ($englishSection.Success -and $englishBullets.Count -ge 3 -and $englishBullets.Count -le 5) 'v2.5.22 English release notes contain three to five bullets'
     $readme = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.md') -Raw
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start\s*\r?\n(?<body>.*?)(?=^## |\z)').Groups['body'].Value
-    Assert-CcodTrue ($readme.Contains('v2.5.22 is the current stable release')) 'English README marks v2.5.22 stable without a version-by-version What''s new block'
+    Assert-CcodTrue ($readme.Contains('v2.5.22 is the current release candidate') -and $readme.Contains('stable Windows acceptance still requires recorded install, upgrade, reboot, repair, UI, and Defender verification')) 'English README does not claim stable Windows acceptance before real-machine evidence'
     Assert-CcodTrue (-not $readme.Contains("## What's new")) 'English README keeps release details off the home page'
     Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.22-setup.exe')) 'English Quick Start names the setup installer'
     Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.22-windows-x64.zip')) 'English Quick Start names the portable ZIP'
@@ -2010,7 +2081,7 @@ Invoke-CcodTest '2.5.22 source metadata and documentation match the release cont
     Assert-CcodTrue ($readme.Contains('Setup embeds and hash-binds its versioned `installer-payload.manifest.json`')) 'English README identifies the embedded hash-bound setup payload manifest'
     Assert-CcodTrue (-not $readme.Contains('shared payload manifest')) 'English README does not claim setup and portable share one payload manifest'
     $readmeZh = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.zh-CN.md') -Raw -Encoding UTF8
-    Assert-CcodTrue ($readmeZh -match 'v2\.5\.22 \u662F\u5F53\u524D\u7A33\u5B9A\u7248') 'Chinese README marks v2.5.22 stable'
+    Assert-CcodTrue ($readmeZh -match 'v2\.5\.22 \u662F\u5F53\u524D\u5019\u9009\u53D1\u5E03\u7248' -and $readmeZh -match '\u7A33\u5B9A\u7248\u9A8C\u6536\u4ECD\u9700\u8BB0\u5F55') 'Chinese README does not claim stable Windows acceptance before real-machine evidence'
     Assert-CcodTrue (-not $readmeZh.Contains("## What's new")) 'Chinese README keeps release details off the home page'
     Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.22-setup.exe')) 'Chinese Quick Start names the setup installer'
     Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.22-windows-x64.zip')) 'Chinese Quick Start names the portable ZIP'
