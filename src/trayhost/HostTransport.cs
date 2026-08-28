@@ -9,10 +9,18 @@ internal sealed class HostTransport : IDisposable
         internal bool Accepted;
     }
 
+    private sealed class UiWorkItem
+    {
+        internal TrayActionResult Result;
+        internal bool Ready;
+        internal bool ProbeObserved;
+    }
+
     private readonly object _gate = new object();
     private readonly Action _presentationReady;
-    private readonly Queue<TrayActionResult> _completedAbout = new Queue<TrayActionResult>();
-    private readonly Queue<TrayActionResult> _failedActions = new Queue<TrayActionResult>();
+    private readonly Action _receiptReady;
+    private readonly Queue<UiWorkItem> _completedAbout = new Queue<UiWorkItem>();
+    private readonly Queue<UiWorkItem> _failedActions = new Queue<UiWorkItem>();
     private readonly Dictionary<Guid, PendingAction> _pendingActions = new Dictionary<Guid, PendingAction>();
     private readonly Queue<Guid> _recentActionOrder = new Queue<Guid>();
     private readonly HashSet<Guid> _recentActions = new HashSet<Guid>();
@@ -21,13 +29,18 @@ internal sealed class HostTransport : IDisposable
     private bool _menuOpen;
     private bool _disposed;
 
-    internal HostTransport() : this(null)
+    internal HostTransport() : this(null, null)
     {
     }
 
-    internal HostTransport(Action presentationReady)
+    internal HostTransport(Action presentationReady) : this(presentationReady, presentationReady)
+    {
+    }
+
+    internal HostTransport(Action presentationReady, Action receiptReady)
     {
         _presentationReady = presentationReady;
+        _receiptReady = receiptReady;
     }
 
     internal void SetMenuOpen(bool value)
@@ -108,8 +121,8 @@ internal sealed class HostTransport : IDisposable
     internal bool TryPublishDurableReceipt(TrayTerminalReceipt receipt)
     {
         if (receipt == null) { return false; }
-        bool notify = false;
-        bool accepted = false;
+        UiWorkItem work = null;
+        Action receiptReady = _receiptReady;
         lock (_gate)
         {
             if (_disposed || !receipt.TryClaimPublication(this)) { return false; }
@@ -117,48 +130,48 @@ internal sealed class HostTransport : IDisposable
             if (result.Status == TrayActionResultStatus.Completed && receipt.Command == TrayCommand.ShowAbout)
             {
                 if (_uiWorkCount >= 8) { return false; }
-                _completedAbout.Enqueue(result);
+                work = new UiWorkItem { Result = result, Ready = receiptReady == null };
+                _completedAbout.Enqueue(work);
                 _uiWorkCount++;
-                notify = true;
-                accepted = true;
             }
             else if (result.Status == TrayActionResultStatus.Rejected || result.Status == TrayActionResultStatus.Failed)
             {
                 if (_uiWorkCount >= 8) { return false; }
-                _failedActions.Enqueue(result);
+                work = new UiWorkItem { Result = result, Ready = receiptReady == null };
+                _failedActions.Enqueue(work);
                 _uiWorkCount++;
-                notify = true;
-                accepted = true;
-            }
-            else
-            {
-                accepted = true;
             }
         }
-        Action presentationReady = _presentationReady;
-        if (notify && presentationReady != null)
+        if (work == null || receiptReady == null) { return true; }
+        try { receiptReady(); }
+        catch
         {
-            try { presentationReady(); }
-            catch
-            {
-                DropUiWork(receipt.Result);
-                return false;
-            }
+            DropUiWork(work);
+            return false;
         }
-        return accepted;
+        bool repost;
+        lock (_gate)
+        {
+            if (_disposed) { return false; }
+            work.Ready = true;
+            repost = work.ProbeObserved;
+            work.ProbeObserved = false;
+        }
+        if (repost) { try { receiptReady(); } catch { } }
+        return true;
     }
 
-    private void DropUiWork(TrayActionResult target)
+    private void DropUiWork(UiWorkItem target)
     {
         if (target == null) { return; }
         lock (_gate)
         {
-            Queue<TrayActionResult> queue = target.Status == TrayActionResultStatus.Completed ? _completedAbout : _failedActions;
+            Queue<UiWorkItem> queue = target.Result.Status == TrayActionResultStatus.Completed ? _completedAbout : _failedActions;
             int count = queue.Count;
             bool removed = false;
             for (int index = 0; index < count; index++)
             {
-                TrayActionResult current = queue.Dequeue();
+                UiWorkItem current = queue.Dequeue();
                 if (!removed && Object.ReferenceEquals(current, target)) { removed = true; }
                 else { queue.Enqueue(current); }
             }
@@ -171,7 +184,9 @@ internal sealed class HostTransport : IDisposable
         lock (_gate)
         {
             if (_completedAbout.Count == 0) { result = null; return false; }
-            result = _completedAbout.Dequeue();
+            UiWorkItem work = _completedAbout.Peek();
+            if (!work.Ready) { work.ProbeObserved = true; result = null; return false; }
+            result = _completedAbout.Dequeue().Result;
             if (_uiWorkCount > 0) { _uiWorkCount--; }
             return true;
         }
@@ -182,7 +197,9 @@ internal sealed class HostTransport : IDisposable
         lock (_gate)
         {
             if (_failedActions.Count == 0) { result = null; return false; }
-            result = _failedActions.Dequeue();
+            UiWorkItem work = _failedActions.Peek();
+            if (!work.Ready) { work.ProbeObserved = true; result = null; return false; }
+            result = _failedActions.Dequeue().Result;
             if (_uiWorkCount > 0) { _uiWorkCount--; }
             return true;
         }

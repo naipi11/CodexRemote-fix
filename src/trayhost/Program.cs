@@ -39,10 +39,17 @@ internal static class Program
         PresentationSnapshot initial = TrayHostWire.ReadPresentation(initialFrame.Payload);
         Win32TrayPlatform platform = new Win32TrayPlatform();
         TrayHostApplication application = null;
+        TrayWindow window = null;
         TrayTerminalDiagnosticStore terminalStore = new TrayTerminalDiagnosticStore();
-        HostTransport transport = new HostTransport(delegate { TrayHostApplication current = application; if (current != null) { current.PostWork(); } });
+        HostTransport transport = new HostTransport(
+            delegate { TrayHostApplication current = application; if (current != null) { current.PostWork(); } },
+            delegate
+            {
+                TrayWindow current = window;
+                if (current == null || !Win32TrayPlatform.PostToWindow(current.OwnerHandle, TrayNativeConstants.WmApp + 2U)) { throw new InvalidOperationException("receipt UI callback failed"); }
+            });
         TrayTerminalReceiptSink receiptSink = new TrayTerminalReceiptSink(terminalStore.TryAppendDurably, transport.TryPublishDurableReceipt, terminalStore.Dispose);
-        TrayWindow window = new TrayWindow(platform, transport.SetMenuOpen);
+        window = new TrayWindow(platform, transport.SetMenuOpen);
         bool shutdownRequested = false; bool shutdownSent = false; object stateGate = new object();
         Action<TrayCommand, ulong> command = delegate(TrayCommand selected, ulong revision)
         {

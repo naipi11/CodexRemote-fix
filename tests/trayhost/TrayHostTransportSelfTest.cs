@@ -102,8 +102,9 @@ internal static class TrayHostTransportSelfTest
     private static void WaitUntil(Func<bool> condition, int milliseconds, string message)
     {
         Stopwatch elapsed = Stopwatch.StartNew();
-        while (!condition() && elapsed.ElapsedMilliseconds < milliseconds) { Thread.Sleep(5); }
-        AssertTrue(condition(), message);
+        bool satisfied = condition();
+        while (!satisfied && elapsed.ElapsedMilliseconds < milliseconds) { Thread.Sleep(5); satisfied = condition(); }
+        AssertTrue(satisfied, message);
     }
 
     private static PresentationSnapshot Snapshot(ulong revision)
@@ -269,8 +270,11 @@ internal static class TrayHostTransportSelfTest
                 store.Release();
                 WaitUntil(delegate { return Interlocked.CompareExchange(ref uiSignals, 0, 0) == 2; }, 2000, "both durable successes post exactly one work signal");
                 TrayActionResult firstUi; TrayActionResult followingUi; TrayActionResult none;
-                AssertTrue(host.TryTakeFailedAction(out firstUi) && firstUi.ActionId == firstId, "first durable receipt publishes its exact generic-feedback item");
-                AssertTrue(host.TryTakeCompletedAbout(out followingUi) && followingUi.ActionId == followingId, "following durable receipt publishes its exact About item");
+                firstUi = null; followingUi = null;
+                WaitUntil(delegate { return host.TryTakeFailedAction(out firstUi); }, 2000, "first durable receipt becomes visible after its callback succeeds");
+                WaitUntil(delegate { return host.TryTakeCompletedAbout(out followingUi); }, 2000, "following durable About becomes visible after its callback succeeds");
+                AssertTrue(firstUi.ActionId == firstId, "first durable receipt publishes its exact generic-feedback item");
+                AssertTrue(followingUi.ActionId == followingId, "following durable receipt publishes its exact About item");
                 AssertTrue(!host.TryTakeFailedAction(out none), "durable callbacks publish no duplicate feedback");
                 AssertTrue(store.WriterThreadCount == 1 && store.MaximumConcurrent == 1, "all blocked stages are serviced by exactly one non-overlapping writer");
             }
@@ -377,7 +381,9 @@ internal static class TrayHostTransportSelfTest
             store.Release();
             WaitUntil(delegate { return store.CompletedCount == 3 && Interlocked.CompareExchange(ref successfulSignals, 0, 0) == 1; }, 3000, "same writer continues through store and callback failures to a later success");
             TrayActionResult recovered; TrayActionResult extra;
-            AssertTrue(host.TryTakeFailedAction(out recovered) && recovered.ActionId == recoveredId, "only the later durable callback publishes generic feedback");
+            recovered = null;
+            WaitUntil(delegate { return host.TryTakeFailedAction(out recovered); }, 2000, "later durable callback makes its recovered feedback visible");
+            AssertTrue(recovered.ActionId == recoveredId, "only the later durable callback publishes generic feedback");
             AssertTrue(!host.TryTakeFailedAction(out extra), "store and callback failures publish no latent UI");
             AssertTrue(store.WriterThreadCount == 1 && store.MaximumConcurrent == 1, "recovery keeps the original single writer instead of starting a replacement");
         }
@@ -424,6 +430,71 @@ internal static class TrayHostTransportSelfTest
             AssertTrue(Interlocked.CompareExchange(ref signals, 0, 0) == 8, "only admitted UI items post application work");
         }
         finally { foreign.Dispose(); host.Dispose(); }
+    }
+
+    private static void TestFailingCallbackNeverExposesProvisionalUiWork()
+    {
+        ManualResetEvent callbackEntered = new ManualResetEvent(false);
+        ManualResetEvent releaseCallback = new ManualResetEvent(false);
+        HostTransport host = new HostTransport(delegate
+        {
+            callbackEntered.Set();
+            releaseCallback.WaitOne();
+            throw new InvalidOperationException("intentional UI callback failure");
+        });
+        try
+        {
+            TrayTerminalReceipt receipt = RegisterAndAcknowledgeFailure(host, Guid.NewGuid(), 29UL, "provisional callback-failure action");
+            bool published = true;
+            Thread publisher = new Thread((ThreadStart)delegate { published = host.TryPublishDurableReceipt(receipt); });
+            publisher.IsBackground = true; publisher.Start();
+            AssertTrue(callbackEntered.WaitOne(2000), "durable UI callback enters before failing");
+            TrayActionResult provisional = null; bool takeReturned = false; bool tookProvisional = true;
+            Thread taker = new Thread((ThreadStart)delegate { tookProvisional = host.TryTakeFailedAction(out provisional); takeReturned = true; });
+            taker.IsBackground = true; taker.Start();
+            AssertTrue(taker.Join(250) && takeReturned && !tookProvisional && provisional == null, "provisional UI work returns immediately but remains unavailable while callback outcome is unknown");
+            releaseCallback.Set();
+            AssertTrue(publisher.Join(2000) && !published, "throwing durable callback reports publication failure");
+            TrayActionResult none;
+            AssertTrue(!host.TryTakeFailedAction(out none), "callback failure leaves no latent generic UI work");
+        }
+        finally
+        {
+            releaseCallback.Set(); host.Dispose(); callbackEntered.Dispose(); releaseCallback.Dispose();
+        }
+    }
+
+    private static void TestSuccessfulCallbackRepostsAfterAnEarlyUiProbe()
+    {
+        ManualResetEvent callbackEntered = new ManualResetEvent(false);
+        ManualResetEvent releaseCallback = new ManualResetEvent(false);
+        int callbackCount = 0;
+        HostTransport host = new HostTransport(delegate
+        {
+            int call = Interlocked.Increment(ref callbackCount);
+            if (call == 1) { callbackEntered.Set(); releaseCallback.WaitOne(); }
+        });
+        try
+        {
+            Guid actionId = Guid.NewGuid();
+            TrayTerminalReceipt receipt = RegisterAndAcknowledgeFailure(host, actionId, 30UL, "early-probe durable action");
+            bool published = false;
+            Thread publisher = new Thread((ThreadStart)delegate { published = host.TryPublishDurableReceipt(receipt); });
+            publisher.IsBackground = true; publisher.Start();
+            AssertTrue(callbackEntered.WaitOne(2000), "first successful UI post is held before returning");
+            TrayActionResult early;
+            AssertTrue(!host.TryTakeFailedAction(out early), "work-message probe cannot consume provisional feedback");
+            releaseCallback.Set();
+            AssertTrue(publisher.Join(2000) && published, "durable publication succeeds after its first UI post returns");
+            AssertTrue(Interlocked.CompareExchange(ref callbackCount, 0, 0) == 2, "an early work-message probe causes one replacement UI post");
+            TrayActionResult ready; TrayActionResult none;
+            AssertTrue(host.TryTakeFailedAction(out ready) && ready.ActionId == actionId, "replacement post observes the now-ready durable feedback");
+            AssertTrue(!host.TryTakeFailedAction(out none), "replacement posting never duplicates the UI item");
+        }
+        finally
+        {
+            releaseCallback.Set(); host.Dispose(); callbackEntered.Dispose(); releaseCallback.Dispose();
+        }
     }
 
     private static void TestDisposalReturnsWhileStoreIsHungAndSuppressesLateCallbacks()
@@ -475,8 +546,10 @@ internal static class TrayHostTransportSelfTest
             TestNinthReceiptAndBusyAdmissionDropWithoutPendingOrUi();
             TestStoreAndCallbackFailuresRecoverOnTheSameWriter();
             TestDurableReceiptTrustAndSharedUiBound();
+            TestFailingCallbackNeverExposesProvisionalUiWork();
+            TestSuccessfulCallbackRepostsAfterAnEarlyUiProbe();
             TestDisposalReturnsWhileStoreIsHungAndSuppressesLateCallbacks();
-            Console.WriteLine("TrayHost transport self-tests passed: 10");
+            Console.WriteLine("TrayHost transport self-tests passed: 12");
             return 0;
         }
         catch (Exception error)
