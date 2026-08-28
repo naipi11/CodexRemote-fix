@@ -60,9 +60,59 @@ internal static class TrayHostNativeSelfTest
     private static void AssertTrue(bool value, string message) { if (!value) { throw new InvalidOperationException(message); } }
     private static void AssertEqual(string expected, string actual, string message) { if (!String.Equals(expected, actual, StringComparison.Ordinal)) { throw new InvalidOperationException(message + " expected=[" + expected + "] actual=[" + actual + "]"); } }
 
+    private static string ProductPath(string root)
+    {
+        return Path.Combine(root, "CodexControlOtherDevices");
+    }
+
+    private static string LogsPath(string root)
+    {
+        return Path.Combine(ProductPath(root), "logs");
+    }
+
+    private static string ReceiptDirectoryPath(string root)
+    {
+        return Path.Combine(LogsPath(root), "tray-receipts");
+    }
+
     private static string ReceiptPath(string root)
     {
-        return Path.Combine(root, "CodexControlOtherDevices", "logs", "trayhost-actions.log");
+        return Path.Combine(ReceiptDirectoryPath(root), "trayhost-actions.log");
+    }
+
+    private static string LegacyReceiptPath(string root)
+    {
+        return Path.Combine(LogsPath(root), "trayhost-actions.log");
+    }
+
+    private static void CreateCompatibilityParents(string root)
+    {
+        Directory.CreateDirectory(LogsPath(root));
+    }
+
+    private static void AssertPrivateReceiptDirectory(string path)
+    {
+        DirectorySecurity security = Directory.GetAccessControl(path);
+        SecurityIdentifier owner = security.GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
+        SecurityIdentifier current;
+        using (WindowsIdentity identity = WindowsIdentity.GetCurrent()) { current = identity.User; }
+        AssertTrue(security.AreAccessRulesProtected && owner != null && current != null && String.Equals(owner.Value, current.Value, StringComparison.Ordinal), "receipt child has a protected current-user owner/DACL");
+        HashSet<string> expected = new HashSet<string>(StringComparer.Ordinal) {
+            current.Value,
+            new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null).Value,
+            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null).Value
+        };
+        HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
+        AuthorizationRuleCollection rules = security.GetAccessRules(true, false, typeof(SecurityIdentifier));
+        AssertTrue(rules.Count == 3, "receipt child DACL contains exactly three explicit rules");
+        foreach (FileSystemAccessRule rule in rules)
+        {
+            SecurityIdentifier sid = rule.IdentityReference as SecurityIdentifier;
+            AssertTrue(sid != null && expected.Contains(sid.Value) && seen.Add(sid.Value), "receipt child DACL contains only current-user, SYSTEM, and Administrators rules");
+            AssertTrue(rule.AccessControlType == AccessControlType.Allow && rule.FileSystemRights == FileSystemRights.FullControl, "receipt child principals receive exact full control");
+            AssertTrue(rule.InheritanceFlags == (InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit) && rule.PropagationFlags == PropagationFlags.None, "receipt child private rules inherit to its fixed leaf");
+        }
+        AssertTrue(seen.Count == expected.Count, "receipt child DACL proves every required principal");
     }
 
     private static TrayTerminalDiagnosticStore TestStore(string root, Action directoryChainOpened, Action leafValidated)
@@ -258,6 +308,7 @@ internal static class TrayHostNativeSelfTest
     {
         string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
+        CreateCompatibilityParents(root);
         string path = ReceiptPath(root);
         try
         {
@@ -270,8 +321,31 @@ internal static class TrayHostNativeSelfTest
             AssertTrue(Convert.ToBase64String(expected) == Convert.ToBase64String(File.ReadAllBytes(path)), "terminal diagnostic file is exact UTF-8 without a BOM and contains only approved fields");
             string defaultPath;
             AssertTrue(TrayTerminalDiagnosticStore.TryGetDefaultPath(out defaultPath), "fixed production receipt path resolves");
-            string expectedDefaultPath = Path.GetFullPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexControlOtherDevices", "logs", "trayhost-actions.log"));
+            string expectedDefaultPath = Path.GetFullPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexControlOtherDevices", "logs", "tray-receipts", "trayhost-actions.log"));
             AssertTrue(String.Equals(expectedDefaultPath, defaultPath, StringComparison.OrdinalIgnoreCase), "production receipt path is fixed to the current user's exact LocalApplicationData leaf");
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    private static void TestTerminalDiagnosticStoreSupportsInheritedCompatibilityParentsAndCreatesPrivateChild()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-compat-" + Guid.NewGuid().ToString("N"));
+        string product = ProductPath(root); string logs = LogsPath(root); string receiptDirectory = ReceiptDirectoryPath(root);
+        string path = ReceiptPath(root); string legacyPath = LegacyReceiptPath(root);
+        byte[] legacySentinel = new byte[] { 0x42, 0x31, 0x37, 0x29 };
+        Directory.CreateDirectory(root); CreateCompatibilityParents(root); File.WriteAllBytes(legacyPath, legacySentinel);
+        try
+        {
+            AssertTrue(!Directory.GetAccessControl(product).AreAccessRulesProtected && !Directory.GetAccessControl(logs).AreAccessRulesProtected, "supported existing product/logs parents retain inherited ACLs");
+            TrayTerminalDiagnostic record = new TrayTerminalDiagnostic(TrayCommand.OpenLogs, 24UL, TrayActionResultStatus.Rejected, "CCOD_TRAY_ACTION_STALE");
+            using (TrayTerminalDiagnosticStore store = TestStore(root, null, null))
+            {
+                AssertTrue(store.TryAppendDurably(record), "inherited supported parents accept a durable receipt in the dedicated private child");
+            }
+            AssertPrivateReceiptDirectory(receiptDirectory);
+            byte[] expected = ReceiptBytes(TrayCommand.OpenLogs, 24UL, TrayActionResultStatus.Rejected, "CCOD_TRAY_ACTION_STALE");
+            AssertTrue(Convert.ToBase64String(expected) == Convert.ToBase64String(File.ReadAllBytes(path)), "compatible parent flow writes only the fixed dedicated receipt leaf");
+            AssertTrue(Convert.ToBase64String(legacySentinel) == Convert.ToBase64String(File.ReadAllBytes(legacyPath)), "legacy direct logs receipt leaf remains byte-identical and is never reused");
         }
         finally { try { Directory.Delete(root, true); } catch { } }
     }
@@ -282,24 +356,34 @@ internal static class TrayHostNativeSelfTest
         string outside = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-outside-" + Guid.NewGuid().ToString("N"));
         string outsideSentinel = Path.Combine(outside, "trayhost-actions.log");
         string path = ReceiptPath(root);
-        string logs = Path.GetDirectoryName(path);
+        string receiptDirectory = ReceiptDirectoryPath(root);
+        string logs = LogsPath(root);
         byte[] sentinel = new byte[] { 0x10, 0x22, 0x34, 0x46, 0x58, 0x6a };
-        Directory.CreateDirectory(root); Directory.CreateDirectory(outside); File.WriteAllBytes(outsideSentinel, sentinel);
+        Directory.CreateDirectory(root); CreateCompatibilityParents(root); Directory.CreateDirectory(outside); File.WriteAllBytes(outsideSentinel, sentinel);
         try
         {
             TrayTerminalDiagnostic record = new TrayTerminalDiagnostic(TrayCommand.OpenLogs, 1UL, TrayActionResultStatus.Rejected, "CCOD_TRAY_ACTION_STALE");
             using (TrayTerminalDiagnosticStore bootstrap = TestStore(root, null, null)) { AssertTrue(bootstrap.TryAppendDurably(record), "safe receipt directories are bootstrapped"); }
-            File.Delete(path); Directory.Delete(logs);
+            File.Delete(path); Directory.Delete(receiptDirectory);
 
+            Directory.Delete(logs);
             CreateJunction(logs, outside);
+            using (TrayTerminalDiagnosticStore reparseParent = TestStore(root, null, null))
+            {
+                AssertTrue(!reparseParent.TryAppendDurably(record), "a reparse compatibility logs parent is rejected before writing");
+            }
+            AssertTrue(Convert.ToBase64String(sentinel) == Convert.ToBase64String(File.ReadAllBytes(outsideSentinel)), "reparse compatibility parent cannot alter the outside sentinel");
+            DeleteJunction(logs); CreateCompatibilityParents(root);
+
+            CreateJunction(receiptDirectory, outside);
             using (TrayTerminalDiagnosticStore reparseDirectory = TestStore(root, null, null))
             {
-                AssertTrue(!reparseDirectory.TryAppendDurably(record), "a reparse logs directory is rejected before writing");
+                AssertTrue(!reparseDirectory.TryAppendDurably(record), "a reparse private receipt directory is rejected before writing");
             }
-            AssertTrue(Convert.ToBase64String(sentinel) == Convert.ToBase64String(File.ReadAllBytes(outsideSentinel)), "reparse directory cannot alter the outside sentinel");
-            DeleteJunction(logs);
+            AssertTrue(Convert.ToBase64String(sentinel) == Convert.ToBase64String(File.ReadAllBytes(outsideSentinel)), "reparse receipt directory cannot alter the outside sentinel");
+            DeleteJunction(receiptDirectory);
 
-            using (TrayTerminalDiagnosticStore restore = TestStore(root, null, null)) { AssertTrue(restore.TryAppendDurably(record), "safe logs directory is restored for leaf tests"); }
+            using (TrayTerminalDiagnosticStore restore = TestStore(root, null, null)) { AssertTrue(restore.TryAppendDurably(record), "safe private receipt directory is restored for leaf tests"); }
             File.Delete(path);
             CreateJunction(path, outside);
             using (TrayTerminalDiagnosticStore reparseLeaf = TestStore(root, null, null))
@@ -317,19 +401,19 @@ internal static class TrayHostNativeSelfTest
             AssertTrue(Convert.ToBase64String(sentinel) == Convert.ToBase64String(File.ReadAllBytes(outsideSentinel)), "hard-link leaf cannot alter the outside sentinel");
             File.Delete(path);
 
-            DirectorySecurity unsafeSecurity = Directory.GetAccessControl(logs);
+            DirectorySecurity unsafeSecurity = Directory.GetAccessControl(receiptDirectory);
             unsafeSecurity.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.WorldSid, null), FileSystemRights.FullControl, InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
-            Directory.SetAccessControl(logs, unsafeSecurity);
+            Directory.SetAccessControl(receiptDirectory, unsafeSecurity);
             using (TrayTerminalDiagnosticStore unsafeAcl = TestStore(root, null, null))
             {
-                AssertTrue(!unsafeAcl.TryAppendDurably(record), "an unexpected logs DACL is rejected before writing");
+                AssertTrue(!unsafeAcl.TryAppendDurably(record), "an unexpected private receipt-child DACL is rejected before writing");
             }
-            AssertTrue(!File.Exists(path), "unsafe directory ACL cannot create or write the receipt leaf");
-            AssertTrue(Convert.ToBase64String(sentinel) == Convert.ToBase64String(File.ReadAllBytes(outsideSentinel)), "unsafe directory ACL cannot alter the outside sentinel");
+            AssertTrue(!File.Exists(path), "unsafe receipt-child ACL cannot create or write the receipt leaf");
+            AssertTrue(Convert.ToBase64String(sentinel) == Convert.ToBase64String(File.ReadAllBytes(outsideSentinel)), "unsafe receipt-child ACL cannot alter the outside sentinel");
         }
         finally
         {
-            DeleteJunction(path); DeleteJunction(logs);
+            DeleteJunction(path); DeleteJunction(receiptDirectory); DeleteJunction(logs);
             try { Directory.Delete(root, true); } catch { }
             try { Directory.Delete(outside, true); } catch { }
         }
@@ -339,11 +423,11 @@ internal static class TrayHostNativeSelfTest
     {
         string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-pin-" + Guid.NewGuid().ToString("N"));
         string outside = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-pin-outside-" + Guid.NewGuid().ToString("N"));
-        string path = ReceiptPath(root); string logs = Path.GetDirectoryName(path); string displaced = logs + ".displaced";
+        string path = ReceiptPath(root); string logs = LogsPath(root); string displaced = logs + ".displaced";
         string outsideSentinel = Path.Combine(outside, "trayhost-actions.log");
         byte[] sentinel = new byte[] { 0x71, 0x72, 0x73, 0x74, 0x75 };
         bool barrierEntered = false; bool replacementSucceeded = false;
-        Directory.CreateDirectory(root); Directory.CreateDirectory(outside); File.WriteAllBytes(outsideSentinel, sentinel);
+        Directory.CreateDirectory(root); CreateCompatibilityParents(root); Directory.CreateDirectory(outside); File.WriteAllBytes(outsideSentinel, sentinel);
         try
         {
             TrayTerminalDiagnostic record = new TrayTerminalDiagnostic(TrayCommand.OpenLogs, 2UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED");
@@ -376,7 +460,7 @@ internal static class TrayHostNativeSelfTest
     private static void TestTerminalDiagnosticStoreRejectsConcurrentWriter()
     {
         string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-share-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(root); CreateCompatibilityParents(root);
         ManualResetEvent leafValidated = new ManualResetEvent(false); ManualResetEvent release = new ManualResetEvent(false);
         bool firstResult = false;
         try
@@ -402,7 +486,7 @@ internal static class TrayHostNativeSelfTest
     private static void TestTerminalDiagnosticStoreRejectsDirectoryLeafWithoutWriting()
     {
         string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-directory-leaf-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(root); string path = ReceiptPath(root);
+        Directory.CreateDirectory(root); CreateCompatibilityParents(root); string path = ReceiptPath(root);
         try
         {
             TrayTerminalDiagnostic record = new TrayTerminalDiagnostic(TrayCommand.OpenLogs, 5UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED");
@@ -420,7 +504,7 @@ internal static class TrayHostNativeSelfTest
     private static void TestTerminalDiagnosticStoreIsBoundedThroughValidatedHandle()
     {
         string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-bound-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(root); string path = ReceiptPath(root);
+        Directory.CreateDirectory(root); CreateCompatibilityParents(root); string path = ReceiptPath(root);
         try
         {
             TrayTerminalDiagnostic first = new TrayTerminalDiagnostic(TrayCommand.OpenLogs, 41UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED");
@@ -527,6 +611,7 @@ internal static class TrayHostNativeSelfTest
             TestAboutCommandDefersProofToSupervisor();
             TestVerifiedAboutUsesTheAcknowledgedSnapshotVersion();
             TestActionFailureUsesTheAcknowledgedSnapshotStrings();
+            TestTerminalDiagnosticStoreSupportsInheritedCompatibilityParentsAndCreatesPrivateChild();
             TestTerminalDiagnosticLogIsSanitizedAndReportsPersistence();
             TestTerminalDiagnosticStoreRejectsUnsafeObjectsAndProtectsOutsideSentinel();
             TestTerminalDiagnosticStorePinsDirectoryChainAgainstReplacement();
@@ -538,7 +623,7 @@ internal static class TrayHostNativeSelfTest
             TestShellRightClickNotificationMapping();
             TestRealNativePInvokeSurface();
             TestPostedWorkMessageDispatchesToItsOwnerWindow();
-            Console.WriteLine("TrayHost native self-tests passed: 21");
+            Console.WriteLine("TrayHost native self-tests passed: 22");
             return 0;
         }
         catch (Exception error)

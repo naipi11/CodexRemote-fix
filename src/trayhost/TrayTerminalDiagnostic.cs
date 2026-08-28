@@ -30,6 +30,7 @@ internal sealed class TrayTerminalDiagnosticStore : IDisposable
         internal string LocalRoot;
         internal string Product;
         internal string Logs;
+        internal string ReceiptDirectory;
         internal string Leaf;
     }
 
@@ -157,35 +158,38 @@ internal sealed class TrayTerminalDiagnosticStore : IDisposable
         using (SafeFileHandle local = OpenDirectory(paths.LocalRoot))
         {
             if (!IsExpectedDirectory(local, paths.LocalRoot, false)) { return false; }
-            if (!TryCreateChildDirectory(paths.Product)) { return false; }
             using (SafeFileHandle product = OpenDirectory(paths.Product))
             {
-                if (!IsExpectedDirectory(product, paths.Product, true)) { return false; }
-                if (!TryCreateChildDirectory(paths.Logs)) { return false; }
+                if (!IsExpectedDirectory(product, paths.Product, false)) { return false; }
                 using (SafeFileHandle logs = OpenDirectory(paths.Logs))
                 {
-                    if (!IsExpectedDirectory(logs, paths.Logs, true)) { return false; }
-#if TRAYHOST_SELF_TEST
-                    if (_testDirectoryChainOpened != null) { _testDirectoryChainOpened(); }
-#endif
-                    using (SafeFileHandle leaf = CreateFileW(paths.Leaf, GenericRead | GenericWrite | ReadControl, FileShareRead, IntPtr.Zero, OpenAlways, FileFlagOpenReparsePoint | FileFlagWriteThrough, IntPtr.Zero))
+                    if (!IsExpectedDirectory(logs, paths.Logs, false)) { return false; }
+                    if (!TryCreatePrivateReceiptDirectory(paths.ReceiptDirectory)) { return false; }
+                    using (SafeFileHandle receiptDirectory = OpenDirectory(paths.ReceiptDirectory))
                     {
-                        if (!IsExpectedLeaf(leaf, paths.Leaf)) { return false; }
+                        if (!IsExpectedDirectory(receiptDirectory, paths.ReceiptDirectory, true)) { return false; }
 #if TRAYHOST_SELF_TEST
-                        if (_testLeafValidated != null) { _testLeafValidated(); }
+                        if (_testDirectoryChainOpened != null) { _testDirectoryChainOpened(); }
 #endif
-                        using (FileStream stream = new FileStream(leaf, FileAccess.ReadWrite, 4096, false))
+                        using (SafeFileHandle leaf = CreateFileW(paths.Leaf, GenericRead | GenericWrite | ReadControl, FileShareRead, IntPtr.Zero, OpenAlways, FileFlagOpenReparsePoint | FileFlagWriteThrough, IntPtr.Zero))
                         {
-                            long length = stream.Length;
-                            if (length > MaximumBytes || length > MaximumBytes - bytes.LongLength)
+                            if (!IsExpectedLeaf(leaf, paths.Leaf)) { return false; }
+#if TRAYHOST_SELF_TEST
+                            if (_testLeafValidated != null) { _testLeafValidated(); }
+#endif
+                            using (FileStream stream = new FileStream(leaf, FileAccess.ReadWrite, 4096, false))
                             {
-                                stream.SetLength(0L);
-                                stream.Position = 0L;
+                                long length = stream.Length;
+                                if (length > MaximumBytes || length > MaximumBytes - bytes.LongLength)
+                                {
+                                    stream.SetLength(0L);
+                                    stream.Position = 0L;
+                                }
+                                else { stream.Position = length; }
+                                stream.Write(bytes, 0, bytes.Length);
+                                stream.Flush(true);
+                                return true;
                             }
-                            else { stream.Position = length; }
-                            stream.Write(bytes, 0, bytes.Length);
-                            stream.Flush(true);
-                            return true;
                         }
                     }
                 }
@@ -201,11 +205,12 @@ internal sealed class TrayTerminalDiagnosticStore : IDisposable
         if (String.IsNullOrEmpty(canonicalRoot)) { return false; }
         string product = NormalizePath(Path.Combine(canonicalRoot, "CodexControlOtherDevices"));
         string logs = NormalizePath(Path.Combine(product, "logs"));
-        string leaf = NormalizePath(Path.Combine(logs, "trayhost-actions.log"));
-        if (String.IsNullOrEmpty(product) || String.IsNullOrEmpty(logs) || String.IsNullOrEmpty(leaf)) { return false; }
-        if (!String.Equals(Path.GetDirectoryName(product), canonicalRoot, StringComparison.OrdinalIgnoreCase) || !String.Equals(Path.GetDirectoryName(logs), product, StringComparison.OrdinalIgnoreCase) || !String.Equals(Path.GetDirectoryName(leaf), logs, StringComparison.OrdinalIgnoreCase)) { return false; }
-        if (!String.Equals(Path.GetFileName(product), "CodexControlOtherDevices", StringComparison.Ordinal) || !String.Equals(Path.GetFileName(logs), "logs", StringComparison.Ordinal) || !String.Equals(Path.GetFileName(leaf), "trayhost-actions.log", StringComparison.Ordinal) || Path.GetFileName(leaf).IndexOf(':') >= 0) { return false; }
-        paths = new ReceiptPaths { LocalRoot = canonicalRoot, Product = product, Logs = logs, Leaf = leaf };
+        string receiptDirectory = NormalizePath(Path.Combine(logs, "tray-receipts"));
+        string leaf = NormalizePath(Path.Combine(receiptDirectory, "trayhost-actions.log"));
+        if (String.IsNullOrEmpty(product) || String.IsNullOrEmpty(logs) || String.IsNullOrEmpty(receiptDirectory) || String.IsNullOrEmpty(leaf)) { return false; }
+        if (!String.Equals(Path.GetDirectoryName(product), canonicalRoot, StringComparison.OrdinalIgnoreCase) || !String.Equals(Path.GetDirectoryName(logs), product, StringComparison.OrdinalIgnoreCase) || !String.Equals(Path.GetDirectoryName(receiptDirectory), logs, StringComparison.OrdinalIgnoreCase) || !String.Equals(Path.GetDirectoryName(leaf), receiptDirectory, StringComparison.OrdinalIgnoreCase)) { return false; }
+        if (!String.Equals(Path.GetFileName(product), "CodexControlOtherDevices", StringComparison.Ordinal) || !String.Equals(Path.GetFileName(logs), "logs", StringComparison.Ordinal) || !String.Equals(Path.GetFileName(receiptDirectory), "tray-receipts", StringComparison.Ordinal) || !String.Equals(Path.GetFileName(leaf), "trayhost-actions.log", StringComparison.Ordinal) || Path.GetFileName(leaf).IndexOf(':') >= 0) { return false; }
+        paths = new ReceiptPaths { LocalRoot = canonicalRoot, Product = product, Logs = logs, ReceiptDirectory = receiptDirectory, Leaf = leaf };
         return true;
     }
 
@@ -221,7 +226,7 @@ internal sealed class TrayTerminalDiagnosticStore : IDisposable
         catch { return null; }
     }
 
-    private static bool TryCreateChildDirectory(string path)
+    private static bool TryCreatePrivateReceiptDirectory(string path)
     {
         try
         {
