@@ -304,6 +304,35 @@ internal static class TrayHostNativeSelfTest
         window.Dispose();
     }
 
+    private static void TestDurableNativeReceiptAuthorizesGenericFeedbackOnce()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-native-feedback-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root); CreateCompatibilityParents(root);
+        FakeTrayPlatform platform = new FakeTrayPlatform(); TrayWindow window = new TrayWindow(platform); window.Create(SnapshotV2(1));
+        HostTransport transport = new HostTransport();
+        TrayTerminalDiagnosticStore store = TestStore(root, null, null);
+        TrayTerminalReceiptSink sink = new TrayTerminalReceiptSink(store.TryAppendDurably, transport.TryPublishDurableReceipt);
+        try
+        {
+            Guid actionId = Guid.NewGuid(); TrayTerminalReceipt receipt;
+            AssertTrue(transport.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.OpenLogs, 1UL)), "native durable-feedback action registers");
+            AssertTrue(transport.TryAcknowledgeAction(new TrayActionResult(actionId, 1UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null), out receipt) && receipt != null, "native durable-feedback action returns one typed receipt");
+            TrayActionResult feedback;
+            AssertTrue(!transport.TryTakeFailedAction(out feedback) && platform.MessageBoxes.Count == 0, "native generic feedback is unavailable before durable receipt success");
+            AssertTrue(sink.TrySubmit(receipt), "native receipt enters the asynchronous sink");
+            Stopwatch elapsed = Stopwatch.StartNew();
+            while (!transport.TryTakeFailedAction(out feedback) && elapsed.ElapsedMilliseconds < 3000L) { Thread.Sleep(5); }
+            AssertTrue(feedback != null && feedback.ActionId == actionId, "handle-pinned durable success authorizes the exact native feedback item");
+            window.ShowActionFailed();
+            AssertTrue(platform.MessageBoxes.Count == 1, "durable native receipt displays generic feedback exactly once");
+            AssertTrue(!transport.TryTakeFailedAction(out feedback), "durable native feedback has no duplicate queue item");
+        }
+        finally
+        {
+            sink.Dispose(); transport.Dispose(); window.Dispose(); store.Dispose(); try { Directory.Delete(root, true); } catch { }
+        }
+    }
+
     private static void TestTerminalDiagnosticLogIsSanitizedAndReportsPersistence()
     {
         string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-" + Guid.NewGuid().ToString("N"));
@@ -611,6 +640,7 @@ internal static class TrayHostNativeSelfTest
             TestAboutCommandDefersProofToSupervisor();
             TestVerifiedAboutUsesTheAcknowledgedSnapshotVersion();
             TestActionFailureUsesTheAcknowledgedSnapshotStrings();
+            TestDurableNativeReceiptAuthorizesGenericFeedbackOnce();
             TestTerminalDiagnosticStoreSupportsInheritedCompatibilityParentsAndCreatesPrivateChild();
             TestTerminalDiagnosticLogIsSanitizedAndReportsPersistence();
             TestTerminalDiagnosticStoreRejectsUnsafeObjectsAndProtectsOutsideSentinel();
@@ -623,7 +653,7 @@ internal static class TrayHostNativeSelfTest
             TestShellRightClickNotificationMapping();
             TestRealNativePInvokeSurface();
             TestPostedWorkMessageDispatchesToItsOwnerWindow();
-            Console.WriteLine("TrayHost native self-tests passed: 22");
+            Console.WriteLine("TrayHost native self-tests passed: 23");
             return 0;
         }
         catch (Exception error)

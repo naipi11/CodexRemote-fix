@@ -81,26 +81,31 @@ internal static class TrayHostParentClientSelfTest
         {
             Guid actionId = Guid.Parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
             TrayHostAction action = new TrayHostAction(actionId, TrayCommand.OpenLogs, staleAction ? 8UL : 1UL);
-            HostTransport host = new HostTransport(null, delegate(TrayTerminalDiagnostic record) { return true; });
+            ManualResetEvent receiptPersisted = new ManualResetEvent(false);
+            HostTransport host = new HostTransport();
+            TrayTerminalReceiptSink receiptSink = new TrayTerminalReceiptSink(delegate(TrayTerminalDiagnostic record) { receiptPersisted.Set(); return true; }, host.TryPublishDurableReceipt);
             ProductionTraceTrayPlatform tracePlatform = new ProductionTraceTrayPlatform();
             TrayWindow traceWindow = new TrayWindow(tracePlatform); traceWindow.Create(Snapshot(1UL));
             AssertTrue(host.TryRegisterAction(action), "program peer registers the exact outbound action");
             ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.Action, epoch, outboundSequence++, TrayHostWire.WriteAction(action)), keys.HostToParent);
             ProtocolFrame terminalFrame = ProtocolCodec.ReadAuthenticated(input, ProtocolDirection.ParentToHost, epoch, inboundSequence++, keys.ParentToHost);
             AssertTrue(terminalFrame.MessageType == TrayHostMessageType.ActionResult, "program peer receives one authenticated terminal result");
-            AssertTrue(Program.TryDispatchAuthenticatedActionResult(host, terminalFrame.Payload), "production Program dispatch accepts the correlated authenticated result");
+            AssertTrue(Program.TryDispatchAuthenticatedActionResult(host, receiptSink, terminalFrame.Payload), "production Program dispatch accepts the correlated authenticated result without waiting for receipt storage");
             TrayActionResult feedback;
             if (staleAction)
             {
-                AssertTrue(host.TryTakeFailedAction(out feedback) && feedback.Revision == 8UL && feedback.Status == TrayActionResultStatus.Rejected && String.Equals(feedback.ErrorCode, "CCOD_TRAY_ACTION_STALE", StringComparison.Ordinal), "stale authenticated result reaches the production generic-feedback queue with its exact code");
+                Stopwatch feedbackWait = Stopwatch.StartNew();
+                while (!host.TryTakeFailedAction(out feedback) && feedbackWait.ElapsedMilliseconds < 3000L) { Thread.Sleep(5); }
+                AssertTrue(feedback != null && feedback.Revision == 8UL && feedback.Status == TrayActionResultStatus.Rejected && String.Equals(feedback.ErrorCode, "CCOD_TRAY_ACTION_STALE", StringComparison.Ordinal), "stale authenticated result reaches the production generic-feedback queue only after its durable callback");
                 traceWindow.ShowActionFailed();
                 AssertTrue(String.Equals(tracePlatform.Message, "string-0|string-15", StringComparison.Ordinal), "stale production trace collapses internal details to the generic acknowledged-snapshot dialog");
             }
             else
             {
+                AssertTrue(receiptPersisted.WaitOne(3000), "completed current action reaches durable receipt storage asynchronously");
                 AssertTrue(!host.TryTakeFailedAction(out feedback) && tracePlatform.Message == null, "completed current action produces no generic failure feedback");
             }
-            traceWindow.Dispose(); host.Dispose();
+            receiptSink.Dispose(); traceWindow.Dispose(); host.Dispose(); receiptPersisted.Dispose();
             return;
         }
         if (emitFaultAndIgnoreShutdown)

@@ -1,11 +1,86 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Reflection;
 using System.Threading;
 
 internal static class TrayHostTransportSelfTest
 {
-    private static bool PersistTerminal(TrayTerminalDiagnostic record) { return true; }
+    private enum ReceiptStoreBlockStage
+    {
+        None = 0,
+        BeforeOpen = 1,
+        DuringWrite = 2,
+        DuringFlush = 3
+    }
+
+    private sealed class ControllableReceiptStore : IDisposable
+    {
+        private readonly object _gate = new object();
+        private readonly ReceiptStoreBlockStage _blockStage;
+        private readonly Queue<int> _outcomes = new Queue<int>();
+        private readonly HashSet<int> _writerThreads = new HashSet<int>();
+        private readonly ManualResetEvent _entered = new ManualResetEvent(false);
+        private readonly ManualResetEvent _release = new ManualResetEvent(false);
+        private int _active;
+        private int _callCount;
+        private int _completedCount;
+        private int _maximumConcurrent;
+
+        internal ControllableReceiptStore(ReceiptStoreBlockStage blockStage, params int[] outcomes)
+        {
+            _blockStage = blockStage;
+            if (outcomes != null) { for (int index = 0; index < outcomes.Length; index++) { _outcomes.Enqueue(outcomes[index]); } }
+        }
+
+        internal bool TryAppendDurably(TrayTerminalDiagnostic record)
+        {
+            if (record == null) { return false; }
+            int call = Interlocked.Increment(ref _callCount);
+            int active = Interlocked.Increment(ref _active);
+            lock (_gate)
+            {
+                _writerThreads.Add(Thread.CurrentThread.ManagedThreadId);
+                if (active > _maximumConcurrent) { _maximumConcurrent = active; }
+            }
+            try
+            {
+                BlockAt(call, ReceiptStoreBlockStage.BeforeOpen);
+                BlockAt(call, ReceiptStoreBlockStage.DuringWrite);
+                BlockAt(call, ReceiptStoreBlockStage.DuringFlush);
+                int outcome = 1;
+                lock (_gate) { if (_outcomes.Count != 0) { outcome = _outcomes.Dequeue(); } }
+                if (outcome < 0) { throw new InvalidOperationException("intentional receipt-store failure"); }
+                return outcome > 0;
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _active);
+                Interlocked.Increment(ref _completedCount);
+            }
+        }
+
+        internal bool WaitUntilBlocked(int milliseconds) { return _entered.WaitOne(milliseconds); }
+        internal void Release() { _release.Set(); }
+        internal int CallCount { get { return Interlocked.CompareExchange(ref _callCount, 0, 0); } }
+        internal int CompletedCount { get { return Interlocked.CompareExchange(ref _completedCount, 0, 0); } }
+        internal int MaximumConcurrent { get { lock (_gate) { return _maximumConcurrent; } } }
+        internal int WriterThreadCount { get { lock (_gate) { return _writerThreads.Count; } } }
+
+        private void BlockAt(int call, ReceiptStoreBlockStage stage)
+        {
+            if (call != 1 || _blockStage != stage) { return; }
+            _entered.Set();
+            _release.WaitOne();
+        }
+
+        public void Dispose()
+        {
+            _release.Set();
+            _entered.Dispose();
+            _release.Dispose();
+        }
+    }
 
     private static void AssertTrue(bool value, string message)
     {
@@ -19,11 +94,46 @@ internal static class TrayHostTransportSelfTest
         AssertTrue(threw, message);
     }
 
+    private static void AssertReturnsQuickly(Stopwatch elapsed, string message)
+    {
+        AssertTrue(elapsed.Elapsed < TimeSpan.FromMilliseconds(250), message + " elapsedMs=" + elapsed.ElapsedMilliseconds.ToString());
+    }
+
+    private static void WaitUntil(Func<bool> condition, int milliseconds, string message)
+    {
+        Stopwatch elapsed = Stopwatch.StartNew();
+        while (!condition() && elapsed.ElapsedMilliseconds < milliseconds) { Thread.Sleep(5); }
+        AssertTrue(condition(), message);
+    }
+
     private static PresentationSnapshot Snapshot(ulong revision)
     {
         string[] strings = new string[16];
         for (int i = 0; i < strings.Length; i++) { strings[i] = "string-" + i; }
         return new PresentationSnapshot(revision, TrayColor.Green, ConnectionState.Connected, ProtectionState.Running, LanguageMode.Chinese, PresentationFlags.OpenLogsEnabled, strings);
+    }
+
+    private static bool TryAcknowledge(HostTransport host, TrayActionResult result)
+    {
+        TrayTerminalReceipt ignored;
+        return host.TryAcknowledgeAction(result, out ignored);
+    }
+
+    private static TrayTerminalReceipt AcknowledgeTerminalQuickly(HostTransport host, TrayActionResult result, string message)
+    {
+        TrayTerminalReceipt receipt;
+        Stopwatch elapsed = Stopwatch.StartNew();
+        bool accepted = host.TryAcknowledgeAction(result, out receipt);
+        elapsed.Stop();
+        AssertTrue(accepted && receipt != null, message + " is correlated into a typed receipt");
+        AssertReturnsQuickly(elapsed, message + " never waits for receipt storage");
+        return receipt;
+    }
+
+    private static TrayTerminalReceipt RegisterAndAcknowledgeFailure(HostTransport host, Guid actionId, ulong revision, string message)
+    {
+        AssertTrue(host.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.OpenLogs, revision)), message + " registers");
+        return AcknowledgeTerminalQuickly(host, new TrayActionResult(actionId, revision, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null), message);
     }
 
     private static void TestParentLatestAndReservedControl()
@@ -69,12 +179,12 @@ internal static class TrayHostTransportSelfTest
         Guid actionId = Guid.NewGuid();
         AssertTrue(transport.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.OpenLogs, 2UL)), "first action accepted");
         AssertTrue(!transport.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.OpenLogs, 2UL)), "replayed action id is rejected");
-        AssertTrue(transport.TryAcknowledgeAction(new TrayActionResult(actionId, 2UL, TrayActionResultStatus.Completed, null, null)), "terminal non-lifecycle result clears the pending action");
+        AssertTrue(TryAcknowledge(transport, new TrayActionResult(actionId, 2UL, TrayActionResultStatus.Completed, null, null)), "terminal non-lifecycle result clears the pending action");
         for (int i = 0; i < 63; i++)
         {
             Guid next = Guid.NewGuid();
             AssertTrue(transport.TryRegisterAction(new TrayHostAction(next, TrayCommand.OpenLogs, 2UL)), "replay cache accepts distinct ids");
-            AssertTrue(transport.TryAcknowledgeAction(new TrayActionResult(next, 2UL, TrayActionResultStatus.Completed, null, null)), "terminal non-lifecycle result drains independently");
+            AssertTrue(TryAcknowledge(transport, new TrayActionResult(next, 2UL, TrayActionResultStatus.Completed, null, null)), "terminal non-lifecycle result drains independently");
         }
         AssertTrue(!transport.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.OpenLogs, 2UL)), "the 64-entry replay cache rejects a replayed id");
         transport.Dispose();
@@ -97,17 +207,18 @@ internal static class TrayHostTransportSelfTest
         Guid actionId = Guid.NewGuid(); Guid transactionId = Guid.Parse("11111111-2222-3333-4444-555555555555");
         HostTransport host = new HostTransport();
         AssertTrue(host.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.CheckAndRepair, 12UL)), "host registers one v2 lifecycle action");
-        AssertTrue(!host.TryAcknowledgeAction(new TrayActionResult(actionId, 12UL, TrayActionResultStatus.Accepted, null, null)), "lifecycle accepted result requires its durable transaction id");
+        AssertTrue(!TryAcknowledge(host, new TrayActionResult(actionId, 12UL, TrayActionResultStatus.Accepted, null, null)), "lifecycle accepted result requires its durable transaction id");
         TrayActionResult accepted = new TrayActionResult(actionId, 12UL, TrayActionResultStatus.Accepted, null, transactionId);
-        AssertTrue(host.TryAcknowledgeAction(accepted), "host accepts the correlated accepted result");
-        AssertTrue(!host.TryAcknowledgeAction(accepted), "host rejects a duplicate accepted result");
-        AssertTrue(!host.TryAcknowledgeAction(new TrayActionResult(Guid.NewGuid(), 12UL, TrayActionResultStatus.Completed, null, transactionId)), "host rejects a result for an unknown action id");
-        AssertTrue(!host.TryAcknowledgeAction(new TrayActionResult(actionId, 99UL, TrayActionResultStatus.Completed, null, transactionId)), "host rejects a result with the wrong revision");
-        AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(actionId, 12UL, TrayActionResultStatus.Completed, null, transactionId)), "host accepts the correlated terminal result after accepted");
-        AssertTrue(!host.TryAcknowledgeAction(new TrayActionResult(actionId, 12UL, TrayActionResultStatus.Completed, null, transactionId)), "host rejects a double terminal result");
+        TrayTerminalReceipt terminal;
+        AssertTrue(host.TryAcknowledgeAction(accepted, out terminal) && terminal == null, "host accepts the correlated nonterminal accepted result without a receipt");
+        AssertTrue(!TryAcknowledge(host, accepted), "host rejects a duplicate accepted result");
+        AssertTrue(!TryAcknowledge(host, new TrayActionResult(Guid.NewGuid(), 12UL, TrayActionResultStatus.Completed, null, transactionId)), "host rejects a result for an unknown action id");
+        AssertTrue(!TryAcknowledge(host, new TrayActionResult(actionId, 99UL, TrayActionResultStatus.Completed, null, transactionId)), "host rejects a result with the wrong revision");
+        AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(actionId, 12UL, TrayActionResultStatus.Completed, null, transactionId), out terminal) && terminal != null, "host returns the correlated terminal receipt after accepted");
+        AssertTrue(!TryAcknowledge(host, new TrayActionResult(actionId, 12UL, TrayActionResultStatus.Completed, null, transactionId)), "host rejects a double terminal result");
         Guid prematureId = Guid.NewGuid();
         AssertTrue(host.TryRegisterAction(new TrayHostAction(prematureId, TrayCommand.CheckAndRepair, 13UL)), "second lifecycle action registers");
-        AssertTrue(!host.TryAcknowledgeAction(new TrayActionResult(prematureId, 13UL, TrayActionResultStatus.Completed, null, null)), "lifecycle completion before accepted is rejected");
+        AssertTrue(!TryAcknowledge(host, new TrayActionResult(prematureId, 13UL, TrayActionResultStatus.Completed, null, null)), "lifecycle completion before accepted is rejected");
         AssertThrows(delegate { new TrayActionResult(Guid.NewGuid(), 1UL, TrayActionResultStatus.Rejected, "not-canonical", null); }, "invalid action result error code is rejected");
         AssertThrows(delegate { new TrayActionResult(Guid.NewGuid(), 1UL, TrayActionResultStatus.Completed, null, Guid.Empty); }, "empty action result transaction id is rejected");
         host.Dispose();
@@ -126,113 +237,228 @@ internal static class TrayHostTransportSelfTest
         parent.Dispose();
     }
 
-    private static void TestAcknowledgedAboutQueuesOneUiWorkItem()
+    private static void TestBlockedReceiptStagesNeverBlockCorrelationOrUi()
     {
-        HostTransport host = new HostTransport(null, PersistTerminal); Guid actionId = Guid.NewGuid();
-        AssertTrue(host.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.ShowAbout, 14UL)), "About action registers");
-        AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(actionId, 14UL, TrayActionResultStatus.Completed, null, null)), "verified About completion is accepted");
-        TrayActionResult result;
-        AssertTrue(host.TryTakeCompletedAbout(out result) && result.ActionId == actionId && result.Status == TrayActionResultStatus.Completed, "verified About completion queues one UI work item");
-        AssertTrue(!host.TryTakeCompletedAbout(out result), "About UI work item is consumed exactly once");
-        host.Dispose();
-    }
-
-    private static void TestRejectedAndFailedActionsQueueUserFeedback()
-    {
-        HostTransport host = new HostTransport(null, PersistTerminal);
-        Guid rejectedId = Guid.NewGuid(); Guid failedId = Guid.NewGuid();
-        AssertTrue(host.TryRegisterAction(new TrayHostAction(rejectedId, TrayCommand.OpenLogs, 20UL)), "rejected action registers");
-        AssertTrue(host.TryRegisterAction(new TrayHostAction(failedId, TrayCommand.SetLanguageEnglish, 20UL)), "failed action registers");
-        AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(rejectedId, 20UL, TrayActionResultStatus.Rejected, "CCOD_TRAY_ACTION_UNAVAILABLE", null)), "correlated rejected result is accepted");
-        AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(failedId, 20UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null)), "correlated failed result is accepted");
-        TrayActionResult first; TrayActionResult second; TrayActionResult none;
-        AssertTrue(host.TryTakeFailedAction(out first) && first.ActionId == rejectedId && first.Revision == 20UL && first.Status == TrayActionResultStatus.Rejected && String.Equals(first.ErrorCode, "CCOD_TRAY_ACTION_UNAVAILABLE", StringComparison.Ordinal), "rejected result preserves its exact correlated terminal record before generic feedback");
-        AssertTrue(host.TryTakeFailedAction(out second) && second.ActionId == failedId && second.Revision == 20UL && second.Status == TrayActionResultStatus.Failed && String.Equals(second.ErrorCode, "CCOD_TRAY_ACTION_FAILED", StringComparison.Ordinal), "failed result preserves its exact correlated terminal record before generic feedback");
-        AssertTrue(!host.TryTakeFailedAction(out none), "each terminal failure queues feedback exactly once");
-        host.Dispose();
-    }
-
-    private static void TestUndisplayedActionFailureFeedbackIsBounded()
-    {
-        HostTransport host = new HostTransport(null, PersistTerminal);
-        for (int index = 0; index < 9; index++)
+        ReceiptStoreBlockStage[] stages = new ReceiptStoreBlockStage[] { ReceiptStoreBlockStage.BeforeOpen, ReceiptStoreBlockStage.DuringWrite, ReceiptStoreBlockStage.DuringFlush };
+        for (int stageIndex = 0; stageIndex < stages.Length; stageIndex++)
         {
-            Guid actionId = Guid.NewGuid();
-            AssertTrue(host.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.OpenLogs, 21UL)), "terminal failure releases pending action capacity");
-            bool accepted = host.TryAcknowledgeAction(new TrayActionResult(actionId, 21UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null));
-            AssertTrue(accepted, "bounded undisplayed feedback never strands an authenticated terminal action");
+            ControllableReceiptStore store = new ControllableReceiptStore(stages[stageIndex], 1, 1);
+            int uiSignals = 0;
+            HostTransport host = new HostTransport(delegate { Interlocked.Increment(ref uiSignals); });
+            TrayTerminalReceiptSink sink = new TrayTerminalReceiptSink(store.TryAppendDurably, host.TryPublishDurableReceipt);
+            try
+            {
+                Guid firstId = Guid.NewGuid(); Guid followingId = Guid.NewGuid();
+                TrayTerminalReceipt first = RegisterAndAcknowledgeFailure(host, firstId, 24UL, stages[stageIndex].ToString() + " current terminal result");
+                Stopwatch firstSubmit = Stopwatch.StartNew(); bool firstAdmitted = sink.TrySubmit(first); firstSubmit.Stop();
+                AssertTrue(firstAdmitted, "current receipt is admitted before the fake store blocks " + stages[stageIndex].ToString());
+                AssertReturnsQuickly(firstSubmit, "current receipt admission is zero-wait");
+                AssertTrue(store.WaitUntilBlocked(2000), "fake store reaches " + stages[stageIndex].ToString());
+
+                AssertTrue(host.TryRegisterAction(new TrayHostAction(followingId, TrayCommand.ShowAbout, 24UL)), stages[stageIndex].ToString() + " following About action registers");
+                TrayTerminalReceipt following = AcknowledgeTerminalQuickly(host, new TrayActionResult(followingId, 24UL, TrayActionResultStatus.Completed, null, null), stages[stageIndex].ToString() + " following About terminal result");
+                Stopwatch followingSubmit = Stopwatch.StartNew(); bool followingAdmitted = sink.TrySubmit(following); followingSubmit.Stop();
+                AssertTrue(followingAdmitted, "following receipt is admitted while the store is blocked " + stages[stageIndex].ToString());
+                AssertReturnsQuickly(followingSubmit, "following receipt admission never waits for the current store operation");
+                TrayTerminalReceipt duplicate;
+                AssertTrue(!host.TryAcknowledgeAction(new TrayActionResult(firstId, 24UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null), out duplicate), "current terminal action is removed before sink submission");
+                AssertTrue(!host.TryAcknowledgeAction(new TrayActionResult(followingId, 24UL, TrayActionResultStatus.Completed, null, null), out duplicate), "following terminal action is removed before sink submission");
+                TrayActionResult prematureFailure; TrayActionResult prematureAbout;
+                AssertTrue(!host.TryTakeFailedAction(out prematureFailure) && !host.TryTakeCompletedAbout(out prematureAbout) && Interlocked.CompareExchange(ref uiSignals, 0, 0) == 0, "blocked store exposes no generic or About UI work before durable success");
+
+                store.Release();
+                WaitUntil(delegate { return Interlocked.CompareExchange(ref uiSignals, 0, 0) == 2; }, 2000, "both durable successes post exactly one work signal");
+                TrayActionResult firstUi; TrayActionResult followingUi; TrayActionResult none;
+                AssertTrue(host.TryTakeFailedAction(out firstUi) && firstUi.ActionId == firstId, "first durable receipt publishes its exact generic-feedback item");
+                AssertTrue(host.TryTakeCompletedAbout(out followingUi) && followingUi.ActionId == followingId, "following durable receipt publishes its exact About item");
+                AssertTrue(!host.TryTakeFailedAction(out none), "durable callbacks publish no duplicate feedback");
+                AssertTrue(store.WriterThreadCount == 1 && store.MaximumConcurrent == 1, "all blocked stages are serviced by exactly one non-overlapping writer");
+            }
+            finally
+            {
+                store.Release();
+                sink.Dispose();
+                host.Dispose();
+                store.Dispose();
+            }
         }
-        host.Dispose();
     }
 
-    private static void TestTerminalDiagnosticFailureNeverStrandsPendingActions()
+    private static void TestNinthReceiptAndBusyAdmissionDropWithoutPendingOrUi()
     {
-        HostTransport missingWriter = new HostTransport();
-        Guid missingWriterId = Guid.NewGuid();
-        AssertTrue(missingWriter.TryRegisterAction(new TrayHostAction(missingWriterId, TrayCommand.OpenLogs, 22UL)), "action registers without a diagnostic writer");
-        AssertTrue(missingWriter.TryAcknowledgeAction(new TrayActionResult(missingWriterId, 22UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null)), "missing diagnostic writer still releases the authenticated terminal action");
-        TrayActionResult missingWriterFeedback;
-        AssertTrue(!missingWriter.TryTakeFailedAction(out missingWriterFeedback), "missing diagnostic writer cannot authorize generic feedback");
-        missingWriter.Dispose();
-
-        bool persist = false;
-        List<TrayTerminalDiagnostic> records = new List<TrayTerminalDiagnostic>();
-        HostTransport host = new HostTransport(null, delegate(TrayTerminalDiagnostic record) { records.Add(record); return persist; });
-        for (int index = 0; index < 10; index++)
-        {
-            Guid actionId = Guid.NewGuid();
-            AssertTrue(host.TryRegisterAction(new TrayHostAction(actionId, TrayCommand.OpenLogs, 22UL)), "diagnostic failure never consumes pending-action capacity");
-            AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(actionId, 22UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null)), "authenticated terminal result releases its pending action even when local persistence fails");
-            TrayActionResult suppressed;
-            AssertTrue(!host.TryTakeFailedAction(out suppressed), "generic feedback is suppressed when its local terminal diagnostic did not persist");
-        }
-        persist = true;
-        Guid recoveredId = Guid.NewGuid();
-        AssertTrue(host.TryRegisterAction(new TrayHostAction(recoveredId, TrayCommand.OpenLogs, 22UL)), "new action registers after repeated diagnostic failures");
-        AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(recoveredId, 22UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null)), "recovered diagnostic persistence accepts a new terminal result");
-        TrayActionResult recoveredFeedback;
-        AssertTrue(host.TryTakeFailedAction(out recoveredFeedback) && recoveredFeedback.ActionId == recoveredId, "generic feedback resumes only after local terminal persistence recovers");
-        Guid completedId = Guid.NewGuid();
-        AssertTrue(host.TryRegisterAction(new TrayHostAction(completedId, TrayCommand.OpenLogs, 22UL)), "post-recovery command can still register");
-        AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(completedId, 22UL, TrayActionResultStatus.Completed, null, null)), "post-recovery command can complete");
-        TrayTerminalDiagnostic last = records[records.Count - 1];
-        AssertTrue(last.Command == TrayCommand.OpenLogs && last.Revision == 22UL && last.Status == TrayActionResultStatus.Completed && String.Equals(last.Code, "CCOD_TRAY_ACTION_COMPLETED", StringComparison.Ordinal), "terminal diagnostic exposes only the exact canonical correlation fields");
-        host.Dispose();
-    }
-
-    private static void TestBlockingTerminalWriterRunsOutsideCorrelationLock()
-    {
-        ManualResetEvent writerEntered = new ManualResetEvent(false);
-        ManualResetEvent releaseWriter = new ManualResetEvent(false);
-        bool first = true;
-        HostTransport host = new HostTransport(null, delegate(TrayTerminalDiagnostic record)
-        {
-            if (first) { first = false; writerEntered.Set(); releaseWriter.WaitOne(TimeSpan.FromSeconds(3)); }
-            return true;
-        });
-        Guid blockedId = Guid.NewGuid();
-        AssertTrue(host.TryRegisterAction(new TrayHostAction(blockedId, TrayCommand.OpenLogs, 24UL)), "blocking-writer action registers");
-        bool acknowledged = false;
-        Thread acknowledgement = new Thread((ThreadStart)delegate { acknowledged = host.TryAcknowledgeAction(new TrayActionResult(blockedId, 24UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null)); });
-        acknowledgement.IsBackground = true;
-        acknowledgement.Start();
+        ControllableReceiptStore store = new ControllableReceiptStore(ReceiptStoreBlockStage.BeforeOpen, 1);
+        HostTransport host = new HostTransport();
+        TrayTerminalReceiptSink sink = new TrayTerminalReceiptSink(store.TryAppendDurably, host.TryPublishDurableReceipt);
         try
         {
-            AssertTrue(writerEntered.WaitOne(TimeSpan.FromSeconds(2)), "terminal writer enters deterministically");
-            Guid concurrentId = Guid.NewGuid();
-            Stopwatch registration = Stopwatch.StartNew();
-            bool registered = host.TryRegisterAction(new TrayHostAction(concurrentId, TrayCommand.OpenLogs, 24UL));
-            registration.Stop();
-            AssertTrue(registered && registration.Elapsed < TimeSpan.FromMilliseconds(250), "blocking terminal I/O cannot hold the correlation lock or pending capacity");
-            releaseWriter.Set();
-            AssertTrue(acknowledgement.Join(TimeSpan.FromSeconds(2)) && acknowledged, "terminal acknowledgement completes after the writer is released");
-            AssertTrue(host.TryAcknowledgeAction(new TrayActionResult(concurrentId, 24UL, TrayActionResultStatus.Completed, null, null)), "concurrent action remains independently completable");
+            TrayTerminalReceipt first = RegisterAndAcknowledgeFailure(host, Guid.NewGuid(), 25UL, "first hung-store action");
+            AssertTrue(sink.TrySubmit(first), "current receipt occupies the first outstanding slot");
+            AssertTrue(store.WaitUntilBlocked(2000), "single writer enters the hung fake store");
+            for (int index = 1; index < 8; index++)
+            {
+                TrayTerminalReceipt queued = RegisterAndAcknowledgeFailure(host, Guid.NewGuid(), 25UL, "queued outstanding action " + index.ToString());
+                AssertTrue(sink.TrySubmit(queued), "outstanding receipt slots include current plus seven queued items");
+            }
+
+            Guid ninthId = Guid.NewGuid();
+            TrayTerminalReceipt ninth = RegisterAndAcknowledgeFailure(host, ninthId, 25UL, "ninth full-sink action");
+            Stopwatch ninthSubmit = Stopwatch.StartNew(); bool ninthAdmitted = sink.TrySubmit(ninth); ninthSubmit.Stop();
+            AssertTrue(!ninthAdmitted, "ninth outstanding receipt is dropped");
+            AssertReturnsQuickly(ninthSubmit, "ninth outstanding admission is rejected immediately");
+            TrayTerminalReceipt duplicate;
+            AssertTrue(!host.TryAcknowledgeAction(new TrayActionResult(ninthId, 25UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null), out duplicate), "full-sink terminal action remains consumed");
+            for (int index = 0; index < 8; index++)
+            {
+                Guid droppedId = Guid.NewGuid();
+                TrayTerminalReceipt dropped = RegisterAndAcknowledgeFailure(host, droppedId, 25UL, "additional full-sink action " + index.ToString());
+                AssertTrue(!sink.TrySubmit(dropped), "repeated full-sink paths drop only receipt feedback");
+            }
+            for (int index = 0; index < 8; index++)
+            {
+                Guid capacityId = Guid.NewGuid();
+                AssertTrue(host.TryRegisterAction(new TrayHostAction(capacityId, TrayCommand.OpenLogs, 25UL)), "receipt saturation never consumes pending action capacity");
+                AssertTrue(TryAcknowledge(host, new TrayActionResult(capacityId, 25UL, TrayActionResultStatus.Completed, null, null)), "capacity proof action remains terminally consumable");
+            }
+            AssertTrue(store.CallCount == 1 && store.WriterThreadCount == 1 && store.MaximumConcurrent == 1, "hung writer is never replaced");
+            TrayActionResult none;
+            AssertTrue(!host.TryTakeFailedAction(out none), "full and hung paths show no UI");
+
+            FieldInfo gateField = typeof(TrayTerminalReceiptSink).GetField("_gate", BindingFlags.Instance | BindingFlags.NonPublic);
+            AssertTrue(gateField != null, "busy-admission fixture locates the sink admission gate");
+            object admissionGate = gateField.GetValue(sink);
+            ManualResetEvent gateHeld = new ManualResetEvent(false); ManualResetEvent releaseGate = new ManualResetEvent(false);
+            Thread holder = new Thread((ThreadStart)delegate { lock (admissionGate) { gateHeld.Set(); releaseGate.WaitOne(); } });
+            holder.IsBackground = true; holder.Start();
+            try
+            {
+                AssertTrue(gateHeld.WaitOne(2000), "busy-admission fixture holds the sink gate");
+                Guid busyId = Guid.NewGuid();
+                TrayTerminalReceipt busy = RegisterAndAcknowledgeFailure(host, busyId, 25UL, "busy-sink action");
+                bool busyReturned = false; bool busyAdmitted = true;
+                Thread submitter = new Thread((ThreadStart)delegate { busyAdmitted = sink.TrySubmit(busy); busyReturned = true; });
+                submitter.IsBackground = true; submitter.Start();
+                AssertTrue(submitter.Join(250) && busyReturned && !busyAdmitted, "busy admission returns immediately without waiting for the gate");
+                AssertTrue(!host.TryAcknowledgeAction(new TrayActionResult(busyId, 25UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null), out duplicate), "busy-sink terminal action remains consumed");
+                AssertTrue(!host.TryTakeFailedAction(out none), "busy admission shows no UI");
+            }
+            finally
+            {
+                releaseGate.Set(); holder.Join(2000); gateHeld.Dispose(); releaseGate.Dispose();
+            }
         }
         finally
         {
-            releaseWriter.Set();
-            if (acknowledgement.IsAlive) { acknowledgement.Join(TimeSpan.FromSeconds(2)); }
-            writerEntered.Dispose(); releaseWriter.Dispose(); host.Dispose();
+            store.Release();
+            sink.Dispose();
+            host.Dispose();
+            store.Dispose();
+        }
+    }
+
+    private static void TestStoreAndCallbackFailuresRecoverOnTheSameWriter()
+    {
+        ControllableReceiptStore store = new ControllableReceiptStore(ReceiptStoreBlockStage.DuringFlush, 0, 1, 1);
+        bool failCallback = true; int successfulSignals = 0;
+        HostTransport host = new HostTransport(delegate
+        {
+            if (failCallback) { failCallback = false; throw new InvalidOperationException("intentional UI callback failure"); }
+            Interlocked.Increment(ref successfulSignals);
+        });
+        TrayTerminalReceiptSink sink = new TrayTerminalReceiptSink(store.TryAppendDurably, host.TryPublishDurableReceipt);
+        try
+        {
+            Guid storeFailureId = Guid.NewGuid(); Guid callbackFailureId = Guid.NewGuid(); Guid recoveredId = Guid.NewGuid();
+            AssertTrue(sink.TrySubmit(RegisterAndAcknowledgeFailure(host, storeFailureId, 26UL, "store-failure action")), "first receipt is admitted before the store failure");
+            AssertTrue(store.WaitUntilBlocked(2000), "first receipt blocks during the simulated flush");
+            AssertTrue(sink.TrySubmit(RegisterAndAcknowledgeFailure(host, callbackFailureId, 26UL, "callback-failure action")), "second receipt queues behind the first store failure");
+            AssertTrue(sink.TrySubmit(RegisterAndAcknowledgeFailure(host, recoveredId, 26UL, "recovered action")), "third receipt queues for recovery");
+            TrayActionResult none;
+            AssertTrue(!host.TryTakeFailedAction(out none), "blocked and not-yet-durable receipts expose no UI");
+            store.Release();
+            WaitUntil(delegate { return store.CompletedCount == 3 && Interlocked.CompareExchange(ref successfulSignals, 0, 0) == 1; }, 3000, "same writer continues through store and callback failures to a later success");
+            TrayActionResult recovered; TrayActionResult extra;
+            AssertTrue(host.TryTakeFailedAction(out recovered) && recovered.ActionId == recoveredId, "only the later durable callback publishes generic feedback");
+            AssertTrue(!host.TryTakeFailedAction(out extra), "store and callback failures publish no latent UI");
+            AssertTrue(store.WriterThreadCount == 1 && store.MaximumConcurrent == 1, "recovery keeps the original single writer instead of starting a replacement");
+        }
+        finally
+        {
+            store.Release(); sink.Dispose(); host.Dispose(); store.Dispose();
+        }
+    }
+
+    private static void TestDurableReceiptTrustAndSharedUiBound()
+    {
+        int signals = 0;
+        HostTransport host = new HostTransport(delegate { Interlocked.Increment(ref signals); });
+        HostTransport foreign = new HostTransport();
+        try
+        {
+            Guid aboutId = Guid.NewGuid();
+            AssertTrue(host.TryRegisterAction(new TrayHostAction(aboutId, TrayCommand.ShowAbout, 27UL)), "About action registers for durable authorization");
+            TrayTerminalReceipt about = AcknowledgeTerminalQuickly(host, new TrayActionResult(aboutId, 27UL, TrayActionResultStatus.Completed, null, null), "About terminal result");
+            TrayActionResult beforeDurable;
+            AssertTrue(!host.TryTakeCompletedAbout(out beforeDurable), "typed receipt alone cannot expose About UI before durable publication");
+            AssertTrue(!foreign.TryPublishDurableReceipt(about), "a different transport rejects a receipt it did not correlate");
+            AssertTrue(host.TryPublishDurableReceipt(about), "originating transport accepts one explicit durable-success callback");
+            AssertTrue(!host.TryPublishDurableReceipt(about), "the same durable receipt cannot publish twice");
+
+            for (int index = 0; index < 7; index++)
+            {
+                TrayTerminalReceipt failure = RegisterAndAcknowledgeFailure(host, Guid.NewGuid(), 27UL, "bounded UI failure " + index.ToString());
+                AssertTrue(host.TryPublishDurableReceipt(failure), "shared UI queue admits through eight total items");
+            }
+            TrayTerminalReceipt overflow = RegisterAndAcknowledgeFailure(host, Guid.NewGuid(), 27UL, "bounded UI overflow");
+            AssertTrue(!host.TryPublishDurableReceipt(overflow), "ninth shared About/failure UI item is dropped");
+
+            Guid noUiId = Guid.NewGuid();
+            AssertTrue(host.TryRegisterAction(new TrayHostAction(noUiId, TrayCommand.OpenLogs, 27UL)), "non-UI completion registers while UI work is full");
+            TrayTerminalReceipt noUi = AcknowledgeTerminalQuickly(host, new TrayActionResult(noUiId, 27UL, TrayActionResultStatus.Completed, null, null), "non-UI completion");
+            AssertTrue(host.TryPublishDurableReceipt(noUi), "durable non-UI completion is consumed without UI capacity");
+
+            TrayActionResult aboutUi;
+            AssertTrue(host.TryTakeCompletedAbout(out aboutUi) && aboutUi.ActionId == aboutId, "durable About maps to one About UI item");
+            int failures = 0; TrayActionResult failed;
+            while (host.TryTakeFailedAction(out failed)) { failures++; }
+            AssertTrue(failures == 7, "About and generic failure share one eight-item UI bound");
+            AssertTrue(Interlocked.CompareExchange(ref signals, 0, 0) == 8, "only admitted UI items post application work");
+        }
+        finally { foreign.Dispose(); host.Dispose(); }
+    }
+
+    private static void TestDisposalReturnsWhileStoreIsHungAndSuppressesLateCallbacks()
+    {
+        ControllableReceiptStore store = new ControllableReceiptStore(ReceiptStoreBlockStage.BeforeOpen, 1);
+        int signals = 0;
+        HostTransport host = new HostTransport(delegate { Interlocked.Increment(ref signals); });
+        TrayTerminalReceiptSink sink = new TrayTerminalReceiptSink(store.TryAppendDurably, host.TryPublishDurableReceipt);
+        try
+        {
+            TrayTerminalReceipt current = RegisterAndAcknowledgeFailure(host, Guid.NewGuid(), 28UL, "dispose-hung current action");
+            AssertTrue(sink.TrySubmit(current), "dispose-hung receipt is admitted");
+            AssertTrue(store.WaitUntilBlocked(2000), "writer is hung before sink disposal");
+            Stopwatch disposal = Stopwatch.StartNew(); sink.Dispose(); disposal.Stop();
+            AssertReturnsQuickly(disposal, "sink disposal uses a bounded join when the only writer is hung");
+
+            Guid closedId = Guid.NewGuid();
+            TrayTerminalReceipt closed = RegisterAndAcknowledgeFailure(host, closedId, 28UL, "closed-sink action");
+            Stopwatch closedSubmit = Stopwatch.StartNew(); bool closedAdmitted = sink.TrySubmit(closed); closedSubmit.Stop();
+            AssertTrue(!closedAdmitted, "disposed sink rejects new receipts");
+            AssertReturnsQuickly(closedSubmit, "closed admission is immediate");
+            TrayTerminalReceipt duplicate;
+            AssertTrue(!host.TryAcknowledgeAction(new TrayActionResult(closedId, 28UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED", null), out duplicate), "closed-sink action remains terminally consumed");
+
+            store.Release();
+            WaitUntil(delegate { return store.CompletedCount == 1; }, 2000, "hung store can return after disposal without reviving the sink");
+            Stopwatch finalJoin = Stopwatch.StartNew(); sink.Dispose(); finalJoin.Stop();
+            AssertReturnsQuickly(finalJoin, "disposed sink remains bounded while joining its original completed writer");
+            TrayActionResult none;
+            AssertTrue(Interlocked.CompareExchange(ref signals, 0, 0) == 0 && !host.TryTakeFailedAction(out none), "late durable return after disposal cannot publish UI");
+            AssertTrue(store.CallCount == 1 && store.WriterThreadCount == 1, "disposal never starts a replacement writer");
+        }
+        finally
+        {
+            store.Release(); sink.Dispose(); host.Dispose(); store.Dispose();
         }
     }
 
@@ -245,11 +471,11 @@ internal static class TrayHostTransportSelfTest
             TestHostPendingAndReplayBound();
             TestDirectPresentationAcksDoNotAccumulateAnUnusedControlQueue();
             TestActionResultCorrelationAndControlPriority();
-            TestAcknowledgedAboutQueuesOneUiWorkItem();
-            TestRejectedAndFailedActionsQueueUserFeedback();
-            TestUndisplayedActionFailureFeedbackIsBounded();
-            TestTerminalDiagnosticFailureNeverStrandsPendingActions();
-            TestBlockingTerminalWriterRunsOutsideCorrelationLock();
+            TestBlockedReceiptStagesNeverBlockCorrelationOrUi();
+            TestNinthReceiptAndBusyAdmissionDropWithoutPendingOrUi();
+            TestStoreAndCallbackFailuresRecoverOnTheSameWriter();
+            TestDurableReceiptTrustAndSharedUiBound();
+            TestDisposalReturnsWhileStoreIsHungAndSuppressesLateCallbacks();
             Console.WriteLine("TrayHost transport self-tests passed: 10");
             return 0;
         }

@@ -40,7 +40,8 @@ internal static class Program
         Win32TrayPlatform platform = new Win32TrayPlatform();
         TrayHostApplication application = null;
         TrayTerminalDiagnosticStore terminalStore = new TrayTerminalDiagnosticStore();
-        HostTransport transport = new HostTransport(delegate { TrayHostApplication current = application; if (current != null) { current.PostWork(); } }, delegate(TrayTerminalDiagnostic record) { return terminalStore.TryAppendDurably(record); });
+        HostTransport transport = new HostTransport(delegate { TrayHostApplication current = application; if (current != null) { current.PostWork(); } });
+        TrayTerminalReceiptSink receiptSink = new TrayTerminalReceiptSink(terminalStore.TryAppendDurably, transport.TryPublishDurableReceipt, terminalStore.Dispose);
         TrayWindow window = new TrayWindow(platform, transport.SetMenuOpen);
         bool shutdownRequested = false; bool shutdownSent = false; object stateGate = new object();
         Action<TrayCommand, ulong> command = delegate(TrayCommand selected, ulong revision)
@@ -90,7 +91,7 @@ internal static class Program
                 {
                     ProtocolFrame frame = ProtocolCodec.ReadAuthenticated(input, ProtocolDirection.ParentToHost, epoch, inboundSequence++, keys.ParentToHost);
                     if (frame.MessageType == TrayHostMessageType.Presentation) { transport.TryAcceptPresentation(TrayHostWire.ReadPresentation(frame.Payload)); application.PostWork(); }
-                    else if (frame.MessageType == TrayHostMessageType.ActionResult) { if (!TryDispatchAuthenticatedActionResult(transport, frame.Payload)) { throw new ProtocolViolationException("action result is uncorrelated"); } application.PostWork(); }
+                    else if (frame.MessageType == TrayHostMessageType.ActionResult) { if (!TryDispatchAuthenticatedActionResult(transport, receiptSink, frame.Payload)) { throw new ProtocolViolationException("action result is uncorrelated"); } }
                     else if (frame.MessageType == TrayHostMessageType.Shutdown) { lock (stateGate) { shutdownRequested = true; } application.PostWork(); }
                     else if (frame.MessageType == TrayHostMessageType.Ping) { lock (WriteGate) { ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.Pong, epoch, outboundSequence++, frame.Payload), keys.HostToParent); } }
                 }
@@ -99,7 +100,7 @@ internal static class Program
         })) { IsBackground = true, Name = "CodexRemote.TrayHost.Reader" };
         reader.Start();
         int result = application.Run();
-        application.Dispose(); transport.Dispose(); terminalStore.Dispose(); return result;
+        receiptSink.Dispose(); application.Dispose(); transport.Dispose(); return result;
     }
 
     private static bool VerifyParentIdentity(int pid, long creation)
@@ -107,10 +108,16 @@ internal static class Program
         try { using (Process process = Process.GetProcessById(pid)) { return process.StartTime.ToFileTimeUtc() == creation; } } catch { return false; }
     }
 
-    internal static bool TryDispatchAuthenticatedActionResult(HostTransport transport, byte[] payload)
+    internal static bool TryDispatchAuthenticatedActionResult(HostTransport transport, TrayTerminalReceiptSink receiptSink, byte[] payload)
     {
         if (transport == null || payload == null) { return false; }
-        return transport.TryAcknowledgeAction(TrayHostWire.ReadActionResult(payload));
+        TrayTerminalReceipt receipt;
+        if (!transport.TryAcknowledgeAction(TrayHostWire.ReadActionResult(payload), out receipt)) { return false; }
+        if (receipt != null && receiptSink != null)
+        {
+            try { receiptSink.TrySubmit(receipt); } catch { }
+        }
+        return true;
     }
 
     private static int RunHeadlessSmoke()
