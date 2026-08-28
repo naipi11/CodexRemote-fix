@@ -1211,7 +1211,7 @@ Invoke-CcodTest 'setup build and activation bind one immutable versioned payload
     Assert-CcodTrue ($inno -cmatch 'InstallerPayloadDirectory' -and $inno -cmatch 'DestDir:\s*"\{app\}\\payload\\\{#ProjectVersion\}"') 'Inno copies the immutable build payload into its exact version directory'
     Assert-CcodTrue ($inno -cmatch "ExpandConstant\('\{app\}\\payload\\\{#ProjectVersion\}'\)" -and $inno -cmatch '-ExpectedVersion\s+"\{#ProjectVersion\}') 'Inno binds activation to its compiled payload version'
     Assert-CcodTrue ($activation -cmatch '\[string\]\$ExpectedVersion' -and $activation -cmatch '\[string\]\$ExpectedPayloadManifestSha256' -and $activation -cmatch 'installer-payload\.manifest\.json') 'activation accepts and resolves the expected payload contract'
-    Assert-CcodTrue ($installer -cmatch '\[string\]\$ExpectedVersion' -and $installer -cmatch '\[string\]\$PayloadManifestPath' -and $installer -cmatch '-ExpectedVersion\s+\$ExpectedVersion' -and $installer -cmatch '-PayloadManifestPath\s+\$PayloadManifestPath') 'installer forwards the immutable payload contract to lifecycle activation'
+    Assert-CcodTrue ($installer -cmatch '\[string\]\$ExpectedVersion' -and $installer -cmatch '\[string\]\$PayloadManifestPath' -and $installer -cmatch '\[string\]\$ExpectedPayloadManifestSha256' -and $installer -cmatch 'Open-CcodInstallerPayloadSeal' -and $installer -cmatch 'PayloadManifestBytesBase64') 'installer revalidates and forwards the exact immutable payload bytes to lifecycle activation'
 }
 
 # Production mutation caught: reopening mutable payload paths after the parent accepted their manifest bytes.
@@ -1434,6 +1434,9 @@ Invoke-CcodTest 'Inno exposes a pre-write payload-directory reparse gate' {
     $inno = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
     $helper = [regex]::Match($inno,'(?ms)^function IsSafeExistingPayloadDirectory\(.*?^end;')
     Assert-CcodTrue $helper.Success 'production Inno script exposes the directory predicate used before payload writes'
+    $streamHelper = [regex]::Match($inno,'(?ms)^function HasOnlyDefaultDataStream\(.*?^end;')
+    $leafHelper = [regex]::Match($inno,'(?ms)^function IsSafeExistingSetupLeaf\(.*?^end;')
+    Assert-CcodTrue ($streamHelper.Success -and $leafHelper.Success) 'production Inno script exposes native stream and link-count predicates for existing leaves'
     $treeHelper = [regex]::Match($inno,'(?ms)^function IsSafeExistingSetupTree\(.*?^end;')
     Assert-CcodTrue $treeHelper.Success 'production Inno script exposes a recursive destination-tree predicate'
     $inventoryValidator = [regex]::Match($inno,'(?ms)^function AreCcodExpectedSetupDirectoriesSafe\(.*?^end;')
@@ -1452,6 +1455,9 @@ Invoke-CcodTest 'Inno exposes a pre-write payload-directory reparse gate' {
         $expectedJunctionRoot = Join-Path $root 'expected-junction-root'
         $normalExpectedRoot = Join-Path $root 'normal-expected-root'
         $inventoryPayload = Join-Path $root 'inventory-payload'
+        $hardLinkTree = Join-Path $root 'hardlink-tree'
+        $outsideHardLink = Join-Path $root 'outside-hardlink-sentinel.txt'
+        $hardLinkLeaf = Join-Path $hardLinkTree 'existing-leaf.txt'
         $fileWriteMarker = Join-Path $expectedFileRoot 'payload-write-marker.txt'
         $junctionWriteMarker = Join-Path $expectedJunctionRoot 'payload-write-marker.txt'
         $resultPath = Join-Path $root 'result.txt'
@@ -1466,6 +1472,9 @@ Invoke-CcodTest 'Inno exposes a pre-write payload-directory reparse gate' {
         [IO.Directory]::CreateDirectory((Join-Path $expectedJunctionRoot 'payload\2.5.22\src')) | Out-Null
         New-Item -ItemType Junction -Path (Join-Path $expectedJunctionRoot 'payload\2.5.22\src\persistence') -Target $target | Out-Null
         [IO.Directory]::CreateDirectory($normalExpectedRoot) | Out-Null
+        [IO.Directory]::CreateDirectory($hardLinkTree) | Out-Null
+        [IO.File]::WriteAllText($outsideHardLink,'outside-original',[Text.UTF8Encoding]::new($false))
+        New-Item -ItemType HardLink -Path $hardLinkLeaf -Target $outsideHardLink | Out-Null
         [IO.Directory]::CreateDirectory((Join-Path $inventoryPayload 'src\persistence\modules')) | Out-Null
         [IO.File]::WriteAllText((Join-Path $inventoryPayload 'src\persistence\modules\InstallLifecycle.psm1'),'fixture',[Text.UTF8Encoding]::new($false))
         $inventoryPath = Join-Path $root 'InventoryFixture.iss'
@@ -1485,10 +1494,60 @@ Uninstallable=no
 const
   CCOD_FILE_ATTRIBUTE_DIRECTORY = `$00000010;
   CCOD_FILE_ATTRIBUTE_REPARSE_POINT = `$00000400;
+  CCOD_FILE_READ_ATTRIBUTES = `$00000080;
+  CCOD_FILE_SHARE_READ = `$00000001;
+  CCOD_FILE_SHARE_WRITE = `$00000002;
+  CCOD_FILE_SHARE_DELETE = `$00000004;
+  CCOD_OPEN_EXISTING = 3;
+  CCOD_FILE_FLAG_OPEN_REPARSE_POINT = `$00200000;
   CCOD_INVALID_FILE_ATTRIBUTES = `$FFFFFFFF;
+  CCOD_INVALID_HANDLE_VALUE = -1;
+  CCOD_ERROR_HANDLE_EOF = 38;
+type
+  TCcodFileTime = record
+    LowDateTime: Cardinal;
+    HighDateTime: Cardinal;
+  end;
+  TCcodByHandleFileInformation = record
+    FileAttributes: Cardinal;
+    CreationTime: TCcodFileTime;
+    LastAccessTime: TCcodFileTime;
+    LastWriteTime: TCcodFileTime;
+    VolumeSerialNumber: Cardinal;
+    FileSizeHigh: Cardinal;
+    FileSizeLow: Cardinal;
+    NumberOfLinks: Cardinal;
+    FileIndexHigh: Cardinal;
+    FileIndexLow: Cardinal;
+  end;
+  TCcodFindStreamData = record
+    StreamSize: Int64;
+    StreamNameBuffer: array[0..591] of Byte;
+  end;
 function GetFileAttributesW(const FileName: String): Cardinal;
   external 'GetFileAttributesW@kernel32.dll stdcall';
+function CreateFileW(const FileName: String; DesiredAccess, ShareMode,
+  SecurityAttributes, CreationDisposition, FlagsAndAttributes,
+  TemplateFile: Cardinal): Integer;
+  external 'CreateFileW@kernel32.dll stdcall';
+function GetFileInformationByHandle(FileHandle: Integer;
+  var Information: TCcodByHandleFileInformation): Boolean;
+  external 'GetFileInformationByHandle@kernel32.dll stdcall';
+function CloseHandle(Handle: Integer): Boolean;
+  external 'CloseHandle@kernel32.dll stdcall';
+function FindFirstStreamW(const FileName: String; InfoLevel: Integer;
+  var StreamData: TCcodFindStreamData; Flags: Cardinal): Integer;
+  external 'FindFirstStreamW@kernel32.dll stdcall';
+function FindNextStreamW(FindHandle: Integer;
+  var StreamData: TCcodFindStreamData): Boolean;
+  external 'FindNextStreamW@kernel32.dll stdcall';
+function CcodFindClose(FindHandle: Integer): Boolean;
+  external 'FindClose@kernel32.dll stdcall';
+function GetLastError(): Cardinal;
+  external 'GetLastError@kernel32.dll stdcall';
 $($helper.Value)
+$($streamHelper.Value)
+$($leafHelper.Value)
 $($treeHelper.Value)
 $inventorySource
 $($inventoryValidator.Value)
@@ -1498,11 +1557,14 @@ begin
     SaveStringToFile('$($fileWriteMarker.Replace("'","''"))','unsafe write',False);
   if AreCcodExpectedSetupDirectoriesSafe('$($expectedJunctionRoot.Replace("'","''"))') then
     SaveStringToFile('$($junctionWriteMarker.Replace("'","''"))','unsafe write',False);
+  if IsSafeExistingSetupTree('$($hardLinkTree.Replace("'","''"))') then
+    SaveStringToFile('$($hardLinkLeaf.Replace("'","''"))','unsafe overwrite',False);
   if IsSafeExistingPayloadDirectory('$($normal.Replace("'","''"))') and
      IsSafeExistingPayloadDirectory('$($missing.Replace("'","''"))') and
      (not IsSafeExistingPayloadDirectory('$($junction.Replace("'","''"))')) and
      (not IsSafeExistingSetupTree('$($tree.Replace("'","''"))')) and
      (not IsSafeExistingSetupTree('$($fileDirectory.Replace("'","''"))')) and
+     (not IsSafeExistingSetupTree('$($hardLinkTree.Replace("'","''"))')) and
      AreCcodExpectedSetupDirectoriesSafe('$($normalExpectedRoot.Replace("'","''"))') and
      (not AreCcodExpectedSetupDirectoriesSafe('$($expectedFileRoot.Replace("'","''"))')) and
      (not AreCcodExpectedSetupDirectoriesSafe('$($expectedJunctionRoot.Replace("'","''"))')) then
@@ -1519,6 +1581,7 @@ end;
         Assert-CcodEqual 'pass' ([IO.File]::ReadAllText($resultPath,[Text.UTF8Encoding]::new($false))) 'production predicate rejects root/nested junctions and file-valued directory paths'
         Assert-CcodTrue (-not (Test-Path -LiteralPath $fileWriteMarker)) 'nested file-as-directory is rejected before simulated payload writes'
         Assert-CcodTrue (-not (Test-Path -LiteralPath $junctionWriteMarker)) 'nested junction is rejected before simulated payload writes'
+        Assert-CcodEqual 'outside-original' ([IO.File]::ReadAllText($outsideHardLink,[Text.UTF8Encoding]::new($false))) 'hard-linked setup leaf is rejected before simulated outside overwrite'
     } finally {
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
     }

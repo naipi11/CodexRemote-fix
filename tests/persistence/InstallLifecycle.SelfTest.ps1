@@ -88,6 +88,20 @@ function New-CcodLifecyclePayloadManifest {
     return $manifestPath
 }
 
+function Get-CcodLifecyclePayloadBinding {
+    param(
+        [Parameter(Mandatory)][string]$ManifestPath,
+        [Parameter(Mandatory)][string]$ExpectedVersion
+    )
+    $bytes = [IO.File]::ReadAllBytes($ManifestPath)
+    return @{
+        ExpectedVersion = $ExpectedVersion
+        PayloadManifestPath = $ManifestPath
+        ExpectedPayloadManifestSha256 = Get-CcodTestFileSha256 -Path $ManifestPath
+        PayloadManifestBytesBase64 = [Convert]::ToBase64String($bytes)
+    }
+}
+
 function New-CcodLifecycleFakeNode {
     param([Parameter(Mandatory)][string]$Root)
     New-Item -ItemType Directory -Path (Join-Path $Root 'node') -Force | Out-Null
@@ -681,8 +695,9 @@ $results += Invoke-CcodTest 'upgrade rejects a payload version mismatch before a
         $before = Read-CcodActiveRuntime -InstallRoot $install
         $fake = New-CcodLifecycleFake -NodePath $nodePath
 
+        $payloadBinding = Get-CcodLifecyclePayloadBinding -ManifestPath $manifestPath -ExpectedVersion '2.5.22'
         Assert-CcodThrows {
-            Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -ExpectedVersion '2.5.22' -PayloadManifestPath $manifestPath -Adapters $fake.Adapters | Out-Null
+            Invoke-CcodInstall -SourceRoot $source -InstallRoot $install @payloadBinding -Adapters $fake.Adapters | Out-Null
         } 'CCOD_INSTALL_PAYLOAD_VERSION_MISMATCH'
 
         $after = Read-CcodActiveRuntime -InstallRoot $install
@@ -707,7 +722,8 @@ $results += Invoke-CcodTest 'matching payload stages only immutable manifest-lis
         [IO.File]::WriteAllText($stalePath,"module.exports = 'stale';`n",[Text.UTF8Encoding]::new($false))
         $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
 
-        $receipt = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -ExpectedVersion '2.5.22' -PayloadManifestPath $manifestPath -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
+        $payloadBinding = Get-CcodLifecyclePayloadBinding -ManifestPath $manifestPath -ExpectedVersion '2.5.22'
+        $receipt = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install @payloadBinding -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
 
         $runtimeRoot = Join-Path $install "runtime\$($receipt.RuntimeId)"
         Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $runtimeRoot 'src\runtime\stale-old-payload.js'))) 'unlisted stale source file is absent from the runtime'
@@ -737,8 +753,9 @@ $results += Invoke-CcodTest 'payload-bound install rereads the active pointer af
             [pscustomobject][ordered]@{ SupervisorReady = $true; TrayReady = $true }
         }.GetNewClosure()
 
+        $payloadBinding = Get-CcodLifecyclePayloadBinding -ManifestPath $manifestPath -ExpectedVersion '2.5.22'
         Assert-CcodThrows {
-            Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -ExpectedVersion '2.5.22' -PayloadManifestPath $manifestPath -Adapters $fake.Adapters | Out-Null
+            Invoke-CcodInstall -SourceRoot $source -InstallRoot $install @payloadBinding -Adapters $fake.Adapters | Out-Null
         } 'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN'
         Assert-CcodTrue ($fake.World.Phases -notcontains 'Ready') 'pointer drift after readiness cannot produce a Ready receipt'
     } finally {
@@ -770,7 +787,8 @@ $results += Invoke-CcodTest 'stable bootstrap and uninstaller come from manifest
             }.GetNewClosure()
         }
 
-        $receipt = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -ExpectedVersion '2.5.22' -PayloadManifestPath $manifestPath -Adapters $fake.Adapters
+        $payloadBinding = Get-CcodLifecyclePayloadBinding -ManifestPath $manifestPath -ExpectedVersion '2.5.22'
+        $receipt = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install @payloadBinding -Adapters $fake.Adapters
 
         $runtimeRoot = Join-Path $install "runtime\$($receipt.RuntimeId)"
         Assert-CcodEqual (Get-CcodTestFileSha256 -Path (Join-Path $runtimeRoot 'src\persistence\bootstrap.ps1')) (Get-CcodTestFileSha256 -Path (Join-Path $install 'bootstrap.ps1')) 'stable bootstrap equals its verified runtime byte copy'
@@ -861,6 +879,40 @@ $results += Invoke-CcodTest 'stable bootstrap leaf junction is rejected before c
     }
 }
 
+# Production mutation caught: treating a non-reparse hard link as a safe overwrite target and changing bytes outside the install root.
+$results += Invoke-CcodTest 'stable bootstrap and public uninstaller reject hard-linked target leaves before outside bytes change' {
+    foreach ($case in @(
+        [pscustomobject]@{Name='bootstrap';Leaf='bootstrap.ps1';AddUninstaller=$false},
+        [pscustomobject]@{Name='uninstaller';Leaf='Uninstall-CodexControlOtherDevices.ps1';AddUninstaller=$true}
+    )) {
+        $source = New-CcodLifecycleTempRoot
+        $install = New-CcodLifecycleTempRoot
+        $outside = New-CcodLifecycleTempRoot
+        $nodeRoot = New-CcodLifecycleTempRoot
+        try {
+            New-CcodLifecycleSourceFixture -Root $source | Out-Null
+            if ($case.AddUninstaller) {
+                [IO.File]::WriteAllText((Join-Path $source 'Uninstall-CodexControlOtherDevices.ps1'),'# verified uninstaller',[Text.UTF8Encoding]::new($false))
+            }
+            [IO.Directory]::CreateDirectory($install) | Out-Null
+            [IO.Directory]::CreateDirectory($outside) | Out-Null
+            $sentinel = Join-Path $outside ($case.Name + '-sentinel.txt')
+            [IO.File]::WriteAllText($sentinel,'outside-original',[Text.UTF8Encoding]::new($false))
+            $targetLeaf = Join-Path $install $case.Leaf
+            New-Item -ItemType HardLink -Path $targetLeaf -Target $sentinel | Out-Null
+            $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+
+            Assert-CcodThrows {
+                Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters | Out-Null
+            } 'CCOD_INSTALL_UNSAFE_LEAF'
+            Assert-CcodEqual 'outside-original' ([IO.File]::ReadAllText($sentinel,[Text.UTF8Encoding]::new($false))) "$($case.Name) hard-link sentinel remains unchanged"
+            Assert-CcodTrue (-not [IO.File]::Exists((Join-Path $install 'active.json'))) "$($case.Name) hard-link rejection cannot commit an active pointer"
+        } finally {
+            foreach ($path in @($source,$install,$outside,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue } }
+        }
+    }
+}
+
 $results += Invoke-CcodTest 'runtime manifest leaf junction is rejected before write' {
     $source = New-CcodLifecycleTempRoot
     $install = New-CcodLifecycleTempRoot
@@ -930,7 +982,8 @@ $results += Invoke-CcodTest 'payload manifest ancestry treats Windows root equal
         New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
         $manifestPath = New-CcodLifecyclePayloadManifest -Root $source -Version '2.5.22'
         $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
-        $receipt = Invoke-CcodInstall -SourceRoot $source.ToUpperInvariant() -InstallRoot $install -ExpectedVersion '2.5.22' -PayloadManifestPath $manifestPath -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
+        $payloadBinding = Get-CcodLifecyclePayloadBinding -ManifestPath $manifestPath -ExpectedVersion '2.5.22'
+        $receipt = Invoke-CcodInstall -SourceRoot $source.ToUpperInvariant() -InstallRoot $install @payloadBinding -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
         Assert-CcodEqual 'Installed' $receipt.Outcome 'case-only source-root difference preserves valid Windows payload ancestry'
     } finally {
         foreach ($path in @($source,$install,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
@@ -954,8 +1007,9 @@ $results += Invoke-CcodTest 'payload-bound install rejects a changed runtime man
             [IO.File]::WriteAllText($runtimeManifestPath,($runtimeManifest|ConvertTo-Json -Depth 16),[Text.UTF8Encoding]::new($false))
             [pscustomobject][ordered]@{SupervisorReady=$true;TrayReady=$true}
         }.GetNewClosure()
+        $payloadBinding = Get-CcodLifecyclePayloadBinding -ManifestPath $manifestPath -ExpectedVersion '2.5.22'
         Assert-CcodThrows {
-            Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -ExpectedVersion '2.5.22' -PayloadManifestPath $manifestPath -Adapters $fake.Adapters | Out-Null
+            Invoke-CcodInstall -SourceRoot $source -InstallRoot $install @payloadBinding -Adapters $fake.Adapters | Out-Null
         } 'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN'
         Assert-CcodTrue ($fake.World.Phases -notcontains 'Ready') 'changed selected runtime manifest cannot produce Ready'
     } finally {

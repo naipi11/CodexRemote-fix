@@ -106,11 +106,39 @@ const
   VALIDATION_LAUNCH_BUDGET_MILLISECONDS = 5000;
   CCOD_FILE_ATTRIBUTE_DIRECTORY = $00000010;
   CCOD_FILE_ATTRIBUTE_REPARSE_POINT = $00000400;
+  CCOD_FILE_READ_ATTRIBUTES = $00000080;
+  CCOD_FILE_SHARE_READ = $00000001;
+  CCOD_FILE_SHARE_WRITE = $00000002;
+  CCOD_FILE_SHARE_DELETE = $00000004;
+  CCOD_OPEN_EXISTING = 3;
+  CCOD_FILE_FLAG_OPEN_REPARSE_POINT = $00200000;
   CCOD_INVALID_FILE_ATTRIBUTES = $FFFFFFFF;
+  CCOD_INVALID_HANDLE_VALUE = -1;
+  CCOD_ERROR_HANDLE_EOF = 38;
 
 type
   TActivationPhase = (apNone, apStoppingPreviousRuntime, apInstallingRuntime,
     apActivatingRuntime, apStartingProtection, apReady, apFailed);
+  TCcodFileTime = record
+    LowDateTime: Cardinal;
+    HighDateTime: Cardinal;
+  end;
+  TCcodByHandleFileInformation = record
+    FileAttributes: Cardinal;
+    CreationTime: TCcodFileTime;
+    LastAccessTime: TCcodFileTime;
+    LastWriteTime: TCcodFileTime;
+    VolumeSerialNumber: Cardinal;
+    FileSizeHigh: Cardinal;
+    FileSizeLow: Cardinal;
+    NumberOfLinks: Cardinal;
+    FileIndexHigh: Cardinal;
+    FileIndexLow: Cardinal;
+  end;
+  TCcodFindStreamData = record
+    StreamSize: Int64;
+    StreamNameBuffer: array[0..591] of Byte;
+  end;
 
 function GetTickCount64(): Int64;
   external 'GetTickCount64@kernel32.dll stdcall';
@@ -120,6 +148,25 @@ function StringFromGUID2(var Guid: TGUID; GuidString: String; MaxCharacters: Int
   external 'StringFromGUID2@ole32.dll stdcall';
 function GetFileAttributesW(const FileName: String): Cardinal;
   external 'GetFileAttributesW@kernel32.dll stdcall';
+function CreateFileW(const FileName: String; DesiredAccess, ShareMode,
+  SecurityAttributes, CreationDisposition, FlagsAndAttributes,
+  TemplateFile: Cardinal): Integer;
+  external 'CreateFileW@kernel32.dll stdcall';
+function GetFileInformationByHandle(FileHandle: Integer;
+  var Information: TCcodByHandleFileInformation): Boolean;
+  external 'GetFileInformationByHandle@kernel32.dll stdcall';
+function CloseHandle(Handle: Integer): Boolean;
+  external 'CloseHandle@kernel32.dll stdcall';
+function FindFirstStreamW(const FileName: String; InfoLevel: Integer;
+  var StreamData: TCcodFindStreamData; Flags: Cardinal): Integer;
+  external 'FindFirstStreamW@kernel32.dll stdcall';
+function FindNextStreamW(FindHandle: Integer;
+  var StreamData: TCcodFindStreamData): Boolean;
+  external 'FindNextStreamW@kernel32.dll stdcall';
+function CcodFindClose(FindHandle: Integer): Boolean;
+  external 'FindClose@kernel32.dll stdcall';
+function GetLastError(): Cardinal;
+  external 'GetLastError@kernel32.dll stdcall';
 
 function IsSafeExistingPayloadDirectory(const DirectoryName: String): Boolean;
 var
@@ -129,6 +176,50 @@ begin
   Result := (Attributes = CCOD_INVALID_FILE_ATTRIBUTES) or
     (((Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) and
      ((Attributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) = 0));
+end;
+
+function HasOnlyDefaultDataStream(const FileName: String): Boolean;
+var
+  FindHandle: Integer;
+  StreamData: TCcodFindStreamData;
+  ErrorCode: Cardinal;
+begin
+  Result := False;
+  FindHandle := FindFirstStreamW(FileName, 0, StreamData, 0);
+  if FindHandle = CCOD_INVALID_HANDLE_VALUE then Exit;
+  try
+    if FindNextStreamW(FindHandle, StreamData) then Exit;
+    ErrorCode := GetLastError();
+    Result := ErrorCode = CCOD_ERROR_HANDLE_EOF;
+  finally
+    CcodFindClose(FindHandle);
+  end;
+end;
+
+function IsSafeExistingSetupLeaf(const FileName: String): Boolean;
+var
+  Attributes: Cardinal;
+  FileHandle: Integer;
+  Information: TCcodByHandleFileInformation;
+begin
+  Result := False;
+  Attributes := GetFileAttributesW(FileName);
+  if (Attributes = CCOD_INVALID_FILE_ATTRIBUTES) or
+     ((Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) or
+     ((Attributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then Exit;
+  FileHandle := CreateFileW(FileName, CCOD_FILE_READ_ATTRIBUTES,
+    CCOD_FILE_SHARE_READ or CCOD_FILE_SHARE_WRITE or CCOD_FILE_SHARE_DELETE,
+    0, CCOD_OPEN_EXISTING, CCOD_FILE_FLAG_OPEN_REPARSE_POINT, 0);
+  if FileHandle = CCOD_INVALID_HANDLE_VALUE then Exit;
+  try
+    if not GetFileInformationByHandle(FileHandle, Information) then Exit;
+    Result := (Information.NumberOfLinks = 1) and
+      ((Information.FileAttributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) = 0) and
+      ((Information.FileAttributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) = 0) and
+      HasOnlyDefaultDataStream(FileName);
+  finally
+    CloseHandle(FileHandle);
+  end;
 end;
 
 function IsSafeExistingSetupTree(const DirectoryName: String): Boolean;
@@ -155,6 +246,12 @@ begin
           end;
           if ((FindRec.Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) and
              (not IsSafeExistingSetupTree(ChildPath)) then
+          begin
+            Result := False;
+            Exit;
+          end;
+          if ((FindRec.Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) = 0) and
+             (not IsSafeExistingSetupLeaf(ChildPath)) then
           begin
             Result := False;
             Exit;

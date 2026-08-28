@@ -194,6 +194,7 @@ function Assert-CcodLifecycleInstallTreeSafe {
                 Throw-CcodLifecycleError 'CCOD_INSTALL_REPARSE_PATH' 'Install tree contains a reparse point or escaped entry' $full
             }
             if ($item.PSIsContainer) { $pending.Push($full) }
+            else { [void](Assert-CcodLifecycleInstallLeafSafe -InstallRoot $InstallRoot -Path $full) }
         }
     }
     return $tree
@@ -420,11 +421,126 @@ function Get-CcodLifecycleSourceFiles {
     return @($files)
 }
 
+function Get-CcodLifecycleFileLinkCount {
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        if ($null -eq ('CcodLifecycleFileIdentityNative' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class CcodLifecycleFileIdentityNative
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FILETIME { public uint Low; public uint High; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public FILETIME CreationTime;
+        public FILETIME LastAccessTime;
+        public FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out BY_HANDLE_FILE_INFORMATION information);
+
+    public static uint GetLinkCount(string path)
+    {
+        const uint FILE_READ_ATTRIBUTES = 0x80;
+        const uint FILE_SHARE_READ = 1, FILE_SHARE_WRITE = 2, FILE_SHARE_DELETE = 4;
+        const uint OPEN_EXISTING = 3, FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+        using (SafeFileHandle handle = CreateFileW(path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero))
+        {
+            if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+            BY_HANDLE_FILE_INFORMATION information;
+            if (!GetFileInformationByHandle(handle, out information)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            return information.NumberOfLinks;
+        }
+    }
+}
+'@
+        }
+        return [uint32][CcodLifecycleFileIdentityNative]::GetLinkCount([IO.Path]::GetFullPath($Path))
+    } catch {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_UNSAFE_LEAF' 'Unable to prove the install leaf link identity' $Path
+    }
+}
+
+function Assert-CcodLifecycleInstallLeafSafe {
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$AllowMissing
+    )
+
+    $candidate = Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $Path
+    if (-not [IO.File]::Exists($candidate)) {
+        if ([IO.Directory]::Exists($candidate) -or -not $AllowMissing) {
+            Throw-CcodLifecycleError 'CCOD_INSTALL_UNSAFE_LEAF' 'Install leaf is missing or not a regular file' $candidate
+        }
+        return $candidate
+    }
+    $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+    $hasAds = $true
+    try { $hasAds = Test-CcodLifecycleAlternateDataStreams -Path $candidate } catch {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_UNSAFE_LEAF' 'Install leaf alternate streams could not be proven absent' $candidate
+    }
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $hasAds -or (Get-CcodLifecycleFileLinkCount -Path $candidate) -ne 1) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_UNSAFE_LEAF' 'Install leaf must be a regular non-reparse single-link file without alternate streams' $candidate
+    }
+    return $candidate
+}
+
+function Copy-CcodLifecycleFileAtomically {
+    param([Parameter(Mandatory)][string]$Source,[Parameter(Mandatory)][string]$Destination)
+
+    $destination = [IO.Path]::GetFullPath($Destination)
+    $parent = Split-Path $destination -Parent
+    [IO.Directory]::CreateDirectory($parent) | Out-Null
+    $temporary = Join-Path $parent ('.ccod-copy-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        [IO.File]::Copy([IO.Path]::GetFullPath($Source),$temporary,$false)
+        if ([IO.File]::Exists($destination)) {
+            [IO.File]::Replace($temporary,$destination,$null,$true)
+        } else {
+            [IO.File]::Move($temporary,$destination)
+        }
+    } finally {
+        if ([IO.File]::Exists($temporary)) { try { [IO.File]::Delete($temporary) } catch { } }
+    }
+}
+
+function Get-CcodLifecycleBytesSha256 {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($sha.ComputeHash($Bytes)).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
 function Get-CcodLifecyclePayloadManifestFiles {
     param(
         [Parameter(Mandatory)][string]$SourceRoot,
         [Parameter(Mandatory)][string]$ExpectedVersion,
-        [Parameter(Mandatory)][string]$PayloadManifestPath
+        [Parameter(Mandatory)][string]$PayloadManifestPath,
+        [Parameter(Mandatory)][string]$ExpectedPayloadManifestSha256,
+        [Parameter(Mandatory)][string]$PayloadManifestBytesBase64
     )
 
     if ($ExpectedVersion -cnotmatch '^\d+\.\d+\.\d+$') {
@@ -448,7 +564,16 @@ function Get-CcodLifecyclePayloadManifestFiles {
             Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' 'Payload manifest escaped the source root' $manifestPath
         }
     }
-    try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -ErrorAction Stop }
+    if ($ExpectedPayloadManifestSha256 -cnotmatch '^[0-9a-f]{64}$' -or [string]::IsNullOrWhiteSpace($PayloadManifestBytesBase64)) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' 'Payload manifest byte binding is missing or invalid' $manifestPath
+    }
+    try {
+        $manifestBytes = [Convert]::FromBase64String($PayloadManifestBytesBase64)
+        if ($manifestBytes.Length -le 0 -or $manifestBytes.Length -gt 4194304 -or
+            (Get-CcodLifecycleBytesSha256 -Bytes $manifestBytes) -cne $ExpectedPayloadManifestSha256) { throw 'manifest byte binding' }
+        $manifestText = [Text.UTF8Encoding]::new($false,$true).GetString($manifestBytes)
+        $manifest = $manifestText | ConvertFrom-Json -ErrorAction Stop
+    }
     catch { Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' 'Payload manifest is not valid JSON' $manifestPath }
     if ($manifest -isnot [pscustomobject]) {
         Throw-CcodLifecycleError 'CCOD_INSTALL_PAYLOAD_MANIFEST_INVALID' 'Payload manifest must be one JSON object' $manifestPath
@@ -570,9 +695,9 @@ function Copy-CcodLifecycleStaging {
             [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $destinationParent)
             [IO.Directory]::CreateDirectory($destinationParent) | Out-Null
             [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $destinationParent)
-            [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $destination)
+            [void](Assert-CcodLifecycleInstallLeafSafe -InstallRoot $InstallRoot -Path $destination -AllowMissing)
             & $Adapters.CopyFile $file.Source $destination
-            [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $destination)
+            [void](Assert-CcodLifecycleInstallLeafSafe -InstallRoot $InstallRoot -Path $destination)
         }
         foreach ($file in $Files) {
             $destination = [IO.Path]::GetFullPath((Join-Path $stagingDirectory $file.Relative))
@@ -586,18 +711,18 @@ function Copy-CcodLifecycleStaging {
         if (-not [IO.File]::Exists($bootstrapSource)) {
             Throw-CcodLifecycleError 'CCOD_INSTALL_SOURCE_INCOMPLETE' 'The verified staging bootstrap script is missing' $bootstrapSource
         }
-        [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $bootstrapPath)
+        [void](Assert-CcodLifecycleInstallLeafSafe -InstallRoot $InstallRoot -Path $bootstrapPath -AllowMissing)
         & $Adapters.CopyFile $bootstrapSource $bootstrapPath
-        [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $bootstrapPath)
+        [void](Assert-CcodLifecycleInstallLeafSafe -InstallRoot $InstallRoot -Path $bootstrapPath)
         if ((Get-CcodLifecycleFileSha256 -Path $bootstrapPath) -cne (Get-CcodLifecycleFileSha256 -Path $bootstrapSource)) {
             Throw-CcodLifecycleError 'CCOD_INSTALL_FILE_HASH_MISMATCH' 'The stable bootstrap copy differs from verified staging bytes' $bootstrapPath
         }
         $copiedStableBootstrap = $true
         $uninstallerSource = Join-Path $stagingDirectory 'Uninstall-CodexControlOtherDevices.ps1'
         if ([IO.File]::Exists($uninstallerSource)) {
-            [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $uninstallerPath)
+            [void](Assert-CcodLifecycleInstallLeafSafe -InstallRoot $InstallRoot -Path $uninstallerPath -AllowMissing)
             & $Adapters.CopyFile $uninstallerSource $uninstallerPath
-            [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $uninstallerPath)
+            [void](Assert-CcodLifecycleInstallLeafSafe -InstallRoot $InstallRoot -Path $uninstallerPath)
             if ((Get-CcodLifecycleFileSha256 -Path $uninstallerPath) -cne (Get-CcodLifecycleFileSha256 -Path $uninstallerSource)) {
                 Throw-CcodLifecycleError 'CCOD_INSTALL_FILE_HASH_MISMATCH' 'The stable uninstaller copy differs from verified staging bytes' $uninstallerPath
             }
@@ -609,10 +734,10 @@ function Copy-CcodLifecycleStaging {
             try { [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $InstallRoot -Path $stagingDirectory); Remove-Item -LiteralPath $stagingDirectory -Recurse -Force -ErrorAction Stop } catch { }
         }
         if ($copiedStableBootstrap -and -not $bootstrapExistedBefore -and [IO.File]::Exists($bootstrapPath)) {
-            try { [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $bootstrapPath); Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction Stop } catch { }
+            try { [void](Assert-CcodLifecycleInstallLeafSafe -InstallRoot $InstallRoot -Path $bootstrapPath); Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction Stop } catch { }
         }
         if ($copiedStableUninstaller -and -not $uninstallerExistedBefore -and [IO.File]::Exists($uninstallerPath)) {
-            try { [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $uninstallerPath); Remove-Item -LiteralPath $uninstallerPath -Force -ErrorAction Stop } catch { }
+            try { [void](Assert-CcodLifecycleInstallLeafSafe -InstallRoot $InstallRoot -Path $uninstallerPath); Remove-Item -LiteralPath $uninstallerPath -Force -ErrorAction Stop } catch { }
         }
         $candidateId = ([string]$_.FullyQualifiedErrorId -split ',')[0]
         if ($candidateId -clike 'CCOD_INSTALL_*' -or $candidateId -clike 'CCOD_*') {
@@ -1450,8 +1575,7 @@ function Get-CcodLifecycleAdapters {
         }
         CopyFile = {
             param($Source, $Destination)
-            [IO.Directory]::CreateDirectory((Split-Path $Destination -Parent)) | Out-Null
-            [IO.File]::Copy($Source, $Destination, $true)
+            Copy-CcodLifecycleFileAtomically -Source $Source -Destination $Destination
         }
         NewRuntimeManifest = {
             param($RuntimeDirectory, $ProjectVersion)
@@ -1750,6 +1874,8 @@ function Invoke-CcodInstall {
         [string]$ActivationId,
         [string]$ExpectedVersion,
         [string]$PayloadManifestPath,
+        [string]$ExpectedPayloadManifestSha256,
+        [string]$PayloadManifestBytesBase64,
         [hashtable]$Adapters
     )
 
@@ -1775,12 +1901,18 @@ function Invoke-CcodInstall {
     if (-not [IO.Directory]::Exists($sourceRoot)) {
         Throw-CcodLifecycleError 'CCOD_INSTALL_SOURCE_MISSING' 'Source checkout does not exist' $sourceRoot
     }
-    $payloadBound = -not [string]::IsNullOrWhiteSpace($ExpectedVersion) -or -not [string]::IsNullOrWhiteSpace($PayloadManifestPath)
-    if ($payloadBound -and ([string]::IsNullOrWhiteSpace($ExpectedVersion) -or [string]::IsNullOrWhiteSpace($PayloadManifestPath))) {
-        Throw-CcodLifecycleError 'CCOD_INSTALL_INPUT_INVALID' 'ExpectedVersion and PayloadManifestPath must be supplied together' $null
+    $payloadBound = -not [string]::IsNullOrWhiteSpace($ExpectedVersion) -or
+        -not [string]::IsNullOrWhiteSpace($PayloadManifestPath) -or
+        -not [string]::IsNullOrWhiteSpace($ExpectedPayloadManifestSha256) -or
+        -not [string]::IsNullOrWhiteSpace($PayloadManifestBytesBase64)
+    if ($payloadBound -and ([string]::IsNullOrWhiteSpace($ExpectedVersion) -or
+        [string]::IsNullOrWhiteSpace($PayloadManifestPath) -or
+        [string]::IsNullOrWhiteSpace($ExpectedPayloadManifestSha256) -or
+        [string]::IsNullOrWhiteSpace($PayloadManifestBytesBase64))) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_INPUT_INVALID' 'ExpectedVersion, manifest path, hash, and exact bytes must be supplied together' $null
     }
     $files = if ($payloadBound) {
-        @(Get-CcodLifecyclePayloadManifestFiles -SourceRoot $sourceRoot -ExpectedVersion $ExpectedVersion -PayloadManifestPath $PayloadManifestPath)
+        @(Get-CcodLifecyclePayloadManifestFiles -SourceRoot $sourceRoot -ExpectedVersion $ExpectedVersion -PayloadManifestPath $PayloadManifestPath -ExpectedPayloadManifestSha256 $ExpectedPayloadManifestSha256 -PayloadManifestBytesBase64 $PayloadManifestBytesBase64)
     } else { $null }
     if (-not (& $adapters.ValidateSource $sourceRoot)) {
         Throw-CcodLifecycleError 'CCOD_INSTALL_SOURCE_INVALID' 'Source checkout failed hermetic validation' $sourceRoot
@@ -1858,13 +1990,13 @@ function Invoke-CcodInstall {
         $stagingDirectory = Copy-CcodLifecycleStaging -SourceRoot $sourceRoot -InstallRoot $root -Adapters $adapters -Files $files
         $manifest = & $adapters.NewRuntimeManifest $stagingDirectory $projectVersion
         $stagingManifestPath = Join-Path $stagingDirectory 'manifest.json'
-        [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $root -Path $stagingManifestPath)
+        [void](Assert-CcodLifecycleInstallLeafSafe -InstallRoot $root -Path $stagingManifestPath -AllowMissing)
         [IO.File]::WriteAllText(
             $stagingManifestPath,
             ($manifest | ConvertTo-Json -Depth 16),
             [Text.UTF8Encoding]::new($false)
         )
-        [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $root -Path $stagingManifestPath)
+        [void](Assert-CcodLifecycleInstallLeafSafe -InstallRoot $root -Path $stagingManifestPath)
         $runtimeId = [string]$manifest.runtimeId
         $validation = Test-CcodRuntimeManifest -RuntimeDirectory $stagingDirectory -ExpectedRuntimeId $runtimeId
         if (-not $validation.Valid) {
