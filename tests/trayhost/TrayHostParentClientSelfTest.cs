@@ -5,37 +5,6 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Threading;
 
-internal sealed class ProductionTraceTrayPlatform : INativeTrayPlatform
-{
-    internal string Message;
-    public void SetMessageHandler(Action<uint, IntPtr, IntPtr> handler) { }
-    public IntPtr CreateOwner() { return new IntPtr(10); }
-    public IntPtr AssociateOwnerInputContext(IntPtr owner, IntPtr context) { return new IntPtr(20); }
-    public IntPtr GetOwnerInputContext(IntPtr owner) { return IntPtr.Zero; }
-    public bool ReleaseInputContext(IntPtr owner, IntPtr context) { return true; }
-    public IntPtr LoadIcon() { return new IntPtr(40); }
-    public bool DestroyIcon(IntPtr icon) { return true; }
-    public bool AddIcon(ref TrayIconData icon) { return true; }
-    public bool SetIconVersion(ref TrayIconData icon) { return true; }
-    public bool DeleteIcon(ref TrayIconData icon) { return true; }
-    public IntPtr CreatePopupMenu() { return new IntPtr(30); }
-    public IntPtr CreateSubMenu() { return new IntPtr(31); }
-    public bool AppendMenu(IntPtr menu, uint flags, UIntPtr command, string text) { return true; }
-    public bool AppendSubMenu(IntPtr menu, IntPtr child, string text) { return true; }
-    public bool ShowOwner(IntPtr owner) { return true; }
-    public bool HideOwner(IntPtr owner) { return true; }
-    public bool SetForegroundWindow(IntPtr owner) { return true; }
-    public IntPtr GetForegroundWindow() { return new IntPtr(10); }
-    public uint TrackPopupMenuEx(IntPtr menu, uint flags, int x, int y, IntPtr owner, IntPtr parameters) { return 0U; }
-    public bool PostMessage(IntPtr owner, uint message, UIntPtr wParam, IntPtr lParam) { return true; }
-    public bool SetNotificationFocus(ref TrayIconData icon) { return true; }
-    public bool ShowMessageBox(IntPtr owner, string text, string caption) { Message = caption + "|" + text; return true; }
-    public bool ConfirmExit(IntPtr owner, string text, string caption) { return true; }
-    public bool DestroyMenu(IntPtr menu) { return true; }
-    public bool EndMenu() { return true; }
-    public bool DestroyOwner(IntPtr owner) { return true; }
-}
-
 internal static class TrayHostParentClientSelfTest
 {
     internal static string PeerArguments = "--peer";
@@ -82,32 +51,13 @@ internal static class TrayHostParentClientSelfTest
         {
             Guid actionId = Guid.Parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
             TrayHostAction action = new TrayHostAction(actionId, TrayCommand.OpenLogs, staleAction ? 8UL : 1UL);
-            ManualResetEvent receiptPersisted = new ManualResetEvent(false);
-            HostTransport host = new HostTransport();
-            TrayTerminalReceiptSink receiptSink = new TrayTerminalReceiptSink(delegate(TrayTerminalDiagnostic record) { receiptPersisted.Set(); return true; }, host.TryPublishDurableReceipt);
-            ProductionTraceTrayPlatform tracePlatform = new ProductionTraceTrayPlatform();
-            TrayWindow traceWindow = new TrayWindow(tracePlatform); traceWindow.Create(Snapshot(1UL));
-            AssertTrue(host.TryRegisterAction(action), "program peer registers the exact outbound action");
             ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.Action, epoch, outboundSequence++, TrayHostWire.WriteAction(action)), keys.HostToParent);
             ProtocolFrame terminalFrame = ProtocolCodec.ReadAuthenticated(input, ProtocolDirection.ParentToHost, epoch, inboundSequence++, keys.ParentToHost);
-            AssertTrue(terminalFrame.MessageType == TrayHostMessageType.ActionResult, "program peer receives one authenticated terminal result");
-            AssertTrue(Program.TryDispatchAuthenticatedActionResult(host, receiptSink, terminalFrame.Payload), "production Program dispatch accepts the correlated authenticated result without waiting for receipt storage");
-            TrayActionResult feedback;
-            if (staleAction)
-            {
-                Stopwatch feedbackWait = Stopwatch.StartNew();
-                while (!host.TryTakeFailedAction(out feedback) && feedbackWait.ElapsedMilliseconds < 3000L) { Thread.Sleep(5); }
-                AssertTrue(feedback != null && feedback.Revision == 8UL && feedback.Status == TrayActionResultStatus.Rejected && String.Equals(feedback.ErrorCode, "CCOD_TRAY_ACTION_STALE", StringComparison.Ordinal), "stale authenticated result reaches the production generic-feedback queue only after its durable callback");
-                traceWindow.ShowActionFailed();
-                AssertTrue(String.Equals(tracePlatform.Message, "string-0|string-15", StringComparison.Ordinal), "stale production trace collapses internal details to the generic acknowledged-snapshot dialog");
-            }
-            else
-            {
-                AssertTrue(receiptPersisted.WaitOne(3000), "completed current action reaches durable receipt storage asynchronously");
-                AssertTrue(!host.TryTakeFailedAction(out feedback) && tracePlatform.Message == null, "completed current action produces no generic failure feedback");
-            }
-            receiptSink.Dispose(); traceWindow.Dispose(); host.Dispose(); receiptPersisted.Dispose();
-            return;
+            AssertTrue(terminalFrame.MessageType == TrayHostMessageType.ActionResult, "synthetic peer receives one authenticated terminal result");
+            TrayActionResult terminal = TrayHostWire.ReadActionResult(terminalFrame.Payload);
+            AssertTrue(terminal.ActionId == action.ActionId && terminal.Revision == action.Revision, "parent writer preserves the exact correlated action identity");
+            if (staleAction) { AssertTrue(terminal.Status == TrayActionResultStatus.Rejected && String.Equals(terminal.ErrorCode, "CCOD_TRAY_ACTION_STALE", StringComparison.Ordinal), "parent writer preserves the stale terminal result"); }
+            else { AssertTrue(terminal.Status == TrayActionResultStatus.Completed && terminal.ErrorCode == null, "parent writer preserves the current completion result"); }
         }
         if (emitFaultAndIgnoreShutdown)
         {
@@ -277,30 +227,5 @@ internal static class TrayHostParentClientSelfTest
             Console.Error.WriteLine(error.Message);
             return 1;
         }
-    }
-}
-
-public static class TrayHostProductionTraceFixture
-{
-    public static TrayHostParentClient Start(string executablePath, bool stale)
-    {
-        if (String.IsNullOrEmpty(executablePath)) { throw new ArgumentException("trace executable is required", "executablePath"); }
-        Process current = Process.GetCurrentProcess();
-        TrayHostParentClient.TestProcessFactory = TrayHostParentClientSelfTest.StartPeer;
-        TrayHostParentClientSelfTest.PeerArguments = stale ? "--stale-action-peer" : "--action-peer";
-        return TrayHostParentClient.Start(new TrayHostStartOptions {
-            ExePath = executablePath,
-            RuntimeId = "trace-runtime",
-            ParentPid = current.Id,
-            ParentCreationFileTimeUtc = current.StartTime.ToFileTimeUtc(),
-            InitialPresentation = CreateSnapshot()
-        });
-    }
-
-    private static PresentationSnapshot CreateSnapshot()
-    {
-        string[] strings = new string[16];
-        for (int index = 0; index < strings.Length; index++) { strings[index] = "trace-" + index.ToString(); }
-        return new PresentationSnapshot(1UL, TrayColor.Green, ConnectionState.Connected, ProtectionState.Running, LanguageMode.English, PresentationFlags.OpenLogsEnabled, strings);
     }
 }

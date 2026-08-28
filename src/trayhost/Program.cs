@@ -1,13 +1,8 @@
 using System;
-using System.Diagnostics;
 using System.IO;
-using System.Security.Cryptography;
-using System.Threading;
 
 internal static class Program
 {
-    private static readonly object WriteGate = new object();
-
     internal static int Main(string[] args)
     {
         try
@@ -21,109 +16,18 @@ internal static class Program
 
     private static int RunChild(string[] args)
     {
-        int expectedParentPid; long expectedParentCreation; string expectedRuntime;
-        if (!Int32.TryParse(args[2], out expectedParentPid) || !Int64.TryParse(args[4], out expectedParentCreation) || String.IsNullOrEmpty(args[6]) || !String.Equals(args[1], "--parent-pid", StringComparison.Ordinal) || !String.Equals(args[3], "--parent-created", StringComparison.Ordinal) || !String.Equals(args[5], "--runtime-id", StringComparison.Ordinal)) { return 2; }
-        expectedRuntime = args[6];
-        Stream input = Console.OpenStandardInput(); Stream output = Console.OpenStandardOutput();
-        ProtocolFrame bootstrap = ProtocolCodec.ReadBootstrap(input, ProtocolDirection.ParentToHost);
-        TrayHostHello parent = TrayHostWire.ReadParentHello(bootstrap.Payload);
-        if (parent.ProcessId != expectedParentPid || parent.CreationFileTimeUtc != expectedParentCreation || !String.Equals(parent.RuntimeId, expectedRuntime, StringComparison.Ordinal) || !VerifyParentIdentity(expectedParentPid, expectedParentCreation)) { return 2; }
-        byte[] nonce = new byte[32]; using (RandomNumberGenerator rng = RandomNumberGenerator.Create()) { rng.GetBytes(nonce); }
-        ulong epoch = (ulong)DateTime.UtcNow.Ticks;
-        Process self = Process.GetCurrentProcess();
-        ProtocolCodec.WriteBootstrap(output, ProtocolFrame.Bootstrap(ProtocolDirection.HostToParent, TrayHostMessageType.HostHello, TrayHostWire.WriteHostHello(self.Id, self.StartTime.ToFileTimeUtc(), expectedRuntime, nonce, epoch)));
-        SessionKeys keys = ProtocolCodec.DeriveDirectionalKeys(parent.SessionSeed, parent.ParentChallenge, nonce, epoch);
-        ulong inboundSequence = 1UL; ulong outboundSequence = 1UL;
-        ProtocolFrame initialFrame = ProtocolCodec.ReadAuthenticated(input, ProtocolDirection.ParentToHost, epoch, inboundSequence++, keys.ParentToHost);
-        if (initialFrame.MessageType != TrayHostMessageType.Presentation) { return 2; }
-        PresentationSnapshot initial = TrayHostWire.ReadPresentation(initialFrame.Payload);
-        Win32TrayPlatform platform = new Win32TrayPlatform();
-        TrayHostApplication application = null;
-        TrayWindow window = null;
-        TrayTerminalDiagnosticStore terminalStore = new TrayTerminalDiagnosticStore();
-        HostTransport transport = new HostTransport(
-            delegate { TrayHostApplication current = application; if (current != null) { current.PostWork(); } },
-            delegate(uint token) { TrayHostApplication current = application; return current != null && current.PostReceiptWork(token); });
-        TrayTerminalReceiptSink receiptSink = new TrayTerminalReceiptSink(terminalStore.TryAppendDurably, transport.TryPublishDurableReceipt, terminalStore.Dispose);
-        window = new TrayWindow(platform, transport.SetMenuOpen);
-        bool shutdownRequested = false; bool shutdownSent = false; object stateGate = new object();
-        Action<TrayCommand, ulong> command = delegate(TrayCommand selected, ulong revision)
-        {
-            TrayHostAction action;
-            try { action = new TrayHostAction(Guid.NewGuid(), selected, revision); }
-            catch (ArgumentException) { return; }
-            if (!transport.TryRegisterAction(action)) { return; }
-            lock (WriteGate) { ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.Action, epoch, outboundSequence++, TrayHostWire.WriteAction(action)), keys.HostToParent); }
-        };
-        Action work = delegate
-        {
-            PresentationSnapshot next;
-            if (transport.TryTakePresentation(out next))
+        TrayHostChildIdentity identity;
+        if (!TrayHostChildSession.TryCreateIdentity(args, out identity)) { return 2; }
+        return TrayHostChildSession.Run(
+            Console.OpenStandardInput(),
+            Console.OpenStandardOutput(),
+            identity,
+            new WindowsTrayHostRuntime(),
+            delegate(HostTransport transport)
             {
-                if (window.Apply(next))
-                {
-                    lock (WriteGate) { ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.PresentationAck, epoch, outboundSequence++, TrayHostWire.WriteRevision(next.Revision)), keys.HostToParent); }
-                }
-            }
-            bool shouldShutdown;
-            lock (stateGate) { shouldShutdown = shutdownRequested && !shutdownSent; if (shouldShutdown) { shutdownSent = true; } }
-            if (shouldShutdown)
-            {
-                window.RequestShutdown();
-                lock (WriteGate) { ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.ShutdownAck, epoch, outboundSequence++, TrayHostWire.WriteRevision(window.CurrentRevision)), keys.HostToParent); }
-                application.RequestExit();
-            }
-        };
-        Action<uint> receiptWork = delegate(uint token)
-        {
-            TrayTerminalReceiptUiKind kind; TrayActionResult receiptResult;
-            if (!transport.TryTakeReceiptUi(token, out kind, out receiptResult)) { return; }
-            if (kind == TrayTerminalReceiptUiKind.About) { window.ShowAbout(); }
-            else if (kind == TrayTerminalReceiptUiKind.Failure) { window.ShowActionFailed(); }
-        };
-        window.CommandSelected += command;
-        application = new TrayHostApplication(platform, window, command, work, receiptWork);
-        window.Create(initial);
-        lock (WriteGate)
-        {
-            ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.PresentationAck, epoch, outboundSequence++, TrayHostWire.WriteRevision(initial.Revision)), keys.HostToParent);
-            ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.UiReady, epoch, outboundSequence++, TrayHostWire.WriteRevision(initial.Revision)), keys.HostToParent);
-        }
-        Thread reader = new Thread(new ThreadStart(delegate
-        {
-            try
-            {
-                while (true)
-                {
-                    ProtocolFrame frame = ProtocolCodec.ReadAuthenticated(input, ProtocolDirection.ParentToHost, epoch, inboundSequence++, keys.ParentToHost);
-                    if (frame.MessageType == TrayHostMessageType.Presentation) { transport.TryAcceptPresentation(TrayHostWire.ReadPresentation(frame.Payload)); application.PostWork(); }
-                    else if (frame.MessageType == TrayHostMessageType.ActionResult) { if (!TryDispatchAuthenticatedActionResult(transport, receiptSink, frame.Payload)) { throw new ProtocolViolationException("action result is uncorrelated"); } }
-                    else if (frame.MessageType == TrayHostMessageType.Shutdown) { lock (stateGate) { shutdownRequested = true; } application.PostWork(); }
-                    else if (frame.MessageType == TrayHostMessageType.Ping) { lock (WriteGate) { ProtocolCodec.WriteAuthenticated(output, ProtocolFrame.Authenticated(ProtocolDirection.HostToParent, TrayHostMessageType.Pong, epoch, outboundSequence++, frame.Payload), keys.HostToParent); } }
-                }
-            }
-            catch { application.RequestExit(); }
-        })) { IsBackground = true, Name = "CodexRemote.TrayHost.Reader" };
-        reader.Start();
-        int result = application.Run();
-        receiptSink.Dispose(); transport.Dispose(); application.Dispose(); return result;
-    }
-
-    private static bool VerifyParentIdentity(int pid, long creation)
-    {
-        try { using (Process process = Process.GetProcessById(pid)) { return process.StartTime.ToFileTimeUtc() == creation; } } catch { return false; }
-    }
-
-    internal static bool TryDispatchAuthenticatedActionResult(HostTransport transport, TrayTerminalReceiptSink receiptSink, byte[] payload)
-    {
-        if (transport == null || payload == null) { return false; }
-        TrayTerminalReceipt receipt;
-        if (!transport.TryAcknowledgeAction(TrayHostWire.ReadActionResult(payload), out receipt)) { return false; }
-        if (receipt != null && receiptSink != null)
-        {
-            try { receiptSink.TrySubmit(receipt); } catch { }
-        }
-        return true;
+                TrayTerminalDiagnosticStore terminalStore = new TrayTerminalDiagnosticStore();
+                return new TrayTerminalReceiptSink(terminalStore.TryAppendDurably, transport.TryPublishDurableReceipt, terminalStore.Dispose);
+            });
     }
 
     private static int RunHeadlessSmoke()

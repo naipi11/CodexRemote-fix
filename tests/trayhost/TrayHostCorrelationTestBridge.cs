@@ -1,12 +1,25 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 
 public sealed class TrayHostCorrelationTestBridge : IDisposable
 {
     private sealed class Platform : INativeTrayPlatform
     {
+        private sealed class Message
+        {
+            internal uint Id;
+            internal IntPtr WParam;
+            internal IntPtr LParam;
+        }
+
+        private readonly object _gate = new object();
+        private readonly Queue<Message> _messages = new Queue<Message>();
+        private readonly AutoResetEvent _available = new AutoResetEvent(false);
+        private Action<uint, IntPtr, IntPtr> _handler;
         internal uint Selection;
-        public void SetMessageHandler(Action<uint, IntPtr, IntPtr> handler) { }
+        internal int MessageBoxCount;
+        public void SetMessageHandler(Action<uint, IntPtr, IntPtr> handler) { _handler = handler; }
         public IntPtr CreateOwner() { return new IntPtr(10); }
         public IntPtr AssociateOwnerInputContext(IntPtr owner, IntPtr context) { return new IntPtr(20); }
         public IntPtr GetOwnerInputContext(IntPtr owner) { return IntPtr.Zero; }
@@ -25,22 +38,48 @@ public sealed class TrayHostCorrelationTestBridge : IDisposable
         public bool SetForegroundWindow(IntPtr owner) { return true; }
         public IntPtr GetForegroundWindow() { return new IntPtr(10); }
         public uint TrackPopupMenuEx(IntPtr menu, uint flags, int x, int y, IntPtr owner, IntPtr parameters) { return Selection; }
-        public bool PostMessage(IntPtr owner, uint message, UIntPtr wParam, IntPtr lParam) { return true; }
+        public bool PostMessage(IntPtr owner, uint message, UIntPtr wParam, IntPtr lParam)
+        {
+            ulong raw = wParam.ToUInt64();
+            IntPtr converted = IntPtr.Size == 4 ? new IntPtr(unchecked((int)raw)) : new IntPtr(unchecked((long)raw));
+            lock (_gate) { _messages.Enqueue(new Message { Id = message, WParam = converted, LParam = lParam }); }
+            _available.Set();
+            return true;
+        }
         public bool SetNotificationFocus(ref TrayIconData icon) { return true; }
-        public bool ShowMessageBox(IntPtr owner, string text, string caption) { return true; }
+        public bool ShowMessageBox(IntPtr owner, string text, string caption) { MessageBoxCount++; return true; }
         public bool ConfirmExit(IntPtr owner, string text, string caption) { return true; }
         public bool DestroyMenu(IntPtr menu) { return true; }
         public bool EndMenu() { return true; }
         public bool DestroyOwner(IntPtr owner) { return true; }
+
+        internal bool DispatchNext(TimeSpan timeout)
+        {
+            Message message = null;
+            lock (_gate) { if (_messages.Count != 0) { message = _messages.Dequeue(); } }
+            if (message == null)
+            {
+                if (!_available.WaitOne(timeout)) { return false; }
+                lock (_gate) { if (_messages.Count != 0) { message = _messages.Dequeue(); } }
+            }
+            if (message == null || _handler == null) { return false; }
+            _handler(message.Id, message.WParam, message.LParam);
+            return true;
+        }
+
+        internal void Dispose() { _available.Dispose(); }
     }
 
     private readonly Platform _platform;
     private readonly HostTransport _transport;
     private readonly TrayWindow _window;
+    private readonly TrayHostApplication _application;
+    private readonly TrayTerminalReceiptSink _receiptSink;
+    private readonly ManualResetEvent _receiptAttempted = new ManualResetEvent(false);
+    private readonly ManualResetEvent _publicationCompleted = new ManualResetEvent(false);
     private TrayHostAction _selected;
     private TrayActionResult _terminal;
     private bool _persistDiagnostics = true;
-    private int _feedbackCount;
 
     public TrayHostCorrelationTestBridge(ulong revision, TrayCommand command) : this(revision, command, true)
     {
@@ -50,7 +89,8 @@ public sealed class TrayHostCorrelationTestBridge : IDisposable
     {
         _platform = new Platform { Selection = (uint)command };
         _persistDiagnostics = persistDiagnostics;
-        _transport = new HostTransport(null, delegate(TrayTerminalDiagnostic record) { return _persistDiagnostics; });
+        TrayHostApplication application = null;
+        _transport = new HostTransport(null, delegate(uint token) { return application != null && application.PostReceiptWork(token); });
         _window = new TrayWindow(_platform, _transport.SetMenuOpen);
         _window.CommandSelected += delegate(TrayCommand selected, ulong displayedRevision)
         {
@@ -58,6 +98,20 @@ public sealed class TrayHostCorrelationTestBridge : IDisposable
             if (!_transport.TryRegisterAction(action)) { throw new InvalidOperationException("test action registration failed"); }
             _selected = action;
         };
+        Action<uint> receiptWork = delegate(uint token)
+        {
+            TrayTerminalReceiptUiKind kind;
+            TrayActionResult result;
+            if (!_transport.TryTakeReceiptUi(token, out kind, out result)) { return; }
+            _terminal = result;
+            if (kind == TrayTerminalReceiptUiKind.Failure) { _window.ShowActionFailed(); }
+            else if (kind == TrayTerminalReceiptUiKind.About) { _window.ShowAbout(); }
+        };
+        application = new TrayHostApplication(_platform, _window, null, delegate { }, receiptWork);
+        _application = application;
+        _receiptSink = new TrayTerminalReceiptSink(
+            delegate(TrayTerminalDiagnostic record) { bool persisted = _persistDiagnostics; _receiptAttempted.Set(); return persisted; },
+            delegate(TrayTerminalReceipt receipt) { bool published = _transport.TryPublishDurableReceipt(receipt); _publicationCompleted.Set(); return published; });
         _window.Create(Snapshot(revision));
     }
 
@@ -75,19 +129,31 @@ public sealed class TrayHostCorrelationTestBridge : IDisposable
     {
         TrayActionResultStatus parsed = (TrayActionResultStatus)Enum.Parse(typeof(TrayActionResultStatus), status, false);
         TrayActionResult result = new TrayActionResult(actionId, revision, parsed, errorCode, null);
-        bool accepted = _transport.TryAcknowledgeAction(result);
+        _receiptAttempted.Reset();
+        _publicationCompleted.Reset();
+        TrayTerminalReceipt receipt;
+        bool accepted = _transport.TryAcknowledgeAction(result, out receipt);
         if (!accepted) { return false; }
         _terminal = result;
-        if (parsed == TrayActionResultStatus.Rejected || parsed == TrayActionResultStatus.Failed)
+        if (receipt != null && _receiptSink.TrySubmit(receipt))
         {
-            TrayActionResult queued;
-            if (_transport.TryTakeFailedAction(out queued)) { _terminal = queued; _feedbackCount++; }
+            if (!_receiptAttempted.WaitOne(TimeSpan.FromSeconds(2))) { throw new InvalidOperationException("test receipt writer did not run"); }
+            if (_persistDiagnostics)
+            {
+                if (!_publicationCompleted.WaitOne(TimeSpan.FromSeconds(2))) { throw new InvalidOperationException("test receipt publication did not complete"); }
+                if (parsed == TrayActionResultStatus.Rejected || parsed == TrayActionResultStatus.Failed)
+                {
+                    DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+                    while (_platform.MessageBoxCount == 0 && DateTime.UtcNow < deadline) { _platform.DispatchNext(TimeSpan.FromMilliseconds(25)); }
+                    if (_platform.MessageBoxCount != 1) { throw new InvalidOperationException("test receipt UI was not token-dispatched"); }
+                }
+            }
         }
         return true;
     }
 
     public void SetDiagnosticPersistence(bool value) { _persistDiagnostics = value; }
-    public int FeedbackCount { get { return _feedbackCount; } }
+    public int FeedbackCount { get { return _platform.MessageBoxCount; } }
 
     public string TerminalStatus { get { return _terminal == null ? String.Empty : _terminal.Status.ToString(); } }
     public string TerminalCode { get { return _terminal == null ? String.Empty : (_terminal.ErrorCode ?? String.Empty); } }
@@ -103,7 +169,11 @@ public sealed class TrayHostCorrelationTestBridge : IDisposable
 
     public void Dispose()
     {
-        _window.Dispose();
+        _receiptSink.Dispose();
         _transport.Dispose();
+        _application.Dispose();
+        _receiptAttempted.Dispose();
+        _publicationCompleted.Dispose();
+        _platform.Dispose();
     }
 }

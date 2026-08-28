@@ -104,4 +104,13 @@ Invoke-CcodTest 'TrayHost client delivers the exact correlated terminal result t
     Assert-CcodEqual 'CCOD_TRAY_ACTION_STALE' $received[0].ErrorCode 'terminal result preserves the stable stale code'
 }
 
+Invoke-CcodTest 'production trace launches the temporary child through the normal parent client' {
+    # Production mutation caught: replacing the real child process with TestProcessFactory or bypassing TrayHostParentClient.Start.
+    $traceSource=Get-Content -LiteralPath (Join-Path $repositoryRoot 'tests\trayhost\TrayHostProductionTraceSelfTest.cs') -Raw -Encoding UTF8
+    $traceScript=Get-Content -LiteralPath (Join-Path $repositoryRoot 'tests\persistence\TrayHostProductionTrace.SelfTest.ps1') -Raw -Encoding UTF8
+    Assert-CcodTrue ($traceSource -cmatch 'TrayHostParentClient\.Start\(') 'temporary trace uses the normal parent-client start path'
+    Assert-CcodTrue ($traceSource -cnotmatch 'TestProcessFactory\s*=') 'temporary trace never assigns the parent-client test process factory'
+    Assert-CcodTrue ($traceScript -cnotmatch 'TryDispatchAuthenticatedActionResult|TryTakeFailedAction') 'PowerShell trace cannot bypass authenticated child dispatch or tokened receipt work'
+}
+
 Write-Host 'TrayHost client self-tests passed.'

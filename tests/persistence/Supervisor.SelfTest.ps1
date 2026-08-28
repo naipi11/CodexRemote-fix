@@ -820,10 +820,12 @@ function Import-CcodTrayHostCorrelationTestBridge {
         (Join-Path $trayRoot 'PipeProtocol.cs'),
         (Join-Path $trayRoot 'TransportMessages.cs'),
         (Join-Path $trayRoot 'TrayTerminalDiagnostic.cs'),
+        (Join-Path $trayRoot 'TrayTerminalReceiptSink.cs'),
         (Join-Path $trayRoot 'NativeMethods.cs'),
         (Join-Path $trayRoot 'InputModeGuard.cs'),
         (Join-Path $trayRoot 'NativeMenu.cs'),
         (Join-Path $trayRoot 'TrayWindow.cs'),
+        (Join-Path $trayRoot 'TrayHostApplication.cs'),
         (Join-Path $trayRoot 'HostTransport.cs'),
         (Join-Path $repositoryRoot 'tests\trayhost\TrayHostCorrelationTestBridge.cs')
     )
