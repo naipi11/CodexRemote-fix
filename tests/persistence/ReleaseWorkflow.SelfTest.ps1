@@ -5,7 +5,7 @@ $repositoryRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $defenderPath = Join-Path $repositoryRoot 'tools\Test-ReleaseDefender.ps1'
 
 function ConvertFrom-CcodWorkflowScalar {
-    param([Parameter(Mandatory)][string]$Value)
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
     $scalar = $Value.Trim()
     if ($scalar.Length -ge 2 -and (($scalar[0] -ceq '"' -and $scalar[$scalar.Length - 1] -ceq '"') -or ($scalar[0] -ceq "'" -and $scalar[$scalar.Length - 1] -ceq "'"))) {
         return $scalar.Substring(1, $scalar.Length - 2)
@@ -56,29 +56,43 @@ function Get-CcodWorkflowStructure {
         }
         if (-not $inSteps) { continue }
         if ($line -cmatch '^      -(?:\s+(?<key>[A-Za-z][A-Za-z0-9_-]*):\s*(?<value>.*))?\s*$') {
-            $currentStep = [pscustomobject]@{ Name = ''; Shell = ''; Run = '' }
+            $currentStep = [pscustomobject]@{ Name = ''; Shell = ''; Run = ''; If = ''; ContinueOnError = '' }
             $currentJob.Steps.Add($currentStep)
             $key = [string]$Matches.key
             $value = [string]$Matches.value
-            if ($key -in @('name', 'shell', 'run')) {
+            if ($key -in @('name', 'shell', 'run', 'if', 'continue-on-error')) {
                 if ($key -ceq 'run' -and $value.Trim() -in @('|', '|-', '|+')) {
                     $runBlock = $true
                     $runLines.Clear()
                 } else {
-                    $currentStep.$key = ConvertFrom-CcodWorkflowScalar $value
+                    $property = switch ($key) {
+                        'name' { 'Name' }
+                        'shell' { 'Shell' }
+                        'run' { 'Run' }
+                        'if' { 'If' }
+                        'continue-on-error' { 'ContinueOnError' }
+                    }
+                    $currentStep.$property = ConvertFrom-CcodWorkflowScalar $value
                 }
             }
             continue
         }
         if ($null -eq $currentStep) { continue }
-        if ($line -cmatch '^        (?<key>shell|run):\s*(?<value>.*)$') {
+        if ($line -cmatch '^        (?<key>name|shell|run|if|continue-on-error):\s*(?<value>.*)$') {
             $key = $Matches.key
             $value = $Matches.value.Trim()
             if ($key -ceq 'run' -and $value -in @('|', '|-', '|+')) {
                 $runBlock = $true
                 $runLines.Clear()
             } else {
-                $currentStep.$key = ConvertFrom-CcodWorkflowScalar $value
+                $property = switch ($key) {
+                    'name' { 'Name' }
+                    'shell' { 'Shell' }
+                    'run' { 'Run' }
+                    'if' { 'If' }
+                    'continue-on-error' { 'ContinueOnError' }
+                }
+                $currentStep.$property = ConvertFrom-CcodWorkflowScalar $value
             }
         }
     }
@@ -133,7 +147,7 @@ function Assert-CcodAuthenticatedTraceWorkflowContract {
         $allTraceSteps = @($workflow.Jobs | ForEach-Object { @($_.Steps) } | Where-Object { $_.Name -ceq $traceName })
         $allTraceInvocationSteps = @($workflow.Jobs | ForEach-Object { @($_.Steps) } | Where-Object { Test-CcodWorkflowStepInvokesProductionTrace -Step $_ })
         $traceSteps = @($jobs[0].Steps | Where-Object { $_.Name -ceq $traceName })
-        if ($allTraceSteps.Count -ne 1 -or $allTraceInvocationSteps.Count -ne 1 -or $traceSteps.Count -ne 1 -or $traceSteps[0].Shell -cne 'pwsh' -or $traceSteps[0].Run -cne $traceRun) {
+        if ($allTraceSteps.Count -ne 1 -or $allTraceInvocationSteps.Count -ne 1 -or $traceSteps.Count -ne 1 -or $traceSteps[0].Shell -cne 'pwsh' -or $traceSteps[0].Run -cne $traceRun -or -not [string]::IsNullOrEmpty([string]$traceSteps[0].If) -or -not [string]::IsNullOrEmpty([string]$traceSteps[0].ContinueOnError)) {
             throw 'CCOD_RELEASE_TRACE_GATE_INVALID'
         }
         if ($target.RequireBuildOrder) {
@@ -1534,7 +1548,7 @@ Invoke-CcodTest 'CI and release build jobs uniquely gate asset production on the
         -ReleasePath (Join-Path $repositoryRoot '.github\workflows\release.yml')
 }
 
-Invoke-CcodTest 'authenticated trace workflow gate rejects comments wrong jobs duplicates and post-build placement' {
+Invoke-CcodTest 'authenticated trace workflow gate rejects bypass modifiers comments wrong jobs duplicates and post-build placement' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-trace-workflow-fixtures-' + [guid]::NewGuid().ToString('N'))
     try {
         [IO.Directory]::CreateDirectory($root) | Out-Null
@@ -1571,7 +1585,43 @@ jobs:
         [IO.File]::WriteAllText($ciPath, $validCi, [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText($releasePath, $validRelease, [Text.UTF8Encoding]::new($false))
         Assert-CcodAuthenticatedTraceWorkflowContract -CiPath $ciPath -ReleasePath $releasePath
+        $emptyModifierCi = @'
+name: fixture CI
+jobs:
+  validate:
+    steps:
+      - name: Run authenticated TrayHost production trace
+        if:
+        continue-on-error:
+        shell: pwsh
+        run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly
+'@
+        [IO.File]::WriteAllText($ciPath, $emptyModifierCi, [Text.UTF8Encoding]::new($false))
+        Assert-CcodAuthenticatedTraceWorkflowContract -CiPath $ciPath -ReleasePath $releasePath
         $invalidFixtures = @(
+            [pscustomobject]@{ Name = 'conditional CI trace step'; Ci = @'
+name: fixture CI
+jobs:
+  validate:
+    steps:
+      - name: Run authenticated TrayHost production trace
+        if: ${{ false }}
+        shell: pwsh
+        run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly
+'@; Release = $validRelease },
+            [pscustomobject]@{ Name = 'continue-on-error release trace step'; Ci = $validCi; Release = @'
+name: fixture release
+jobs:
+  build:
+    steps:
+      - name: Run authenticated TrayHost production trace
+        continue-on-error: true
+        shell: pwsh
+        run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly
+      - name: Build assets
+        shell: pwsh
+        run: ./build/build.ps1 -Version 2.5.21
+'@ },
             [pscustomobject]@{ Name = 'comment-only CI decoy'; Ci = @'
 name: fixture CI
 jobs:
