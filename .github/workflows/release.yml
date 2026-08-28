@@ -134,17 +134,8 @@ jobs:
             throw "Release tag output is invalid: '$tag'."
           }
           $version = $tag.Substring(1)
-          $changelog = Get-Content -LiteralPath (Join-Path $PWD 'CHANGELOG.md') -Raw -Encoding UTF8
-          $releaseSection = [regex]::Match($changelog, '(?ms)^## ' + [regex]::Escape($tag) + '\r?\n(.*?)(?=^## |\z)')
-          if (-not $releaseSection.Success) {
-            throw "CHANGELOG.md has no release section for $tag"
-          }
-          $englishSection = [regex]::Match($releaseSection.Groups[1].Value, '(?ms)^### English\r?\n(.*?)(?=^### |\z)')
-          if (-not $englishSection.Success) {
-            throw "CHANGELOG.md has no English release section for $tag"
-          }
           $notesPath = Join-Path $env:RUNNER_TEMP ("CodexRemote-fix-$tag-release-notes.md")
-          Set-Content -LiteralPath $notesPath -Value ("# CodexRemote-fix $version`n`n" + $englishSection.Groups[1].Value.Trim() + "`n") -Encoding UTF8
+          & (Join-Path $PWD 'tools\New-GitHubReleaseNotes.ps1') -ChangelogPath (Join-Path $PWD 'CHANGELOG.md') -Tag $tag -OutputPath $notesPath | Out-Null
           & gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets 2>$null | Out-Null
           $exists = $LASTEXITCODE -eq 0
           $existingAssets = @()

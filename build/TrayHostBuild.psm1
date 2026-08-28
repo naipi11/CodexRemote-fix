@@ -35,6 +35,53 @@ function Test-CcodTrayHostOutputDirectory {
     if([string]::IsNullOrWhiteSpace($full) -or $full -eq [IO.Path]::GetPathRoot($full).TrimEnd('\')){throw 'CCOD_TRAYHOST_OUTPUT_PATH_INVALID'}
 }
 
+function Assert-CcodNativeVersionContract {
+    param(
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][string]$Version,
+        [Parameter(Mandatory)][ValidateSet('trayhost','portable')][string]$Component
+    )
+    $definition=if($Component -ceq 'trayhost'){
+        [pscustomobject]@{ManifestName='CodexRemote.TrayHost.manifest';IdentityName='CodexRemote.fix.TrayHost';MissingError='CCOD_TRAYHOST_SOURCE_MISSING';VersionError='CCOD_TRAYHOST_VERSION_MISMATCH'}
+    }else{
+        [pscustomobject]@{ManifestName='CodexRemote.Portable.manifest';IdentityName='CodexRemote.fix.Portable';MissingError='CCOD_PORTABLE_LAUNCHER_SOURCE_MISSING';VersionError='CCOD_PORTABLE_LAUNCHER_VERSION_MISMATCH'}
+    }
+    $repo=[IO.Path]::GetFullPath($RepositoryRoot)
+    $sourceRoot=Join-Path $repo ('src\'+$Component)
+    $packagePath=Join-Path $repo 'package.json'
+    $assemblyInfoPath=Join-Path $sourceRoot 'AssemblyInfo.cs'
+    $manifestPath=Join-Path $sourceRoot $definition.ManifestName
+    foreach($required in @($packagePath,$assemblyInfoPath,$manifestPath)){if(-not(Test-Path -LiteralPath $required -PathType Leaf)){throw $definition.MissingError}}
+    try{
+        $package=Get-Content -LiteralPath $packagePath -Raw|ConvertFrom-Json
+        if([string]$package.version -cne $Version){throw $definition.VersionError}
+        $expectedNativeVersion="$Version.0"
+        $assemblyInfo=[IO.File]::ReadAllText($assemblyInfoPath,[Text.UTF8Encoding]::new($false))
+        $assemblyVersions=@([regex]::Matches($assemblyInfo,'(?m)^\s*\[assembly:\s*AssemblyVersion\("(?<version>[^"]+)"\)\]\s*$'))
+        $fileVersions=@([regex]::Matches($assemblyInfo,'(?m)^\s*\[assembly:\s*AssemblyFileVersion\("(?<version>[^"]+)"\)\]\s*$'))
+        if($assemblyVersions.Count -ne 1 -or $fileVersions.Count -ne 1 -or
+            [string]$assemblyVersions[0].Groups['version'].Value -cne $expectedNativeVersion -or
+            [string]$fileVersions[0].Groups['version'].Value -cne $expectedNativeVersion){throw $definition.VersionError}
+        [xml]$manifest=[IO.File]::ReadAllText($manifestPath,[Text.UTF8Encoding]::new($false))
+        $namespace=[Xml.XmlNamespaceManager]::new($manifest.NameTable)
+        $namespace.AddNamespace('asmv1','urn:schemas-microsoft-com:asm.v1')
+        $identities=@($manifest.SelectNodes('/asmv1:assembly/asmv1:assemblyIdentity',$namespace))
+        if($identities.Count -ne 1 -or [string]$identities[0].version -cne $expectedNativeVersion -or
+            [string]$identities[0].name -cne [string]$definition.IdentityName -or [string]$identities[0].type -cne 'win32'){throw $definition.VersionError}
+        return [pscustomobject][ordered]@{SourceRoot=$sourceRoot;AssemblyInfoPath=$assemblyInfoPath;ManifestPath=$manifestPath;NativeVersion=$expectedNativeVersion}
+    }catch{
+        if(([string]$_.FullyQualifiedErrorId -split ',')[0] -like "$($definition.MissingError)*"){throw}
+        throw $definition.VersionError
+    }
+}
+
+function Assert-CcodNativePeVersion {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Version,[Parameter(Mandatory)][string]$ErrorId)
+    $expected="$Version.0"
+    try{$versionInfo=[Diagnostics.FileVersionInfo]::GetVersionInfo([IO.Path]::GetFullPath($Path))}catch{throw $ErrorId}
+    if([string]$versionInfo.FileVersion -cne $expected -or [string]$versionInfo.ProductVersion -cne $expected){throw $ErrorId}
+}
+
 function Invoke-CcodTrayHostBuild {
     [CmdletBinding()]
     param(
@@ -46,11 +93,12 @@ function Invoke-CcodTrayHostBuild {
     )
     if($Version -notmatch '^\d+\.\d+\.\d+$'){throw 'CCOD_TRAYHOST_VERSION_INVALID'}
     $repo=[IO.Path]::GetFullPath($RepositoryRoot);$out=[IO.Path]::GetFullPath($OutputDirectory);Test-CcodTrayHostOutputDirectory $out
+    $versionContract=Assert-CcodNativeVersionContract -RepositoryRoot $repo -Version $Version -Component trayhost
     if([string]::IsNullOrWhiteSpace($GitCommit)){$GitCommit=Get-CcodTrayHostGitCommit -RepositoryRoot $repo}else{$GitCommit=$GitCommit.ToLowerInvariant()}
     if($GitCommit -cnotmatch '^[0-9a-f]{40}$'){throw 'CCOD_TRAYHOST_PROVENANCE_INVALID'}
     if([string]::IsNullOrWhiteSpace($BuildTimestampUtc)){$BuildTimestampUtc=[datetime]::UtcNow.ToString('o',[Globalization.CultureInfo]::InvariantCulture)}
     if(-not (Test-CcodTrayHostCanonicalUtc $BuildTimestampUtc)){throw 'CCOD_TRAYHOST_PROVENANCE_INVALID'}
-    $sourceRoot=Join-Path $repo 'src\trayhost';$manifest=Join-Path $sourceRoot 'CodexRemote.TrayHost.manifest';$config=Join-Path $sourceRoot 'CodexRemote.TrayHost.exe.config';$icon=Join-Path $repo 'assets\codexremote-fix\codexremote-fix.ico'
+    $sourceRoot=$versionContract.SourceRoot;$manifest=$versionContract.ManifestPath;$config=Join-Path $sourceRoot 'CodexRemote.TrayHost.exe.config';$icon=Join-Path $repo 'assets\codexremote-fix\codexremote-fix.ico'
     foreach($required in @($manifest,$config,$icon)){if(-not(Test-Path -LiteralPath $required -PathType Leaf)){throw 'CCOD_TRAYHOST_SOURCE_MISSING'}}
     $sources=@(Get-ChildItem -LiteralPath $sourceRoot -Filter '*.cs' -File|Sort-Object Name)
     if($sources.Count -lt 10){throw 'CCOD_TRAYHOST_SOURCE_INCOMPLETE'}
@@ -65,6 +113,7 @@ function Invoke-CcodTrayHostBuild {
         $compilerArgs+=@($sources|ForEach-Object FullName)
         & $compiler @compilerArgs
         if($LASTEXITCODE -ne 0 -or -not(Test-Path -LiteralPath $exe -PathType Leaf)){throw 'CCOD_TRAYHOST_COMPILE_FAILED'}
+        Assert-CcodNativePeVersion -Path $exe -Version $Version -ErrorId 'CCOD_TRAYHOST_ARTIFACT_VERSION_INVALID'
         $configOut=Join-Path $work 'CodexRemote.TrayHost.exe.config';Copy-Item -LiteralPath $config -Destination $configOut -Force
         $stdoutPath=Join-Path $work 'stdout.txt';$stderrPath=Join-Path $work 'stderr.txt'
         $smoke=Start-Process -FilePath $exe -ArgumentList '--headless-smoke' -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
@@ -83,15 +132,23 @@ function Invoke-CcodTrayHostBuild {
 function Test-CcodTrayHostArtifact {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$RepositoryRoot,[Parameter(Mandatory)][string]$Version,[Parameter(Mandatory)][string]$ArtifactDirectory,[string]$ExpectedGitCommit)
+    if($Version -notmatch '^\d+\.\d+\.\d+$'){throw 'CCOD_TRAYHOST_VERSION_INVALID'}
     $repo=[IO.Path]::GetFullPath($RepositoryRoot);$out=[IO.Path]::GetFullPath($ArtifactDirectory);Test-CcodTrayHostOutputDirectory $out
+    $versionContract=Assert-CcodNativeVersionContract -RepositoryRoot $repo -Version $Version -Component trayhost
     $exe=Join-Path $out 'CodexRemote.TrayHost.exe';$config=Join-Path $out 'CodexRemote.TrayHost.exe.config';$provenancePath=Join-Path $out 'trayhost-build-provenance.json'
     foreach($path in @($exe,$config,$provenancePath)){if(-not(Test-Path -LiteralPath $path -PathType Leaf)){throw 'CCOD_TRAYHOST_ARTIFACT_MISSING'}}
     $provenance=Get-Content -LiteralPath $provenancePath -Raw|ConvertFrom-Json
     $commit=$provenance.PSObject.Properties['gitCommit'];$timestamp=$provenance.PSObject.Properties['buildTimestampUtc']
     if([int]$provenance.schemaVersion -ne 1 -or [string]$provenance.version -cne $Version -or [string]$provenance.targetFramework -cne 'net48' -or $null -eq $commit -or $null -eq $timestamp -or $commit.Value -isnot [string] -or $commit.Value -cnotmatch '^[0-9a-f]{40}$' -or $timestamp.Value -isnot [string] -or -not(Test-CcodTrayHostCanonicalUtc $timestamp.Value) -or (-not [string]::IsNullOrWhiteSpace($ExpectedGitCommit) -and $commit.Value -cne $ExpectedGitCommit)){throw 'CCOD_TRAYHOST_PROVENANCE_INVALID'}
-    $icon=Join-Path $repo 'assets\codexremote-fix\codexremote-fix.ico'
-    if([string]$provenance.artifactSha256 -cne (Get-CcodTrayHostHash $exe) -or [string]$provenance.configArtifactSha256 -cne (Get-CcodTrayHostHash $config) -or [string]$provenance.iconSha256 -cne (Get-CcodTrayHostHash $icon)){throw 'CCOD_TRAYHOST_ARTIFACT_TAMPERED'}
-    $sourceRoot=Join-Path $repo 'src\trayhost'
+    $icon=Join-Path $repo 'assets\codexremote-fix\codexremote-fix.ico';$sourceConfig=Join-Path $versionContract.SourceRoot 'CodexRemote.TrayHost.exe.config'
+    foreach($required in @($icon,$sourceConfig)){if(-not(Test-Path -LiteralPath $required -PathType Leaf)){throw 'CCOD_TRAYHOST_SOURCE_MISSING'}}
+    if([string]$provenance.artifactSha256 -cne (Get-CcodTrayHostHash $exe) -or
+        [string]$provenance.configArtifactSha256 -cne (Get-CcodTrayHostHash $config) -or
+        [string]$provenance.iconSha256 -cne (Get-CcodTrayHostHash $icon) -or
+        [string]$provenance.manifestSha256 -cne (Get-CcodTrayHostHash $versionContract.ManifestPath) -or
+        [string]$provenance.configSha256 -cne (Get-CcodTrayHostHash $sourceConfig)){throw 'CCOD_TRAYHOST_ARTIFACT_TAMPERED'}
+    Assert-CcodNativePeVersion -Path $exe -Version $Version -ErrorId 'CCOD_TRAYHOST_ARTIFACT_VERSION_INVALID'
+    $sourceRoot=$versionContract.SourceRoot
     $currentSources=@(Get-ChildItem -LiteralPath $sourceRoot -Filter '*.cs' -File|Sort-Object Name)
     $sourceFilesProperty=$provenance.PSObject.Properties['sourceFiles']
     $sourceRecords=if($null -eq $sourceFilesProperty){@()}else{@($sourceFilesProperty.Value)}
@@ -121,12 +178,13 @@ function Invoke-CcodPortableLauncherBuild {
     )
     if($Version -notmatch '^\d+\.\d+\.\d+$'){throw 'CCOD_PORTABLE_LAUNCHER_VERSION_INVALID'}
     $repo=[IO.Path]::GetFullPath($RepositoryRoot);$out=[IO.Path]::GetFullPath($OutputDirectory);Test-CcodTrayHostOutputDirectory $out
+    $versionContract=Assert-CcodNativeVersionContract -RepositoryRoot $repo -Version $Version -Component portable
     if([string]::IsNullOrWhiteSpace($GitCommit)){$GitCommit=Get-CcodTrayHostGitCommit -RepositoryRoot $repo}else{$GitCommit=$GitCommit.ToLowerInvariant()}
     if($GitCommit -cnotmatch '^[0-9a-f]{40}$'){throw 'CCOD_PORTABLE_LAUNCHER_PROVENANCE_INVALID'}
     if([string]::IsNullOrWhiteSpace($BuildTimestampUtc)){$BuildTimestampUtc=[datetime]::UtcNow.ToString('o',[Globalization.CultureInfo]::InvariantCulture)}
     if(-not (Test-CcodTrayHostCanonicalUtc $BuildTimestampUtc)){throw 'CCOD_PORTABLE_LAUNCHER_PROVENANCE_INVALID'}
-    $sourceRoot=Join-Path $repo 'src\portable';$launcher=Join-Path $sourceRoot 'PortableLauncher.cs';$assemblyInfo=Join-Path $sourceRoot 'AssemblyInfo.cs';
-    $manifest=Join-Path $sourceRoot 'CodexRemote.Portable.manifest';$config=Join-Path $sourceRoot 'CodexRemote.Portable.exe.config';
+    $sourceRoot=$versionContract.SourceRoot;$launcher=Join-Path $sourceRoot 'PortableLauncher.cs';$assemblyInfo=$versionContract.AssemblyInfoPath;
+    $manifest=$versionContract.ManifestPath;$config=Join-Path $sourceRoot 'CodexRemote.Portable.exe.config';
     $icon=Join-Path $repo 'assets\codexremote-fix\codexremote-fix.ico'
     foreach($required in @($launcher,$assemblyInfo,$manifest,$config,$icon)){if(-not(Test-Path -LiteralPath $required -PathType Leaf)){throw 'CCOD_PORTABLE_LAUNCHER_SOURCE_MISSING'}}
     Import-Module (Join-Path $repo 'build\TrayHostReferencePack.psm1') -Force
@@ -139,6 +197,7 @@ function Invoke-CcodPortableLauncherBuild {
         $compilerArgs+=@($launcher,$assemblyInfo)
         & $compiler @compilerArgs
         if($LASTEXITCODE -ne 0 -or -not(Test-Path -LiteralPath $exe -PathType Leaf)){throw 'CCOD_PORTABLE_LAUNCHER_COMPILE_FAILED'}
+        Assert-CcodNativePeVersion -Path $exe -Version $Version -ErrorId 'CCOD_PORTABLE_LAUNCHER_ARTIFACT_VERSION_INVALID'
         $configOut=Join-Path $work 'CodexRemote.Portable.exe.config';Copy-Item -LiteralPath $config -Destination $configOut -Force
         $provenance=[ordered]@{schemaVersion=1;product='CodexRemote-fix';version=$Version;gitCommit=$GitCommit;buildTimestampUtc=$BuildTimestampUtc;targetFramework='net48';compiler=[ordered]@{name='csc.exe';sha256=(Get-CcodTrayHostHash $compiler)};referenceRoot='locked-net48';sourceFiles=@([ordered]@{name='PortableLauncher.cs';sha256=(Get-CcodTrayHostHash $launcher)},[ordered]@{name='AssemblyInfo.cs';sha256=(Get-CcodTrayHostHash $assemblyInfo)});iconSha256=(Get-CcodTrayHostHash $icon);manifestSha256=(Get-CcodTrayHostHash $manifest);configSha256=(Get-CcodTrayHostHash $config);artifactSha256=(Get-CcodTrayHostHash $exe);configArtifactSha256=(Get-CcodTrayHostHash $configOut)}
         $provenancePath=Join-Path $work 'portable-launcher-provenance.json';$provenance|ConvertTo-Json -Depth 8|Set-Content -LiteralPath $provenancePath -Encoding UTF8

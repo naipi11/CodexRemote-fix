@@ -1494,34 +1494,15 @@ Invoke-CcodTest 'TrayHost artifact validation requires the exact compiled source
     Import-Module (Join-Path $repositoryRoot 'build\TrayHostBuild.psm1') -Force
     $artifact = Join-Path ([IO.Path]::GetTempPath()) ('ccod-trayhost-provenance-fixture-' + [guid]::NewGuid().ToString('N'))
     try {
-        [IO.Directory]::CreateDirectory($artifact) | Out-Null
-        $executable = Join-Path $artifact 'CodexRemote.TrayHost.exe'
-        $config = Join-Path $artifact 'CodexRemote.TrayHost.exe.config'
+        $commit = 'c' * 40
+        Invoke-CcodTrayHostBuild -RepositoryRoot $repositoryRoot -Version '2.5.22' -OutputDirectory $artifact -GitCommit $commit -BuildTimestampUtc '2026-08-28T00:00:00.0000000Z' | Out-Null
         $provenancePath = Join-Path $artifact 'trayhost-build-provenance.json'
-        [IO.File]::WriteAllBytes($executable, [byte[]](7, 5, 2, 2, 1))
-        [IO.File]::WriteAllText($config, '<configuration/>', [Text.UTF8Encoding]::new($false))
-        $sourceRoot = Join-Path $repositoryRoot 'src\trayhost'
-        $sourceRecords = @(Get-ChildItem -LiteralPath $sourceRoot -Filter '*.cs' -File | Sort-Object Name | ForEach-Object {
-            [ordered]@{ name = $_.Name; sha256 = Get-CcodTestFileSha256 -Path $_.FullName }
-        })
+        $baselineJson = [IO.File]::ReadAllText($provenancePath,[Text.UTF8Encoding]::new($false))
+        $baseline = $baselineJson | ConvertFrom-Json
+        $sourceRecords = @($baseline.sourceFiles)
         Assert-CcodTrue (@($sourceRecords.name) -ccontains 'TrayHostChildSession.cs') 'release provenance fixture includes the shared production child session'
         Assert-CcodTrue (@($sourceRecords.name) -ccontains 'WindowsTrayHostRuntime.cs') 'release provenance fixture includes the production Windows runtime adapter'
-        $commit = 'c' * 40
-        $baseline = [ordered]@{
-            schemaVersion = 1
-            product = 'CodexRemote-fix'
-            version = '2.5.21'
-            gitCommit = $commit
-            buildTimestampUtc = '2026-08-28T00:00:00.0000000Z'
-            targetFramework = 'net48'
-            sourceFiles = $sourceRecords
-            iconSha256 = Get-CcodTestFileSha256 -Path (Join-Path $repositoryRoot 'assets\codexremote-fix\codexremote-fix.ico')
-            artifactSha256 = Get-CcodTestFileSha256 -Path $executable
-            configArtifactSha256 = Get-CcodTestFileSha256 -Path $config
-        }
-        $baselineJson = $baseline | ConvertTo-Json -Depth 8
-        [IO.File]::WriteAllText($provenancePath, $baselineJson, [Text.UTF8Encoding]::new($false))
-        Test-CcodTrayHostArtifact -RepositoryRoot $repositoryRoot -Version '2.5.21' -ArtifactDirectory $artifact -ExpectedGitCommit $commit | Out-Null
+        Test-CcodTrayHostArtifact -RepositoryRoot $repositoryRoot -Version '2.5.22' -ArtifactDirectory $artifact -ExpectedGitCommit $commit | Out-Null
         $mutations = @(
             [pscustomobject]@{ Name = 'missing shared child session'; Apply = { param($record) $record.sourceFiles = @($record.sourceFiles | Where-Object { $_.name -cne 'TrayHostChildSession.cs' }) } },
             [pscustomobject]@{ Name = 'duplicate shared child session'; Apply = { param($record) $child = @($record.sourceFiles | Where-Object { $_.name -ceq 'TrayHostChildSession.cs' })[0]; $record.sourceFiles = @($record.sourceFiles | Where-Object { $_.name -cne 'WindowsTrayHostRuntime.cs' }) + @([pscustomobject]@{ name = $child.name; sha256 = $child.sha256 }) } },
@@ -1534,7 +1515,7 @@ Invoke-CcodTest 'TrayHost artifact validation requires the exact compiled source
             & $applyMutation $mutated
             [IO.File]::WriteAllText($provenancePath, ($mutated | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
             Assert-CcodThrows {
-                Test-CcodTrayHostArtifact -RepositoryRoot $repositoryRoot -Version '2.5.21' -ArtifactDirectory $artifact -ExpectedGitCommit $commit | Out-Null
+                Test-CcodTrayHostArtifact -RepositoryRoot $repositoryRoot -Version '2.5.22' -ArtifactDirectory $artifact -ExpectedGitCommit $commit | Out-Null
             } 'CCOD_TRAYHOST_SOURCE_TAMPERED'
         }
     } finally {
@@ -1718,6 +1699,7 @@ Invoke-CcodTest 'package scripts build provenance and workflows retain the relea
     Assert-CcodTrue ($release -match 'download-artifact') 'release promotion downloads a previously built candidate'
     Assert-CcodTrue ($release -match 'test:release-contract') 'release promotion checks the release contract'
     Assert-CcodTrue ($release -match 'release-manifest') 'release promotion uploads the bound release manifest'
+    Assert-CcodTrue ($release -match 'New-GitHubReleaseNotes\.ps1') 'release publication uses the behavior-tested English notes extractor'
     Assert-CcodTrue ($release -match 'gh release download') 'existing release assets are downloaded before any publication decision'
     Assert-CcodTrue (-not ($release -match 'gh release upload[^\r\n]*--clobber')) 'release publication never overwrites an existing asset'
     Assert-CcodTrue ($release -match 'Read back published GitHub release assets') 'release publication re-downloads every uploaded asset for hash read-back'
@@ -1726,31 +1708,96 @@ Invoke-CcodTest 'package scripts build provenance and workflows retain the relea
 }
 
 $iss = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw; Assert-CcodTrue ($iss -match 'PortableArtifactDirectory' -and $iss -match 'CodexRemote.Portable.exe' -and $iss -match 'portable-launcher-provenance.json') 'Inno installer packages the portable launcher into the verified bin set';
-Invoke-CcodTest '2.5.21 documentation matches the stable portable release, Defender gate, and protected uninstall contract' {
+Invoke-CcodTest 'release notes extraction emits only the target release English section' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-release-notes-fixture-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        $changelogPath = Join-Path $root 'CHANGELOG.md'
+        $notesPath = Join-Path $root 'notes.md'
+        $fixture = @'
+# Fixture release notes
+
+## Unreleased
+
+### English
+
+- UNRELEASED_DECOY
+
+## v2.5.23
+
+### English
+
+- NEWER_DECOY
+
+## v2.5.22
+
+### English
+
+- Target English note.
+- Second target English note.
+
+### 简体中文
+
+- CHINESE_DECOY
+
+## v2.5.21
+
+### English
+
+- OLDER_DECOY
+'@
+        [IO.File]::WriteAllText($changelogPath,$fixture.Replace("`n","`r`n"),[Text.UTF8Encoding]::new($false))
+        & (Join-Path $repositoryRoot 'tools\New-GitHubReleaseNotes.ps1') -ChangelogPath $changelogPath -Tag 'v2.5.22' -OutputPath $notesPath | Out-Null
+        $actual = [IO.File]::ReadAllText($notesPath,[Text.UTF8Encoding]::new($false))
+        Assert-CcodEqual "# CodexRemote-fix 2.5.22`n`n- Target English note.`n- Second target English note.`n" $actual 'release body contains exactly the current target English notes'
+        foreach ($decoy in @('UNRELEASED_DECOY','NEWER_DECOY','CHINESE_DECOY','OLDER_DECOY')) {
+            Assert-CcodTrue (-not $actual.Contains($decoy)) "release body excludes $decoy"
+        }
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Invoke-CcodTest '2.5.22 source metadata and documentation match the release contract' {
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
-    Assert-CcodEqual '2.5.21' ([string]$package.version) 'package metadata is the 2.5.21 release'
+    Assert-CcodEqual '2.5.22' ([string]$package.version) 'package metadata is the 2.5.22 release'
+    foreach ($nativeComponent in @('trayhost','portable')) {
+        $assemblyInfo = Get-Content -LiteralPath (Join-Path $repositoryRoot ("src\{0}\AssemblyInfo.cs" -f $nativeComponent)) -Raw
+        Assert-CcodTrue ($assemblyInfo -cmatch 'AssemblyVersion\("2\.5\.22\.0"\)') "$nativeComponent assembly version is 2.5.22.0"
+        Assert-CcodTrue ($assemblyInfo -cmatch 'AssemblyFileVersion\("2\.5\.22\.0"\)') "$nativeComponent file version is 2.5.22.0"
+    }
+    $trayHostManifest = Get-Content -LiteralPath (Join-Path $repositoryRoot 'src\trayhost\CodexRemote.TrayHost.manifest') -Raw
+    Assert-CcodTrue ($trayHostManifest -cmatch '<assemblyIdentity version="2\.5\.22\.0" name="CodexRemote\.fix\.TrayHost"') 'TrayHost embedded manifest identity is 2.5.22.0'
+    $portableManifest = Get-Content -LiteralPath (Join-Path $repositoryRoot 'src\portable\CodexRemote.Portable.manifest') -Raw
+    Assert-CcodTrue ($portableManifest -cmatch '<assemblyIdentity version="2\.5\.22\.0" name="CodexRemote\.fix\.Portable"') 'portable embedded manifest identity is 2.5.22.0'
     $changelog = Get-Content -LiteralPath (Join-Path $repositoryRoot 'CHANGELOG.md') -Raw
-    $releaseSection = [regex]::Match($changelog, '(?ms)^## v2\.5\.21\s*\r?\n(?<body>.*?)(?=^## |\z)')
-    Assert-CcodTrue $releaseSection.Success 'v2.5.21 release section exists'
-    Assert-CcodTrue ($releaseSection.Groups['body'].Value -match '(?m)^### English\s*$') 'v2.5.21 changelog has concise English release notes'
-    Assert-CcodTrue ($releaseSection.Groups['body'].Value.Contains('stale-status recovery')) 'v2.5.21 changelog records stale-status repair'
-    Assert-CcodTrue ($releaseSection.Groups['body'].Value.Contains('safe lifecycle diagnostics')) 'v2.5.21 changelog records exact safe diagnostics'
-    Assert-CcodTrue (-not $releaseSection.Groups['body'].Value.Contains('installed Supervisor and TrayHost lifecycle evidence')) 'v2.5.21 changelog omits the unsupported Supervisor and TrayHost validation claim'
+    $releaseSection = [regex]::Match($changelog, '(?ms)^## v2\.5\.22\s*\r?\n(?<body>.*?)(?=^## |\z)')
+    Assert-CcodTrue $releaseSection.Success 'v2.5.22 release section exists'
+    Assert-CcodTrue ($releaseSection.Groups['body'].Value -match '(?m)^### English\s*$') 'v2.5.22 changelog has concise English release notes'
+    $englishSection = [regex]::Match($releaseSection.Groups['body'].Value,'(?ms)^### English\s*\r?\n(?<body>.*?)(?=^### |\z)')
+    $englishBullets = @($englishSection.Groups['body'].Value -split '\r?\n' | Where-Object { $_ -cmatch '^- ' })
+    Assert-CcodTrue ($englishSection.Success -and $englishBullets.Count -ge 3 -and $englishBullets.Count -le 5) 'v2.5.22 English release notes contain three to five bullets'
     $readme = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.md') -Raw
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start\s*\r?\n(?<body>.*?)(?=^## |\z)').Groups['body'].Value
-    Assert-CcodTrue ($readme.Contains('v2.5.21 is the current stable release')) 'English README marks v2.5.21 stable without a version-by-version What''s new block'
+    Assert-CcodTrue ($readme.Contains('v2.5.22 is the current stable release')) 'English README marks v2.5.22 stable without a version-by-version What''s new block'
     Assert-CcodTrue (-not $readme.Contains("## What's new")) 'English README keeps release details off the home page'
-    Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.21-setup.exe')) 'English Quick Start names the setup installer'
-    Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.21-windows-x64.zip')) 'English Quick Start names the portable ZIP'
+    Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.22-setup.exe')) 'English Quick Start names the setup installer'
+    Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.22-windows-x64.zip')) 'English Quick Start names the portable ZIP'
     Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix.exe')) 'English Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($quickStart.Contains('Microsoft Defender')) 'English Quick Start documents the local Defender gate'
+    Assert-CcodTrue (-not $readme.Contains('\r\n')) 'English README contains no literal CRLF escape text'
+    Assert-CcodTrue ($readme.Contains('The portable distribution publishes its payload manifest as an asset')) 'English README identifies the externally published portable payload manifest'
+    Assert-CcodTrue ($readme.Contains('Setup embeds and hash-binds its versioned `installer-payload-manifest.json`')) 'English README identifies the embedded hash-bound setup payload manifest'
+    Assert-CcodTrue (-not $readme.Contains('shared payload manifest')) 'English README does not claim setup and portable share one payload manifest'
     $readmeZh = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.zh-CN.md') -Raw -Encoding UTF8
-    Assert-CcodTrue ($readmeZh -match 'v2\.5\.21 \u662F\u5F53\u524D\u7A33\u5B9A\u7248') 'Chinese README marks v2.5.21 stable'
+    Assert-CcodTrue ($readmeZh -match 'v2\.5\.22 \u662F\u5F53\u524D\u7A33\u5B9A\u7248') 'Chinese README marks v2.5.22 stable'
     Assert-CcodTrue (-not $readmeZh.Contains("## What's new")) 'Chinese README keeps release details off the home page'
-    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.21-setup.exe')) 'Chinese Quick Start names the setup installer'
-    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.21-windows-x64.zip')) 'Chinese Quick Start names the portable ZIP'
+    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.22-setup.exe')) 'Chinese Quick Start names the setup installer'
+    Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.22-windows-x64.zip')) 'Chinese Quick Start names the portable ZIP'
     Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix.exe')) 'Chinese Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($readmeZh.Contains('Microsoft Defender')) 'Chinese Quick Start documents the local Defender gate'
+    Assert-CcodTrue ($readmeZh -match '\u4FBF\u643A\u53D1\u884C\u7248\u4F1A\u5916\u53D1\u81EA\u5DF1\u7684 payload manifest') 'Chinese README identifies the externally published portable payload manifest'
+    Assert-CcodTrue ($readmeZh -match 'Setup \u5219\u5185\u5D4C\u5E76\u4EE5\u54C8\u5E0C\u7ED1\u5B9A\u7248\u672C\u5316\u7684 `installer-payload-manifest\.json`') 'Chinese README identifies the embedded hash-bound setup payload manifest'
     $technical = Get-Content -LiteralPath (Join-Path $repositoryRoot 'docs\TECHNICAL.md') -Raw
     Assert-CcodTrue ($technical.Contains('PortableUninstallFinalizer.ps1')) 'technical documentation records the staged portable finalizer'
     $security = Get-Content -LiteralPath (Join-Path $repositoryRoot 'SECURITY.md') -Raw
