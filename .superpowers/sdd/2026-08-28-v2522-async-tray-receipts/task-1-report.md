@@ -219,3 +219,85 @@ Exit `0`; only Git's existing LF-to-CRLF conversion notices were printed.
 - No installer, installed Codex process, real tray UI, push, release, or public
   operation was run. Release-wide and real-machine acceptance remain outside
   Task 1.
+
+## Fix round 1/5: inherited compatibility parents
+
+Review finding: the first implementation required the existing product and
+`logs` directories to have the protected receipt-private ACL. Supported
+current and legacy installations create those parents with normal inherited
+ACLs, so production receipt writes returned `false` before opening a leaf.
+
+### Compatibility ruling and implementation
+
+- The fixed production leaf moved from the legacy direct path to
+  `%LOCALAPPDATA%\CodexControlOtherDevices\logs\tray-receipts\trayhost-actions.log`.
+- LocalAppData, product, and `logs` remain pinned compatibility parents. Their
+  actual opened handles must still prove disk-directory type, non-reparse
+  attributes, and the exact final path, and the handles continue to deny
+  delete sharing while the receipt child and leaf are opened and written.
+- The store no longer creates product or `logs`; supported installation/runtime
+  setup remains responsible for those parents. A missing, wrong-type,
+  reparse-point, or unqueryable parent fails closed.
+- Only the fixed `logs\tray-receipts` child is created with the protected
+  current-user/SYSTEM/Administrators ACL. Its reopened native handle must pass
+  the strict owner/DACL, non-reparse, type, and final-path checks. An existing
+  arbitrary or broadened child remains rejected and is never repaired.
+- The direct legacy `logs\trayhost-actions.log` leaf is never opened, reused,
+  truncated, or written.
+
+### RED evidence
+
+The compatibility test precreated product and `logs` with normal inherited
+ACLs, asserted `AreAccessRulesProtected == false`, placed a byte sentinel in
+the legacy direct leaf, and requested a durable receipt. Before the production
+fix, this command exited `1`:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/trayhost/Invoke-TrayHostSelfTest.ps1 -NativeOnly
+```
+
+Exact decisive output:
+
+```text
+TrayHost native self-test failed: System.InvalidOperationException
+inherited supported parents accept a durable receipt in the dedicated private child
+CCOD_TRAYHOST_NATIVE_TEST_FAILED
+```
+
+This is the reviewed compatibility defect: the old store rejected supported
+inherited parents before it could create a safe receipt boundary.
+
+### GREEN and regression evidence
+
+After the change, the compatibility test proves durable success, exact private
+ACL creation on `tray-receipts`, exact UTF-8 content in the new leaf, and
+byte-identical retention of the direct legacy leaf. Existing negative coverage
+was retained or moved to the correct boundary: reparse compatibility parent,
+reparse receipt child, reparse/directory/hard-link leaf, broadened receipt-child
+ACL, concurrent writer, replacement barrier/outside sentinel, and exact or
+crossing 64-KiB rollover.
+
+Fresh pre-commit commands and results:
+
+```text
+NativeOnly:       exit 0, TrayHost native self-tests passed: 22
+ProductionOnly:   exit 0, headless compile/run emitted no output
+TransportOnly:    exit 0, TrayHost transport self-tests passed: 10
+ProtocolOnly:     exit 0, TrayHost protocol self-tests passed: 11
+ParentClientOnly: exit 0, TrayHost parent-client self-tests passed: 4
+Production trace:          TrayHost production correlation trace passed: 2
+git diff --check: exit 0 (only repository LF-to-CRLF notices)
+```
+
+The ParentClient command again emitted the repository's existing unapproved-
+verbs warning for `TrayHostClient`; this fix did not modify that module.
+
+### Fix-round commit and remaining boundary
+
+- `f207496df1ceee744a09bbc5c3d24a48695e58bc` —
+  `fix: preserve tray receipt parent compatibility`
+
+Task 1 now supports the inherited parent ACLs created by existing
+installations while retaining a dedicated fail-closed private receipt child.
+The asynchronous/non-blocking sink remains Task 2. No installer, installed
+process, real UI, release, push, or public operation was run in this fix round.
