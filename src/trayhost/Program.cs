@@ -39,9 +39,8 @@ internal static class Program
         PresentationSnapshot initial = TrayHostWire.ReadPresentation(initialFrame.Payload);
         Win32TrayPlatform platform = new Win32TrayPlatform();
         TrayHostApplication application = null;
-        string terminalLogPath;
-        if (!TrayTerminalDiagnosticLog.TryGetDefaultPath(out terminalLogPath)) { terminalLogPath = null; }
-        HostTransport transport = new HostTransport(delegate { TrayHostApplication current = application; if (current != null) { current.PostWork(); } }, delegate(TrayTerminalDiagnostic record) { return TrayTerminalDiagnosticLog.TryAppend(terminalLogPath, record); });
+        TrayTerminalDiagnosticStore terminalStore = new TrayTerminalDiagnosticStore();
+        HostTransport transport = new HostTransport(delegate { TrayHostApplication current = application; if (current != null) { current.PostWork(); } }, delegate(TrayTerminalDiagnostic record) { return terminalStore.TryAppendDurably(record); });
         TrayWindow window = new TrayWindow(platform, transport.SetMenuOpen);
         bool shutdownRequested = false; bool shutdownSent = false; object stateGate = new object();
         Action<TrayCommand, ulong> command = delegate(TrayCommand selected, ulong revision)
@@ -100,7 +99,7 @@ internal static class Program
         })) { IsBackground = true, Name = "CodexRemote.TrayHost.Reader" };
         reader.Start();
         int result = application.Run();
-        application.Dispose(); transport.Dispose(); return result;
+        application.Dispose(); transport.Dispose(); terminalStore.Dispose(); return result;
     }
 
     private static bool VerifyParentIdentity(int pid, long creation)

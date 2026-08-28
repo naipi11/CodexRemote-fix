@@ -2,6 +2,11 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.Text;
+using System.Threading;
 
 internal sealed class FakeTrayPlatform : INativeTrayPlatform
 {
@@ -48,8 +53,47 @@ internal sealed class FakeTrayPlatform : INativeTrayPlatform
 
 internal static class TrayHostNativeSelfTest
 {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateHardLinkW(string fileName, string existingFileName, IntPtr securityAttributes);
+
     private static void AssertTrue(bool value, string message) { if (!value) { throw new InvalidOperationException(message); } }
     private static void AssertEqual(string expected, string actual, string message) { if (!String.Equals(expected, actual, StringComparison.Ordinal)) { throw new InvalidOperationException(message + " expected=[" + expected + "] actual=[" + actual + "]"); } }
+
+    private static string ReceiptPath(string root)
+    {
+        return Path.Combine(root, "CodexControlOtherDevices", "logs", "trayhost-actions.log");
+    }
+
+    private static TrayTerminalDiagnosticStore TestStore(string root, Action directoryChainOpened, Action leafValidated)
+    {
+        return TrayTerminalDiagnosticStore.CreateForTesting(root, directoryChainOpened, leafValidated);
+    }
+
+    private static void CreateJunction(string link, string target)
+    {
+        ProcessStartInfo info = new ProcessStartInfo {
+            FileName = Environment.GetEnvironmentVariable("ComSpec"),
+            Arguments = "/d /c mklink /J \"" + link + "\" \"" + target + "\"",
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true
+        };
+        using (Process process = Process.Start(info))
+        {
+            process.WaitForExit();
+            AssertTrue(process.ExitCode == 0, "test junction is created: " + process.StandardError.ReadToEnd());
+        }
+    }
+
+    private static void DeleteJunction(string path)
+    {
+        try { if (Directory.Exists(path)) { Directory.Delete(path); } } catch { }
+    }
+
+    private static byte[] ReceiptBytes(TrayCommand command, ulong revision, TrayActionResultStatus status, string code)
+    {
+        string line = "command=" + command.ToString() + " revision=" + revision.ToString(System.Globalization.CultureInfo.InvariantCulture) + " status=" + status.ToString() + " code=" + code + Environment.NewLine;
+        return new UTF8Encoding(false).GetBytes(line);
+    }
 
     private static PresentationSnapshot Snapshot(ulong revision)
     {
@@ -214,46 +258,194 @@ internal static class TrayHostNativeSelfTest
     {
         string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
-        string path = Path.Combine(root, "trayhost-actions.log");
+        string path = ReceiptPath(root);
         try
         {
             TrayTerminalDiagnostic record = new TrayTerminalDiagnostic(TrayCommand.OpenLogs, 23UL, TrayActionResultStatus.Rejected, "CCOD_TRAY_ACTION_STALE");
-            AssertTrue(TrayTerminalDiagnosticLog.TryAppend(path, record), "terminal diagnostic append reports durable success");
-            AssertEqual("command=OpenLogs revision=23 status=Rejected code=CCOD_TRAY_ACTION_STALE" + Environment.NewLine, File.ReadAllText(path), "terminal diagnostic file contains only the approved correlation fields");
-            AssertTrue(!TrayTerminalDiagnosticLog.TryAppend(root, record), "terminal diagnostic append reports persistence failure without throwing");
+            using (TrayTerminalDiagnosticStore store = TestStore(root, null, null))
+            {
+                AssertTrue(store.TryAppendDurably(record), "terminal diagnostic append reports durable success");
+            }
+            byte[] expected = ReceiptBytes(TrayCommand.OpenLogs, 23UL, TrayActionResultStatus.Rejected, "CCOD_TRAY_ACTION_STALE");
+            AssertTrue(Convert.ToBase64String(expected) == Convert.ToBase64String(File.ReadAllBytes(path)), "terminal diagnostic file is exact UTF-8 without a BOM and contains only approved fields");
+            string defaultPath;
+            AssertTrue(TrayTerminalDiagnosticStore.TryGetDefaultPath(out defaultPath), "fixed production receipt path resolves");
+            string expectedDefaultPath = Path.GetFullPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexControlOtherDevices", "logs", "trayhost-actions.log"));
+            AssertTrue(String.Equals(expectedDefaultPath, defaultPath, StringComparison.OrdinalIgnoreCase), "production receipt path is fixed to the current user's exact LocalApplicationData leaf");
         }
         finally { try { Directory.Delete(root, true); } catch { } }
     }
 
-    private static void TestTerminalDiagnosticLogIsBoundedAndRejectsReparseComponents()
+    private static void TestTerminalDiagnosticStoreRejectsUnsafeObjectsAndProtectsOutsideSentinel()
     {
-        string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-bound-" + Guid.NewGuid().ToString("N"));
-        string target = Path.Combine(root, "target");
-        string junction = Path.Combine(root, "junction");
-        Directory.CreateDirectory(target);
-        string path = Path.Combine(target, "trayhost-actions.log");
+        string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-unsafe-" + Guid.NewGuid().ToString("N"));
+        string outside = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-outside-" + Guid.NewGuid().ToString("N"));
+        string outsideSentinel = Path.Combine(outside, "trayhost-actions.log");
+        string path = ReceiptPath(root);
+        string logs = Path.GetDirectoryName(path);
+        byte[] sentinel = new byte[] { 0x10, 0x22, 0x34, 0x46, 0x58, 0x6a };
+        Directory.CreateDirectory(root); Directory.CreateDirectory(outside); File.WriteAllBytes(outsideSentinel, sentinel);
         try
         {
-            string lastLine = String.Empty;
-            for (ulong revision = 1UL; revision <= 1400UL; revision++)
-            {
-                TrayTerminalDiagnostic record = new TrayTerminalDiagnostic(TrayCommand.OpenLogs, revision, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED");
-                AssertTrue(TrayTerminalDiagnosticLog.TryAppend(path, record), "bounded terminal diagnostic append succeeds");
-                lastLine = "command=OpenLogs revision=" + revision.ToString(System.Globalization.CultureInfo.InvariantCulture) + " status=Failed code=CCOD_TRAY_ACTION_FAILED" + Environment.NewLine;
-            }
-            FileInfo retained = new FileInfo(path);
-            AssertTrue(retained.Length <= TrayTerminalDiagnosticLog.MaximumBytes, "terminal diagnostic retention never exceeds its fixed byte bound");
-            AssertTrue(File.ReadAllText(path).EndsWith(lastLine, StringComparison.Ordinal), "deterministic rollover retains the complete latest terminal record");
+            TrayTerminalDiagnostic record = new TrayTerminalDiagnostic(TrayCommand.OpenLogs, 1UL, TrayActionResultStatus.Rejected, "CCOD_TRAY_ACTION_STALE");
+            using (TrayTerminalDiagnosticStore bootstrap = TestStore(root, null, null)) { AssertTrue(bootstrap.TryAppendDurably(record), "safe receipt directories are bootstrapped"); }
+            File.Delete(path); Directory.Delete(logs);
 
-            ProcessStartInfo junctionInfo = new ProcessStartInfo {
-                FileName = Environment.GetEnvironmentVariable("ComSpec"),
-                Arguments = "/d /c mklink /J \"" + junction + "\" \"" + target + "\"",
-                UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true
-            };
-            using (Process junctionProcess = Process.Start(junctionInfo)) { junctionProcess.WaitForExit(); AssertTrue(junctionProcess.ExitCode == 0, "test junction is created"); }
-            AssertTrue(!TrayTerminalDiagnosticLog.TryAppend(Path.Combine(junction, "trayhost-actions.log"), new TrayTerminalDiagnostic(TrayCommand.OpenLogs, 1UL, TrayActionResultStatus.Rejected, "CCOD_TRAY_ACTION_STALE")), "terminal diagnostic rejects a reparse-point path component");
+            CreateJunction(logs, outside);
+            using (TrayTerminalDiagnosticStore reparseDirectory = TestStore(root, null, null))
+            {
+                AssertTrue(!reparseDirectory.TryAppendDurably(record), "a reparse logs directory is rejected before writing");
+            }
+            AssertTrue(Convert.ToBase64String(sentinel) == Convert.ToBase64String(File.ReadAllBytes(outsideSentinel)), "reparse directory cannot alter the outside sentinel");
+            DeleteJunction(logs);
+
+            using (TrayTerminalDiagnosticStore restore = TestStore(root, null, null)) { AssertTrue(restore.TryAppendDurably(record), "safe logs directory is restored for leaf tests"); }
+            File.Delete(path);
+            CreateJunction(path, outside);
+            using (TrayTerminalDiagnosticStore reparseLeaf = TestStore(root, null, null))
+            {
+                AssertTrue(!reparseLeaf.TryAppendDurably(record), "a reparse receipt leaf is rejected before writing");
+            }
+            AssertTrue(Convert.ToBase64String(sentinel) == Convert.ToBase64String(File.ReadAllBytes(outsideSentinel)), "reparse leaf cannot alter the outside sentinel");
+            DeleteJunction(path);
+
+            AssertTrue(CreateHardLinkW(path, outsideSentinel, IntPtr.Zero), "test hard link is created");
+            using (TrayTerminalDiagnosticStore hardLinkLeaf = TestStore(root, null, null))
+            {
+                AssertTrue(!hardLinkLeaf.TryAppendDurably(record), "a multi-link receipt leaf is rejected before writing");
+            }
+            AssertTrue(Convert.ToBase64String(sentinel) == Convert.ToBase64String(File.ReadAllBytes(outsideSentinel)), "hard-link leaf cannot alter the outside sentinel");
+            File.Delete(path);
+
+            DirectorySecurity unsafeSecurity = Directory.GetAccessControl(logs);
+            unsafeSecurity.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.WorldSid, null), FileSystemRights.FullControl, InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+            Directory.SetAccessControl(logs, unsafeSecurity);
+            using (TrayTerminalDiagnosticStore unsafeAcl = TestStore(root, null, null))
+            {
+                AssertTrue(!unsafeAcl.TryAppendDurably(record), "an unexpected logs DACL is rejected before writing");
+            }
+            AssertTrue(!File.Exists(path), "unsafe directory ACL cannot create or write the receipt leaf");
+            AssertTrue(Convert.ToBase64String(sentinel) == Convert.ToBase64String(File.ReadAllBytes(outsideSentinel)), "unsafe directory ACL cannot alter the outside sentinel");
         }
-        finally { try { if (Directory.Exists(junction)) { Directory.Delete(junction); } } catch { } try { Directory.Delete(root, true); } catch { } }
+        finally
+        {
+            DeleteJunction(path); DeleteJunction(logs);
+            try { Directory.Delete(root, true); } catch { }
+            try { Directory.Delete(outside, true); } catch { }
+        }
+    }
+
+    private static void TestTerminalDiagnosticStorePinsDirectoryChainAgainstReplacement()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-pin-" + Guid.NewGuid().ToString("N"));
+        string outside = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-pin-outside-" + Guid.NewGuid().ToString("N"));
+        string path = ReceiptPath(root); string logs = Path.GetDirectoryName(path); string displaced = logs + ".displaced";
+        string outsideSentinel = Path.Combine(outside, "trayhost-actions.log");
+        byte[] sentinel = new byte[] { 0x71, 0x72, 0x73, 0x74, 0x75 };
+        bool barrierEntered = false; bool replacementSucceeded = false;
+        Directory.CreateDirectory(root); Directory.CreateDirectory(outside); File.WriteAllBytes(outsideSentinel, sentinel);
+        try
+        {
+            TrayTerminalDiagnostic record = new TrayTerminalDiagnostic(TrayCommand.OpenLogs, 2UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED");
+            using (TrayTerminalDiagnosticStore bootstrap = TestStore(root, null, null)) { AssertTrue(bootstrap.TryAppendDurably(record), "safe receipt chain is bootstrapped"); }
+            File.Delete(path);
+            Action barrier = delegate
+            {
+                barrierEntered = true;
+                try { Directory.Move(logs, displaced); replacementSucceeded = true; CreateJunction(logs, outside); } catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+                throw new InvalidOperationException("intentional barrier stop");
+            };
+            using (TrayTerminalDiagnosticStore store = TestStore(root, barrier, null))
+            {
+                AssertTrue(!store.TryAppendDurably(record), "a replacement attempt at the directory-to-leaf barrier fails closed");
+            }
+            AssertTrue(barrierEntered, "replacement barrier runs after the directory chain is opened");
+            AssertTrue(!replacementSucceeded, "the opened logs handle denies rename replacement");
+            AssertTrue(Convert.ToBase64String(sentinel) == Convert.ToBase64String(File.ReadAllBytes(outsideSentinel)), "replacement attempt leaves the outside sentinel byte-identical");
+        }
+        finally
+        {
+            DeleteJunction(logs);
+            try { if (Directory.Exists(displaced) && !Directory.Exists(logs)) { Directory.Move(displaced, logs); } } catch { }
+            try { Directory.Delete(root, true); } catch { }
+            try { Directory.Delete(outside, true); } catch { }
+        }
+    }
+
+    private static void TestTerminalDiagnosticStoreRejectsConcurrentWriter()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-share-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        ManualResetEvent leafValidated = new ManualResetEvent(false); ManualResetEvent release = new ManualResetEvent(false);
+        bool firstResult = false;
+        try
+        {
+            TrayTerminalDiagnostic first = new TrayTerminalDiagnostic(TrayCommand.OpenLogs, 3UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED");
+            TrayTerminalDiagnostic second = new TrayTerminalDiagnostic(TrayCommand.OpenLogs, 4UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED");
+            using (TrayTerminalDiagnosticStore firstStore = TestStore(root, null, delegate { leafValidated.Set(); release.WaitOne(); }))
+            using (TrayTerminalDiagnosticStore secondStore = TestStore(root, null, null))
+            {
+                Thread writer = new Thread(new ThreadStart(delegate { firstResult = firstStore.TryAppendDurably(first); }));
+                writer.Start();
+                AssertTrue(leafValidated.WaitOne(5000), "first writer reaches the validated leaf barrier");
+                Stopwatch rejection = Stopwatch.StartNew();
+                AssertTrue(!secondStore.TryAppendDurably(second), "a concurrent writer is rejected by leaf sharing");
+                rejection.Stop(); AssertTrue(rejection.ElapsedMilliseconds < 250L, "a sharing conflict fails without waiting or retrying");
+                release.Set(); AssertTrue(writer.Join(5000), "first writer completes after the sharing probe");
+                AssertTrue(firstResult, "the validated first writer remains durable");
+            }
+        }
+        finally { release.Set(); leafValidated.Dispose(); release.Dispose(); try { Directory.Delete(root, true); } catch { } }
+    }
+
+    private static void TestTerminalDiagnosticStoreRejectsDirectoryLeafWithoutWriting()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-directory-leaf-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root); string path = ReceiptPath(root);
+        try
+        {
+            TrayTerminalDiagnostic record = new TrayTerminalDiagnostic(TrayCommand.OpenLogs, 5UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED");
+            using (TrayTerminalDiagnosticStore bootstrap = TestStore(root, null, null)) { AssertTrue(bootstrap.TryAppendDurably(record), "safe receipt chain is bootstrapped for directory-leaf test"); }
+            File.Delete(path); Directory.CreateDirectory(path);
+            using (TrayTerminalDiagnosticStore directoryLeaf = TestStore(root, null, null))
+            {
+                AssertTrue(!directoryLeaf.TryAppendDurably(record), "a directory at the fixed receipt leaf is rejected before writing");
+            }
+            AssertTrue(Directory.Exists(path) && Directory.GetFileSystemEntries(path).Length == 0, "directory leaf remains unchanged after rejection");
+        }
+        finally { try { if (Directory.Exists(path)) { Directory.Delete(path, true); } } catch { } try { Directory.Delete(root, true); } catch { } }
+    }
+
+    private static void TestTerminalDiagnosticStoreIsBoundedThroughValidatedHandle()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "ccod-tray-terminal-bound-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root); string path = ReceiptPath(root);
+        try
+        {
+            TrayTerminalDiagnostic first = new TrayTerminalDiagnostic(TrayCommand.OpenLogs, 41UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED");
+            TrayTerminalDiagnostic second = new TrayTerminalDiagnostic(TrayCommand.OpenLogs, 42UL, TrayActionResultStatus.Rejected, "CCOD_TRAY_ACTION_STALE");
+            byte[] firstBytes = ReceiptBytes(TrayCommand.OpenLogs, 41UL, TrayActionResultStatus.Failed, "CCOD_TRAY_ACTION_FAILED");
+            byte[] secondBytes = ReceiptBytes(TrayCommand.OpenLogs, 42UL, TrayActionResultStatus.Rejected, "CCOD_TRAY_ACTION_STALE");
+            using (TrayTerminalDiagnosticStore store = TestStore(root, null, null))
+            {
+                AssertTrue(store.TryAppendDurably(first), "safe receipt chain is created before boundary setup");
+                byte[] boundaryPrefix = new byte[checked((int)(TrayTerminalDiagnosticStore.MaximumBytes - firstBytes.Length))];
+                for (int i = 0; i < boundaryPrefix.Length; i++) { boundaryPrefix[i] = (byte)'x'; }
+                File.WriteAllBytes(path, boundaryPrefix);
+                AssertTrue(store.TryAppendDurably(first), "a whole receipt fitting the exact 64-KiB boundary is appended");
+                AssertTrue(new FileInfo(path).Length == TrayTerminalDiagnosticStore.MaximumBytes, "exact-boundary append retains exactly 64 KiB");
+                AssertTrue(File.ReadAllText(path).EndsWith(Encoding.UTF8.GetString(firstBytes), StringComparison.Ordinal), "exact-boundary append retains the whole latest record");
+
+                AssertTrue(store.TryAppendDurably(second), "a boundary-crossing receipt rolls over through the validated handle");
+                AssertTrue(Convert.ToBase64String(secondBytes) == Convert.ToBase64String(File.ReadAllBytes(path)), "rollover retains exactly one complete latest record");
+
+                File.WriteAllBytes(path, new byte[checked((int)TrayTerminalDiagnosticStore.MaximumBytes + 17)]);
+                AssertTrue(store.TryAppendDurably(first), "an oversized existing receipt rolls over through the validated handle");
+                AssertTrue(Convert.ToBase64String(firstBytes) == Convert.ToBase64String(File.ReadAllBytes(path)), "oversized rollover retains exactly one complete latest record");
+            }
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
     }
 
     private static void TestNoHimcFailureIsSafe()
@@ -336,13 +528,17 @@ internal static class TrayHostNativeSelfTest
             TestVerifiedAboutUsesTheAcknowledgedSnapshotVersion();
             TestActionFailureUsesTheAcknowledgedSnapshotStrings();
             TestTerminalDiagnosticLogIsSanitizedAndReportsPersistence();
-            TestTerminalDiagnosticLogIsBoundedAndRejectsReparseComponents();
+            TestTerminalDiagnosticStoreRejectsUnsafeObjectsAndProtectsOutsideSentinel();
+            TestTerminalDiagnosticStorePinsDirectoryChainAgainstReplacement();
+            TestTerminalDiagnosticStoreRejectsConcurrentWriter();
+            TestTerminalDiagnosticStoreRejectsDirectoryLeafWithoutWriting();
+            TestTerminalDiagnosticStoreIsBoundedThroughValidatedHandle();
             TestSimplifiedMenuAndExitConfirmation();
             TestNoHimcFailureIsSafe();
             TestShellRightClickNotificationMapping();
             TestRealNativePInvokeSurface();
             TestPostedWorkMessageDispatchesToItsOwnerWindow();
-            Console.WriteLine("TrayHost native self-tests passed: 17");
+            Console.WriteLine("TrayHost native self-tests passed: 21");
             return 0;
         }
         catch (Exception error)
