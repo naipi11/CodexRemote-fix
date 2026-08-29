@@ -72,13 +72,18 @@ terminal receipt has been validated. A diagnostic copy under `{app}` may exist
 after a successful transaction, but Setup must never execute that copy as part
 of the install success path.
 
-The old Inno `AppId`, installed user-facing name, current-user scope, and
-existing control-panel uninstall entry are preserved for migration. A failed
-transaction never unregisters or recursively deletes a legacy entry. Legacy
-installer shell files become compatibility inputs only; they are never used as
-a source-file discovery root. After `Ready`, the transaction records the
-sealed package identity beside the existing entry so an explicit future
-uninstall can distinguish owned legacy files from unknown files.
+The new Inno shell sets `CreateAppDir=no` and `Uninstallable=no`; it writes no
+product file, product shortcut, or product registry entry under `{app}` before
+`Ready`. The old Inno `AppId`, installed user-facing name, current-user scope,
+and existing control-panel uninstall entry remain compatibility inputs during
+migration. After `Ready`, the transaction writes and reads back one verified
+current-user product registration pointing at the sealed stable uninstaller and
+two verified current-user shortcut records: the Start-menu `CodexRemote-fix`
+shortcut and the desktop `CodexRemote-fix` shortcut. Only after all three
+records are read back does it remove the exact legacy registry entry and exact
+legacy shortcut names. A failed transaction never unregisters or recursively
+deletes a legacy entry. Legacy installer shell files are never used as a
+source-file discovery root.
 
 ### 2. Private pinned file transaction module
 
@@ -115,18 +120,27 @@ Prepared
   -> RuntimeStaged
   -> PreviousProtectionStopped
   -> RuntimePromoted
-  -> StableShellCommitted
   -> PointerCommitted
+  -> StableShellCommitted
   -> ProtectionReady
   -> Ready
+  -> Failed
 ```
 
 - Before `PointerCommitted`, a failure leaves the previous stable shell and
   active pointer unchanged, then proves the retained previous runtime can run.
+- The stable shell is committed only after pointer commit. That creates one
+  post-pointer compensation boundary, but preserves the pre-pointer invariant:
+  a failure before pointer commit cannot alter the shell a legacy bootstrap
+  would execute.
 - After `PointerCommitted`, a failure records a new, higher compensating
   generation targeting the retained previous runtime and restores the matching
   stable shell. If compensation cannot be proven, it writes no `Ready`, retains
-  all candidates, and returns a stable rollback code.
+  all candidates, writes terminal `Failed` with a stable rollback code, and
+  returns that code.
+- `Failed` is the only terminal error phase. Its record carries the same sealed
+  transaction identity and phase order as `Ready`, plus exactly one canonical
+  `CCOD_*` error code; no raw exception or private path is persisted.
 - Legacy installations without the transaction record start at `Idle`; their
   active runtime is treated as a compatibility candidate only after the
   existing strict identity and manifest checks succeed.
@@ -201,7 +215,8 @@ No release may be called stable until this evidence exists.
 - `Activate-CcodRemoteFix.ps1` and a private
   `src/persistence/modules/InstallFileTransaction.psm1`;
 - `src/persistence/modules/InstallLifecycle.psm1` and its transaction/state
-  tests;
+  tests, plus `src/persistence/modules/ProductRegistration.psm1` for the
+  post-Ready current-user uninstall and shortcut migration;
 - `Install-CodexRemote-fix.ps1`, `tools/Test-ReleaseDefender.ps1`, CI/release
   workflows, release contract tests, and installed lifecycle acceptance tests;
 - concise English and Chinese README/CHANGELOG text that only describes
