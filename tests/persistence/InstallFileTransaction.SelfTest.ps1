@@ -130,7 +130,7 @@ function New-CcodHardLink {
 }
 
 Invoke-CcodTest 'exports only immutable generation operations and an inert CLR marker' {
-    $expected=@('Close-CcodInstallFileTransaction','Commit-CcodInstallActivePointer','Copy-CcodInstallSealedSource','New-CcodInstallGenerationLeaf','Open-CcodInstallGeneration','Retire-CcodInstallGeneration','Write-CcodInstallGenerationManifest')
+    $expected=@('Close-CcodInstallFileTransaction','Commit-CcodInstallActivePointer','Copy-CcodInstallSealedSource','New-CcodInstallDirectory','New-CcodInstallGenerationLeaf','Open-CcodInstallGeneration','Open-CcodInstallRetainedGeneration','Retire-CcodInstallGeneration','Write-CcodInstallGenerationManifest','Write-CcodInstallRecord')
     Assert-CcodEqual ($expected -join '|') ((@($module.ExportedCommands.Keys)|Sort-Object)-join '|') 'module export surface is capability-only'
     Assert-CcodEqual 2 ([CcodInstallGenerationCapabilityMarkerV2]::CapabilityAbi) 'marker exposes the current non-mutating ABI value'
     Assert-CcodEqual 'CcodInstallGenerationCapabilityMarkerV2' ((@([CcodInstallGenerationCapabilityMarkerV2].Assembly.GetExportedTypes()|ForEach-Object FullName)) -join '|') 'current CLR bridge exports only the inert marker'
@@ -147,6 +147,25 @@ Invoke-CcodTest 'force re-import rebinds the current runtime ABI before real use
         $child = New-CcodInstallGenerationLeaf -Generation $generation -Leaf 'child'
         Assert-CcodEqual '' (@($child.PSObject.Properties.Name) -join ',') 'second import uses the current runtime type binding'
     } finally { Remove-CcodInstallFileFixture $fixture }
+}
+
+Invoke-CcodTest 'creates nested scoped directories and publishes sanitized records create-only' {
+    $fixture=New-CcodInstallFileFixture
+    try {
+        $transaction=Open-CcodFixtureGeneration $fixture 'runtime-scoped-records'
+        $state=New-CcodInstallDirectory -Transaction $transaction -Parent $transaction -Leaf 'state' -CreateIfMissing
+        $stateOpened=New-CcodInstallDirectory -Transaction $transaction -Parent $transaction -Leaf 'state';Assert-CcodEqual '' (@($stateOpened.PSObject.Properties.Name)-join ',') 'existing install-root directory opens through the same opaque wrapper'
+        $receipts=New-CcodInstallDirectory -Transaction $transaction -Parent $state -Leaf 'receipts' -CreateIfMissing
+        $final=Join-Path $fixture.Install 'state\receipts\activation.json';$observer=[CcodInstallFileRaceProbe]::ObserveFirstVisibleBytes($final)
+        $record=[ordered]@{schemaVersion=1;phase='Prepared';runtimeId='runtime-scoped-records'}
+        $written=Write-CcodInstallRecord -Transaction $transaction -Parent $receipts -Leaf 'activation.json' -Record $record
+        $firstVisible=$observer.GetAwaiter().GetResult();Assert-CcodEqual $written.Length ([int64]$firstVisible.LongLength) 'first visible scoped record has its sealed length'
+        $observed=Join-Path $fixture.Base 'observed-record.json';[IO.File]::WriteAllBytes($observed,$firstVisible);Assert-CcodEqual $written.Sha256 (Get-CcodTestFileSha256 $observed) 'first visible scoped record has its sealed digest'
+        $before=Get-CcodTestFileSha256 $final;Assert-CcodThrows {Write-CcodInstallRecord -Transaction $transaction -Parent $receipts -Leaf 'activation.json' -Record $record|Out-Null} 'CCOD_INSTALL_RECORD_EXISTS';Assert-CcodEqual $before (Get-CcodTestFileSha256 $final) 'record collision leaves existing bytes unchanged'
+        Write-CcodInstallRecord -Transaction $transaction -Parent $receipts -Leaf 'install.log' -Record ([ordered]@{event='phase';code='CCOD_OK'})|Out-Null
+        Assert-CcodThrows {New-CcodInstallDirectory -Transaction $transaction -Parent $state -Leaf '..\escape' -CreateIfMissing|Out-Null} 'CCOD_INSTALL_LEAF_INVALID'
+        Assert-CcodThrows {Write-CcodInstallRecord -Transaction $transaction -Parent $receipts -Leaf 'nested\record.json' -Record $record|Out-Null} 'CCOD_INSTALL_LEAF_INVALID'
+    } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
 Invoke-CcodTest 'generation and capabilities are unique create-only opaque references' {
@@ -239,7 +258,7 @@ Invoke-CcodTest 'source and destination handles remain private pinned and same-h
         $visibleSha=Get-CcodTestFileSha256 $destination
         if($visibleSha-cne$source.Sha256){
             Write-CcodInstallGenerationManifest -Generation $generation -Manifest (New-CcodGenerationManifest $runtimeId)|Out-Null
-            try{Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -ExpectedPreviousGeneration ([uint64]0) -NewRuntimeId $runtimeId -FileTransaction $generation|Out-Null;throw 'ASSERT_ATTACKED_GENERATION_COMMITTED'}catch{Assert-CcodTrue ($_.FullyQualifiedErrorId-match'^CCOD_INSTALL_(?:PIN_CHANGED|SEAL_MISMATCH|UNKNOWN_LEAF)') 'post-commit same-user mutation cannot become an eligible generation'}
+            try{Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $generation -ExpectedPreviousGeneration ([uint64]0) -FileTransaction $generation|Out-Null;throw 'ASSERT_ATTACKED_GENERATION_COMMITTED'}catch{Assert-CcodTrue ($_.FullyQualifiedErrorId-match'^CCOD_INSTALL_(?:PIN_CHANGED|SEAL_MISMATCH|UNKNOWN_LEAF)') 'post-commit same-user mutation cannot become an eligible generation'}
             return
         }
         Assert-CcodEqual $source.Sha256 $visibleSha 'successful sealed leaf is readable by path before transaction close'
@@ -289,7 +308,7 @@ Invoke-CcodTest 'rejects forged cross-transaction and closed capabilities' {
         $first=Open-CcodFixtureGeneration $firstFixture 'runtime-first';$second=Open-CcodFixtureGeneration $secondFixture 'runtime-second';$forged=New-Object psobject
         Assert-CcodThrows {New-CcodInstallGenerationLeaf -Generation $forged -Leaf 'forged'|Out-Null} 'CCOD_INSTALL_GENERATION_INVALID'
         Write-CcodInstallGenerationManifest -Generation $first -Manifest (New-CcodGenerationManifest 'runtime-first')|Out-Null
-        Assert-CcodThrows {Commit-CcodInstallActivePointer -InstallRoot $secondFixture.Install -ExpectedPreviousGeneration ([uint64]0) -NewRuntimeId 'runtime-first' -FileTransaction $first|Out-Null} 'CCOD_INSTALL_TRANSACTION_SCOPE'
+        Assert-CcodThrows {Commit-CcodInstallActivePointer -InstallRoot $secondFixture.Install -TargetGeneration $first -ExpectedPreviousGeneration ([uint64]0) -FileTransaction $first|Out-Null} 'CCOD_INSTALL_TRANSACTION_SCOPE'
         Assert-CcodThrows {Retire-CcodInstallGeneration -InstallRoot $firstFixture.Install -RuntimeId 'runtime-first' -FileTransaction $second|Out-Null} 'CCOD_INSTALL_TRANSACTION_SCOPE'
         Close-CcodInstallFileTransaction -Transaction $first -Disposition Failed|Out-Null
         Assert-CcodThrows {New-CcodInstallGenerationLeaf -Generation $first -Leaf 'after-close'|Out-Null} 'CCOD_INSTALL_TRANSACTION_CLOSED'
@@ -331,17 +350,17 @@ Invoke-CcodTest 'pointer generation records are monotonic create-only and collis
     $fixture=New-CcodInstallFileFixture
     try {
         $first=Open-CcodFixtureGeneration $fixture 'runtime-pointer-one';Write-CcodInstallGenerationManifest -Generation $first -Manifest (New-CcodGenerationManifest 'runtime-pointer-one')|Out-Null
-        $committed=Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -ExpectedPreviousGeneration ([uint64]0) -NewRuntimeId 'runtime-pointer-one' -FileTransaction $first
+        $committed=Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $first -ExpectedPreviousGeneration ([uint64]0) -FileTransaction $first
         Assert-CcodEqual ([uint64]1) ([uint64]$committed.Generation) 'first pointer generation is one'
         $records=@(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\active-generation') -File -Filter '*.json');Assert-CcodEqual 1 $records.Count 'one pointer record';$before=Get-CcodTestFileSha256 $records[0].FullName
         $second=Open-CcodFixtureGeneration $fixture 'runtime-pointer-two';Write-CcodInstallGenerationManifest -Generation $second -Manifest (New-CcodGenerationManifest 'runtime-pointer-two')|Out-Null
-        $secondCommit=Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -ExpectedPreviousGeneration ([uint64]1) -NewRuntimeId 'runtime-pointer-two' -FileTransaction $second
+        $secondCommit=Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $second -ExpectedPreviousGeneration ([uint64]1) -FileTransaction $second
         Assert-CcodEqual ([uint64]2) ([uint64]$secondCommit.Generation) 'second pointer generation increments to two'
         $after=@(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\active-generation') -File -Filter '*.json'|Sort-Object Name);Assert-CcodEqual 2 $after.Count 'successful second commit appends one record';Assert-CcodEqual $before (Get-CcodTestFileSha256 $after[0].FullName) 'generation one remains unchanged'
         $third=Open-CcodFixtureGeneration $fixture 'runtime-pointer-three';Write-CcodInstallGenerationManifest -Generation $third -Manifest (New-CcodGenerationManifest 'runtime-pointer-three')|Out-Null
-        Assert-CcodThrows {Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -ExpectedPreviousGeneration ([uint64]1) -NewRuntimeId 'runtime-pointer-three' -FileTransaction $third|Out-Null} 'CCOD_INSTALL_POINTER_GENERATION_EXISTS'
+        Assert-CcodThrows {Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $third -ExpectedPreviousGeneration ([uint64]1) -FileTransaction $third|Out-Null} 'CCOD_INSTALL_POINTER_GENERATION_EXISTS'
         Assert-CcodEqual 2 @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\active-generation') -File -Filter '*.json').Count 'no-replace contender publishes no third record'
-        Assert-CcodThrows {Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -ExpectedPreviousGeneration ([uint64]::MaxValue) -NewRuntimeId 'runtime-pointer-three' -FileTransaction $third|Out-Null} 'CCOD_INSTALL_POINTER_GENERATION_OVERFLOW'
+        Assert-CcodThrows {Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $third -ExpectedPreviousGeneration ([uint64]::MaxValue) -FileTransaction $third|Out-Null} 'CCOD_INSTALL_POINTER_GENERATION_OVERFLOW'
         Assert-CcodEqual 2 @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\active-generation') -File -Filter '*.json').Count 'overflow publishes no record'
         Assert-CcodOutsideUnchanged $fixture 'pointer monotonicity'
     } finally {Remove-CcodInstallFileFixture $fixture}
@@ -352,7 +371,7 @@ Invoke-CcodTest 'independent transactions race one pointer generation with exact
     $processes=@()
     try {
         $initial=Open-CcodFixtureGeneration $fixture 'runtime-pointer-initial';Write-CcodInstallGenerationManifest -Generation $initial -Manifest (New-CcodGenerationManifest 'runtime-pointer-initial')|Out-Null
-        Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -ExpectedPreviousGeneration ([uint64]0) -NewRuntimeId 'runtime-pointer-initial' -FileTransaction $initial|Out-Null
+        Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $initial -ExpectedPreviousGeneration ([uint64]0) -FileTransaction $initial|Out-Null
         $go=Join-Path $fixture.Base 'go';$escapedModule=$modulePath.Replace("'","''");$escapedRoot=$fixture.Install.Replace("'","''")
         foreach($index in 1..2){
             $runtimeId="runtime-pointer-racer-$index";$scriptPath=Join-Path $fixture.Base "racer-$index.ps1";$ready=Join-Path $fixture.Base "ready-$index";$outcome=Join-Path $fixture.Base "outcome-$index"
@@ -367,7 +386,7 @@ try {
     [IO.File]::WriteAllText('$($ready.Replace("'","''"))','ready')
     `$deadline=[DateTime]::UtcNow.AddSeconds(15)
     while(-not[IO.File]::Exists('$($go.Replace("'","''"))')){if([DateTime]::UtcNow-gt`$deadline){throw 'barrier timeout'};Start-Sleep -Milliseconds 10}
-    try{Commit-CcodInstallActivePointer -InstallRoot '$escapedRoot' -ExpectedPreviousGeneration ([uint64]1) -NewRuntimeId '$runtimeId' -FileTransaction `$tx|Out-Null;[IO.File]::WriteAllText('$($outcome.Replace("'","''"))','success')}
+    try{Commit-CcodInstallActivePointer -InstallRoot '$escapedRoot' -TargetGeneration `$tx -ExpectedPreviousGeneration ([uint64]1) -FileTransaction `$tx|Out-Null;[IO.File]::WriteAllText('$($outcome.Replace("'","''"))','success')}
     catch{[IO.File]::WriteAllText('$($outcome.Replace("'","''"))',[string]`$_.FullyQualifiedErrorId)}
 } finally {if(`$null-ne`$tx){Close-CcodInstallFileTransaction -Transaction `$tx -Disposition Failed|Out-Null}}
 "@
@@ -386,6 +405,59 @@ try {
     } finally {
         foreach($process in $processes){if(-not$process.HasExited){Stop-Process -Id $process.Id -Force}}
         Remove-CcodInstallFileFixture $fixture
+    }
+}
+
+Invoke-CcodTest 'opens a retained generation read-only and targets it with a generation-three compensation pointer' {
+    $fixture=New-CcodInstallFileFixture
+    $otherFixture=New-CcodInstallFileFixture
+    try {
+        $source=New-CcodSourceFile $fixture 'retained-source.bin' 'retained-runtime-bytes'
+        $old=Open-CcodFixtureGeneration $fixture 'runtime-retained-old';Copy-CcodInstallSealedSource -Generation $old -SourcePath $source.Path -Leaf 'payload.bin' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null
+        $oldManifest=Write-CcodInstallGenerationManifest -Generation $old -Manifest (New-CcodGenerationManifest 'runtime-retained-old' @([ordered]@{path='payload.bin';length=$source.Length;sha256=$source.Sha256}))
+        Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $old -ExpectedPreviousGeneration ([uint64]0) -FileTransaction $old|Out-Null
+        Close-CcodInstallFileTransaction -Transaction $old -Disposition Ready|Out-Null
+
+        $current=Open-CcodFixtureGeneration $fixture 'runtime-retained-current';Write-CcodInstallGenerationManifest -Generation $current -Manifest (New-CcodGenerationManifest 'runtime-retained-current')|Out-Null
+        Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $current -ExpectedPreviousGeneration ([uint64]1) -FileTransaction $current|Out-Null
+        try{$retained=Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId 'runtime-retained-old' -ExpectedManifestSha256 $oldManifest.Sha256 -FileTransaction $current}catch{$openFailure=$_;try{Close-CcodInstallFileTransaction -Transaction $current -Disposition Failed|Out-Null}catch{};throw $openFailure}
+        Assert-CcodEqual '' (@($retained.PSObject.Properties.Name)-join ',') 'retained generation capability is opaque'
+        Assert-CcodThrows {New-CcodInstallGenerationLeaf -Generation $retained -Leaf 'blocked'|Out-Null} 'CCOD_INSTALL_GENERATION_READ_ONLY'
+        Assert-CcodThrows {Copy-CcodInstallSealedSource -Generation $retained -SourcePath $source.Path -Leaf 'blocked.bin' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null} 'CCOD_INSTALL_GENERATION_READ_ONLY'
+        Assert-CcodThrows {Write-CcodInstallGenerationManifest -Generation $retained -Manifest (New-CcodGenerationManifest 'runtime-retained-old')|Out-Null} 'CCOD_INSTALL_GENERATION_READ_ONLY'
+        Assert-CcodThrows {New-CcodInstallDirectory -Transaction $current -Parent $retained -Leaf 'blocked-dir' -CreateIfMissing|Out-Null} 'CCOD_INSTALL_GENERATION_READ_ONLY'
+        Assert-CcodThrows {Write-CcodInstallRecord -Transaction $current -Parent $retained -Leaf 'blocked.json' -Record ([ordered]@{value='blocked'})|Out-Null} 'CCOD_INSTALL_GENERATION_READ_ONLY'
+        $compensation=Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $retained -ExpectedPreviousGeneration ([uint64]2) -FileTransaction $current
+        Assert-CcodEqual ([uint64]3) ([uint64]$compensation.Generation) 'retained target appends compensation generation three'
+        $pointer=Get-Content -LiteralPath (Join-Path $fixture.Install 'state\active-generation\00000000000000000003.json') -Raw|ConvertFrom-Json
+        Assert-CcodEqual 'runtime-retained-old' $pointer.activeRuntime 'compensation pointer targets retained runtime ID'
+
+        Assert-CcodThrows {Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId 'runtime-missing' -ExpectedManifestSha256 $oldManifest.Sha256 -FileTransaction $current|Out-Null} 'CCOD_INSTALL_RETAINED_GENERATION_INVALID'
+        Assert-CcodThrows {Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId 'runtime-retained-old' -ExpectedManifestSha256 ('0'*64) -FileTransaction $current|Out-Null} 'CCOD_INSTALL_RETAINED_MANIFEST_MISMATCH'
+        $sameRootForeign=Open-CcodFixtureGeneration $fixture 'runtime-same-root-foreign';Write-CcodInstallGenerationManifest -Generation $sameRootForeign -Manifest (New-CcodGenerationManifest 'runtime-same-root-foreign')|Out-Null
+        Assert-CcodThrows {Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $retained -ExpectedPreviousGeneration ([uint64]3) -FileTransaction $sameRootForeign|Out-Null} 'CCOD_INSTALL_POINTER_TARGET_INVALID'
+        $other=Open-CcodFixtureGeneration $otherFixture 'runtime-other-root';Write-CcodInstallGenerationManifest -Generation $other -Manifest (New-CcodGenerationManifest 'runtime-other-root')|Out-Null
+        Assert-CcodThrows {Commit-CcodInstallActivePointer -InstallRoot $otherFixture.Install -TargetGeneration $retained -ExpectedPreviousGeneration ([uint64]0) -FileTransaction $other|Out-Null} 'CCOD_INSTALL_POINTER_TARGET_INVALID'
+    } finally {Remove-CcodInstallFileFixture $fixture;Remove-CcodInstallFileFixture $otherFixture}
+}
+
+Invoke-CcodTest 'rejects structurally invalid or unowned retained generations' {
+    foreach($case in @('reparse','ads','multilink','unowned')){
+        $fixture=New-CcodInstallFileFixture
+        try {
+            $source=New-CcodSourceFile $fixture 'source.bin' 'retained-invalid-source';$runtimeId="runtime-retained-$case";$old=Open-CcodFixtureGeneration $fixture $runtimeId
+            if($case-cne'unowned'){Copy-CcodInstallSealedSource -Generation $old -SourcePath $source.Path -Leaf 'payload.bin' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null}
+            $manifest=Write-CcodInstallGenerationManifest -Generation $old -Manifest (New-CcodGenerationManifest $runtimeId);Close-CcodInstallFileTransaction -Transaction $old -Disposition Ready|Out-Null
+            $runtimePath=Join-Path $fixture.Install "runtime\$runtimeId"
+            switch($case){
+                'reparse'{New-CcodJunction -Path (Join-Path $runtimePath 'linked') -Target $fixture.Outside;$expected='CCOD_INSTALL_REPARSE_LEAF'}
+                'ads'{[IO.File]::SetAttributes((Join-Path $runtimePath 'payload.bin'),[IO.FileAttributes]::Normal);$previous=$ErrorActionPreference;try{$ErrorActionPreference='Continue';$output=&cmd.exe /d /c "echo attacker>`"$(Join-Path $runtimePath 'payload.bin'):metadata`"" 2>&1;$exitCode=$LASTEXITCODE}finally{$ErrorActionPreference=$previous};if($exitCode-ne0){throw "ADS fixture failed: $($output-join' ')"};$expected='CCOD_INSTALL_ADS_LEAF'}
+                'multilink'{New-CcodHardLink -Path (Join-Path $fixture.Outside 'retained-hardlink.bin') -Existing (Join-Path $runtimePath 'payload.bin');$expected='CCOD_INSTALL_MULTILINK_LEAF'}
+                'unowned'{[IO.Directory]::CreateDirectory((Join-Path $fixture.Install 'runtime\runtime-unowned'))|Out-Null;[IO.File]::Copy((Join-Path $runtimePath 'manifest.json'),(Join-Path $fixture.Install 'runtime\runtime-unowned\manifest.json'));$runtimeId='runtime-unowned';$expected='CCOD_INSTALL_RETAINED_RUNTIME_ID_MISMATCH'}
+            }
+            $transaction=Open-CcodFixtureGeneration $fixture ("runtime-validator-$case");Write-CcodInstallGenerationManifest -Generation $transaction -Manifest (New-CcodGenerationManifest ("runtime-validator-$case"))|Out-Null
+            Assert-CcodThrows {Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId -ExpectedManifestSha256 $manifest.Sha256 -FileTransaction $transaction|Out-Null} $expected
+        } finally {Remove-CcodInstallFileFixture $fixture}
     }
 }
 
