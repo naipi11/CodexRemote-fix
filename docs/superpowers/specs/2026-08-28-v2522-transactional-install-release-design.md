@@ -99,8 +99,8 @@ Its required operations are:
 | Create pinned temporary leaf | Creates only a single generated leaf under a pinned directory with no overwrite of an existing inode. |
 | Copy and verify | Reads sealed source bytes, writes through the pinned leaf, flushes, and rehashes through the same handle. |
 | Commit promotion | Atomically promotes a verified temporary leaf within the pinned directory; identity or sharing ambiguity fails closed. |
-| Enumerate/delete owned tree | Walks by pinned handles, rejects reparse points, alternate streams, and multi-link leaves, then removes only transaction-owned entries from leaves upward. |
-| Close transaction | Releases handles only after a terminal success/failure decision; failed cleanup preserves its owned candidate for later diagnosis rather than performing a pathname-recursive delete. |
+| Retire owned tree | Atomically moves a complete, transaction-owned nonempty tree to a no-replace quarantine name under its pinned parent. Empty owned trees may be marked for delete-on-close. |
+| Close transaction | Releases handles only after a terminal success/failure decision; quarantine is retained for later diagnosis or separately proven reclamation rather than performing a pathname-recursive delete. |
 
 The module accepts only pinned handles and validated relative segments. It
 cannot be called with an untrusted absolute destination. Existing checks for
@@ -147,8 +147,10 @@ Prepared
 - A same-version repair reuses a package only when version and sealed package
   hash both match. A same version with different bytes fails as a conflict,
   preventing a mixed repair.
-- Unknown legacy files are never recursively removed. Cleanup is limited to
-  transaction-owned objects that the module can prove safe.
+- Unknown legacy files are never recursively removed. Nonempty transaction-owned
+  objects are retired atomically; only a separately proven empty tree is
+  physically removed. Cleanup is therefore limited to transaction-owned objects
+  that the module can prove safe.
 
 ### 4. Defender and draft-release promotion
 

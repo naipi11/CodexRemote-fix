@@ -96,9 +96,11 @@ Assert-CcodEqual 'blocked' $result.Outcome 'pinned missing directory cannot be r
 Add RED cases for a replacement between temporary-leaf creation and promotion,
 source-byte replacement after `Copy-CcodInstallSealedFile` opens the source,
 reparse/ADS/multi-link leaves, a promotion whose parent was renamed, and a
-delete tree containing an unknown, reparse, or multi-link leaf. Each case must
-assert the outside sentinel remains unchanged and that failed cleanup retains
-the unproven owned candidate.
+owned-tree retirement containing an unknown, reparse, or multi-link leaf. Each
+case must assert the outside sentinel remains unchanged and that failed cleanup
+retains the unproven owned candidate. A normal nonempty owned tree must leave
+its live name only through a no-replace atomic quarantine rename with every
+original file preserved; an empty owned tree may be deleted on close.
 
 Add REDs that a pinned JSON write and a pinned log append reject a replaced
 state/log parent and cannot alter an outside sentinel. These operations become
@@ -122,9 +124,11 @@ Use native `SafeFileHandle` operations with `FILE_OPEN_REPARSE_POINT` and
 relative child opens/creates. Directory handles deny delete sharing for their
 lifetime. Temporary leaves use create-new semantics; source and destination
 bytes are read/written/hashed through the opened handles, flush completes
-before promotion, and promotion is limited to the pinned parent. Enumerate and
-delete only transaction-owned objects from leaves upward; any unexpected
-identity stops deletion and leaves the candidate in place.
+before promotion, and promotion is limited to the pinned parent. Retire a
+complete nonempty transaction-owned candidate only by no-replace atomic rename
+to a random quarantine leaf under the pinned parent. Mark only an empty owned
+tree for delete-on-close. Any unexpected identity stops retirement and leaves
+the candidate in place.
 
 Do not import `LifecycleTransaction.psm1` or change any public wire schema;
 this module is file-object ownership only.
@@ -191,7 +195,7 @@ Assert-CcodEqual $oldPointerJson (Get-Content $active -Raw) 'failed promotion ne
 
 Cover a missing fresh `.staging`/`runtime` directory, a replacement after a
 parent pin, a promotion failure, a stable-shell candidate hash failure, owned
-old-runtime cleanup after an unexpected leaf appears, and a legacy unknown
+old-runtime retirement after an unexpected leaf appears, and a legacy unknown
 file that must be retained. Add REDs that runtime `manifest.json`, initial
 state, and UI-preference writes use a pinned state/runtime parent. Keep the
 current hard-link, ADS, reparse, and source-manifest coverage; adapt it to
@@ -213,7 +217,7 @@ staging/promotion or early stable-shell copy is not transaction-bound.
 Replace `Directory.CreateDirectory`, direct copy/move/replace, and
 `Remove-Item -Recurse` mutation paths inside lifecycle staging, runtime
 promotion, runtime manifest, initial state/UI preference, stable-shell
-candidate handling, old-runtime cleanup, and failed-candidate cleanup with
+candidate handling, old-runtime retirement, and failed-candidate retirement with
 Task 1 operations. Retain the existing process identity and scheduled-task
 rules. Build/validate runtime manifest bytes through its pinned leaf before
 promotion. Do not commit stable shell bytes yet; Task 3 commits them only after
