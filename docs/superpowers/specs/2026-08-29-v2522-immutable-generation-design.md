@@ -20,7 +20,11 @@ ordinary pathname races by using unique create-only generations, strict
 manifest/hash/version checks, and atomic pointer commits. It does not claim to
 defeat a same-user process that already has unrestricted write/DACL authority;
 that guarantee would require an elevated or signed broker, which is outside
-this product's current-user scope.
+this product's current-user scope. PowerShell module scope and CLR reflection
+are also not process-isolation boundaries: code already executing inside the
+same PowerShell process may inspect private module state. The enforced contract
+is the exported API and sealed generation/pointer rules, not protection against
+arbitrary in-process introspection.
 
 This design never modifies `ChatGPT.exe`, `app.asar`, `WindowsApps`, account
 state, or the current-user DPAPI device-key store. It does not add a remote
@@ -86,8 +90,8 @@ Retire-CcodInstallGeneration -InstallRoot <absolute-root> -RuntimeId <owned-id> 
 Close-CcodInstallFileTransaction -Transaction <opaque-context> -Disposition Ready|Failed
 ```
 
-`Retire-CcodInstallGeneration` removes a generation from the active namespace
-by an atomic create-only pointer/retired-record update; it does not recursively
+`Retire-CcodInstallGeneration` removes a generation from the active selection by
+one create-only retired-generation record; it does not rename or recursively
 delete the nonempty directory. Physical reclamation is a later operation that
 requires no running owner and a complete safe-tree proof. This avoids a
 partial-delete rollback claim and avoids persistent DACL changes.

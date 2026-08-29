@@ -72,9 +72,10 @@ Close-CcodInstallFileTransaction -Transaction <opaque-context> -Disposition Read
 ```
 
 Capabilities are opaque reference tokens stored in module-private state. The
-CLR bridge exposes only a non-mutating marker; no public method accepts an
-arbitrary path or bare handle. There is no persistent DACL change and no
-nonempty recursive deletion operation.
+CLR bridge exposes only a non-mutating marker; no exported method accepts an
+arbitrary path or bare handle. PowerShell module scope/CLR reflection is not a
+process-isolation boundary and is outside this unprivileged model. There is no
+persistent DACL change and no nonempty recursive deletion operation.
 
 - [ ] **Step 1: Write failing immutable-generation tests**
 
@@ -101,7 +102,8 @@ Use relative native creates under a validated generation parent, create-new
 leaf semantics, private source/destination handles, flush plus same-handle
 length/SHA-256 verification, and opaque capabilities. A destination that
 already exists fails with a stable collision code. Retire only a fully proven
-owned generation by no-replace relative rename; retain the quarantine tree.
+owned generation by writing one create-only retired-generation record; do not
+rename or recursively delete the nonempty generation.
 
 - [ ] **Step 4: Run GREEN and registration checks**
 
