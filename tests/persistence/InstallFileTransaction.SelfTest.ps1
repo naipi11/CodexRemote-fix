@@ -55,6 +55,16 @@ public static class CcodInstallTransactionTestNative
         return handle;
     }
 
+    public static int TryOpenDirectoryForChildWrite(string path)
+    {
+        using (SafeFileHandle handle = CreateFileW(path, 0x00000002 | 0x00000004 | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, IntPtr.Zero, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero))
+        {
+            return handle.IsInvalid ? Marshal.GetLastWin32Error() : 0;
+        }
+    }
+
     public static SafeFileHandle OpenFileAllowDeleteShare(string path)
     {
         SafeFileHandle handle = CreateFileW(path, GENERIC_READ | GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES,
@@ -79,6 +89,16 @@ public static class CcodInstallTransactionTestNative
                 Thread.Yield();
             }
             return "timeout";
+        });
+    }
+
+    public static Task<string> InsertUnknownAfterDelay(string unknownLeaf, int delayMilliseconds)
+    {
+        return Task.Run(() => {
+            Thread.Sleep(delayMilliseconds);
+            try { File.WriteAllText(unknownLeaf, "concurrent-unknown"); return "inserted"; }
+            catch (IOException) { return "blocked"; }
+            catch (UnauthorizedAccessException) { return "blocked"; }
         });
     }
 }
@@ -364,7 +384,7 @@ foreach ($case in @('unknown','reparse','multilink')) {
     }
 }
 
-Invoke-CcodTest 'deletes a fully proven transaction-owned tree from leaves upward' {
+Invoke-CcodTest 'fails closed when a nonempty owned tree cannot establish every delete disposition' {
     $fixture = New-CcodInstallFileFixture
     try {
         $source = New-CcodSourceFile $fixture
@@ -376,9 +396,23 @@ Invoke-CcodTest 'deletes a fully proven transaction-owned tree from leaves upwar
             Copy-CcodInstallSealedFile -Transaction $Tx -SourcePath $Source -DestinationLeaf $Leaf -ExpectedLength $Length -ExpectedSha256 $Sha | Out-Null
             Commit-CcodInstallPinnedPromotion -Transaction $Tx -ParentDirectory $Parent -TemporaryLeaf $Leaf -DestinationLeaf 'payload.bin' | Out-Null
         } @($tx,$source.Path,$candidate,$temporary,$source.Length,$source.Sha256)
-        Invoke-CcodInstallModule { param($Tx) Remove-CcodInstallOwnedTree -Transaction $Tx -ParentDirectory $Tx.RootDirectory -Leaf 'candidate' } @($tx) | Out-Null
-        Assert-CcodTrue (-not [IO.Directory]::Exists((Join-Path $fixture.Install 'candidate'))) 'proven owned tree is removed'
+        Assert-CcodThrows {
+            Invoke-CcodInstallModule { param($Tx) Remove-CcodInstallOwnedTree -Transaction $Tx -ParentDirectory $Tx.RootDirectory -Leaf 'candidate' } @($tx) | Out-Null
+        } 'CCOD_INSTALL_DELETE_FAILED'
+        Assert-CcodTrue ([IO.Directory]::Exists((Join-Path $fixture.Install 'candidate'))) 'failed root disposition retains the owned directory'
+        Assert-CcodTrue ([IO.File]::Exists((Join-Path $fixture.Install 'candidate\payload.bin'))) 'failed root disposition clears the prior file disposition'
         Assert-CcodOutsideUnchanged $fixture 'owned tree removal'
+    } finally { Remove-CcodInstallFileFixture $fixture }
+}
+
+Invoke-CcodTest 'deletes an empty fully-owned candidate after establishing its root disposition' {
+    $fixture = New-CcodInstallFileFixture
+    try {
+        $tx = Open-CcodFixtureTransaction $fixture
+        $candidate = Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'empty-candidate' -CreateIfMissing
+        Remove-CcodInstallOwnedTree -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'empty-candidate'
+        Assert-CcodTrue (-not [IO.Directory]::Exists((Join-Path $fixture.Install 'empty-candidate'))) 'empty owned candidate is deleted only after its root disposition is established'
+        Assert-CcodOutsideUnchanged $fixture 'empty owned tree removal'
     } finally { Remove-CcodInstallFileFixture $fixture }
 }
 
@@ -591,6 +625,21 @@ Invoke-CcodTest 'rolls back earlier delete dispositions when a later owned leaf 
     } finally { Remove-CcodInstallFileFixture $fixture }
 }
 
+Invoke-CcodTest 'clears a child-directory disposition when the later root mark fails' {
+    $fixture = New-CcodInstallFileFixture
+    try {
+        $tx = Open-CcodFixtureTransaction $fixture
+        $candidate = Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'candidate' -CreateIfMissing
+        $child = Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $candidate -Leaf 'child' -CreateIfMissing
+        Assert-CcodThrows {
+            Remove-CcodInstallOwnedTree -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'candidate'
+        } 'CCOD_INSTALL_DELETE_FAILED'
+        Assert-CcodTrue ([IO.Directory]::Exists((Join-Path $fixture.Install 'candidate')) ) 'later root-mark failure retains the candidate root'
+        Assert-CcodTrue ([IO.Directory]::Exists((Join-Path $fixture.Install 'candidate\child')) ) 'later root-mark failure clears the child-directory disposition'
+        Assert-CcodOutsideUnchanged $fixture 'directory disposition rollback'
+    } finally { Remove-CcodInstallFileFixture $fixture }
+}
+
 Invoke-CcodTest 'detects an unknown insertion between deletion planning and first release' {
     $fixture = New-CcodInstallFileFixture
     try {
@@ -602,21 +651,41 @@ Invoke-CcodTest 'detects an unknown insertion between deletion planning and firs
         }
         $watch = Join-Path $fixture.Install 'candidate\a-first.tmp'
         $unknown = Join-Path $fixture.Install 'candidate\concurrent-unknown.tmp'
-        $attacker = [CcodInstallTransactionTestNative]::InsertUnknownWhenLeafBecomesUnavailable($watch, $unknown)
+        $attacker = [CcodInstallTransactionTestNative]::InsertUnknownAfterDelay($unknown, 1)
         $failure = $null
         try { Remove-CcodInstallOwnedTree -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'candidate' }
         catch { $failure = $_ }
         $attackOutcome = $attacker.GetAwaiter().GetResult()
-        Assert-CcodTrue ($attackOutcome -in @('inserted','blocked')) 'concurrent namespace attempt reaches the delete boundary'
+        Assert-CcodTrue ($attackOutcome -in @('inserted','blocked')) 'concurrent namespace attempt reaches the cleanup boundary'
         if ($attackOutcome -ceq 'inserted') {
-            Assert-CcodTrue ($null -ne $failure -and $failure.FullyQualifiedErrorId -like 'CCOD_INSTALL_UNKNOWN_LEAF*') "inserted unknown leaf fails the final namespace proof actual=$($failure.FullyQualifiedErrorId) message=$($failure.Exception.Message)"
-            Assert-CcodTrue ([IO.File]::Exists($watch)) 'failed final namespace proof restores the first delete disposition'
+            Assert-CcodTrue ($null -ne $failure -and $failure.FullyQualifiedErrorId -match '^CCOD_INSTALL_(?:UNKNOWN_LEAF|DELETE_FAILED)') "inserted unknown leaf fails cleanup before release actual=$($failure.FullyQualifiedErrorId) message=$($failure.Exception.Message)"
+            Assert-CcodTrue ([IO.File]::Exists($watch)) 'failed concurrent cleanup retains the first candidate leaf'
             Assert-CcodTrue ([IO.File]::Exists($unknown)) 'unproven concurrent object is retained for diagnosis'
             Assert-CcodTrue ([IO.Directory]::Exists((Join-Path $fixture.Install 'candidate'))) 'concurrent insertion retains the complete candidate tree'
         } else {
-            Assert-CcodTrue ($null -eq $failure) 'sharing lock may block the concurrent insertion and permit proven cleanup'
+            Assert-CcodTrue ($null -ne $failure -and $failure.FullyQualifiedErrorId -like 'CCOD_INSTALL_DELETE_FAILED*') 'blocked insertion still fails closed when the nonempty root disposition is unsupported'
         }
         Assert-CcodOutsideUnchanged $fixture 'concurrent cleanup insertion'
+    } finally { Remove-CcodInstallFileFixture $fixture }
+}
+
+Invoke-CcodTest 'owned directory denies external child creation and hard-link insertion for its lifetime' {
+    $fixture = New-CcodInstallFileFixture
+    try {
+        $outsideSource = Join-Path $fixture.Outside 'outside-source.bin'
+        [IO.File]::WriteAllText($outsideSource, 'outside-source')
+        $tx = Open-CcodFixtureTransaction $fixture
+        $candidate = Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'candidate' -CreateIfMissing
+        $childPath = Join-Path $fixture.Install 'candidate\attacker-child.bin'
+        $writeHandleError = [CcodInstallTransactionTestNative]::TryOpenDirectoryForChildWrite((Join-Path $fixture.Install 'candidate'))
+        Assert-CcodTrue ($writeHandleError -ne 0) 'owned directory share lock blocks an external child-write handle'
+
+        $hardLinkPath = Join-Path $fixture.Install 'candidate\attacker-hardlink.bin'
+        $hardLinkError = [CcodInstallTransactionTestNative]::CreateHardLink($hardLinkPath, $outsideSource)
+        Assert-CcodTrue ($hardLinkError -ne 0) 'owned directory share lock blocks external hard-link insertion'
+        Assert-CcodTrue (-not [IO.File]::Exists($childPath)) 'blocked child path remains absent'
+        Assert-CcodTrue (-not [IO.File]::Exists($hardLinkPath)) 'blocked hard-link path remains absent'
+        Assert-CcodOutsideUnchanged $fixture 'owned directory namespace lock'
     } finally { Remove-CcodInstallFileFixture $fixture }
 }
 
