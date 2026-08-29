@@ -110,6 +110,12 @@ function Assert-CcodOutsideUnchanged {
     Assert-CcodEqual $Fixture.SentinelSha256 (Get-CcodTestFileSha256 $Fixture.Sentinel) "$Message sentinel bytes"
 }
 
+function Invoke-CcodExtensionRedTest {
+    param([Parameter(Mandatory)][string]$Id,[Parameter(Mandatory)][string]$Name,[Parameter(Mandatory)][scriptblock]$Action)
+    if (-not [string]::IsNullOrWhiteSpace($env:CCOD_INSTALL_EXTENSION_RED_CASE) -and $env:CCOD_INSTALL_EXTENSION_RED_CASE -cne $Id) { return }
+    Invoke-CcodTest $Name $Action
+}
+
 function Invoke-CcodMoveAttempt {
     param([Parameter(Mandatory)][string]$Path)
     try { [IO.File]::Move($Path,$Path+'.moved'); 'moved' } catch [IO.IOException] { 'blocked' } catch [UnauthorizedAccessException] { 'blocked' }
@@ -132,9 +138,9 @@ function New-CcodHardLink {
 Invoke-CcodTest 'exports only immutable generation operations and an inert CLR marker' {
     $expected=@('Close-CcodInstallFileTransaction','Commit-CcodInstallActivePointer','Copy-CcodInstallSealedSource','New-CcodInstallDirectory','New-CcodInstallGenerationLeaf','Open-CcodInstallGeneration','Open-CcodInstallRetainedGeneration','Retire-CcodInstallGeneration','Write-CcodInstallGenerationManifest','Write-CcodInstallRecord')
     Assert-CcodEqual ($expected -join '|') ((@($module.ExportedCommands.Keys)|Sort-Object)-join '|') 'module export surface is capability-only'
-    Assert-CcodEqual 2 ([CcodInstallGenerationCapabilityMarkerV2]::CapabilityAbi) 'marker exposes the current non-mutating ABI value'
-    Assert-CcodEqual 'CcodInstallGenerationCapabilityMarkerV2' ((@([CcodInstallGenerationCapabilityMarkerV2].Assembly.GetExportedTypes()|ForEach-Object FullName)) -join '|') 'current CLR bridge exports only the inert marker'
-    $dangerous=@([CcodInstallGenerationCapabilityMarkerV2].GetMethods([Reflection.BindingFlags]'Public,Static,DeclaredOnly')|Where-Object{@($_.GetParameters()|Where-Object{$_.ParameterType-in@([string],[IntPtr],[IO.Stream])-or[Microsoft.Win32.SafeHandles.SafeHandle].IsAssignableFrom($_.ParameterType)}).Count-ne 0})
+    Assert-CcodEqual 3 ([CcodInstallGenerationCapabilityMarkerV3]::CapabilityAbi) 'marker exposes the current non-mutating ABI value'
+    Assert-CcodEqual 'CcodInstallGenerationCapabilityMarkerV3' ((@([CcodInstallGenerationCapabilityMarkerV3].Assembly.GetExportedTypes()|ForEach-Object FullName)) -join '|') 'current CLR bridge exports only the inert marker'
+    $dangerous=@([CcodInstallGenerationCapabilityMarkerV3].GetMethods([Reflection.BindingFlags]'Public,Static,DeclaredOnly')|Where-Object{@($_.GetParameters()|Where-Object{$_.ParameterType-in@([string],[IntPtr],[IO.Stream])-or[Microsoft.Win32.SafeHandles.SafeHandle].IsAssignableFrom($_.ParameterType)}).Count-ne 0})
     Assert-CcodEqual 0 $dangerous.Count 'marker accepts no path stream or bare handle'
 }
 
@@ -459,6 +465,68 @@ Invoke-CcodTest 'rejects structurally invalid or unowned retained generations' {
             Assert-CcodThrows {Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId -ExpectedManifestSha256 $manifest.Sha256 -FileTransaction $transaction|Out-Null} $expected
         } finally {Remove-CcodInstallFileFixture $fixture}
     }
+}
+
+Invoke-CcodExtensionRedTest 'retained-alias' 'retained read-only propagates through transaction-root alias traversal' {
+    $fixture=New-CcodInstallFileFixture
+    try {
+        $runtimeId='runtime-retained-alias';$old=Open-CcodFixtureGeneration $fixture $runtimeId;$manifest=Write-CcodInstallGenerationManifest -Generation $old -Manifest (New-CcodGenerationManifest $runtimeId);Close-CcodInstallFileTransaction -Transaction $old -Disposition Ready|Out-Null
+        $transaction=Open-CcodFixtureGeneration $fixture 'runtime-alias-transaction';Write-CcodInstallGenerationManifest -Generation $transaction -Manifest (New-CcodGenerationManifest 'runtime-alias-transaction')|Out-Null
+        $retained=Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId -ExpectedManifestSha256 $manifest.Sha256 -FileTransaction $transaction
+        $runtimeDirectory=New-CcodInstallDirectory -Transaction $transaction -Parent $transaction -Leaf 'runtime'
+        $alias=New-CcodInstallDirectory -Transaction $transaction -Parent $runtimeDirectory -Leaf $runtimeId
+        Assert-CcodThrows {New-CcodInstallDirectory -Transaction $transaction -Parent $alias -Leaf 'blocked-dir' -CreateIfMissing|Out-Null} 'CCOD_INSTALL_GENERATION_READ_ONLY'
+        Assert-CcodThrows {Write-CcodInstallRecord -Transaction $transaction -Parent $alias -Leaf 'blocked.json' -Record ([ordered]@{value='blocked'})|Out-Null} 'CCOD_INSTALL_GENERATION_READ_ONLY'
+        Assert-CcodThrows {New-CcodInstallGenerationLeaf -Generation $alias -Leaf 'blocked-leaf'|Out-Null} 'CCOD_INSTALL_GENERATION_READ_ONLY'
+        Assert-CcodThrows {Write-CcodInstallGenerationManifest -Generation $alias -Manifest (New-CcodGenerationManifest $runtimeId)|Out-Null} 'CCOD_INSTALL_GENERATION_READ_ONLY'
+        Assert-CcodTrue ($null-ne$retained) 'direct retained capability remains available only as a pointer target'
+    } finally {Remove-CcodInstallFileFixture $fixture}
+}
+
+Invoke-CcodExtensionRedTest 'nested-retained' 'opens and recursively validates a nested retained generation read-only' {
+    $fixture=New-CcodInstallFileFixture
+    try {
+        $runtimeId='runtime-retained-nested';$source=New-CcodSourceFile $fixture 'nested-source.bin' 'nested-retained-bytes';$old=Open-CcodFixtureGeneration $fixture $runtimeId;$first=New-CcodInstallGenerationLeaf -Generation $old -Leaf 'first';$second=New-CcodInstallGenerationLeaf -Generation $first -Leaf 'second';Copy-CcodInstallSealedSource -Generation $second -SourcePath $source.Path -Leaf 'payload.bin' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null
+        $manifest=Write-CcodInstallGenerationManifest -Generation $old -Manifest (New-CcodGenerationManifest $runtimeId @([ordered]@{path='first\second\payload.bin';length=$source.Length;sha256=$source.Sha256}));Close-CcodInstallFileTransaction -Transaction $old -Disposition Ready|Out-Null
+        $transaction=Open-CcodFixtureGeneration $fixture 'runtime-nested-validator';Write-CcodInstallGenerationManifest -Generation $transaction -Manifest (New-CcodGenerationManifest 'runtime-nested-validator')|Out-Null
+        $retained=Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId -ExpectedManifestSha256 $manifest.Sha256 -FileTransaction $transaction
+        Assert-CcodEqual '' (@($retained.PSObject.Properties.Name)-join ',') 'nested retained generation opens as an opaque capability'
+        $result=Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $retained -ExpectedPreviousGeneration ([uint64]0) -FileTransaction $transaction
+        Assert-CcodEqual $runtimeId $result.RuntimeId 'nested retained tree remains a valid read-only pointer target'
+    } finally {Remove-CcodInstallFileFixture $fixture}
+}
+
+Invoke-CcodExtensionRedTest 'semantic-runtime-id' 'rejects an escaped or nested runtimeId without one matching top-level property' {
+    $fixture=New-CcodInstallFileFixture
+    try {
+        $runtimeId='runtime-semantic-target';$old=Open-CcodFixtureGeneration $fixture $runtimeId
+        $manifest=Write-CcodInstallGenerationManifest -Generation $old -Manifest ([ordered]@{schemaVersion=1;projectVersion='2.5.22';description='escaped runtimeId marker';metadata=[ordered]@{runtimeId=$runtimeId};commit='0123456789abcdef0123456789abcdef01234567';files=@()});Close-CcodInstallFileTransaction -Transaction $old -Disposition Ready|Out-Null
+        $transaction=Open-CcodFixtureGeneration $fixture 'runtime-semantic-validator';Write-CcodInstallGenerationManifest -Generation $transaction -Manifest (New-CcodGenerationManifest 'runtime-semantic-validator')|Out-Null
+        Assert-CcodThrows {Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId -ExpectedManifestSha256 $manifest.Sha256 -FileTransaction $transaction|Out-Null} 'CCOD_INSTALL_RETAINED_RUNTIME_ID_MISMATCH'
+    } finally {Remove-CcodInstallFileFixture $fixture}
+}
+
+Invoke-CcodExtensionRedTest 'child-transaction' 'rejects a child directory capability as retained-open FileTransaction' {
+    $fixture=New-CcodInstallFileFixture
+    try {
+        $runtimeId='runtime-child-transaction-old';$old=Open-CcodFixtureGeneration $fixture $runtimeId;$manifest=Write-CcodInstallGenerationManifest -Generation $old -Manifest (New-CcodGenerationManifest $runtimeId);Close-CcodInstallFileTransaction -Transaction $old -Disposition Ready|Out-Null
+        $transaction=Open-CcodFixtureGeneration $fixture 'runtime-child-transaction-new';Write-CcodInstallGenerationManifest -Generation $transaction -Manifest (New-CcodGenerationManifest 'runtime-child-transaction-new')|Out-Null;$state=New-CcodInstallDirectory -Transaction $transaction -Parent $transaction -Leaf 'state' -CreateIfMissing
+        Assert-CcodThrows {Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId -ExpectedManifestSha256 $manifest.Sha256 -FileTransaction $state|Out-Null} 'CCOD_INSTALL_TRANSACTION_INVALID'
+    } finally {Remove-CcodInstallFileFixture $fixture}
+}
+
+Invoke-CcodExtensionRedTest 'v3-reimport' 're-imports ABI V3 and exercises every retained extension export' {
+    $fixture=New-CcodInstallFileFixture
+    try {
+        if($null-eq('CcodInstallGenerationCapabilityMarkerV2'-as[type])){Add-Type -TypeDefinition 'public sealed class CcodInstallGenerationCapabilityMarkerV2 { private CcodInstallGenerationCapabilityMarkerV2() {} public static int CapabilityAbi { get { return 2; } } }'}
+        Assert-CcodEqual 2 ([CcodInstallGenerationCapabilityMarkerV2]::CapabilityAbi) 'old V2 marker is preloaded in the AppDomain'
+        $module=Import-Module $modulePath -Force -PassThru -DisableNameChecking;$module=Import-Module $modulePath -Force -PassThru -DisableNameChecking
+        $old=Open-CcodFixtureGeneration $fixture 'runtime-v3-old';$manifest=Write-CcodInstallGenerationManifest -Generation $old -Manifest (New-CcodGenerationManifest 'runtime-v3-old');Close-CcodInstallFileTransaction -Transaction $old -Disposition Ready|Out-Null
+        $transaction=Open-CcodFixtureGeneration $fixture 'runtime-v3-new';Write-CcodInstallGenerationManifest -Generation $transaction -Manifest (New-CcodGenerationManifest 'runtime-v3-new')|Out-Null
+        $state=New-CcodInstallDirectory -Transaction $transaction -Parent $transaction -Leaf 'state' -CreateIfMissing;$records=New-CcodInstallDirectory -Transaction $transaction -Parent $state -Leaf 'records' -CreateIfMissing;Write-CcodInstallRecord -Transaction $transaction -Parent $records -Leaf 'record.json' -Record ([ordered]@{schemaVersion=1;value='v3'})|Out-Null
+        $retained=Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId 'runtime-v3-old' -ExpectedManifestSha256 $manifest.Sha256 -FileTransaction $transaction;Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $retained -ExpectedPreviousGeneration ([uint64]0) -FileTransaction $transaction|Out-Null
+        Assert-CcodEqual 3 ([CcodInstallGenerationCapabilityMarkerV3]::CapabilityAbi) 'module binds the new ABI V3 despite the preloaded V2 marker'
+    } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
 Invoke-CcodTest 'retirement writes one create-only record and keeps the nonempty generation in place' {

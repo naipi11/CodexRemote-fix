@@ -9,7 +9,7 @@ function Throw-CcodInstallFileError {
 }
 
 function Initialize-CcodInstallRuntime {
-    $marker = 'CcodInstallGenerationCapabilityMarkerV2' -as [type]
+    $marker = 'CcodInstallGenerationCapabilityMarkerV3' -as [type]
     if ($null -eq $marker) {
         Add-Type -TypeDefinition @'
 using System;
@@ -20,16 +20,15 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.RegularExpressions;
 using Microsoft.Win32.SafeHandles;
 
-public sealed class CcodInstallGenerationCapabilityMarkerV2
+public sealed class CcodInstallGenerationCapabilityMarkerV3
 {
-    private CcodInstallGenerationCapabilityMarkerV2() { }
-    public static int CapabilityAbi { get { return 2; } }
+    private CcodInstallGenerationCapabilityMarkerV3() { }
+    public static int CapabilityAbi { get { return 3; } }
 }
 
-internal sealed class CcodInstallGenerationRuntimeV2 : IDisposable
+internal sealed class CcodInstallGenerationRuntimeV3 : IDisposable
 {
     private const uint READ = 0x80000000, WRITE = 0x40000000, DELETE = 0x00010000, SYNC = 0x00100000;
     private const uint READ_ATTRIBUTES = 0x80, WRITE_ATTRIBUTES = 0x100, LIST_DIRECTORY = 0x1, ADD_FILE = 0x2, ADD_SUBDIRECTORY = 0x4;
@@ -80,13 +79,14 @@ internal sealed class CcodInstallGenerationRuntimeV2 : IDisposable
     private readonly Dictionary<object,Pin> pins = new Dictionary<object,Pin>(ReferenceComparer.Instance);
     private readonly Dictionary<string,Pin> names = new Dictionary<string,Pin>(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<object> retainedRoots = new HashSet<object>(ReferenceComparer.Instance);
+    private readonly HashSet<object> retainedScopes = new HashSet<object>(ReferenceComparer.Instance);
     private readonly List<FileStream> externalStreams = new List<FileStream>();
     private bool disposed; private string cleanupError;
 
-    private CcodInstallGenerationRuntimeV2(string installRoot,Pin root,Pin runtimeParent)
+    private CcodInstallGenerationRuntimeV3(string installRoot,Pin root,Pin runtimeParent)
     { this.installRoot=installRoot;this.root=root;this.runtimeParent=runtimeParent;AddPin(root);AddPin(runtimeParent); }
 
-    internal static object Open(string path,string runtimeId,out CcodInstallGenerationRuntimeV2 runtime)
+    internal static object Open(string path,string runtimeId,out CcodInstallGenerationRuntimeV3 runtime)
     {
         runtime=null;string full=Path.GetFullPath(path).TrimEnd('\\');SafeFileHandle rootHandle=OpenAbsoluteDirectory(full,true);Pin rootPin=null,runtimePin=null;
         try
@@ -101,7 +101,7 @@ internal sealed class CcodInstallGenerationRuntimeV2 : IDisposable
             try
             {
                 Pin generation=ValidateDirectoryPin(runtimePin,runtimeId,Path.Combine(runtimePin.Path,runtimeId),true,generationResult.Handle);generationResult.Handle=null;
-                runtime=new CcodInstallGenerationRuntimeV2(full,rootPin,runtimePin);rootPin=null;runtimePin=null;runtime.AddPin(generation);return generation.Token;
+                runtime=new CcodInstallGenerationRuntimeV3(full,rootPin,runtimePin);rootPin=null;runtimePin=null;runtime.AddPin(generation);return generation.Token;
             }
             finally { if(generationResult.Handle!=null)generationResult.Handle.Dispose(); }
         }
@@ -117,23 +117,24 @@ internal sealed class CcodInstallGenerationRuntimeV2 : IDisposable
 
     [MethodImpl(MethodImplOptions.Synchronized)] internal object OpenDirectory(object parentToken,string leaf,bool createIfMissing)
     {
-        Pin parent=Require(parentToken,true);ValidateCurrent(parent);Pin known;if(names.TryGetValue(Key(parent,leaf),out known)){ValidateCurrent(known);return known.Token;}OpenResult result;
+        Pin parent=Require(parentToken,true);ValidateCurrent(parent);Pin known;if(names.TryGetValue(Key(parent,leaf),out known)){ValidateCurrent(known);if(retainedScopes.Contains(parentToken)||retainedRoots.Contains(known.Token))MarkRetainedTree(known);return known.Token;}OpenResult result;
         if(createIfMissing){try{result=OpenRelative(parent.Native,leaf,LIST_DIRECTORY|ADD_FILE|ADD_SUBDIRECTORY|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,CREATE,DIRECTORY|BACKUP_INTENT);}catch(Win32Exception exception){if(exception.NativeErrorCode!=80&&exception.NativeErrorCode!=183)throw;result=OpenRelative(parent.Native,leaf,LIST_DIRECTORY|ADD_FILE|ADD_SUBDIRECTORY|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);}}
         else result=OpenRelative(parent.Native,leaf,LIST_DIRECTORY|ADD_FILE|ADD_SUBDIRECTORY|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);
-        try{Pin pin=ValidateDirectoryPin(parent,leaf,Path.Combine(parent.Path,leaf),result.Created,result.Handle);result.Handle=null;AddPin(pin);return pin.Token;}finally{if(result.Handle!=null)result.Handle.Dispose();}
+        try{Pin pin=ValidateDirectoryPin(parent,leaf,Path.Combine(parent.Path,leaf),result.Created,result.Handle);result.Handle=null;AddPin(pin);if(retainedScopes.Contains(parentToken))retainedScopes.Add(pin.Token);return pin.Token;}finally{if(result.Handle!=null)result.Handle.Dispose();}
     }
 
     [MethodImpl(MethodImplOptions.Synchronized)] internal object GetInstallRoot(){if(disposed)throw new ObjectDisposedException("transaction");ValidateCurrent(root);return root.Token;}
+    [MethodImpl(MethodImplOptions.Synchronized)] internal bool IsRetained(object token){if(disposed)throw new ObjectDisposedException("transaction");return token!=null&&retainedScopes.Contains(token);}
 
     [MethodImpl(MethodImplOptions.Synchronized)] internal object OpenRetained(string runtimeId,string expectedManifestSha)
     {
-        if(disposed)throw new ObjectDisposedException("transaction");Pin existing;if(names.TryGetValue(Key(runtimeParent,runtimeId),out existing)){if(!retainedRoots.Contains(existing.Token))throw new InvalidDataException("retained generation already scoped");ValidateRetainedTree(existing);ValidateRetainedManifest(existing,runtimeId,expectedManifestSha);return existing.Token;}OpenResult result=OpenRelative(runtimeParent.Native,runtimeId,LIST_DIRECTORY|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);List<Pin> added=new List<Pin>();
+        if(disposed)throw new ObjectDisposedException("transaction");Pin existing;if(names.TryGetValue(Key(runtimeParent,runtimeId),out existing)){if(!retainedRoots.Contains(existing.Token))throw new InvalidDataException("retained generation already scoped");ValidateRetainedTree(existing);return new object[]{existing.Token,ValidateRetainedManifest(existing,expectedManifestSha)};}OpenResult result=OpenRelative(runtimeParent.Native,runtimeId,LIST_DIRECTORY|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);List<Pin> added=new List<Pin>();
         try
         {
             Pin candidate=ValidateDirectoryPin(runtimeParent,runtimeId,Path.Combine(runtimeParent.Path,runtimeId),false,result.Handle);result.Handle=null;Pin generation;if(names.TryGetValue(Key(runtimeParent,runtimeId),out generation)){candidate.Dispose();}else{generation=candidate;AddPin(generation);added.Add(generation);}OpenRetainedTree(generation,added);
-            ValidateRetainedManifest(generation,runtimeId,expectedManifestSha);ValidateRetainedTree(generation);retainedRoots.Add(generation.Token);return generation.Token;
+            string manifestText=ValidateRetainedManifest(generation,expectedManifestSha);ValidateRetainedTree(generation);retainedRoots.Add(generation.Token);MarkRetainedTree(generation);return new object[]{generation.Token,manifestText};
         }
-        catch(Exception exception){for(int i=added.Count-1;i>=0;i--){Pin pin=added[i];if(pin.Parent!=null)names.Remove(Key(pin.Parent,pin.Leaf));pins.Remove(pin.Token);try{pin.Dispose();}catch{}}throw new InvalidDataException("retained open failed: "+exception.Message,exception);}
+        catch(Exception exception){for(int i=added.Count-1;i>=0;i--){Pin pin=added[i];retainedScopes.Remove(pin.Token);if(pin.Parent!=null)names.Remove(Key(pin.Parent,pin.Leaf));pins.Remove(pin.Token);try{pin.Dispose();}catch{}}throw new InvalidDataException("retained open failed: "+exception.Message,exception);}
         finally{if(result.Handle!=null)result.Handle.Dispose();}
     }
 
@@ -198,10 +199,11 @@ internal sealed class CcodInstallGenerationRuntimeV2 : IDisposable
     {
         foreach(string leaf in Enumerate(directory.Native))
         {
-            OpenResult probe=OpenRelative(directory.Native,leaf,READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,BACKUP_INTENT);try{FILE_INFO info=Info(probe.Handle);if((info.FileAttributes&ATTR_REPARSE)!=0)throw new InvalidDataException("reparse leaf");string path=Path.Combine(directory.Path,leaf);if(IsDirectory(info)){if(!OnlyDefaultStream(probe.Handle)||!SamePath(FinalPath(probe.Handle),path))throw new InvalidDataException("directory invalid");Pin child=new Pin(directory,leaf,path,true,false,probe.Handle,null,info);probe.Handle=null;AddPin(child);added.Add(child);OpenRetainedTree(child,added);}else{probe.Handle.Dispose();probe.Handle=null;OpenResult file=OpenRelative(directory.Native,leaf,READ|READ_ATTRIBUTES|SYNC,SHARE_READ,OPEN,NON_DIRECTORY);FileStream stream=null;try{stream=new FileStream(file.Handle,FileAccess.Read,65536,false);file.Handle=null;FILE_INFO fileInfo=Info(stream.SafeFileHandle);ValidatePlain(fileInfo,stream.SafeFileHandle);if(!SamePath(FinalPath(stream.SafeFileHandle),path))throw new InvalidDataException("pin changed");Pin child=new Pin(directory,leaf,path,false,false,null,stream,fileInfo);child.SealedLength=stream.Length;child.SealedSha=Sha(stream);child.Sealed=true;child.Published=true;AddPin(child);added.Add(child);stream=null;}finally{if(stream!=null)stream.Dispose();if(file.Handle!=null)file.Handle.Dispose();}}}finally{if(probe.Handle!=null)probe.Handle.Dispose();}}
+            OpenResult probe=OpenRelative(directory.Native,leaf,READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,BACKUP_INTENT);try{FILE_INFO info=Info(probe.Handle);if((info.FileAttributes&ATTR_REPARSE)!=0)throw new InvalidDataException("reparse leaf");string path=Path.Combine(directory.Path,leaf);if(IsDirectory(info)){probe.Handle.Dispose();probe.Handle=null;OpenResult childDirectory=OpenRelative(directory.Native,leaf,LIST_DIRECTORY|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);try{FILE_INFO childInfo=Info(childDirectory.Handle);if(!IsDirectory(childInfo)||(childInfo.FileAttributes&ATTR_REPARSE)!=0||!OnlyDefaultStream(childDirectory.Handle)||!SamePath(FinalPath(childDirectory.Handle),path))throw new InvalidDataException("directory invalid");Pin child=new Pin(directory,leaf,path,true,false,childDirectory.Handle,null,childInfo);childDirectory.Handle=null;AddPin(child);added.Add(child);retainedScopes.Add(child.Token);OpenRetainedTree(child,added);}finally{if(childDirectory.Handle!=null)childDirectory.Handle.Dispose();}}else{probe.Handle.Dispose();probe.Handle=null;OpenResult file=OpenRelative(directory.Native,leaf,READ|READ_ATTRIBUTES|SYNC,SHARE_READ,OPEN,NON_DIRECTORY);FileStream stream=null;try{stream=new FileStream(file.Handle,FileAccess.Read,65536,false);file.Handle=null;FILE_INFO fileInfo=Info(stream.SafeFileHandle);ValidatePlain(fileInfo,stream.SafeFileHandle);if(!SamePath(FinalPath(stream.SafeFileHandle),path))throw new InvalidDataException("pin changed");Pin child=new Pin(directory,leaf,path,false,false,null,stream,fileInfo);child.SealedLength=stream.Length;child.SealedSha=Sha(stream);child.Sealed=true;child.Published=true;AddPin(child);added.Add(child);retainedScopes.Add(child.Token);stream=null;}finally{if(stream!=null)stream.Dispose();if(file.Handle!=null)file.Handle.Dispose();}}}finally{if(probe.Handle!=null)probe.Handle.Dispose();}}
     }
     private void ValidateRetainedTree(Pin directory){ValidateCurrent(directory);foreach(string leaf in Enumerate(directory.Native)){Pin child;if(!names.TryGetValue(Key(directory,leaf),out child))throw new InvalidDataException("unknown retained leaf");if(child.Directory)ValidateRetainedTree(child);else{ValidateCurrent(child);if(child.Stream.Length!=child.SealedLength||Sha(child.Stream)!=child.SealedSha)throw new InvalidDataException("seal mismatch");}}}
-    private void ValidateRetainedManifest(Pin generation,string runtimeId,string expectedManifestSha){Pin manifest;if(!names.TryGetValue(Key(generation,"manifest.json"),out manifest)||manifest.Directory)throw new InvalidDataException("retained manifest missing");if(manifest.SealedSha!=expectedManifestSha)throw new InvalidDataException("retained manifest mismatch");string text=ReadText(manifest.Stream);string propertyPattern="\\\"runtimeId\\\"\\s*:";string valuePattern=propertyPattern+"\\s*\\\""+Regex.Escape(runtimeId)+"\\\"";if(Regex.Matches(text,propertyPattern).Count!=1||Regex.Matches(text,valuePattern).Count!=1)throw new InvalidDataException("retained runtime id mismatch");}
+    private string ValidateRetainedManifest(Pin generation,string expectedManifestSha){Pin manifest;if(!names.TryGetValue(Key(generation,"manifest.json"),out manifest)||manifest.Directory)throw new InvalidDataException("retained manifest missing");if(manifest.SealedSha!=expectedManifestSha)throw new InvalidDataException("retained manifest mismatch");return ReadText(manifest.Stream);}
+    private void MarkRetainedTree(Pin directory){retainedScopes.Add(directory.Token);foreach(Pin pin in pins.Values)if(!pin.Closed&&pin.Path.StartsWith(directory.Path.TrimEnd('\\')+"\\",StringComparison.OrdinalIgnoreCase))retainedScopes.Add(pin.Token);}
     private static string ReadText(FileStream stream){if(stream.Length>4194304)throw new InvalidDataException("retained manifest too large");long position=stream.Position;try{stream.Position=0;byte[] bytes=new byte[stream.Length];int offset=0;while(offset<bytes.Length){int read=stream.Read(bytes,offset,bytes.Length-offset);if(read==0)break;offset+=read;}if(offset!=bytes.Length)throw new EndOfStreamException();return new UTF8Encoding(false,true).GetString(bytes);}finally{stream.Position=position;}}
     private Pin CreateTemporaryFile(Pin parent)
     {
@@ -244,10 +246,10 @@ internal sealed class CcodInstallGenerationRuntimeV2 : IDisposable
     private static int Rename(SafeFileHandle source,SafeFileHandle parent,string destination){byte[] name=Encoding.Unicode.GetBytes(destination);int rootOffset=IntPtr.Size,lengthOffset=rootOffset+IntPtr.Size,nameOffset=lengthOffset+4,size=nameOffset+name.Length+2;IntPtr buffer=Marshal.AllocHGlobal(size);bool parentAdded=false,sourceAdded=false;try{source.DangerousAddRef(ref sourceAdded);parent.DangerousAddRef(ref parentAdded);for(int i=0;i<size;i++)Marshal.WriteByte(buffer,i,0);Marshal.WriteByte(buffer,0,0);Marshal.WriteIntPtr(buffer,rootOffset,parent.DangerousGetHandle());Marshal.WriteInt32(buffer,lengthOffset,name.Length);Marshal.Copy(name,0,IntPtr.Add(buffer,nameOffset),name.Length);IO_STATUS_BLOCK io;int status=NtSetInformationFile(source,out io,buffer,(uint)size,FileRenameInformation);return status>=0?0:(int)RtlNtStatusToDosError(status);}finally{if(parentAdded)parent.DangerousRelease();if(sourceAdded)source.DangerousRelease();Marshal.FreeHGlobal(buffer);}}
 }
 '@
-        $marker = 'CcodInstallGenerationCapabilityMarkerV2' -as [type]
+        $marker = 'CcodInstallGenerationCapabilityMarkerV3' -as [type]
     }
-    if ($null -eq $marker -or [int]$marker.GetProperty('CapabilityAbi').GetValue($null,$null) -ne 2) { Throw-CcodInstallFileError 'CCOD_INSTALL_RUNTIME_ABI_INVALID' 'Install generation runtime ABI is unavailable' $null }
-    $script:CcodRuntimeType = $marker.Assembly.GetType('CcodInstallGenerationRuntimeV2',$true)
+    if ($null -eq $marker -or [int]$marker.GetProperty('CapabilityAbi').GetValue($null,$null) -ne 3) { Throw-CcodInstallFileError 'CCOD_INSTALL_RUNTIME_ABI_INVALID' 'Install generation runtime ABI is unavailable' $null }
+    $script:CcodRuntimeType = $marker.Assembly.GetType('CcodInstallGenerationRuntimeV3',$true)
 }
 
 function Assert-CcodInstallLeaf([string]$Leaf,[string]$ErrorId='CCOD_INSTALL_LEAF_INVALID') {
@@ -286,6 +288,7 @@ function Test-CcodInstallValue($Value,[int]$Depth=0) {
 }
 function ConvertTo-CcodInstallJsonBytes($Value){if(-not(Test-CcodInstallValue $Value)){Throw-CcodInstallFileError 'CCOD_INSTALL_JSON_INVALID' 'Invalid install JSON value' $null};return ,([Text.UTF8Encoding]::new($false).GetBytes(($Value|ConvertTo-Json -Depth 32 -Compress)+"`n"))}
 function Get-CcodInstallBytesSha256([byte[]]$Bytes){$sha=[Security.Cryptography.SHA256]::Create();try{return [BitConverter]::ToString($sha.ComputeHash($Bytes)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}}
+function Test-CcodRetainedManifestIdentity([string]$Json,[string]$RuntimeId){try{$manifest=$Json|ConvertFrom-Json -ErrorAction Stop}catch{return$false};if($manifest-isnot[pscustomobject]){return$false};$properties=@($manifest.PSObject.Properties|Where-Object Name -CEQ 'runtimeId');return($properties.Count-eq 1-and$properties[0].Value-is[string]-and[string]$properties[0].Value-ceq$RuntimeId)}
 function Assert-CcodInstallRootScope($State,[string]$InstallRoot,[string]$ErrorId){if(-not[IO.Path]::IsPathRooted($InstallRoot)-or-not[String]::Equals([IO.Path]::GetFullPath($InstallRoot).TrimEnd('\'),$State.InstallRoot,[StringComparison]::OrdinalIgnoreCase)){Throw-CcodInstallFileError $ErrorId 'Install root does not match transaction scope' $InstallRoot}}
 
 function Open-CcodInstallGeneration {
@@ -295,8 +298,8 @@ function Open-CcodInstallGeneration {
     try{$token=Invoke-CcodRuntimeStatic Open $arguments}catch [ComponentModel.Win32Exception]{if($_.Exception.NativeErrorCode-in@(32,80,183)){Throw-CcodInstallFileError 'CCOD_INSTALL_GENERATION_EXISTS' 'Install generation already exists' $RuntimeId};throw}
     $runtime=$arguments[2];$transaction=New-CcodInstallCapability;$script:CcodTransactions.Add($transaction,[pscustomobject]@{Runtime=$runtime;InstallRoot=[IO.Path]::GetFullPath($InstallRoot).TrimEnd('\');RuntimeId=$RuntimeId;RootToken=$token;Closed=$false;CleanupFailed=$false;Retired=$false;RetirementResult=$null;Disposition=$null});$script:CcodScopes.Add($transaction,[pscustomobject]@{Transaction=$transaction;Token=$token;Kind='Generation';ReadOnly=$false;RuntimeId=$RuntimeId});$transaction
 }
-function Open-CcodInstallRetainedGeneration { param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][string]$RuntimeId,[Parameter(Mandatory)][string]$ExpectedManifestSha256,[Parameter(Mandatory)]$FileTransaction) if(-not[IO.Path]::IsPathRooted($InstallRoot)-or$ExpectedManifestSha256-cnotmatch'^[0-9a-f]{64}$'){Throw-CcodInstallFileError 'CCOD_INSTALL_RETAINED_GENERATION_INVALID' 'Invalid retained generation contract' $RuntimeId};Assert-CcodInstallLeaf $RuntimeId 'CCOD_INSTALL_RUNTIME_ID_INVALID';$scope=Get-CcodInstallTransaction $FileTransaction 'CCOD_INSTALL_TRANSACTION_INVALID';Assert-CcodInstallRootScope $scope.State $InstallRoot 'CCOD_INSTALL_TRANSACTION_SCOPE';$token=Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $scope.State.Runtime OpenRetained @($RuntimeId,$ExpectedManifestSha256)} 'CCOD_INSTALL_RETAINED_GENERATION_INVALID';Add-CcodInstallScope $scope.Record.Transaction $token Generation $true $RuntimeId }
-function New-CcodInstallDirectory { param([Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)]$Parent,[Parameter(Mandatory)][string]$Leaf,[switch]$CreateIfMissing) Assert-CcodInstallLeaf $Leaf;$transactionScope=Get-CcodInstallTransaction $Transaction 'CCOD_INSTALL_TRANSACTION_INVALID';if(-not[object]::ReferenceEquals($transactionScope.Record.Transaction,$Transaction)){Throw-CcodInstallFileError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Transaction capability must be the transaction root' $null};if([object]::ReferenceEquals($Parent,$Transaction)){$token=Invoke-CcodRuntimeMethod $transactionScope.State.Runtime GetInstallRoot @();$parentScope=[pscustomobject]@{State=$transactionScope.State;Record=[pscustomobject]@{Transaction=$Transaction;Token=$token;Kind='Directory';ReadOnly=$false;RuntimeId=$null}}}else{$parentScope=Get-CcodInstallScopedDirectory $Transaction $Parent};Assert-CcodInstallWritableScope $parentScope;$token=Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $parentScope.State.Runtime OpenDirectory @($parentScope.Record.Token,$Leaf,[bool]$CreateIfMissing)} 'CCOD_INSTALL_DIRECTORY_OPEN_FAILED';Add-CcodInstallScope $Transaction $token Directory $false $null }
+function Open-CcodInstallRetainedGeneration { param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][string]$RuntimeId,[Parameter(Mandatory)][string]$ExpectedManifestSha256,[Parameter(Mandatory)]$FileTransaction) if(-not[IO.Path]::IsPathRooted($InstallRoot)-or$ExpectedManifestSha256-cnotmatch'^[0-9a-f]{64}$'){Throw-CcodInstallFileError 'CCOD_INSTALL_RETAINED_GENERATION_INVALID' 'Invalid retained generation contract' $RuntimeId};Assert-CcodInstallLeaf $RuntimeId 'CCOD_INSTALL_RUNTIME_ID_INVALID';$scope=Get-CcodInstallTransaction $FileTransaction 'CCOD_INSTALL_TRANSACTION_INVALID';if(-not[object]::ReferenceEquals($scope.Record.Transaction,$FileTransaction)){Throw-CcodInstallFileError 'CCOD_INSTALL_TRANSACTION_INVALID' 'FileTransaction must be the transaction root capability' $null};Assert-CcodInstallRootScope $scope.State $InstallRoot 'CCOD_INSTALL_TRANSACTION_SCOPE';$nativeResult=Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $scope.State.Runtime OpenRetained @($RuntimeId,$ExpectedManifestSha256)} 'CCOD_INSTALL_RETAINED_GENERATION_INVALID';if(@($nativeResult).Count-ne 2-or-not(Test-CcodRetainedManifestIdentity ([string]$nativeResult[1]) $RuntimeId)){Throw-CcodInstallFileError 'CCOD_INSTALL_RETAINED_RUNTIME_ID_MISMATCH' 'Retained manifest must contain exactly one matching top-level runtimeId string' $RuntimeId};Add-CcodInstallScope $scope.Record.Transaction $nativeResult[0] Generation $true $RuntimeId }
+function New-CcodInstallDirectory { param([Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)]$Parent,[Parameter(Mandatory)][string]$Leaf,[switch]$CreateIfMissing) Assert-CcodInstallLeaf $Leaf;$transactionScope=Get-CcodInstallTransaction $Transaction 'CCOD_INSTALL_TRANSACTION_INVALID';if(-not[object]::ReferenceEquals($transactionScope.Record.Transaction,$Transaction)){Throw-CcodInstallFileError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Transaction capability must be the transaction root' $null};if([object]::ReferenceEquals($Parent,$Transaction)){$token=Invoke-CcodRuntimeMethod $transactionScope.State.Runtime GetInstallRoot @();$parentScope=[pscustomobject]@{State=$transactionScope.State;Record=[pscustomobject]@{Transaction=$Transaction;Token=$token;Kind='Directory';ReadOnly=$false;RuntimeId=$null}}}else{$parentScope=Get-CcodInstallScopedDirectory $Transaction $Parent};Assert-CcodInstallWritableScope $parentScope;$token=Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $parentScope.State.Runtime OpenDirectory @($parentScope.Record.Token,$Leaf,[bool]$CreateIfMissing)} 'CCOD_INSTALL_DIRECTORY_OPEN_FAILED';$readOnly=[bool](Invoke-CcodRuntimeMethod $parentScope.State.Runtime IsRetained @($token));Add-CcodInstallScope $Transaction $token Directory $readOnly $(if($readOnly){$parentScope.Record.RuntimeId}else{$null}) }
 function New-CcodInstallGenerationLeaf { param([Parameter(Mandatory)]$Generation,[Parameter(Mandatory)][string]$Leaf) Assert-CcodInstallLeaf $Leaf;$scope=Get-CcodInstallTransaction $Generation;Assert-CcodInstallWritableScope $scope;$token=Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $scope.State.Runtime CreateDirectory @($scope.Record.Token,$Leaf)} 'CCOD_INSTALL_LEAF_CREATE_FAILED';Add-CcodInstallScope $scope.Record.Transaction $token Directory $scope.Record.ReadOnly $scope.Record.RuntimeId }
 function Copy-CcodInstallSealedSource { param([Parameter(Mandatory)]$Generation,[Parameter(Mandatory)][string]$SourcePath,[Parameter(Mandatory)][string]$Leaf,[Parameter(Mandatory)][int64]$ExpectedLength,[Parameter(Mandatory)][string]$ExpectedSha256) Assert-CcodInstallLeaf $Leaf;if(-not[IO.Path]::IsPathRooted($SourcePath)-or$ExpectedLength-lt 0-or$ExpectedSha256-cnotmatch'^[0-9a-f]{64}$'){Throw-CcodInstallFileError 'CCOD_INSTALL_SOURCE_INVALID' 'Invalid sealed source contract' $SourcePath};$scope=Get-CcodInstallTransaction $Generation;Assert-CcodInstallWritableScope $scope;$result=[pscustomobject]@{Length=$ExpectedLength;Sha256=$ExpectedSha256};Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $scope.State.Runtime Copy @($scope.Record.Token,$Leaf,[IO.Path]::GetFullPath($SourcePath),$ExpectedLength,$ExpectedSha256)|Out-Null} 'CCOD_INSTALL_SOURCE_MISMATCH';return $result }
 function Write-CcodInstallGenerationManifest { param([Parameter(Mandatory)]$Generation,[Parameter(Mandatory)]$Manifest) $scope=Get-CcodInstallTransaction $Generation;Assert-CcodInstallWritableScope $scope;if($scope.Record.Token-ne$scope.State.RootToken){Throw-CcodInstallFileError 'CCOD_INSTALL_MANIFEST_SCOPE' 'Manifest must be written at the generation root' $null};$bytes=ConvertTo-CcodInstallJsonBytes $Manifest;$result=[pscustomobject]@{Length=[int64]$bytes.LongLength;Sha256=(Get-CcodInstallBytesSha256 $bytes)};Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $scope.State.Runtime Write @($scope.Record.Token,'manifest.json',$bytes,$true)|Out-Null} 'CCOD_INSTALL_MANIFEST_WRITE_FAILED';return $result }
