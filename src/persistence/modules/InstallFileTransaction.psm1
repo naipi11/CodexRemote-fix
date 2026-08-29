@@ -9,8 +9,9 @@ function Throw-CcodInstallFileError {
 }
 
 function Initialize-CcodInstallRuntime {
-    if ($null -ne ('CcodInstallCapabilityMarker' -as [type])) { return }
-    Add-Type -TypeDefinition @'
+    $marker = 'CcodInstallGenerationCapabilityMarkerV2' -as [type]
+    if ($null -eq $marker) {
+        Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -21,13 +22,13 @@ using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
 
-public sealed class CcodInstallCapabilityMarker
+public sealed class CcodInstallGenerationCapabilityMarkerV2
 {
-    private CcodInstallCapabilityMarker() { }
-    public static int CapabilityAbi { get { return 1; } }
+    private CcodInstallGenerationCapabilityMarkerV2() { }
+    public static int CapabilityAbi { get { return 2; } }
 }
 
-internal sealed class CcodInstallRuntime : IDisposable
+internal sealed class CcodInstallGenerationRuntimeV2 : IDisposable
 {
     private const uint READ = 0x80000000, WRITE = 0x40000000, DELETE = 0x00010000, SYNC = 0x00100000;
     private const uint READ_ATTRIBUTES = 0x80, LIST_DIRECTORY = 0x1, ADD_FILE = 0x2, ADD_SUBDIRECTORY = 0x4;
@@ -63,7 +64,7 @@ internal sealed class CcodInstallRuntime : IDisposable
         internal readonly object Token = new object();
         internal readonly Pin Parent; internal string Leaf, Path;
         internal readonly bool Directory, Owned; internal SafeFileHandle Handle; internal FileStream Stream;
-        internal readonly uint Volume; internal readonly ulong Index; internal bool Closed, Sealed, Manifest;
+        internal readonly uint Volume; internal readonly ulong Index; internal bool Closed, Sealed, Manifest; internal long SealedLength; internal string SealedSha;
         internal Pin(Pin parent,string leaf,string path,bool directory,bool owned,SafeFileHandle handle,FileStream stream,FILE_INFO info)
         { Parent=parent;Leaf=leaf;Path=path;Directory=directory;Owned=owned;Handle=handle;Stream=stream;Volume=info.VolumeSerialNumber;Index=((ulong)info.FileIndexHigh<<32)|info.FileIndexLow; }
         internal SafeFileHandle Native { get { return Stream != null ? Stream.SafeFileHandle : Handle; } }
@@ -80,10 +81,10 @@ internal sealed class CcodInstallRuntime : IDisposable
     private readonly List<FileStream> externalStreams = new List<FileStream>();
     private bool disposed;
 
-    private CcodInstallRuntime(string installRoot,Pin root,Pin runtimeParent)
+    private CcodInstallGenerationRuntimeV2(string installRoot,Pin root,Pin runtimeParent)
     { this.installRoot=installRoot;this.root=root;this.runtimeParent=runtimeParent;AddPin(root);AddPin(runtimeParent); }
 
-    internal static object Open(string path,string runtimeId,out CcodInstallRuntime runtime)
+    internal static object Open(string path,string runtimeId,out CcodInstallGenerationRuntimeV2 runtime)
     {
         runtime=null;string full=Path.GetFullPath(path).TrimEnd('\\');SafeFileHandle rootHandle=OpenAbsoluteDirectory(full,true);Pin rootPin=null,runtimePin=null;
         try
@@ -98,7 +99,7 @@ internal sealed class CcodInstallRuntime : IDisposable
             try
             {
                 Pin generation=ValidateDirectoryPin(runtimePin,runtimeId,Path.Combine(runtimePin.Path,runtimeId),true,generationResult.Handle);generationResult.Handle=null;
-                runtime=new CcodInstallRuntime(full,rootPin,runtimePin);rootPin=null;runtimePin=null;runtime.AddPin(generation);return generation.Token;
+                runtime=new CcodInstallGenerationRuntimeV2(full,rootPin,runtimePin);rootPin=null;runtimePin=null;runtime.AddPin(generation);return generation.Token;
             }
             finally { if(generationResult.Handle!=null)generationResult.Handle.Dispose(); }
         }
@@ -127,7 +128,7 @@ internal sealed class CcodInstallRuntime : IDisposable
             FILE_INFO destinationInfo=Info(destinationStream.SafeFileHandle);ValidatePlain(destinationInfo,destinationStream.SafeFileHandle);
             Pin destination=new Pin(parent,leaf,Path.Combine(parent.Path,leaf),false,true,null,destinationStream,destinationInfo);destinationStream=null;
             sourceStream.CopyTo(destination.Stream);destination.Stream.Flush(true);
-            if(destination.Stream.Length!=expectedLength||Sha(destination.Stream)!=expectedSha)throw new InvalidDataException("destination mismatch");destination.Sealed=true;MakeReadable(destination);AddPin(destination);externalStreams.Add(sourceStream);sourceStream=null;return destination.Token;
+            if(destination.Stream.Length!=expectedLength||Sha(destination.Stream)!=expectedSha)throw new InvalidDataException("destination mismatch");destination.SealedLength=expectedLength;destination.SealedSha=expectedSha;AddPin(destination);try{MakeReadable(destination,expectedLength,expectedSha);}catch(Exception exception){throw new InvalidDataException("seal mismatch",exception);}destination.Sealed=true;externalStreams.Add(sourceStream);sourceStream=null;return destination.Token;
         }
         finally { if(sourceStream!=null)sourceStream.Dispose();if(sourceHandle!=null)sourceHandle.Dispose();if(destinationStream!=null)destinationStream.Dispose();if(destinationResult!=null&&destinationResult.Handle!=null)destinationResult.Handle.Dispose(); }
     }
@@ -138,7 +139,7 @@ internal sealed class CcodInstallRuntime : IDisposable
         try
         {
             stream=new FileStream(result.Handle,FileAccess.ReadWrite,65536,false);result.Handle=null;FILE_INFO info=Info(stream.SafeFileHandle);ValidatePlain(info,stream.SafeFileHandle);Pin pin=new Pin(parent,leaf,Path.Combine(parent.Path,leaf),false,true,null,stream,info);stream=null;
-            pin.Stream.Write(bytes,0,bytes.Length);pin.Stream.Flush(true);string sha=Sha(pin.Stream);if(pin.Stream.Length!=bytes.LongLength)throw new InvalidDataException("destination mismatch");pin.Sealed=true;pin.Manifest=manifest;if(manifest)MakeReadable(pin);AddPin(pin);return new object[]{pin.Token,pin.Stream.Length,sha};
+            pin.Stream.Write(bytes,0,bytes.Length);pin.Stream.Flush(true);string sha=Sha(pin.Stream);if(pin.Stream.Length!=bytes.LongLength)throw new InvalidDataException("destination mismatch");pin.SealedLength=bytes.LongLength;pin.SealedSha=sha;AddPin(pin);if(manifest)MakeReadable(pin,bytes.LongLength,sha);pin.Sealed=true;pin.Manifest=manifest;return new object[]{pin.Token,pin.SealedLength,sha};
         }
         finally { if(stream!=null)stream.Dispose();if(result.Handle!=null)result.Handle.Dispose(); }
     }
@@ -146,15 +147,14 @@ internal sealed class CcodInstallRuntime : IDisposable
     [MethodImpl(MethodImplOptions.Synchronized)] internal object CommitPointer(object generationToken,ulong previousGeneration,string runtimeId,byte[] bytes)
     {
         Pin generation=Require(generationToken,true);ValidateCurrent(generation);if(!Object.ReferenceEquals(generation.Parent,runtimeParent)||!String.Equals(generation.Leaf,runtimeId,StringComparison.Ordinal))throw new InvalidDataException("transaction scope");
-        Pin manifest=null;if(!names.TryGetValue(Key(generation,"manifest.json"),out manifest)||!manifest.Manifest||!manifest.Sealed)throw new InvalidDataException("manifest missing");ValidateCurrent(manifest);
-        Pin state=OpenOrCreateDirectory(root,"state"),pointer=OpenOrCreateDirectory(state,"active-generation");if(CurrentPointerGeneration(pointer)!=previousGeneration)throw new InvalidOperationException("pointer generation exists");string leaf=(previousGeneration+1).ToString("D20")+".json";return WriteAtomic(pointer,leaf,bytes);
+        Pin manifest=null;if(!names.TryGetValue(Key(generation,"manifest.json"),out manifest)||!manifest.Manifest||!manifest.Sealed)throw new InvalidDataException("manifest missing");ValidateCurrent(manifest);ValidateOwnedTree(generation);
+        if(previousGeneration==UInt64.MaxValue)throw new OverflowException("pointer generation overflow");Pin state=OpenOrCreateDirectory(root,"state"),pointer=OpenOrCreateDirectory(state,"active-generation");if(CurrentPointerGeneration(pointer)!=previousGeneration)throw new InvalidOperationException("pointer generation exists");string leaf=(previousGeneration+1).ToString("D20")+".json";return WriteAtomic(pointer,leaf,bytes);
     }
 
-    [MethodImpl(MethodImplOptions.Synchronized)] internal object Retire(object generationToken,string runtimeId,string retiredLeaf,byte[] record)
+    [MethodImpl(MethodImplOptions.Synchronized)] internal object Retire(object generationToken,string runtimeId,string recordLeaf,byte[] record)
     {
         Pin generation=Require(generationToken,true);ValidateCurrent(generation);if(!Object.ReferenceEquals(generation.Parent,runtimeParent)||!String.Equals(generation.Leaf,runtimeId,StringComparison.Ordinal)||!generation.Owned)throw new InvalidDataException("generation not owned");
-        ValidateOwnedTree(generation);Pin retired=OpenOrCreateDirectory(root,"retired"),state=OpenOrCreateDirectory(root,"state"),retirements=OpenOrCreateDirectory(state,"retirements");ReleaseDescendants(generation);int error=Rename(generation.Native,retired.Native,retiredLeaf);if(error!=0)throw new Win32Exception(error);MoveDirectoryPin(generation,retired,retiredLeaf,Path.Combine(retired.Path,retiredLeaf));
-        WriteAtomic(retirements,retiredLeaf+".json",record);return generation.Token;
+        ValidateOwnedTree(generation);Pin state=OpenOrCreateDirectory(root,"state"),retirements=OpenOrCreateDirectory(state,"retired-generations");WriteAtomic(retirements,recordLeaf,record);ValidateCurrent(generation);return generation.Token;
     }
 
     [MethodImpl(MethodImplOptions.Synchronized)] internal void Close()
@@ -173,26 +173,21 @@ internal sealed class CcodInstallRuntime : IDisposable
 
     private void ValidateOwnedTree(Pin directory)
     {
-        ValidateCurrent(directory);foreach(string leaf in Enumerate(directory.Native)){Pin child;if(!names.TryGetValue(Key(directory,leaf),out child)||!child.Owned)throw new InvalidDataException("unknown leaf");ValidateCurrent(child);if(child.Directory)ValidateOwnedTree(child);else if(!child.Sealed)throw new InvalidDataException("unsealed leaf");}
+        ValidateCurrent(directory);foreach(string leaf in Enumerate(directory.Native)){Pin child;if(!names.TryGetValue(Key(directory,leaf),out child)||!child.Owned)throw new InvalidDataException("unknown leaf");if(child.Directory){ValidateCurrent(child);ValidateOwnedTree(child);}else{if(!child.Sealed)throw new InvalidDataException("unsealed leaf");ValidateCurrent(child);}}
     }
     private object WriteAtomic(Pin parent,string leaf,byte[] bytes)
     {
-        string temporary=".ccod."+Guid.NewGuid().ToString("N")+".tmp";object[] result=(object[])Write(parent.Token,temporary,bytes,false);Pin pin=Require(result[0],false);int error=Rename(pin.Native,parent.Native,leaf);if(error!=0)throw new Win32Exception(error);names.Remove(Key(parent,temporary));pin.Leaf=leaf;pin.Path=Path.Combine(parent.Path,leaf);names.Add(Key(parent,leaf),pin);MakeReadable(pin);return result;
+        string temporary=".ccod."+Guid.NewGuid().ToString("N")+".tmp";object[] result=(object[])Write(parent.Token,temporary,bytes,false);Pin pin=Require(result[0],false);int error=Rename(pin.Native,parent.Native,leaf);if(error!=0)throw new Win32Exception(error);names.Remove(Key(parent,temporary));pin.Leaf=leaf;pin.Path=Path.Combine(parent.Path,leaf);names.Add(Key(parent,leaf),pin);MakeReadable(pin,pin.SealedLength,pin.SealedSha);return result;
     }
     private static ulong CurrentPointerGeneration(Pin pointer)
     {
         ulong maximum=0;foreach(string leaf in Enumerate(pointer.Native)){if(leaf.StartsWith(".ccod.",StringComparison.OrdinalIgnoreCase)&&leaf.EndsWith(".tmp",StringComparison.OrdinalIgnoreCase))continue;if(leaf.Length!=25||!leaf.EndsWith(".json",StringComparison.OrdinalIgnoreCase))throw new InvalidDataException("unknown pointer leaf");ulong value;if(!UInt64.TryParse(leaf.Substring(0,20),out value)||value==0)throw new InvalidDataException("unknown pointer leaf");if(value>maximum)maximum=value;}return maximum;
     }
-    private void ReleaseDescendants(Pin directory)
-    {
-        foreach(Pin pin in pins.Values)if(!pin.Closed&&!Object.ReferenceEquals(pin,directory)&&pin.Path.StartsWith(directory.Path.TrimEnd('\\')+"\\",StringComparison.OrdinalIgnoreCase))pin.Dispose();
-    }
     private Pin Require(object token,bool directory){if(disposed)throw new ObjectDisposedException("transaction");Pin pin;if(token==null||!pins.TryGetValue(token,out pin)||pin.Closed||pin.Directory!=directory)throw new InvalidDataException("invalid capability");return pin;}
     private void AddPin(Pin pin){pins.Add(pin.Token,pin);if(pin.Parent!=null)names.Add(Key(pin.Parent,pin.Leaf),pin);}
     private static string Key(Pin parent,string leaf){return parent.Index.ToString("x16")+"|"+leaf.ToLowerInvariant();}
-    private void MoveDirectoryPin(Pin directory,Pin parent,string leaf,string path){string oldPath=directory.Path;names.Remove(Key(directory.Parent,directory.Leaf));directory.Leaf=leaf;directory.Path=path;names.Add(Key(parent,leaf),directory);string prefix=oldPath.TrimEnd('\\')+"\\";foreach(Pin pin in pins.Values)if(!Object.ReferenceEquals(pin,directory)&&pin.Path.StartsWith(prefix,StringComparison.OrdinalIgnoreCase))pin.Path=path+"\\"+pin.Path.Substring(prefix.Length);}
     private static Pin ValidateDirectoryPin(Pin parent,string leaf,string path,bool owned,SafeFileHandle handle){FILE_INFO info=Info(handle);if(!IsDirectory(info)||(info.FileAttributes&ATTR_REPARSE)!=0||!OnlyDefaultStream(handle)||!SamePath(FinalPath(handle),path))throw new InvalidDataException("directory invalid");return new Pin(parent,leaf,path,true,owned,handle,null,info);}
-    private static void MakeReadable(Pin pin){OpenResult bridge=OpenRelative(pin.Parent.Native,pin.Leaf,READ|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE|SHARE_DELETE,OPEN,NON_DIRECTORY);FILE_INFO bridgeInfo=Info(bridge.Handle);if(bridgeInfo.VolumeSerialNumber!=pin.Volume||(((ulong)bridgeInfo.FileIndexHigh<<32)|bridgeInfo.FileIndexLow)!=pin.Index){bridge.Handle.Dispose();throw new InvalidDataException("pin changed");}pin.Stream.Dispose();pin.Stream=null;OpenResult strict=OpenRelative(pin.Parent.Native,pin.Leaf,READ|READ_ATTRIBUTES|SYNC,SHARE_READ,OPEN,NON_DIRECTORY);bridge.Handle.Dispose();pin.Stream=new FileStream(strict.Handle,FileAccess.Read,65536,false);strict.Handle=null;}
+    private static void MakeReadable(Pin pin,long expectedLength,string expectedSha){OpenResult bridge=null,strict=null;FileStream strictStream=null;try{bridge=OpenRelative(pin.Parent.Native,pin.Leaf,READ|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE|SHARE_DELETE,OPEN,NON_DIRECTORY);FILE_INFO bridgeInfo=Info(bridge.Handle);if(bridgeInfo.VolumeSerialNumber!=pin.Volume||(((ulong)bridgeInfo.FileIndexHigh<<32)|bridgeInfo.FileIndexLow)!=pin.Index)throw new InvalidDataException("pin changed");pin.Stream.Dispose();pin.Stream=null;strict=OpenRelative(pin.Parent.Native,pin.Leaf,READ|READ_ATTRIBUTES|SYNC,SHARE_READ,OPEN,NON_DIRECTORY);strictStream=new FileStream(strict.Handle,FileAccess.Read,65536,false);strict.Handle=null;FILE_INFO strictInfo=Info(strictStream.SafeFileHandle);ValidatePlain(strictInfo,strictStream.SafeFileHandle);if(strictInfo.VolumeSerialNumber!=pin.Volume||(((ulong)strictInfo.FileIndexHigh<<32)|strictInfo.FileIndexLow)!=pin.Index||!SamePath(FinalPath(strictStream.SafeFileHandle),pin.Path)||strictStream.Length!=expectedLength||Sha(strictStream)!=expectedSha)throw new InvalidDataException("seal mismatch");pin.Stream=strictStream;strictStream=null;}finally{if(strictStream!=null)strictStream.Dispose();if(strict!=null&&strict.Handle!=null)strict.Handle.Dispose();if(bridge!=null&&bridge.Handle!=null)bridge.Handle.Dispose();}}
     private static SafeFileHandle OpenAbsoluteDirectory(string path,bool allowWrite){uint access=LIST_DIRECTORY|READ_ATTRIBUTES|SYNC;if(allowWrite)access|=ADD_FILE|ADD_SUBDIRECTORY;SafeFileHandle handle=CreateFileW(path,access,SHARE_READ|SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,FLAG_BACKUP|FLAG_REPARSE,IntPtr.Zero);if(handle.IsInvalid)throw new Win32Exception(Marshal.GetLastWin32Error());return handle;}
     private static void ValidateCurrent(Pin pin){FILE_INFO info=Info(pin.Native);if(info.VolumeSerialNumber!=pin.Volume||(((ulong)info.FileIndexHigh<<32)|info.FileIndexLow)!=pin.Index||IsDirectory(info)!=pin.Directory||(info.FileAttributes&ATTR_REPARSE)!=0||!SamePath(FinalPath(pin.Native),pin.Path))throw new InvalidDataException("pin changed");if(!OnlyDefaultStream(pin.Native))throw new InvalidDataException("alternate stream");if(!pin.Directory&&info.NumberOfLinks!=1)throw new InvalidDataException("multi-link");}
     private static void ValidatePlain(FILE_INFO info,SafeFileHandle handle){if(IsDirectory(info))throw new InvalidDataException("file type");if((info.FileAttributes&ATTR_REPARSE)!=0)throw new InvalidDataException("reparse leaf");if(info.NumberOfLinks!=1)throw new InvalidDataException("multi-link");if(!OnlyDefaultStream(handle))throw new InvalidDataException("alternate stream");}
@@ -207,7 +202,10 @@ internal sealed class CcodInstallRuntime : IDisposable
     private static int Rename(SafeFileHandle source,SafeFileHandle parent,string destination){byte[] name=Encoding.Unicode.GetBytes(destination);int rootOffset=IntPtr.Size,lengthOffset=rootOffset+IntPtr.Size,nameOffset=lengthOffset+4,size=nameOffset+name.Length+2;IntPtr buffer=Marshal.AllocHGlobal(size);bool parentAdded=false,sourceAdded=false;try{source.DangerousAddRef(ref sourceAdded);parent.DangerousAddRef(ref parentAdded);for(int i=0;i<size;i++)Marshal.WriteByte(buffer,i,0);Marshal.WriteByte(buffer,0,0);Marshal.WriteIntPtr(buffer,rootOffset,parent.DangerousGetHandle());Marshal.WriteInt32(buffer,lengthOffset,name.Length);Marshal.Copy(name,0,IntPtr.Add(buffer,nameOffset),name.Length);IO_STATUS_BLOCK io;int status=NtSetInformationFile(source,out io,buffer,(uint)size,FileRenameInformation);return status>=0?0:(int)RtlNtStatusToDosError(status);}finally{if(parentAdded)parent.DangerousRelease();if(sourceAdded)source.DangerousRelease();Marshal.FreeHGlobal(buffer);}}
 }
 '@
-    $script:CcodRuntimeType = [CcodInstallCapabilityMarker].Assembly.GetType('CcodInstallRuntime',$true)
+        $marker = 'CcodInstallGenerationCapabilityMarkerV2' -as [type]
+    }
+    if ($null -eq $marker -or [int]$marker.GetProperty('CapabilityAbi').GetValue($null,$null) -ne 2) { Throw-CcodInstallFileError 'CCOD_INSTALL_RUNTIME_ABI_INVALID' 'Install generation runtime ABI is unavailable' $null }
+    $script:CcodRuntimeType = $marker.Assembly.GetType('CcodInstallGenerationRuntimeV2',$true)
 }
 
 function Assert-CcodInstallLeaf([string]$Leaf,[string]$ErrorId='CCOD_INSTALL_LEAF_INVALID') {
@@ -216,9 +214,9 @@ function Assert-CcodInstallLeaf([string]$Leaf,[string]$ErrorId='CCOD_INSTALL_LEA
 function Invoke-CcodRuntimeStatic([string]$Name,[object[]]$Arguments){$method=$script:CcodRuntimeType.GetMethod($Name,[Reflection.BindingFlags]'NonPublic,Static');try{return $method.Invoke($null,$Arguments)}catch [Reflection.TargetInvocationException]{throw $_.Exception.InnerException}}
 function Invoke-CcodRuntimeMethod($Runtime,[string]$Name,[object[]]$Arguments){$method=$Runtime.GetType().GetMethod($Name,[Reflection.BindingFlags]'NonPublic,Instance');try{return $method.Invoke($Runtime,$Arguments)}catch [Reflection.TargetInvocationException]{throw $_.Exception.InnerException}}
 function New-CcodInstallCapability { New-Object psobject }
-function Get-CcodInstallTransaction($Capability,[string]$InvalidId='CCOD_INSTALL_GENERATION_INVALID'){$record=$null;if($null-eq$Capability-or-not$script:CcodScopes.TryGetValue($Capability,[ref]$record)){Throw-CcodInstallFileError $InvalidId 'Invalid install generation capability' $null};$state=$null;if(-not$script:CcodTransactions.TryGetValue($record.Transaction,[ref]$state)){Throw-CcodInstallFileError $InvalidId 'Invalid install transaction capability' $null};if($state.Closed){Throw-CcodInstallFileError 'CCOD_INSTALL_TRANSACTION_CLOSED' 'Install file transaction is closed' $null};if($state.Retired){Throw-CcodInstallFileError 'CCOD_INSTALL_GENERATION_RETIRED' 'Install generation is retired' $null};[pscustomobject]@{State=$state;Record=$record}}
+function Get-CcodInstallTransaction($Capability,[string]$InvalidId='CCOD_INSTALL_GENERATION_INVALID',[switch]$AllowRetired){$record=$null;if($null-eq$Capability-or-not$script:CcodScopes.TryGetValue($Capability,[ref]$record)){Throw-CcodInstallFileError $InvalidId 'Invalid install generation capability' $null};$state=$null;if(-not$script:CcodTransactions.TryGetValue($record.Transaction,[ref]$state)){Throw-CcodInstallFileError $InvalidId 'Invalid install transaction capability' $null};if($state.Closed){Throw-CcodInstallFileError 'CCOD_INSTALL_TRANSACTION_CLOSED' 'Install file transaction is closed' $null};if($state.Retired-and-not$AllowRetired){Throw-CcodInstallFileError 'CCOD_INSTALL_GENERATION_RETIRED' 'Install generation is retired' $null};[pscustomobject]@{State=$state;Record=$record}}
 function Add-CcodInstallScope($Transaction,$Token){$capability=New-CcodInstallCapability;$script:CcodScopes.Add($capability,[pscustomobject]@{Transaction=$Transaction;Token=$Token});$capability}
-function Convert-CcodInstallRuntimeError($Action,[string]$DefaultId){try{return&$Action}catch{$exception=$_.Exception;while($null-ne$exception.InnerException-and$exception-is[Management.Automation.RuntimeException]){$exception=$exception.InnerException};$message=[string]$exception.Message;if($exception-is[ObjectDisposedException]){Throw-CcodInstallFileError 'CCOD_INSTALL_TRANSACTION_CLOSED' $message $null};if($exception-is[ComponentModel.Win32Exception]-and$exception.NativeErrorCode-in@(80,183)){Throw-CcodInstallFileError 'CCOD_INSTALL_LEAF_EXISTS' 'Install object already exists' $null};if($message-match'pointer generation exists'){Throw-CcodInstallFileError 'CCOD_INSTALL_POINTER_GENERATION_EXISTS' $message $null};if($message-match'alternate stream'){Throw-CcodInstallFileError 'CCOD_INSTALL_ADS_LEAF' $message $null};if($message-match'multi-link'){Throw-CcodInstallFileError 'CCOD_INSTALL_MULTILINK_LEAF' $message $null};if($message-match'reparse'){Throw-CcodInstallFileError 'CCOD_INSTALL_REPARSE_LEAF' $message $null};if($message-match'transaction scope'){Throw-CcodInstallFileError 'CCOD_INSTALL_TRANSACTION_SCOPE' $message $null};if($message-match'generation not owned'){Throw-CcodInstallFileError 'CCOD_INSTALL_GENERATION_NOT_OWNED' $message $null};if($message-match'unknown|unsealed'){Throw-CcodInstallFileError 'CCOD_INSTALL_UNKNOWN_LEAF' $message $null};if($message-match'pin changed|path changed'){Throw-CcodInstallFileError 'CCOD_INSTALL_PIN_CHANGED' $message $null};Throw-CcodInstallFileError $DefaultId $message $null}}
+function Convert-CcodInstallRuntimeError($Action,[string]$DefaultId){try{return&$Action}catch{$exception=$_.Exception;while($null-ne$exception.InnerException-and$exception-is[Management.Automation.RuntimeException]){$exception=$exception.InnerException};$message=[string]$exception.Message;if($exception-is[ObjectDisposedException]){Throw-CcodInstallFileError 'CCOD_INSTALL_TRANSACTION_CLOSED' $message $null};if($exception-is[ComponentModel.Win32Exception]-and$exception.NativeErrorCode-in@(80,183)){Throw-CcodInstallFileError 'CCOD_INSTALL_LEAF_EXISTS' 'Install object already exists' $null};if($message-match'pointer generation exists'){Throw-CcodInstallFileError 'CCOD_INSTALL_POINTER_GENERATION_EXISTS' $message $null};if($message-match'pointer generation overflow'){Throw-CcodInstallFileError 'CCOD_INSTALL_POINTER_GENERATION_OVERFLOW' $message $null};if($message-match'seal mismatch'){Throw-CcodInstallFileError 'CCOD_INSTALL_SEAL_MISMATCH' $message $null};if($message-match'alternate stream'){Throw-CcodInstallFileError 'CCOD_INSTALL_ADS_LEAF' $message $null};if($message-match'multi-link'){Throw-CcodInstallFileError 'CCOD_INSTALL_MULTILINK_LEAF' $message $null};if($message-match'reparse'){Throw-CcodInstallFileError 'CCOD_INSTALL_REPARSE_LEAF' $message $null};if($message-match'transaction scope'){Throw-CcodInstallFileError 'CCOD_INSTALL_TRANSACTION_SCOPE' $message $null};if($message-match'generation not owned'){Throw-CcodInstallFileError 'CCOD_INSTALL_GENERATION_NOT_OWNED' $message $null};if($message-match'unknown|unsealed'){Throw-CcodInstallFileError 'CCOD_INSTALL_UNKNOWN_LEAF' $message $null};if($message-match'pin changed|path changed'){Throw-CcodInstallFileError 'CCOD_INSTALL_PIN_CHANGED' $message $null};Throw-CcodInstallFileError $DefaultId $message $null}}
 function Test-CcodInstallValue($Value,[int]$Depth=0) {
     if ($Depth -gt 12) { return $false }
     if ($null -eq $Value) { return $true }
@@ -250,13 +248,13 @@ function Open-CcodInstallGeneration {
     Initialize-CcodInstallRuntime;if(-not[IO.Path]::IsPathRooted($InstallRoot)){Throw-CcodInstallFileError 'CCOD_INSTALL_ROOT_INVALID' 'Install root must be absolute' $InstallRoot};Assert-CcodInstallLeaf $RuntimeId 'CCOD_INSTALL_RUNTIME_ID_INVALID'
     $arguments=[object[]]@([IO.Path]::GetFullPath($InstallRoot),$RuntimeId,$null)
     try{$token=Invoke-CcodRuntimeStatic Open $arguments}catch [ComponentModel.Win32Exception]{if($_.Exception.NativeErrorCode-in@(32,80,183)){Throw-CcodInstallFileError 'CCOD_INSTALL_GENERATION_EXISTS' 'Install generation already exists' $RuntimeId};throw}
-    $runtime=$arguments[2];$transaction=New-CcodInstallCapability;$script:CcodTransactions.Add($transaction,[pscustomobject]@{Runtime=$runtime;InstallRoot=[IO.Path]::GetFullPath($InstallRoot).TrimEnd('\');RuntimeId=$RuntimeId;RootToken=$token;Closed=$false;Retired=$false;Disposition=$null});$script:CcodScopes.Add($transaction,[pscustomobject]@{Transaction=$transaction;Token=$token});$transaction
+    $runtime=$arguments[2];$transaction=New-CcodInstallCapability;$script:CcodTransactions.Add($transaction,[pscustomobject]@{Runtime=$runtime;InstallRoot=[IO.Path]::GetFullPath($InstallRoot).TrimEnd('\');RuntimeId=$RuntimeId;RootToken=$token;Closed=$false;Retired=$false;RetirementResult=$null;Disposition=$null});$script:CcodScopes.Add($transaction,[pscustomobject]@{Transaction=$transaction;Token=$token});$transaction
 }
 function New-CcodInstallGenerationLeaf { param([Parameter(Mandatory)]$Generation,[Parameter(Mandatory)][string]$Leaf) Assert-CcodInstallLeaf $Leaf;$scope=Get-CcodInstallTransaction $Generation;$token=Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $scope.State.Runtime CreateDirectory @($scope.Record.Token,$Leaf)} 'CCOD_INSTALL_LEAF_CREATE_FAILED';Add-CcodInstallScope $scope.Record.Transaction $token }
 function Copy-CcodInstallSealedSource { param([Parameter(Mandatory)]$Generation,[Parameter(Mandatory)][string]$SourcePath,[Parameter(Mandatory)][string]$Leaf,[Parameter(Mandatory)][int64]$ExpectedLength,[Parameter(Mandatory)][string]$ExpectedSha256) Assert-CcodInstallLeaf $Leaf;if(-not[IO.Path]::IsPathRooted($SourcePath)-or$ExpectedLength-lt 0-or$ExpectedSha256-cnotmatch'^[0-9a-f]{64}$'){Throw-CcodInstallFileError 'CCOD_INSTALL_SOURCE_INVALID' 'Invalid sealed source contract' $SourcePath};$scope=Get-CcodInstallTransaction $Generation;Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $scope.State.Runtime Copy @($scope.Record.Token,$Leaf,[IO.Path]::GetFullPath($SourcePath),$ExpectedLength,$ExpectedSha256)|Out-Null} 'CCOD_INSTALL_SOURCE_MISMATCH';[pscustomobject]@{Length=$ExpectedLength;Sha256=$ExpectedSha256} }
 function Write-CcodInstallGenerationManifest { param([Parameter(Mandatory)]$Generation,[Parameter(Mandatory)]$Manifest) $scope=Get-CcodInstallTransaction $Generation;if($scope.Record.Token-ne$scope.State.RootToken){Throw-CcodInstallFileError 'CCOD_INSTALL_MANIFEST_SCOPE' 'Manifest must be written at the generation root' $null};$bytes=ConvertTo-CcodInstallJsonBytes $Manifest;$result=Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $scope.State.Runtime Write @($scope.Record.Token,'manifest.json',$bytes,$true)} 'CCOD_INSTALL_MANIFEST_WRITE_FAILED';[pscustomobject]@{Length=[int64]$result[1];Sha256=[string]$result[2]} }
-function Commit-CcodInstallActivePointer { param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][uint64]$ExpectedPreviousGeneration,[Parameter(Mandatory)][string]$NewRuntimeId,[Parameter(Mandatory)]$FileTransaction) Assert-CcodInstallLeaf $NewRuntimeId 'CCOD_INSTALL_RUNTIME_ID_INVALID';$scope=Get-CcodInstallTransaction $FileTransaction 'CCOD_INSTALL_TRANSACTION_INVALID';Assert-CcodInstallRootScope $scope.State $InstallRoot 'CCOD_INSTALL_TRANSACTION_SCOPE';$generation=$ExpectedPreviousGeneration+1;$pointer=[ordered]@{schemaVersion=1;generation=$generation;activeRuntime=$NewRuntimeId;previousGeneration=$ExpectedPreviousGeneration};$bytes=ConvertTo-CcodInstallJsonBytes $pointer;try{Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $scope.State.Runtime CommitPointer @($scope.Record.Token,$ExpectedPreviousGeneration,$NewRuntimeId,$bytes)|Out-Null} 'CCOD_INSTALL_POINTER_COMMIT_FAILED'}catch{if($_.FullyQualifiedErrorId-like'CCOD_INSTALL_LEAF_EXISTS*'){Throw-CcodInstallFileError 'CCOD_INSTALL_POINTER_GENERATION_EXISTS' 'Pointer generation already exists' $generation};throw};[pscustomobject]@{Generation=[uint64]$generation;RuntimeId=$NewRuntimeId} }
-function Retire-CcodInstallGeneration { param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][string]$RuntimeId,[Parameter(Mandatory)]$FileTransaction) Assert-CcodInstallLeaf $RuntimeId 'CCOD_INSTALL_RUNTIME_ID_INVALID';$scope=Get-CcodInstallTransaction $FileTransaction 'CCOD_INSTALL_TRANSACTION_INVALID';Assert-CcodInstallRootScope $scope.State $InstallRoot 'CCOD_INSTALL_TRANSACTION_SCOPE';if($RuntimeId-cne$scope.State.RuntimeId-or$scope.Record.Token-ne$scope.State.RootToken){Throw-CcodInstallFileError 'CCOD_INSTALL_GENERATION_NOT_OWNED' 'Generation is not owned by this transaction' $RuntimeId};$retiredLeaf=$RuntimeId+'.'+[guid]::NewGuid().ToString('N');$record=ConvertTo-CcodInstallJsonBytes ([ordered]@{schemaVersion=1;runtimeId=$RuntimeId;retiredName=$retiredLeaf});$token=Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $scope.State.Runtime Retire @($scope.Record.Token,$RuntimeId,$retiredLeaf,$record)} 'CCOD_INSTALL_RETIREMENT_FAILED';$capability=Add-CcodInstallScope $scope.Record.Transaction $token;$scope.State.Retired=$true;[pscustomobject]@{Disposition='Retired';Capability=$capability} }
+function Commit-CcodInstallActivePointer { param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][uint64]$ExpectedPreviousGeneration,[Parameter(Mandatory)][string]$NewRuntimeId,[Parameter(Mandatory)]$FileTransaction) Assert-CcodInstallLeaf $NewRuntimeId 'CCOD_INSTALL_RUNTIME_ID_INVALID';if($ExpectedPreviousGeneration-eq[uint64]::MaxValue){Throw-CcodInstallFileError 'CCOD_INSTALL_POINTER_GENERATION_OVERFLOW' 'Pointer generation cannot advance beyond UInt64.MaxValue' $ExpectedPreviousGeneration};$scope=Get-CcodInstallTransaction $FileTransaction 'CCOD_INSTALL_TRANSACTION_INVALID';Assert-CcodInstallRootScope $scope.State $InstallRoot 'CCOD_INSTALL_TRANSACTION_SCOPE';$generation=[uint64]($ExpectedPreviousGeneration+1);$pointer=[ordered]@{schemaVersion=1;generation=$generation;activeRuntime=$NewRuntimeId;previousGeneration=$ExpectedPreviousGeneration};$bytes=ConvertTo-CcodInstallJsonBytes $pointer;try{Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $scope.State.Runtime CommitPointer @($scope.Record.Token,$ExpectedPreviousGeneration,$NewRuntimeId,$bytes)|Out-Null} 'CCOD_INSTALL_POINTER_COMMIT_FAILED'}catch{if($_.FullyQualifiedErrorId-like'CCOD_INSTALL_LEAF_EXISTS*'){Throw-CcodInstallFileError 'CCOD_INSTALL_POINTER_GENERATION_EXISTS' 'Pointer generation already exists' $generation};throw};[pscustomobject]@{Generation=$generation;RuntimeId=$NewRuntimeId} }
+function Retire-CcodInstallGeneration { param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][string]$RuntimeId,[Parameter(Mandatory)]$FileTransaction) Assert-CcodInstallLeaf $RuntimeId 'CCOD_INSTALL_RUNTIME_ID_INVALID';$scope=Get-CcodInstallTransaction $FileTransaction 'CCOD_INSTALL_TRANSACTION_INVALID' -AllowRetired;Assert-CcodInstallRootScope $scope.State $InstallRoot 'CCOD_INSTALL_TRANSACTION_SCOPE';if($RuntimeId-cne$scope.State.RuntimeId-or$scope.Record.Token-ne$scope.State.RootToken){Throw-CcodInstallFileError 'CCOD_INSTALL_GENERATION_NOT_OWNED' 'Generation is not owned by this transaction' $RuntimeId};if($scope.State.Retired){return $scope.State.RetirementResult};$recordLeaf=$RuntimeId+'.json';$record=ConvertTo-CcodInstallJsonBytes ([ordered]@{schemaVersion=1;runtimeId=$RuntimeId;state='Retired'});try{$token=Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $scope.State.Runtime Retire @($scope.Record.Token,$RuntimeId,$recordLeaf,$record)} 'CCOD_INSTALL_RETIREMENT_FAILED'}catch{if($_.FullyQualifiedErrorId-like'CCOD_INSTALL_LEAF_EXISTS*'){Throw-CcodInstallFileError 'CCOD_INSTALL_RETIREMENT_RECORD_EXISTS' 'Retirement record already exists' $recordLeaf};throw};$capability=Add-CcodInstallScope $scope.Record.Transaction $token;$result=[pscustomobject]@{Disposition='Retired';Capability=$capability};$scope.State.RetirementResult=$result;$scope.State.Retired=$true;return $result }
 function Close-CcodInstallFileTransaction { param([Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)][ValidateSet('Ready','Failed')][string]$Disposition) $state=$null;if($null-eq$Transaction-or-not$script:CcodTransactions.TryGetValue($Transaction,[ref]$state)){Throw-CcodInstallFileError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Invalid install file transaction capability' $null};if(-not$state.Closed){Invoke-CcodRuntimeMethod $state.Runtime Close @()|Out-Null;$state.Closed=$true;$state.Disposition=$Disposition} }
 
 Initialize-CcodInstallRuntime
