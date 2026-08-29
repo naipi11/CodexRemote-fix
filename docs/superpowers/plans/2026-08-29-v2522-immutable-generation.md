@@ -63,10 +63,13 @@ create-only operations:
 
 ```powershell
 Open-CcodInstallGeneration -InstallRoot <absolute-root> -RuntimeId <unique-id>
+Open-CcodInstallRetainedGeneration -InstallRoot <absolute-root> -RuntimeId <existing-id> -ExpectedManifestSha256 <hex>
+New-CcodInstallDirectory -Transaction <opaque-context> -Parent <opaque-directory> -Leaf <single-segment> [-CreateIfMissing]
 New-CcodInstallGenerationLeaf -Generation <opaque-generation> -Leaf <single-segment>
 Copy-CcodInstallSealedSource -Generation <opaque-generation> -SourcePath <sealed-source> -Leaf <single-segment> -ExpectedLength <int64> -ExpectedSha256 <lowercase-hex>
 Write-CcodInstallGenerationManifest -Generation <opaque-generation> -Manifest <object>
-Commit-CcodInstallActivePointer -InstallRoot <absolute-root> -ExpectedPreviousGeneration <uint64> -NewRuntimeId <unique-id> -FileTransaction <opaque-context>
+Write-CcodInstallRecord -Transaction <opaque-context> -Parent <opaque-directory> -Leaf <single-segment> -Record <object>
+Commit-CcodInstallActivePointer -InstallRoot <absolute-root> -TargetGeneration <opaque-generation> -ExpectedPreviousGeneration <uint64> -FileTransaction <opaque-context>
 Retire-CcodInstallGeneration -InstallRoot <absolute-root> -RuntimeId <owned-id> -FileTransaction <opaque-context>
 Close-CcodInstallFileTransaction -Transaction <opaque-context> -Disposition Ready|Failed
 ```
@@ -80,7 +83,10 @@ persistent DACL change and no nonempty recursive deletion operation.
 - [ ] **Step 1: Write failing immutable-generation tests**
 
 Add RED cases proving a duplicate generation ID, destination leaf, or pointer
-generation is rejected without changing the existing object. Add barriers for
+generation is rejected without changing the existing object. Add a read-only
+retained-generation fixture that can be selected by a compensating pointer but
+cannot create or mutate a leaf. Add a generic scoped-record fixture for state,
+receipt, and log files. Add barriers for
 source replacement after handle open, generation manifest mutation after
 write, invalid reparse/ADS/multilink entries, forged/cross-transaction
 capabilities, and native handle close during a relative operation. Add a
@@ -145,7 +151,8 @@ transaction. These private operations are added or adapted:
 New-CcodInstallTransactionRecord -TransactionId <guid> -OldRuntimeId <nullable> -OldGeneration <nullable-uint64> -NewRuntimeId <nullable> -NewGeneration <uint64> -SealedPackageSha256 <hex> -OwnedObjectNames <string[]>
 Read-CcodInstallTransactionRecord -InstallRoot <absolute-root>
 Set-CcodInstallTransactionPhase -InstallRoot <root> -TransactionId <guid> -ExpectedPhase <phase> -NewPhase <phase> -FileTransaction <context>
-Set-CcodActiveRuntime -InstallRoot <root> -NewRuntimeId <unique-id> -FileTransaction <context> -Ownership <fence>
+Open-CcodInstallRetainedGeneration -InstallRoot <root> -RuntimeId <existing-id> -ExpectedManifestSha256 <hex> -FileTransaction <context>
+Set-CcodActiveRuntime -InstallRoot <root> -TargetGeneration <opaque-generation> -FileTransaction <context> -Ownership <fence>
 Write-CcodActivationReceiptFile -InstallRoot <root> -Receipt <object> -FileTransaction <context>
 Invoke-CcodInstallCompensation -InstallRoot <root> -TransactionRecord <record> -FileTransaction <context> -Adapters <hashtable>
 ```

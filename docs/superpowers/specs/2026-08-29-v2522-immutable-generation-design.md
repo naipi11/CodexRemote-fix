@@ -34,8 +34,12 @@ control channel or change the authenticated TrayHost wire contract.
 
 - Every generation directory and file name is unique and create-only. No
   existing runtime or stable shell is overwritten during staging.
-- A generation becomes eligible only after every manifest-listed file is
+- A new generation becomes eligible only after every manifest-listed file is
   copied, flushed, and rehashed, and its runtime manifest/version/commit match.
+- A retained generation may be opened only read-only after its existing
+  manifest, runtime ID, and recorded generation identity are revalidated. It
+  can be selected by a higher compensating pointer but cannot receive new
+  files.
 - The only mutable install control record is a small atomic active-generation
   pointer. It includes a monotonically increasing generation number and the
   previous generation ID.
@@ -82,10 +86,13 @@ Required operations are create-only:
 
 ```powershell
 Open-CcodInstallGeneration -InstallRoot <absolute-root> -RuntimeId <unique-id>
+Open-CcodInstallRetainedGeneration -InstallRoot <absolute-root> -RuntimeId <existing-id> -ExpectedManifestSha256 <hex>
+New-CcodInstallDirectory -Transaction <opaque-context> -Parent <opaque-directory> -Leaf <single-segment> [-CreateIfMissing]
 New-CcodInstallGenerationLeaf -Generation <opaque-generation> -Leaf <single-segment>
 Copy-CcodInstallSealedSource -Generation <opaque-generation> -SourcePath <sealed-source> -Leaf <single-segment> -ExpectedLength <int64> -ExpectedSha256 <hex>
 Write-CcodInstallGenerationManifest -Generation <opaque-generation> -Manifest <object>
-Commit-CcodInstallActivePointer -InstallRoot <absolute-root> -ExpectedPreviousGeneration <uint64> -NewRuntimeId <unique-id> -FileTransaction <context>
+Write-CcodInstallRecord -Transaction <opaque-context> -Parent <opaque-directory> -Leaf <single-segment> -Record <object>
+Commit-CcodInstallActivePointer -InstallRoot <absolute-root> -ExpectedPreviousGeneration <uint64> -TargetGeneration <opaque-generation> -FileTransaction <context>
 Retire-CcodInstallGeneration -InstallRoot <absolute-root> -RuntimeId <owned-id> -FileTransaction <context>
 Close-CcodInstallFileTransaction -Transaction <opaque-context> -Disposition Ready|Failed
 ```
