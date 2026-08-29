@@ -24,6 +24,7 @@ $failures = [System.Collections.Generic.List[string]]::new()
 $cleanRoomSelfTest = Join-Path $PSScriptRoot 'CleanroomSelfTest.js'
 $packageCheckerSelfTest = Join-Path $PSScriptRoot 'PackageCheckerSelfTest.mjs'
 $persistenceSelfTest = Join-Path $PSScriptRoot 'PersistenceSelfTest.ps1'
+$installFileTransactionSelfTest = Join-Path $PSScriptRoot 'persistence\InstallFileTransaction.SelfTest.ps1'
 
 function Get-CcodValidationSafeChildMarkers {
     param($Output)
@@ -92,6 +93,10 @@ if (-not $node) {
             $failures.Add("Package checker self-test failed: $($packageCheckerOutput -join ' ')")
         }
     }
+}
+
+if (-not (Test-Path -LiteralPath $installFileTransactionSelfTest -PathType Leaf)) {
+    $failures.Add("Immutable generation file-layer self-test is missing: $installFileTransactionSelfTest")
 }
 
 if ($failures.Count -eq 0) {

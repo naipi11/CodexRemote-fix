@@ -3,135 +3,7 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $modulePath = Join-Path $projectRoot 'src\persistence\modules\InstallFileTransaction.psm1'
-$module = $null
-if (Test-Path -LiteralPath $modulePath -PathType Leaf) {
-    $module = Import-Module $modulePath -Force -PassThru -DisableNameChecking
-}
-
-if ($null -eq ('CcodInstallTransactionTestNative' -as [type])) {
-    Add-Type -TypeDefinition @'
-using System;
-using System.ComponentModel;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.Win32.SafeHandles;
-
-public static class CcodInstallTransactionTestNative
-{
-    private const uint FILE_LIST_DIRECTORY = 0x00000001;
-    private const uint FILE_READ_ATTRIBUTES = 0x00000080;
-    private const uint DELETE = 0x00010000;
-    private const uint GENERIC_READ = 0x80000000;
-    private const uint GENERIC_WRITE = 0x40000000;
-    private const uint FILE_SHARE_READ = 0x00000001;
-    private const uint FILE_SHARE_WRITE = 0x00000002;
-    private const uint FILE_SHARE_DELETE = 0x00000004;
-    private const uint OPEN_EXISTING = 3;
-    private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
-    private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
-    private const uint FILE_FLAG_WRITE_THROUGH = 0x80000000;
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security,
-        uint creation, uint flags, IntPtr template);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool CreateHardLinkW(string newName, string existingName, IntPtr securityAttributes);
-
-    public static int CreateHardLink(string newName, string existingName)
-    {
-        return CreateHardLinkW(newName, existingName, IntPtr.Zero) ? 0 : Marshal.GetLastWin32Error();
-    }
-
-    public static SafeFileHandle OpenDirectoryAllowDeleteShare(string path)
-    {
-        SafeFileHandle handle = CreateFileW(path, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | DELETE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, IntPtr.Zero, OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
-        if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
-        return handle;
-    }
-
-    public static int TryOpenDirectoryForChildWrite(string path)
-    {
-        using (SafeFileHandle handle = CreateFileW(path, 0x00000002 | 0x00000004 | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, IntPtr.Zero, OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero))
-        {
-            return handle.IsInvalid ? Marshal.GetLastWin32Error() : 0;
-        }
-    }
-
-    public static SafeFileHandle OpenFileAllowDeleteShare(string path)
-    {
-        SafeFileHandle handle = CreateFileW(path, GENERIC_READ | GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, IntPtr.Zero, OPEN_EXISTING,
-            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH, IntPtr.Zero);
-        if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
-        return handle;
-    }
-
-    public static Task<string> InsertUnknownWhenLeafBecomesUnavailable(string watchedLeaf, string unknownLeaf)
-    {
-        return Task.Run(() => {
-            DateTime deadline = DateTime.UtcNow.AddSeconds(10);
-            while (DateTime.UtcNow < deadline)
-            {
-                if (!File.Exists(watchedLeaf))
-                {
-                    try { File.WriteAllText(unknownLeaf, "concurrent-unknown"); return "inserted"; }
-                    catch (IOException) { return "blocked"; }
-                    catch (UnauthorizedAccessException) { return "blocked"; }
-                }
-                Thread.Yield();
-            }
-            return "timeout";
-        });
-    }
-
-    public static Task<string> InsertUnknownAfterDelay(string unknownLeaf, int delayMilliseconds)
-    {
-        return Task.Run(() => {
-            Thread.Sleep(delayMilliseconds);
-            try { File.WriteAllText(unknownLeaf, "concurrent-unknown"); return "inserted"; }
-            catch (IOException) { return "blocked"; }
-            catch (UnauthorizedAccessException) { return "blocked"; }
-        });
-    }
-
-    public static Task<string> ProbeNamespaceAfterLeafUnlock(string watchedLeaf, string directory, string hardLinkSource, string hardLinkDestination)
-    {
-        return Task.Run(() => {
-            DateTime deadline = DateTime.UtcNow.AddSeconds(10);
-            while (DateTime.UtcNow < deadline)
-            {
-                try
-                {
-                    using (FileStream stream = File.Open(watchedLeaf, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete)) { }
-                    int directoryError = TryOpenDirectoryForChildWrite(directory);
-                    int linkError = CreateHardLink(hardLinkDestination, hardLinkSource);
-                    return directoryError != 0 && linkError != 0 ? "blocked" : "escaped";
-                }
-                catch (IOException) { }
-                catch (UnauthorizedAccessException) { }
-                if (!Directory.Exists(directory)) return "retired-before-probe";
-                Thread.Yield();
-            }
-            return "timeout";
-        });
-    }
-}
-'@
-}
-
-function Invoke-CcodInstallModule {
-    param([Parameter(Mandatory)][scriptblock]$Action, [object[]]$Arguments = @())
-    if ($null -eq $module) { return & $Action @Arguments }
-    return & $module $Action @Arguments
-}
+$module = Import-Module $modulePath -Force -PassThru -DisableNameChecking
 
 function New-CcodInstallFileFixture {
     $base = Join-Path ([IO.Path]::GetTempPath()) ('ccod-install-file-' + [guid]::NewGuid().ToString('N'))
@@ -140,693 +12,201 @@ function New-CcodInstallFileFixture {
     [IO.Directory]::CreateDirectory($install) | Out-Null
     [IO.Directory]::CreateDirectory($outside) | Out-Null
     $sentinel = Join-Path $outside 'sentinel.txt'
-    $sentinelBytes = [Text.UTF8Encoding]::new($false).GetBytes('outside-sentinel-v1')
-    [IO.File]::WriteAllBytes($sentinel, $sentinelBytes)
-    return [pscustomobject]@{
-        Base = $base
-        MovedBase = $null
-        Install = $install
-        Outside = $outside
-        Sentinel = $sentinel
-        SentinelSha256 = Get-CcodTestFileSha256 -Path $sentinel
-        Transaction = $null
-    }
-}
-
-function Assert-CcodOutsideUnchanged {
-    param([Parameter(Mandatory)]$Fixture, [Parameter(Mandatory)][string]$Message)
-    Assert-CcodTrue ([IO.File]::Exists($Fixture.Sentinel)) "$Message sentinel exists"
-    Assert-CcodEqual $Fixture.SentinelSha256 (Get-CcodTestFileSha256 -Path $Fixture.Sentinel) "$Message sentinel bytes"
-}
-
-function Close-CcodFixtureTransaction {
-    param([Parameter(Mandatory)]$Fixture)
-    if ($null -eq $Fixture.Transaction) { return }
-    try {
-        Invoke-CcodInstallModule { param($Tx) Close-CcodInstallFileTransaction -Transaction $Tx -Disposition Failed } @($Fixture.Transaction) | Out-Null
-    } catch { }
-    $Fixture.Transaction = $null
+    [IO.File]::WriteAllText($sentinel, 'outside-sentinel-v1')
+    [pscustomobject]@{ Base=$base; Outside=$outside; Install=$install; Sentinel=$sentinel; SentinelSha256=(Get-CcodTestFileSha256 $sentinel); Transactions=[Collections.Generic.List[object]]::new() }
 }
 
 function Remove-CcodInstallFileFixture {
     param([Parameter(Mandatory)]$Fixture)
-    Close-CcodFixtureTransaction -Fixture $Fixture
+    foreach ($transaction in @($Fixture.Transactions)) { try { Close-CcodInstallFileTransaction -Transaction $transaction -Disposition Failed | Out-Null } catch { } }
     $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
-    foreach ($candidate in @($Fixture.Base, $Fixture.MovedBase, $Fixture.Outside)) {
-        if ([string]::IsNullOrWhiteSpace([string]$candidate)) { continue }
+    foreach ($candidate in @($Fixture.Base,$Fixture.Outside)) {
         $full = [IO.Path]::GetFullPath([string]$candidate)
-        if (-not $full.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) {
-            throw "Refusing to remove non-temporary fixture path: $full"
-        }
+        if (-not $full.StartsWith($tempRoot,[StringComparison]::OrdinalIgnoreCase)) { throw "Refusing to remove non-temporary fixture path: $full" }
         if (Test-Path -LiteralPath $full) { Remove-Item -LiteralPath $full -Recurse -Force }
     }
 }
 
-function Open-CcodFixtureTransaction {
-    param([Parameter(Mandatory)]$Fixture)
-    $Fixture.Transaction = Invoke-CcodInstallModule { param($Install) Open-CcodInstallFileTransaction -InstallRoot $Install } @($Fixture.Install)
-    return $Fixture.Transaction
-}
-
-function Invoke-CcodAttemptDirectoryReplacement {
-    param([Parameter(Mandatory)][string]$Path)
-    $backup = $Path + '.attacker-old'
-    try {
-        [IO.Directory]::Move($Path, $backup)
-        return [pscustomobject]@{ Outcome = 'replaced'; Backup = $backup }
-    } catch [IO.IOException] {
-        return [pscustomobject]@{ Outcome = 'blocked'; Backup = $null }
-    } catch [UnauthorizedAccessException] {
-        return [pscustomobject]@{ Outcome = 'blocked'; Backup = $null }
-    }
-}
-
-function Invoke-CcodAttemptFileReplacement {
-    param([Parameter(Mandatory)][string]$Path)
-    $backup = $Path + '.attacker-old'
-    try {
-        [IO.File]::Move($Path, $backup)
-        return [pscustomobject]@{ Outcome = 'replaced'; Backup = $backup }
-    } catch [IO.IOException] {
-        return [pscustomobject]@{ Outcome = 'blocked'; Backup = $null }
-    } catch [UnauthorizedAccessException] {
-        return [pscustomobject]@{ Outcome = 'blocked'; Backup = $null }
-    }
-}
-
-function Invoke-CcodReplacePinnedDirectory {
-    param(
-        [Parameter(Mandatory)]$Fixture,
-        [Parameter(Mandatory)][string]$Path
-    )
-    $moved = $Path + '.attacker-old'
-    try {
-        [IO.Directory]::Move($Path, $moved)
-    } catch [IO.IOException] {
-        return [pscustomobject]@{ Outcome = 'blocked'; MovedDirectory = $null }
-    } catch [UnauthorizedAccessException] {
-        return [pscustomobject]@{ Outcome = 'blocked'; MovedDirectory = $null }
-    }
-    $result = & cmd.exe /d /c mklink /J $Path $Fixture.Outside 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "Could not create replacement junction: $result" }
-    return [pscustomobject]@{ Outcome = 'replaced'; MovedDirectory = $moved }
-}
-
-function New-CcodHardLink {
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Existing)
-    $errorCode = [CcodInstallTransactionTestNative]::CreateHardLink($Path, $Existing)
-    if ($errorCode -ne 0) { throw "CreateHardLink failed with Windows error $errorCode" }
-}
-
-function New-CcodJunction {
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Target)
-    $result = & cmd.exe /d /c mklink /J $Path $Target 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "Could not create junction: $result" }
-}
-
-function Invoke-CcodAttemptAdsWrite {
-    param([Parameter(Mandatory)][string]$Path)
-    $previous = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $output = & cmd.exe /d /c "echo attacker>`"$Path`"" 2>&1
-        $exitCode = $LASTEXITCODE
-    } finally { $ErrorActionPreference = $previous }
-    return [pscustomobject]@{ Outcome = $(if ($exitCode -eq 0) { 'created' } else { 'blocked' }); Output = $output }
+function Open-CcodFixtureGeneration {
+    param([Parameter(Mandatory)]$Fixture,[Parameter(Mandatory)][string]$RuntimeId)
+    $generation = Open-CcodInstallGeneration -InstallRoot $Fixture.Install -RuntimeId $RuntimeId
+    $Fixture.Transactions.Add($generation)
+    $generation
 }
 
 function New-CcodSourceFile {
-    param([Parameter(Mandatory)]$Fixture, [string]$Name = 'source.bin', [string]$Content = 'sealed-source-v1')
+    param([Parameter(Mandatory)]$Fixture,[Parameter(Mandatory)][string]$Name,[Parameter(Mandatory)][string]$Content)
     $path = Join-Path $Fixture.Base $Name
-    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Content)
-    [IO.File]::WriteAllBytes($path, $bytes)
-    return [pscustomobject]@{ Path = $path; Length = [int64]$bytes.LongLength; Sha256 = Get-CcodTestFileSha256 -Path $path }
+    [IO.File]::WriteAllText($path,$Content)
+    [pscustomobject]@{ Path=$path; Length=[int64](Get-Item -LiteralPath $path).Length; Sha256=(Get-CcodTestFileSha256 $path) }
 }
 
-Invoke-CcodTest 'pins a newly created child directory against pathname replacement' {
-    $fixture = New-CcodInstallFileFixture
+function New-CcodGenerationManifest {
+    param([Parameter(Mandatory)][string]$RuntimeId,[object[]]$Files=@())
+    [ordered]@{ schemaVersion=1; projectVersion='2.5.22'; runtimeId=$RuntimeId; commit='0123456789abcdef0123456789abcdef01234567'; files=@($Files) }
+}
+
+function Assert-CcodOutsideUnchanged {
+    param([Parameter(Mandatory)]$Fixture,[Parameter(Mandatory)][string]$Message)
+    Assert-CcodTrue ([IO.File]::Exists($Fixture.Sentinel)) "$Message sentinel exists"
+    Assert-CcodEqual $Fixture.SentinelSha256 (Get-CcodTestFileSha256 $Fixture.Sentinel) "$Message sentinel bytes"
+}
+
+function Invoke-CcodMoveAttempt {
+    param([Parameter(Mandatory)][string]$Path)
+    try { [IO.File]::Move($Path,$Path+'.moved'); 'moved' } catch [IO.IOException] { 'blocked' } catch [UnauthorizedAccessException] { 'blocked' }
+}
+
+function New-CcodJunction {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Target)
+    $previous=$ErrorActionPreference
+    try { $ErrorActionPreference='Continue'; $output=& cmd.exe /d /c mklink /J $Path $Target 2>&1; $exitCode=$LASTEXITCODE } finally { $ErrorActionPreference=$previous }
+    if($exitCode-ne 0){throw "Could not create junction: $($output -join ' ')"}
+}
+
+function New-CcodHardLink {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Existing)
+    $previous=$ErrorActionPreference
+    try { $ErrorActionPreference='Continue'; $output=& cmd.exe /d /c mklink /H $Path $Existing 2>&1; $exitCode=$LASTEXITCODE } finally { $ErrorActionPreference=$previous }
+    if($exitCode-ne 0){throw "Could not create hard link: $($output -join ' ')"}
+}
+
+Invoke-CcodTest 'exports only immutable generation operations and an inert CLR marker' {
+    $expected=@('Close-CcodInstallFileTransaction','Commit-CcodInstallActivePointer','Copy-CcodInstallSealedSource','New-CcodInstallGenerationLeaf','Open-CcodInstallGeneration','Retire-CcodInstallGeneration','Write-CcodInstallGenerationManifest')
+    Assert-CcodEqual ($expected -join '|') ((@($module.ExportedCommands.Keys)|Sort-Object)-join '|') 'module export surface is capability-only'
+    Assert-CcodEqual 1 ([CcodInstallCapabilityMarker]::CapabilityAbi) 'marker exposes a non-mutating ABI value'
+    Assert-CcodEqual 'CcodInstallCapabilityMarker' ((@([CcodInstallCapabilityMarker].Assembly.GetExportedTypes()|ForEach-Object FullName)) -join '|') 'CLR bridge exports only the inert marker'
+    $dangerous=@([CcodInstallCapabilityMarker].GetMethods([Reflection.BindingFlags]'Public,Static,DeclaredOnly')|Where-Object{@($_.GetParameters()|Where-Object{$_.ParameterType-in@([string],[IntPtr],[IO.Stream])-or[Microsoft.Win32.SafeHandles.SafeHandle].IsAssignableFrom($_.ParameterType)}).Count-ne 0})
+    Assert-CcodEqual 0 $dangerous.Count 'marker accepts no path stream or bare handle'
+}
+
+Invoke-CcodTest 'generation and capabilities are unique create-only opaque references' {
+    $fixture=New-CcodInstallFileFixture
     try {
-        $tx = Open-CcodFixtureTransaction $fixture
-        $child = Invoke-CcodInstallModule { param($Tx) Open-CcodInstallPinnedDirectory -Transaction $Tx -ParentDirectory $Tx.RootDirectory -Leaf 'runtime' -CreateIfMissing } @($tx)
-        $result = Invoke-CcodAttemptDirectoryReplacement -Path (Join-Path $fixture.Install 'runtime')
-        Assert-CcodEqual 'blocked' $result.Outcome 'pinned missing directory cannot be replaced after creation'
-        Assert-CcodOutsideUnchanged $fixture 'directory replacement'
-    } finally { Remove-CcodInstallFileFixture $fixture }
+        $runtimeId='runtime-unique-a';$source=New-CcodSourceFile $fixture 'first.bin' 'first-generation-bytes';$generation=Open-CcodFixtureGeneration $fixture $runtimeId
+        Assert-CcodEqual '' (@($generation.PSObject.Properties.Name)-join ',') 'generation capability exposes no fields'
+        Copy-CcodInstallSealedSource -Generation $generation -SourcePath $source.Path -Leaf 'payload.bin' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null
+        $payload=Join-Path $fixture.Install "runtime\$runtimeId\payload.bin";$before=Get-CcodTestFileSha256 $payload
+        Assert-CcodThrows {Open-CcodInstallGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId|Out-Null} 'CCOD_INSTALL_GENERATION_EXISTS'
+        Assert-CcodEqual $before (Get-CcodTestFileSha256 $payload) 'duplicate generation leaves existing bytes unchanged'
+        $child=New-CcodInstallGenerationLeaf -Generation $generation -Leaf 'child'
+        Assert-CcodEqual '' (@($child.PSObject.Properties.Name)-join ',') 'child capability exposes no fields'
+        Assert-CcodThrows {New-CcodInstallGenerationLeaf -Generation $generation -Leaf 'child'|Out-Null} 'CCOD_INSTALL_LEAF_EXISTS'
+        Assert-CcodTrue ([IO.Directory]::Exists((Join-Path $fixture.Install "runtime\$runtimeId\child"))) 'duplicate child keeps existing directory'
+        Assert-CcodOutsideUnchanged $fixture 'duplicate generation and directory'
+    } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
-Invoke-CcodTest 'pins a temporary leaf against replacement before promotion' {
-    $fixture = New-CcodInstallFileFixture
+Invoke-CcodTest 'destination collisions preserve the first object byte-for-byte' {
+    $fixture=New-CcodInstallFileFixture
     try {
-        $tx = Open-CcodFixtureTransaction $fixture
-        $runtime = Invoke-CcodInstallModule { param($Tx) Open-CcodInstallPinnedDirectory -Transaction $Tx -ParentDirectory $Tx.RootDirectory -Leaf 'runtime' -CreateIfMissing } @($tx)
-        $temporary = Invoke-CcodInstallModule { param($Tx,$Parent) New-CcodInstallPinnedTemporaryLeaf -Transaction $Tx -ParentDirectory $Parent -Leaf 'payload.tmp' } @($tx,$runtime)
-        $result = Invoke-CcodAttemptFileReplacement -Path (Join-Path $fixture.Install 'runtime\payload.tmp')
-        Assert-CcodEqual 'blocked' $result.Outcome 'temporary leaf replacement is blocked while pinned'
-        Assert-CcodOutsideUnchanged $fixture 'temporary replacement'
-    } finally { Remove-CcodInstallFileFixture $fixture }
+        $runtimeId='runtime-destination-collision';$first=New-CcodSourceFile $fixture 'first.bin' 'first-object';$second=New-CcodSourceFile $fixture 'second.bin' 'second-object';$generation=Open-CcodFixtureGeneration $fixture $runtimeId
+        Copy-CcodInstallSealedSource -Generation $generation -SourcePath $first.Path -Leaf 'payload.bin' -ExpectedLength $first.Length -ExpectedSha256 $first.Sha256|Out-Null
+        Assert-CcodThrows {Copy-CcodInstallSealedSource -Generation $generation -SourcePath $second.Path -Leaf 'payload.bin' -ExpectedLength $second.Length -ExpectedSha256 $second.Sha256|Out-Null} 'CCOD_INSTALL_LEAF_EXISTS'
+        Assert-CcodEqual $first.Sha256 (Get-CcodTestFileSha256 (Join-Path $fixture.Install "runtime\$runtimeId\payload.bin")) 'collision never overwrites the first object'
+        Assert-CcodOutsideUnchanged $fixture 'destination collision'
+    } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
-Invoke-CcodTest 'pins sealed source bytes while copying and verifies the destination handle' {
-    $fixture = New-CcodInstallFileFixture
+Invoke-CcodTest 'source and destination handles remain private pinned and same-handle verified' {
+    $fixture=New-CcodInstallFileFixture
     try {
-        $source = New-CcodSourceFile $fixture
-        $tx = Open-CcodFixtureTransaction $fixture
-        $runtime = Invoke-CcodInstallModule { param($Tx) Open-CcodInstallPinnedDirectory -Transaction $Tx -ParentDirectory $Tx.RootDirectory -Leaf 'runtime' -CreateIfMissing } @($tx)
-        $temporary = Invoke-CcodInstallModule { param($Tx,$Parent) New-CcodInstallPinnedTemporaryLeaf -Transaction $Tx -ParentDirectory $Parent -Leaf 'payload.tmp' } @($tx,$runtime)
-        $copy = Invoke-CcodInstallModule {
-            param($Tx,$Source,$Leaf,$Length,$Sha)
-            Copy-CcodInstallSealedFile -Transaction $Tx -SourcePath $Source -DestinationLeaf $Leaf -ExpectedLength $Length -ExpectedSha256 $Sha
-        } @($tx,$source.Path,$temporary,$source.Length,$source.Sha256)
-        Assert-CcodEqual $source.Length $copy.Length 'copied length is sealed'
-        Assert-CcodEqual $source.Sha256 $copy.Sha256 'copied digest is sealed'
-        Assert-CcodOutsideUnchanged $fixture 'source replacement'
-    } finally { Remove-CcodInstallFileFixture $fixture }
+        $runtimeId='runtime-pinned-copy';$source=New-CcodSourceFile $fixture 'source.bin' 'sealed-source-v1';$generation=Open-CcodFixtureGeneration $fixture $runtimeId
+        $copy=Copy-CcodInstallSealedSource -Generation $generation -SourcePath $source.Path -Leaf 'payload.bin' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256
+        Assert-CcodEqual $source.Length $copy.Length 'copy returns verified length';Assert-CcodEqual $source.Sha256 $copy.Sha256 'copy returns verified digest'
+        Assert-CcodEqual 'blocked' (Invoke-CcodMoveAttempt $source.Path) 'source replacement is blocked after its handle opens'
+        $destination=Join-Path $fixture.Install "runtime\$runtimeId\payload.bin";Assert-CcodEqual $source.Sha256 (Get-CcodTestFileSha256 $destination) 'destination bytes match sealed handle digest'
+        try {[IO.File]::WriteAllText($destination,'attacker');throw 'ASSERT_DESTINATION_MUTABLE'} catch [IO.IOException] {}
+        Assert-CcodEqual $source.Sha256 (Get-CcodTestFileSha256 $destination) 'destination handle blocks mutation after verification'
+        Assert-CcodOutsideUnchanged $fixture 'pinned copy'
+    } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
-Invoke-CcodTest 'rejects reparse ADS and multi-link leaf inputs' {
-    $fixture = New-CcodInstallFileFixture
+Invoke-CcodTest 'manifest is create-only pinned and immutable after its same-handle write' {
+    $fixture=New-CcodInstallFileFixture
     try {
-        New-CcodJunction -Path (Join-Path $fixture.Install 'linked') -Target $fixture.Outside
-        $tx = Open-CcodFixtureTransaction $fixture
-        Assert-CcodThrows {
-            Invoke-CcodInstallModule { param($Tx) Open-CcodInstallPinnedDirectory -Transaction $Tx -ParentDirectory $Tx.RootDirectory -Leaf 'linked' } @($tx) | Out-Null
-        } 'CCOD_INSTALL_REPARSE_LEAF'
-        Assert-CcodThrows {
-            Invoke-CcodInstallModule { param($Tx) New-CcodInstallPinnedTemporaryLeaf -Transaction $Tx -ParentDirectory $Tx.RootDirectory -Leaf 'payload.tmp:ads' } @($tx) | Out-Null
-        } 'CCOD_INSTALL_LEAF_INVALID'
-
-        $source = New-CcodSourceFile $fixture
-        New-CcodHardLink -Path (Join-Path $fixture.Base 'source-hardlink.bin') -Existing $source.Path
-        $temporary = Invoke-CcodInstallModule { param($Tx) New-CcodInstallPinnedTemporaryLeaf -Transaction $Tx -ParentDirectory $Tx.RootDirectory -Leaf 'payload.tmp' } @($tx)
-        Assert-CcodThrows {
-            Invoke-CcodInstallModule {
-                param($Tx,$Source,$Leaf,$Length,$Sha)
-                Copy-CcodInstallSealedFile -Transaction $Tx -SourcePath $Source -DestinationLeaf $Leaf -ExpectedLength $Length -ExpectedSha256 $Sha
-            } @($tx,$source.Path,$temporary,$source.Length,$source.Sha256) | Out-Null
-        } 'CCOD_INSTALL_MULTILINK_LEAF'
-        Assert-CcodTrue ([IO.File]::Exists((Join-Path $fixture.Install 'payload.tmp'))) 'rejected multi-link source retains the owned temporary candidate'
-        Assert-CcodOutsideUnchanged $fixture 'invalid leaves'
-    } finally { Remove-CcodInstallFileFixture $fixture }
+        $runtimeId='runtime-manifest';$generation=Open-CcodFixtureGeneration $fixture $runtimeId;$result=Write-CcodInstallGenerationManifest -Generation $generation -Manifest (New-CcodGenerationManifest $runtimeId)
+        Assert-CcodTrue ($result.Length-gt 0) 'manifest returns verified length';Assert-CcodTrue ($result.Sha256-cmatch'^[0-9a-f]{64}$') 'manifest returns lowercase digest'
+        $path=Join-Path $fixture.Install "runtime\$runtimeId\manifest.json";$before=Get-CcodTestFileSha256 $path
+        Assert-CcodThrows {Write-CcodInstallGenerationManifest -Generation $generation -Manifest (New-CcodGenerationManifest $runtimeId)|Out-Null} 'CCOD_INSTALL_LEAF_EXISTS'
+        try {[IO.File]::WriteAllText($path,'{"attacker":true}');throw 'ASSERT_MANIFEST_MUTABLE'} catch [IO.IOException] {}
+        Assert-CcodEqual $before (Get-CcodTestFileSha256 $path) 'manifest mutation changes no bytes';Assert-CcodOutsideUnchanged $fixture 'manifest immutability'
+    } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
-Invoke-CcodTest 'rejects an existing ADS-bearing promotion destination without replacement' {
-    $fixture = New-CcodInstallFileFixture
-    try {
-        $destination = Join-Path $fixture.Install 'active.json'
-        [IO.File]::WriteAllText($destination, 'old')
-        $adsResult = & cmd.exe /d /c "echo attacker>`"$destination`:metadata`"" 2>&1
-        if ($LASTEXITCODE -ne 0) { throw "Could not create alternate data stream: $adsResult" }
-        $source = New-CcodSourceFile $fixture
-        $tx = Open-CcodFixtureTransaction $fixture
-        $temporary = Invoke-CcodInstallModule { param($Tx) New-CcodInstallPinnedTemporaryLeaf -Transaction $Tx -ParentDirectory $Tx.RootDirectory -Leaf 'active.tmp' } @($tx)
-        Invoke-CcodInstallModule {
-            param($Tx,$Source,$Leaf,$Length,$Sha)
-            Copy-CcodInstallSealedFile -Transaction $Tx -SourcePath $Source -DestinationLeaf $Leaf -ExpectedLength $Length -ExpectedSha256 $Sha | Out-Null
-        } @($tx,$source.Path,$temporary,$source.Length,$source.Sha256)
-        Assert-CcodThrows {
-            Invoke-CcodInstallModule { param($Tx,$Leaf) Commit-CcodInstallPinnedPromotion -Transaction $Tx -ParentDirectory $Tx.RootDirectory -TemporaryLeaf $Leaf -DestinationLeaf 'active.json' } @($tx,$temporary) | Out-Null
-        } 'CCOD_INSTALL_PROMOTION_DESTINATION_EXISTS'
-        Assert-CcodTrue ([IO.File]::Exists((Join-Path $fixture.Install 'active.tmp'))) 'failed ADS promotion retains the temporary candidate'
-        Assert-CcodOutsideUnchanged $fixture 'ADS destination'
-    } finally { Remove-CcodInstallFileFixture $fixture }
-}
-
-Invoke-CcodTest 'rejects promotion after an ancestor rename changes the pinned parent path' {
-    $fixture = New-CcodInstallFileFixture
-    try {
-        $source = New-CcodSourceFile $fixture
-        $tx = Open-CcodFixtureTransaction $fixture
-        $runtime = Invoke-CcodInstallModule { param($Tx) Open-CcodInstallPinnedDirectory -Transaction $Tx -ParentDirectory $Tx.RootDirectory -Leaf 'runtime' -CreateIfMissing } @($tx)
-        $temporary = Invoke-CcodInstallModule { param($Tx,$Parent) New-CcodInstallPinnedTemporaryLeaf -Transaction $Tx -ParentDirectory $Parent -Leaf 'payload.tmp' } @($tx,$runtime)
-        Invoke-CcodInstallModule {
-            param($Tx,$Source,$Leaf,$Length,$Sha)
-            Copy-CcodInstallSealedFile -Transaction $Tx -SourcePath $Source -DestinationLeaf $Leaf -ExpectedLength $Length -ExpectedSha256 $Sha | Out-Null
-        } @($tx,$source.Path,$temporary,$source.Length,$source.Sha256)
-        $attack = Invoke-CcodReplacePinnedDirectory -Fixture $fixture -Path (Join-Path $fixture.Install 'runtime')
-        if ($attack.Outcome -ceq 'replaced') {
-            Assert-CcodThrows {
-                Invoke-CcodInstallModule { param($Tx,$Parent,$Leaf) Commit-CcodInstallPinnedPromotion -Transaction $Tx -ParentDirectory $Parent -TemporaryLeaf $Leaf -DestinationLeaf 'payload.bin' } @($tx,$runtime,$temporary) | Out-Null
-            } 'CCOD_INSTALL_PIN_CHANGED'
-            Assert-CcodTrue ([IO.File]::Exists((Join-Path $attack.MovedDirectory 'payload.tmp'))) 'renamed-parent promotion retains its temporary candidate'
-        } else {
-            Assert-CcodThrows {
-                Invoke-CcodInstallModule { param($Tx,$Parent,$Leaf) Commit-CcodInstallPinnedPromotion -Transaction $Tx -ParentDirectory $Parent -TemporaryLeaf $Leaf -DestinationLeaf 'payload.bin' } @($tx,$runtime,$temporary) | Out-Null
-            } 'CCOD_INSTALL_PROMOTION_FAILED'
-            Assert-CcodTrue (-not [IO.File]::Exists((Join-Path $fixture.Install 'runtime\payload.bin'))) 'incompatible owned parent publishes no final destination'
-            Assert-CcodTrue ([IO.File]::Exists((Join-Path $fixture.Install 'runtime\payload.tmp'))) 'incompatible owned parent retains sealed temporary bytes'
-        }
-        Assert-CcodOutsideUnchanged $fixture 'renamed parent promotion'
-    } finally { Remove-CcodInstallFileFixture $fixture }
-}
-
-foreach ($case in @('unknown','reparse','multilink')) {
-    Invoke-CcodTest "retains an owned tree containing an unproven $case leaf" {
-        $fixture = New-CcodInstallFileFixture
+Invoke-CcodTest 'rejects reparse ADS and multilink inputs before publishing a leaf' {
+    foreach($case in @('reparse','ads','multilink')){
+        $fixture=New-CcodInstallFileFixture
         try {
-            $tx = Open-CcodFixtureTransaction $fixture
-            $candidate = Invoke-CcodInstallModule { param($Tx) Open-CcodInstallPinnedDirectory -Transaction $Tx -ParentDirectory $Tx.RootDirectory -Leaf 'candidate' -CreateIfMissing } @($tx)
-            switch ($case) {
-                'unknown' { [IO.File]::WriteAllText((Join-Path $fixture.Install 'candidate\surprise.bin'), 'unknown') }
-                'reparse' { New-CcodJunction -Path (Join-Path $fixture.Install 'candidate\outside-link') -Target $fixture.Outside }
-                'multilink' {
-                    $owned = Invoke-CcodInstallModule { param($Tx,$Parent) New-CcodInstallPinnedTemporaryLeaf -Transaction $Tx -ParentDirectory $Parent -Leaf 'owned.tmp' } @($tx,$candidate)
-                    New-CcodHardLink -Path (Join-Path $fixture.Outside 'owned-hardlink.tmp') -Existing (Join-Path $fixture.Install 'candidate\owned.tmp')
-                }
+            $runtimeId="runtime-invalid-$case"
+            if($case-ceq'reparse'){
+                [IO.Directory]::CreateDirectory((Join-Path $fixture.Install 'runtime'))|Out-Null;New-CcodJunction (Join-Path $fixture.Install "runtime\$runtimeId") $fixture.Outside
+                Assert-CcodThrows {Open-CcodInstallGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId|Out-Null} 'CCOD_INSTALL_GENERATION_EXISTS';Assert-CcodOutsideUnchanged $fixture 'reparse collision';continue
             }
-            $expected = switch ($case) {
-                'unknown' { 'CCOD_INSTALL_UNKNOWN_LEAF' }
-                'reparse' { 'CCOD_INSTALL_REPARSE_LEAF' }
-                'multilink' { 'CCOD_INSTALL_MULTILINK_LEAF' }
-            }
-            Assert-CcodThrows {
-                Invoke-CcodInstallModule { param($Tx) Remove-CcodInstallOwnedTree -Transaction $Tx -ParentDirectory $Tx.RootDirectory -Leaf 'candidate' } @($tx) | Out-Null
-            } $expected
-            Assert-CcodTrue ([IO.Directory]::Exists((Join-Path $fixture.Install 'candidate'))) "failed $case cleanup retains the candidate directory"
-            Assert-CcodOutsideUnchanged $fixture "$case cleanup"
-        } finally { Remove-CcodInstallFileFixture $fixture }
+            $source=New-CcodSourceFile $fixture 'source.bin' 'invalid-source';$generation=Open-CcodFixtureGeneration $fixture $runtimeId
+            if($case-ceq'ads'){
+                $previous=$ErrorActionPreference
+                try {$ErrorActionPreference='Continue';$output=& cmd.exe /d /c "echo attacker>`"$($source.Path):metadata`"" 2>&1;$exitCode=$LASTEXITCODE} finally {$ErrorActionPreference=$previous}
+                if($exitCode-ne 0){throw "Could not create alternate data stream: $($output -join ' ')"}
+                $expected='CCOD_INSTALL_ADS_LEAF'
+            }else{New-CcodHardLink (Join-Path $fixture.Outside 'outside-hardlink.bin') $source.Path;$expected='CCOD_INSTALL_MULTILINK_LEAF'}
+            Assert-CcodThrows {Copy-CcodInstallSealedSource -Generation $generation -SourcePath $source.Path -Leaf 'payload.bin' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null} $expected
+            Assert-CcodTrue (-not [IO.File]::Exists((Join-Path $fixture.Install "runtime\$runtimeId\payload.bin"))) "$case publishes no destination";Assert-CcodOutsideUnchanged $fixture "$case input"
+        } finally {Remove-CcodInstallFileFixture $fixture}
     }
 }
 
-Invoke-CcodTest 'retires a fully proven nonempty owned tree with every byte intact' {
-    $fixture = New-CcodInstallFileFixture
+Invoke-CcodTest 'rejects forged cross-transaction and closed capabilities' {
+    $firstFixture=New-CcodInstallFileFixture;$secondFixture=New-CcodInstallFileFixture
     try {
-        $source = New-CcodSourceFile $fixture
-        $tx = Open-CcodFixtureTransaction $fixture
-        $candidate = Invoke-CcodInstallModule { param($Tx) Open-CcodInstallPinnedDirectory -Transaction $Tx -ParentDirectory $Tx.RootDirectory -Leaf 'candidate' -CreateIfMissing } @($tx)
-        $temporary = Invoke-CcodInstallModule { param($Tx,$Parent) New-CcodInstallPinnedTemporaryLeaf -Transaction $Tx -ParentDirectory $Parent -Leaf 'payload.tmp' } @($tx,$candidate)
-        Invoke-CcodInstallModule {
-            param($Tx,$Source,$Leaf,$Length,$Sha)
-            Copy-CcodInstallSealedFile -Transaction $Tx -SourcePath $Source -DestinationLeaf $Leaf -ExpectedLength $Length -ExpectedSha256 $Sha | Out-Null
-        } @($tx,$source.Path,$temporary,$source.Length,$source.Sha256)
-        $retirement = Invoke-CcodInstallModule { param($Tx) Remove-CcodInstallOwnedTree -Transaction $Tx -ParentDirectory $Tx.RootDirectory -Leaf 'candidate' } @($tx)
-        Assert-CcodEqual 'Retired' $retirement.Disposition 'nonempty cleanup returns bounded retirement result'
-        Assert-CcodEqual '' (@($retirement.Object.PSObject.Properties.Name) -join ',') 'retired object capability exposes no path or handle'
-        Assert-CcodTrue (-not [IO.Directory]::Exists((Join-Path $fixture.Install 'candidate'))) 'one atomic retirement removes the live candidate name'
-        Close-CcodInstallFileTransaction -Transaction $tx -Disposition Failed | Out-Null
-        $fixture.Transaction = $null
-        $retired = @(Get-ChildItem -LiteralPath $fixture.Install -Directory -Force | Where-Object Name -Like '.__ccod_retired_*')
-        Assert-CcodEqual 1 $retired.Count 'exactly one retired quarantine object remains'
-        Assert-CcodEqual $source.Sha256 (Get-CcodTestFileSha256 (Join-Path $retired[0].FullName 'payload.tmp')) 'retired object retains every sealed payload byte'
-        Assert-CcodOutsideUnchanged $fixture 'owned tree removal'
-    } finally { Remove-CcodInstallFileFixture $fixture }
+        $first=Open-CcodFixtureGeneration $firstFixture 'runtime-first';$second=Open-CcodFixtureGeneration $secondFixture 'runtime-second';$forged=New-Object psobject
+        Assert-CcodThrows {New-CcodInstallGenerationLeaf -Generation $forged -Leaf 'forged'|Out-Null} 'CCOD_INSTALL_GENERATION_INVALID'
+        Write-CcodInstallGenerationManifest -Generation $first -Manifest (New-CcodGenerationManifest 'runtime-first')|Out-Null
+        Assert-CcodThrows {Commit-CcodInstallActivePointer -InstallRoot $secondFixture.Install -ExpectedPreviousGeneration ([uint64]0) -NewRuntimeId 'runtime-first' -FileTransaction $first|Out-Null} 'CCOD_INSTALL_TRANSACTION_SCOPE'
+        Assert-CcodThrows {Retire-CcodInstallGeneration -InstallRoot $firstFixture.Install -RuntimeId 'runtime-first' -FileTransaction $second|Out-Null} 'CCOD_INSTALL_TRANSACTION_SCOPE'
+        Close-CcodInstallFileTransaction -Transaction $first -Disposition Failed|Out-Null
+        Assert-CcodThrows {New-CcodInstallGenerationLeaf -Generation $first -Leaf 'after-close'|Out-Null} 'CCOD_INSTALL_TRANSACTION_CLOSED'
+        Assert-CcodOutsideUnchanged $firstFixture 'capability first';Assert-CcodOutsideUnchanged $secondFixture 'capability second'
+    } finally {Remove-CcodInstallFileFixture $firstFixture;Remove-CcodInstallFileFixture $secondFixture}
 }
 
-Invoke-CcodTest 'retirement collision leaves live candidate and collision untouched' {
-    $fixture = New-CcodInstallFileFixture
+Invoke-CcodTest 'close serializes native handle release against later relative operations' {
+    $fixture=New-CcodInstallFileFixture
     try {
-        $source = New-CcodSourceFile $fixture
-        $collisionLeaf = '.__ccod_retired_forced_collision'
-        $collision = Join-Path $fixture.Install $collisionLeaf
-        [IO.Directory]::CreateDirectory($collision) | Out-Null
-        $collisionSentinel = Join-Path $collision 'collision.txt'
-        [IO.File]::WriteAllText($collisionSentinel, 'collision-original')
-        $collisionSha = Get-CcodTestFileSha256 $collisionSentinel
-        $tx = Open-CcodFixtureTransaction $fixture
-        $candidate = Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'candidate' -CreateIfMissing
-        $temporary = New-CcodInstallPinnedTemporaryLeaf -Transaction $tx -ParentDirectory $candidate -Leaf 'payload.tmp'
-        Copy-CcodInstallSealedFile -Transaction $tx -SourcePath $source.Path -DestinationLeaf $temporary -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256 | Out-Null
-        Assert-CcodThrows {
-            Invoke-CcodInstallModule {
-                param($Tx,$Parent,$Leaf,$RetiredLeaf)
-                $pin = Get-CcodPinToken $Tx $Parent Directory
-                Convert-CcodRuntimeError {
-                    Invoke-CcodRuntimeMethod $pin.State.Runtime RemoveOwnedTreeCore @($pin.Token,$Leaf,$RetiredLeaf) | Out-Null
-                } 'CCOD_INSTALL_RETIREMENT_FAILED'
-            } @($tx,$tx.RootDirectory,'candidate',$collisionLeaf)
-        } 'CCOD_INSTALL_RETIREMENT_DESTINATION_EXISTS'
-        Assert-CcodTrue ([IO.Directory]::Exists((Join-Path $fixture.Install 'candidate'))) 'collision retains the original live candidate name'
-        Close-CcodInstallFileTransaction -Transaction $tx -Disposition Failed | Out-Null
-        $fixture.Transaction = $null
-        Assert-CcodEqual $source.Sha256 (Get-CcodTestFileSha256 (Join-Path $fixture.Install 'candidate\payload.tmp')) 'collision retains every candidate byte'
-        Assert-CcodEqual $collisionSha (Get-CcodTestFileSha256 $collisionSentinel) 'collision target remains untouched'
-        Assert-CcodOutsideUnchanged $fixture 'retirement collision'
-    } finally { Remove-CcodInstallFileFixture $fixture }
+        $runtimeId='runtime-close-barrier';$generation=Open-CcodFixtureGeneration $fixture $runtimeId;$child=New-CcodInstallGenerationLeaf -Generation $generation -Leaf 'child'
+        Close-CcodInstallFileTransaction -Transaction $generation -Disposition Failed|Out-Null
+        Assert-CcodThrows {New-CcodInstallGenerationLeaf -Generation $child -Leaf 'late'|Out-Null} 'CCOD_INSTALL_TRANSACTION_CLOSED'
+        $live=Join-Path $fixture.Install "runtime\$runtimeId";$moved=$live+'.moved';[IO.Directory]::Move($live,$moved);Assert-CcodTrue ([IO.Directory]::Exists($moved)) 'close released native handles';Assert-CcodOutsideUnchanged $fixture 'close barrier'
+    } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
-Invoke-CcodTest 'owned-parent promotion fails closed without publishing a copy' {
-    $fixture = New-CcodInstallFileFixture
+Invoke-CcodTest 'pointer generation records are monotonic create-only and collision safe' {
+    $fixture=New-CcodInstallFileFixture
     try {
-        $source = New-CcodSourceFile $fixture
-        $tx = Open-CcodFixtureTransaction $fixture
-        $candidate = Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'candidate' -CreateIfMissing
-        $temporary = New-CcodInstallPinnedTemporaryLeaf -Transaction $tx -ParentDirectory $candidate -Leaf 'sealed.tmp'
-        Copy-CcodInstallSealedFile -Transaction $tx -SourcePath $source.Path -DestinationLeaf $temporary -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256 | Out-Null
-        Assert-CcodThrows {
-            Commit-CcodInstallPinnedPromotion -Transaction $tx -ParentDirectory $candidate -TemporaryLeaf $temporary -DestinationLeaf 'final.bin' | Out-Null
-        } 'CCOD_INSTALL_PROMOTION_FAILED'
-        Assert-CcodTrue (-not [IO.File]::Exists((Join-Path $fixture.Install 'candidate\final.bin'))) 'failed owned-parent rename publishes no final destination'
-        Assert-CcodTrue ([IO.File]::Exists((Join-Path $fixture.Install 'candidate\sealed.tmp'))) 'failed owned-parent rename retains the sealed temporary leaf'
-        Assert-CcodOutsideUnchanged $fixture 'owned-parent promotion failure'
-    } finally { Remove-CcodInstallFileFixture $fixture }
+        $first=Open-CcodFixtureGeneration $fixture 'runtime-pointer-one';Write-CcodInstallGenerationManifest -Generation $first -Manifest (New-CcodGenerationManifest 'runtime-pointer-one')|Out-Null
+        $committed=Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -ExpectedPreviousGeneration ([uint64]0) -NewRuntimeId 'runtime-pointer-one' -FileTransaction $first
+        Assert-CcodEqual ([uint64]1) ([uint64]$committed.Generation) 'first pointer generation is one'
+        $records=@(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\active-generation') -File -Filter '*.json');Assert-CcodEqual 1 $records.Count 'one pointer record';$before=Get-CcodTestFileSha256 $records[0].FullName
+        $second=Open-CcodFixtureGeneration $fixture 'runtime-pointer-two';Write-CcodInstallGenerationManifest -Generation $second -Manifest (New-CcodGenerationManifest 'runtime-pointer-two')|Out-Null
+        Assert-CcodThrows {Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -ExpectedPreviousGeneration ([uint64]0) -NewRuntimeId 'runtime-pointer-two' -FileTransaction $second|Out-Null} 'CCOD_INSTALL_POINTER_GENERATION_EXISTS'
+        $after=@(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\active-generation') -File -Filter '*.json');Assert-CcodEqual 1 $after.Count 'duplicate publishes no record';Assert-CcodEqual $before (Get-CcodTestFileSha256 $after[0].FullName) 'existing pointer unchanged';Assert-CcodOutsideUnchanged $fixture 'pointer collision'
+    } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
-Invoke-CcodTest 'compatible-parent promotion is readable before transaction close' {
-    $fixture = New-CcodInstallFileFixture
+Invoke-CcodTest 'atomically retires a proven nonempty generation without deleting bytes or changing its DACL' {
+    $fixture=New-CcodInstallFileFixture
     try {
-        $source = New-CcodSourceFile $fixture
-        $tx = Open-CcodFixtureTransaction $fixture
-        $temporary = New-CcodInstallPinnedTemporaryLeaf -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'readable.tmp'
-        Copy-CcodInstallSealedFile -Transaction $tx -SourcePath $source.Path -DestinationLeaf $temporary -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256 | Out-Null
-        Commit-CcodInstallPinnedPromotion -Transaction $tx -ParentDirectory $tx.RootDirectory -TemporaryLeaf $temporary -DestinationLeaf 'readable.bin' | Out-Null
-        Assert-CcodEqual $source.Sha256 (Get-CcodTestFileSha256 (Join-Path $fixture.Install 'readable.bin')) 'compatible atomic promotion is readable while transaction stays open'
-        Assert-CcodOutsideUnchanged $fixture 'readable compatible promotion'
-    } finally { Remove-CcodInstallFileFixture $fixture }
-}
-
-Invoke-CcodTest 'deletes an empty fully-owned candidate after establishing its root disposition' {
-    $fixture = New-CcodInstallFileFixture
-    try {
-        $tx = Open-CcodFixtureTransaction $fixture
-        $candidate = Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'empty-candidate' -CreateIfMissing
-        Remove-CcodInstallOwnedTree -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'empty-candidate' | Out-Null
-        Assert-CcodTrue (-not [IO.Directory]::Exists((Join-Path $fixture.Install 'empty-candidate'))) 'empty owned candidate is deleted only after its root disposition is established'
-        Assert-CcodOutsideUnchanged $fixture 'empty owned tree removal'
-    } finally { Remove-CcodInstallFileFixture $fixture }
-}
-
-foreach ($case in @('json','log')) {
-    Invoke-CcodTest "rejects a pinned $case write after parent pathname replacement" {
-        $fixture = New-CcodInstallFileFixture
-        try {
-            $tx = Open-CcodFixtureTransaction $fixture
-            $parent = Invoke-CcodInstallModule { param($Tx,$Leaf) Open-CcodInstallPinnedDirectory -Transaction $Tx -ParentDirectory $Tx.RootDirectory -Leaf $Leaf -CreateIfMissing } @($tx,$case)
-            $attack = Invoke-CcodReplacePinnedDirectory -Fixture $fixture -Path (Join-Path $fixture.Install $case)
-            if ($case -ceq 'json') {
-                if ($attack.Outcome -ceq 'replaced') {
-                    Assert-CcodThrows { Invoke-CcodInstallModule { param($Tx,$Parent) Write-CcodInstallPinnedJson -Transaction $Tx -ParentDirectory $Parent -Leaf 'state.json' -Value ([ordered]@{ schemaVersion = 1; value = 'safe' }) -Compress } @($tx,$parent) } 'CCOD_INSTALL_PIN_CHANGED'
-                } else {
-                    Assert-CcodThrows { Invoke-CcodInstallModule { param($Tx,$Parent) Write-CcodInstallPinnedJson -Transaction $Tx -ParentDirectory $Parent -Leaf 'state.json' -Value ([ordered]@{ schemaVersion = 1; value = 'safe' }) -Compress } @($tx,$parent) } 'CCOD_INSTALL_PROMOTION_FAILED'
-                    Assert-CcodTrue (-not [IO.File]::Exists((Join-Path $fixture.Install "$case\state.json"))) 'incompatible owned JSON parent publishes no final state'
-                }
-                Assert-CcodTrue (-not [IO.File]::Exists((Join-Path $fixture.Outside 'state.json'))) 'replaced JSON path is untouched'
-            } else {
-                if ($attack.Outcome -ceq 'replaced') {
-                    Assert-CcodThrows { Invoke-CcodInstallModule { param($Tx,$Parent) Append-CcodInstallPinnedLog -Transaction $Tx -ParentDirectory $Parent -Leaf 'install.log' -Record ([ordered]@{ event = 'safe'; code = 'CCOD_TEST' }) } @($tx,$parent) } 'CCOD_INSTALL_PIN_CHANGED'
-                } else {
-                    Invoke-CcodInstallModule { param($Tx,$Parent) Append-CcodInstallPinnedLog -Transaction $Tx -ParentDirectory $Parent -Leaf 'install.log' -Record ([ordered]@{ event = 'safe'; code = 'CCOD_TEST' }) } @($tx,$parent) | Out-Null
-                }
-                Assert-CcodTrue (-not [IO.File]::Exists((Join-Path $fixture.Outside 'install.log'))) 'replaced log path is untouched'
-            }
-            Assert-CcodOutsideUnchanged $fixture "replaced $case parent"
-        } finally { Remove-CcodInstallFileFixture $fixture }
-    }
-}
-
-Invoke-CcodTest 'writes pinned JSON and appends sanitized records through relative handles' {
-    $fixture = New-CcodInstallFileFixture
-    try {
-        $tx = Open-CcodFixtureTransaction $fixture
-        $state = $tx.RootDirectory
-        $logs = $tx.RootDirectory
-        Invoke-CcodInstallModule { param($Tx,$Parent) Write-CcodInstallPinnedJson -Transaction $Tx -ParentDirectory $Parent -Leaf 'active.json' -Value ([ordered]@{ schemaVersion = 1; active = 'runtime-a' }) -Compress } @($tx,$state) | Out-Null
-        Assert-CcodThrows {
-            Invoke-CcodInstallModule { param($Tx,$Parent) Write-CcodInstallPinnedJson -Transaction $Tx -ParentDirectory $Parent -Leaf 'active.json' -Value ([ordered]@{ schemaVersion = 1; active = 'runtime-b' }) -Compress } @($tx,$state) | Out-Null
-        } 'CCOD_INSTALL_PROMOTION_DESTINATION_EXISTS'
-        Invoke-CcodInstallModule { param($Tx,$Parent) Append-CcodInstallPinnedLog -Transaction $Tx -ParentDirectory $Parent -Leaf 'install.log' -Record ([ordered]@{ event = 'one'; code = 'CCOD_OK' }) } @($tx,$logs) | Out-Null
-        Invoke-CcodInstallModule { param($Tx,$Parent) Append-CcodInstallPinnedLog -Transaction $Tx -ParentDirectory $Parent -Leaf 'install.log' -Record ([ordered]@{ event = 'two'; code = 'CCOD_READY' }) } @($tx,$logs) | Out-Null
-        Invoke-CcodInstallModule { param($Tx) Close-CcodInstallFileTransaction -Transaction $Tx -Disposition Ready } @($tx) | Out-Null
-        $fixture.Transaction = $null
-
-        $json = [IO.File]::ReadAllText((Join-Path $fixture.Install 'active.json'), [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
-        Assert-CcodEqual 'runtime-a' $json.active 'no-replace pinned JSON preserves the first committed object'
-        $records = @([IO.File]::ReadAllLines((Join-Path $fixture.Install 'install.log'), [Text.UTF8Encoding]::new($false)))
-        Assert-CcodEqual 2 $records.Count 'pinned log appends one JSON line per record'
-        Assert-CcodEqual 'one' (($records[0] | ConvertFrom-Json).event) 'first log record is retained'
-        Assert-CcodEqual 'two' (($records[1] | ConvertFrom-Json).event) 'second log record is appended'
-        Assert-CcodOutsideUnchanged $fixture 'successful pinned writers'
-    } finally { Remove-CcodInstallFileFixture $fixture }
-}
-
-Invoke-CcodTest 'exports only the private transaction surface and closes on a terminal disposition' {
-    $fixture = New-CcodInstallFileFixture
-    try {
-        $expectedExports = @(
-            'Append-CcodInstallPinnedLog','Close-CcodInstallFileTransaction','Commit-CcodInstallPinnedPromotion',
-            'Copy-CcodInstallSealedFile','New-CcodInstallPinnedTemporaryLeaf','Open-CcodInstallFileTransaction',
-            'Open-CcodInstallPinnedDirectory','Remove-CcodInstallOwnedTree','Write-CcodInstallPinnedJson'
-        )
-        $actualExports = @($module.ExportedFunctions.Keys | Sort-Object)
-        Assert-CcodEqual ($expectedExports -join ',') ($actualExports -join ',') 'module exports only the approved private transaction surface'
-        $tx = Open-CcodFixtureTransaction $fixture
-        Invoke-CcodInstallModule { param($Tx) Close-CcodInstallFileTransaction -Transaction $Tx -Disposition Ready } @($tx) | Out-Null
-        $fixture.Transaction = $null
-        Assert-CcodEqual 'RootDirectory' (@($tx.PSObject.Properties.Name) -join ',') 'terminal transaction remains opaque'
-        Assert-CcodThrows {
-            Invoke-CcodInstallModule { param($Tx) Open-CcodInstallPinnedDirectory -Transaction $Tx -ParentDirectory $Tx.RootDirectory -Leaf 'after-close' -CreateIfMissing } @($tx) | Out-Null
-        } 'CCOD_INSTALL_TRANSACTION_CLOSED'
-    } finally { Remove-CcodInstallFileFixture $fixture }
-}
-
-Invoke-CcodTest 'returns opaque unforgeable capabilities and hides native mutation helpers' {
-    $fixture = New-CcodInstallFileFixture
-    try {
-        $tx = Open-CcodFixtureTransaction $fixture
-        $txProperties = @($tx.PSObject.Properties.Name)
-        Assert-CcodEqual 'RootDirectory' ($txProperties -join ',') 'transaction reveals only its root capability'
-        $rootProperties = @($tx.RootDirectory.PSObject.Properties.Name)
-        Assert-CcodEqual '' ($rootProperties -join ',') 'directory capability reveals no native or ownership state'
-        $transactionAssemblyExports = @([CcodInstallCapabilityMarker].Assembly.ExportedTypes | Select-Object -ExpandProperty Name | Sort-Object)
-        Assert-CcodEqual 'CcodInstallCapabilityMarker' ($transactionAssemblyExports -join ',') 'transaction assembly exports only a non-mutating marker type'
-        $dangerousPublicMethods = @([CcodInstallCapabilityMarker].Assembly.ExportedTypes | ForEach-Object {
-            $_.GetMethods([Reflection.BindingFlags]'Public,Static') | Where-Object {
-                $_.Name -match 'Open|Create|Rename|Delete|Write|Append|Promote|Remove' -or
-                @($_.GetParameters().ParameterType.FullName) -contains 'Microsoft.Win32.SafeHandles.SafeFileHandle'
-            }
-        })
-        Assert-CcodEqual 0 $dangerousPublicMethods.Count 'transaction assembly exposes no public native mutation helper'
-        Assert-CcodEqual $null ('CcodInstallRuntime' -as [type]) 'internal runtime type is not directly callable through PowerShell type resolution'
-
-        $forged = [pscustomobject]@{}
-        Assert-CcodThrows {
-            Open-CcodInstallPinnedDirectory -Transaction $forged -ParentDirectory $tx.RootDirectory -Leaf 'forged' -CreateIfMissing | Out-Null
-        } 'CCOD_INSTALL_TRANSACTION_INVALID'
-
-        $otherFixture = New-CcodInstallFileFixture
-        try {
-            $other = Open-CcodFixtureTransaction $otherFixture
-            Assert-CcodThrows {
-                Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $other.RootDirectory -Leaf 'cross-issuer' -CreateIfMissing | Out-Null
-            } 'CCOD_INSTALL_PIN_INVALID'
-        } finally { Remove-CcodInstallFileFixture $otherFixture }
-        Assert-CcodOutsideUnchanged $fixture 'opaque capability rejection'
-    } finally { Remove-CcodInstallFileFixture $fixture }
-}
-
-Invoke-CcodTest 'recomputes the private seal and never trusts forged public fields' {
-    $fixture = New-CcodInstallFileFixture
-    try {
-        $source = New-CcodSourceFile $fixture
-        $tx = Open-CcodFixtureTransaction $fixture
-        $temporary = New-CcodInstallPinnedTemporaryLeaf -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'sealed.tmp'
-        Copy-CcodInstallSealedFile -Transaction $tx -SourcePath $source.Path -DestinationLeaf $temporary -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256 | Out-Null
-        $forgedLeaf = [pscustomobject]@{ Sealed = $true; Length = $source.Length; Sha256 = $source.Sha256 }
-        Assert-CcodThrows {
-            Commit-CcodInstallPinnedPromotion -Transaction $tx -ParentDirectory $tx.RootDirectory -TemporaryLeaf $forgedLeaf -DestinationLeaf 'forged.bin' | Out-Null
-        } 'CCOD_INSTALL_PIN_INVALID'
-        Assert-CcodTrue (-not [IO.File]::Exists((Join-Path $fixture.Install 'forged.bin'))) 'forged public sealing fields cannot create a destination'
-        $independentWrite = $null
-        try {
-            $independentWrite = [IO.File]::Open((Join-Path $fixture.Install 'sealed.tmp'), [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-        } catch [IO.IOException] { }
-        if ($null -ne $independentWrite) {
-            try {
-                $bytes = [Text.UTF8Encoding]::new($false).GetBytes('tampered')
-                $independentWrite.SetLength(0); $independentWrite.Write($bytes,0,$bytes.Length); $independentWrite.Flush($true)
-            } finally { $independentWrite.Dispose() }
-            Assert-CcodThrows {
-                Commit-CcodInstallPinnedPromotion -Transaction $tx -ParentDirectory $tx.RootDirectory -TemporaryLeaf $temporary -DestinationLeaf 'sealed.bin' | Out-Null
-            } 'CCOD_INSTALL_SEAL_MISMATCH'
-        } else {
-            Commit-CcodInstallPinnedPromotion -Transaction $tx -ParentDirectory $tx.RootDirectory -TemporaryLeaf $temporary -DestinationLeaf 'sealed.bin' | Out-Null
-            Close-CcodInstallFileTransaction -Transaction $tx -Disposition Ready | Out-Null
-            $fixture.Transaction = $null
-            Assert-CcodEqual $source.Sha256 (Get-CcodTestFileSha256 (Join-Path $fixture.Install 'sealed.bin')) 'blocked mutation preserves sealed promotion bytes'
-        }
-        Assert-CcodOutsideUnchanged $fixture 'seal recomputation'
-    } finally { Remove-CcodInstallFileFixture $fixture }
-}
-
-Invoke-CcodTest 'promotion is no-replace when a destination appears before commit' {
-    $fixture = New-CcodInstallFileFixture
-    try {
-        $source = New-CcodSourceFile $fixture
-        $tx = Open-CcodFixtureTransaction $fixture
-        $temporary = New-CcodInstallPinnedTemporaryLeaf -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'new.tmp'
-        Copy-CcodInstallSealedFile -Transaction $tx -SourcePath $source.Path -DestinationLeaf $temporary -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256 | Out-Null
-        $destination = Join-Path $fixture.Install 'existing.bin'
-        [IO.File]::WriteAllText($destination, 'unexpected-existing-object')
-        $existingSha = Get-CcodTestFileSha256 $destination
-        Assert-CcodThrows {
-            Commit-CcodInstallPinnedPromotion -Transaction $tx -ParentDirectory $tx.RootDirectory -TemporaryLeaf $temporary -DestinationLeaf 'existing.bin' | Out-Null
-        } 'CCOD_INSTALL_PROMOTION_DESTINATION_EXISTS'
-        Assert-CcodEqual $existingSha (Get-CcodTestFileSha256 $destination) 'no-replace leaves the existing object untouched'
-        Assert-CcodTrue ([IO.File]::Exists((Join-Path $fixture.Install 'new.tmp'))) 'no-replace failure retains the sealed temporary leaf'
-        Assert-CcodOutsideUnchanged $fixture 'no-replace promotion'
-    } finally { Remove-CcodInstallFileFixture $fixture }
-}
-
-foreach ($directoryCase in @('root','child','owned')) {
-    Invoke-CcodTest "rejects $directoryCase directory alternate data streams" {
-        $fixture = New-CcodInstallFileFixture
-        try {
-            if ($directoryCase -ceq 'root') {
-                $adsPath = $fixture.Install + ':metadata'
-                $adsResult = Invoke-CcodAttemptAdsWrite $adsPath
-                Assert-CcodEqual 'created' $adsResult.Outcome 'root ADS fixture is established before pinning'
-                Assert-CcodThrows { Open-CcodFixtureTransaction $fixture | Out-Null } 'CCOD_INSTALL_ADS_LEAF'
-            } else {
-                $tx = Open-CcodFixtureTransaction $fixture
-                $directory = Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf $directoryCase -CreateIfMissing
-                $adsPath = (Join-Path $fixture.Install $directoryCase) + ':metadata'
-                $adsResult = Invoke-CcodAttemptAdsWrite $adsPath
-                if ($adsResult.Outcome -ceq 'blocked') {
-                    Assert-CcodTrue $true "$directoryCase directory pin blocks ADS creation"
-                } elseif ($directoryCase -ceq 'child') {
-                    Assert-CcodThrows {
-                        New-CcodInstallPinnedTemporaryLeaf -Transaction $tx -ParentDirectory $directory -Leaf 'blocked.tmp' | Out-Null
-                    } 'CCOD_INSTALL_ADS_LEAF'
-                } else {
-                    Assert-CcodThrows {
-                        Remove-CcodInstallOwnedTree -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'owned'
-                    } 'CCOD_INSTALL_ADS_LEAF'
-                    Assert-CcodTrue ([IO.Directory]::Exists((Join-Path $fixture.Install 'owned'))) 'directory ADS cleanup failure retains the owned directory'
-                }
-            }
-            Assert-CcodOutsideUnchanged $fixture "$directoryCase directory ADS"
-        } finally { Remove-CcodInstallFileFixture $fixture }
-    }
-}
-
-Invoke-CcodTest 'retires a nonempty tree containing a read-only owned leaf without changing bytes' {
-    $fixture = New-CcodInstallFileFixture
-    try {
-        $tx = Open-CcodFixtureTransaction $fixture
-        $candidate = Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'candidate' -CreateIfMissing
-        $first = New-CcodInstallPinnedTemporaryLeaf -Transaction $tx -ParentDirectory $candidate -Leaf 'a.tmp'
-        $later = New-CcodInstallPinnedTemporaryLeaf -Transaction $tx -ParentDirectory $candidate -Leaf 'z.tmp'
-        [IO.File]::SetAttributes((Join-Path $fixture.Install 'candidate\z.tmp'), [IO.FileAttributes]::ReadOnly)
-        $result = Remove-CcodInstallOwnedTree -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'candidate'
-        Assert-CcodEqual 'Retired' $result.Disposition 'read-only leaf uses atomic retirement instead of recursive deletion'
-        Assert-CcodTrue (-not [IO.Directory]::Exists((Join-Path $fixture.Install 'candidate'))) 'read-only candidate leaves the live namespace atomically'
-        Close-CcodInstallFileTransaction -Transaction $tx -Disposition Failed | Out-Null
-        $fixture.Transaction = $null
-        $retired = @(Get-ChildItem -LiteralPath $fixture.Install -Directory -Force | Where-Object Name -Like '.__ccod_retired_*')
-        Assert-CcodEqual 1 $retired.Count 'read-only candidate has one retired object'
-        Assert-CcodTrue ([IO.File]::Exists((Join-Path $retired[0].FullName 'a.tmp'))) 'first leaf remains in retired tree'
-        Assert-CcodTrue ([IO.File]::Exists((Join-Path $retired[0].FullName 'z.tmp'))) 'read-only leaf remains in retired tree'
-        Assert-CcodOutsideUnchanged $fixture 'read-only retirement'
-    } finally { Remove-CcodInstallFileFixture $fixture }
-}
-
-Invoke-CcodTest 'retires a nested owned directory without releasing its contents' {
-    $fixture = New-CcodInstallFileFixture
-    try {
-        $tx = Open-CcodFixtureTransaction $fixture
-        $candidate = Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'candidate' -CreateIfMissing
-        $child = Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $candidate -Leaf 'child' -CreateIfMissing
-        $result = Remove-CcodInstallOwnedTree -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'candidate'
-        Assert-CcodEqual 'Retired' $result.Disposition 'nested nonempty candidate is retired'
-        Assert-CcodTrue (-not [IO.Directory]::Exists((Join-Path $fixture.Install 'candidate'))) 'nested candidate live name disappears atomically'
-        Close-CcodInstallFileTransaction -Transaction $tx -Disposition Failed | Out-Null
-        $fixture.Transaction = $null
-        $retired = @(Get-ChildItem -LiteralPath $fixture.Install -Directory -Force | Where-Object Name -Like '.__ccod_retired_*')
-        Assert-CcodEqual 1 $retired.Count 'nested candidate has one retired object'
-        Assert-CcodTrue ([IO.Directory]::Exists((Join-Path $retired[0].FullName 'child'))) 'nested child directory remains intact after retirement'
-        Assert-CcodOutsideUnchanged $fixture 'nested directory retirement'
-    } finally { Remove-CcodInstallFileFixture $fixture }
-}
-
-Invoke-CcodTest 'detects an unknown insertion between deletion planning and first release' {
-    $fixture = New-CcodInstallFileFixture
-    try {
-        $tx = Open-CcodFixtureTransaction $fixture
-        $candidate = Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'candidate' -CreateIfMissing
-        $first = New-CcodInstallPinnedTemporaryLeaf -Transaction $tx -ParentDirectory $candidate -Leaf 'a-first.tmp'
-        for ($index = 0; $index -lt 128; $index++) {
-            New-CcodInstallPinnedTemporaryLeaf -Transaction $tx -ParentDirectory $candidate -Leaf ('b-{0:d3}.tmp' -f $index) | Out-Null
-        }
-        $watch = Join-Path $fixture.Install 'candidate\a-first.tmp'
-        $unknown = Join-Path $fixture.Install 'candidate\concurrent-unknown.tmp'
-        $attacker = [CcodInstallTransactionTestNative]::InsertUnknownAfterDelay($unknown, 1)
-        $failure = $null
-        $retirement = $null
-        try { $retirement = Remove-CcodInstallOwnedTree -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'candidate' }
-        catch { $failure = $_ }
-        $attackOutcome = $attacker.GetAwaiter().GetResult()
-        Assert-CcodTrue ($attackOutcome -in @('inserted','blocked')) 'concurrent namespace attempt reaches the cleanup boundary'
-        if ($attackOutcome -ceq 'inserted') {
-            Assert-CcodTrue ($null -ne $failure -and $failure.FullyQualifiedErrorId -match '^CCOD_INSTALL_(?:UNKNOWN_LEAF|DELETE_FAILED)') "inserted unknown leaf fails cleanup before release actual=$($failure.FullyQualifiedErrorId) message=$($failure.Exception.Message)"
-            Assert-CcodTrue ([IO.File]::Exists($watch)) 'failed concurrent cleanup retains the first candidate leaf'
-            Assert-CcodTrue ([IO.File]::Exists($unknown)) 'unproven concurrent object is retained for diagnosis'
-            Assert-CcodTrue ([IO.Directory]::Exists((Join-Path $fixture.Install 'candidate'))) 'concurrent insertion retains the complete candidate tree'
-        } else {
-            Assert-CcodTrue ($null -eq $failure -and $retirement.Disposition -ceq 'Retired') 'blocked insertion permits one atomic retirement'
-        }
-        Assert-CcodOutsideUnchanged $fixture 'concurrent cleanup insertion'
-    } finally { Remove-CcodInstallFileFixture $fixture }
-}
-
-Invoke-CcodTest 'owned directory denies external child creation and hard-link insertion for its lifetime' {
-    $fixture = New-CcodInstallFileFixture
-    try {
-        $outsideSource = Join-Path $fixture.Outside 'outside-source.bin'
-        [IO.File]::WriteAllText($outsideSource, 'outside-source')
-        $tx = Open-CcodFixtureTransaction $fixture
-        $candidate = Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'candidate' -CreateIfMissing
-        $childPath = Join-Path $fixture.Install 'candidate\attacker-child.bin'
-        $writeHandleError = [CcodInstallTransactionTestNative]::TryOpenDirectoryForChildWrite((Join-Path $fixture.Install 'candidate'))
-        Assert-CcodTrue ($writeHandleError -ne 0) 'owned directory share lock blocks an external child-write handle'
-
-        $hardLinkPath = Join-Path $fixture.Install 'candidate\attacker-hardlink.bin'
-        $hardLinkError = [CcodInstallTransactionTestNative]::CreateHardLink($hardLinkPath, $outsideSource)
-        Assert-CcodTrue ($hardLinkError -ne 0) 'owned directory share lock blocks external hard-link insertion'
-        Assert-CcodTrue (-not [IO.File]::Exists($childPath)) 'blocked child path remains absent'
-        Assert-CcodTrue (-not [IO.File]::Exists($hardLinkPath)) 'blocked hard-link path remains absent'
-        Assert-CcodOutsideUnchanged $fixture 'owned directory namespace lock'
-    } finally { Remove-CcodInstallFileFixture $fixture }
-}
-
-Invoke-CcodTest 'target pin blocks namespace mutation after descendant handles are released' {
-    $fixture = New-CcodInstallFileFixture
-    try {
-        $outsideSource = Join-Path $fixture.Outside 'outside-source.bin'
-        [IO.File]::WriteAllText($outsideSource, 'outside-source')
-        $tx = Open-CcodFixtureTransaction $fixture
-        $candidate = Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'candidate' -CreateIfMissing
-        $first = New-CcodInstallPinnedTemporaryLeaf -Transaction $tx -ParentDirectory $candidate -Leaf 'a-first.tmp'
-        for ($index = 0; $index -lt 256; $index++) {
-            New-CcodInstallPinnedTemporaryLeaf -Transaction $tx -ParentDirectory $candidate -Leaf ('b-{0:d3}.tmp' -f $index) | Out-Null
-        }
-        $candidatePath = Join-Path $fixture.Install 'candidate'
-        $probe = [CcodInstallTransactionTestNative]::ProbeNamespaceAfterLeafUnlock(
-            (Join-Path $candidatePath 'a-first.tmp'),
-            $candidatePath,
-            $outsideSource,
-            (Join-Path $candidatePath 'attacker-hardlink.bin')
-        )
-        $retirement = Remove-CcodInstallOwnedTree -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'candidate'
-        Assert-CcodEqual 'Retired' $retirement.Disposition 'candidate retires after descendant release probe'
-        Assert-CcodEqual 'blocked' $probe.GetAwaiter().GetResult() 'retained target pin blocks child-write and hard-link namespace mutation after descendant release'
-        Assert-CcodTrue (-not [IO.File]::Exists((Join-Path $candidatePath 'attacker-hardlink.bin'))) 'descendant-release probe creates no attacker hard link'
-        Assert-CcodOutsideUnchanged $fixture 'descendant-release namespace lock'
-    } finally { Remove-CcodInstallFileFixture $fixture }
-}
-
-Invoke-CcodTest 'closing releases every sharing lock and rejects close-versus-relative operations' {
-    $fixture = New-CcodInstallFileFixture
-    try {
-        $tx = Open-CcodFixtureTransaction $fixture
-        $child = Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $tx.RootDirectory -Leaf 'release-me' -CreateIfMissing
-        Close-CcodInstallFileTransaction -Transaction $tx -Disposition Failed | Out-Null
-        $fixture.Transaction = $null
-        Assert-CcodThrows {
-            Open-CcodInstallPinnedDirectory -Transaction $tx -ParentDirectory $child -Leaf 'after-close' -CreateIfMissing | Out-Null
-        } 'CCOD_INSTALL_TRANSACTION_CLOSED'
-        $renamed = Join-Path $fixture.Install 'released'
-        [IO.Directory]::Move((Join-Path $fixture.Install 'release-me'), $renamed)
-        [IO.Directory]::Delete($renamed)
-        Assert-CcodTrue (-not [IO.Directory]::Exists($renamed)) 'closed transaction releases directory sharing locks'
-    } finally { Remove-CcodInstallFileFixture $fixture }
+        $runtimeId='runtime-retire';$source=New-CcodSourceFile $fixture 'source.bin' 'retained-retirement-bytes';$generation=Open-CcodFixtureGeneration $fixture $runtimeId;$child=New-CcodInstallGenerationLeaf $generation 'child'
+        Copy-CcodInstallSealedSource -Generation $child -SourcePath $source.Path -Leaf 'payload.bin' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null
+        Write-CcodInstallGenerationManifest -Generation $generation -Manifest (New-CcodGenerationManifest $runtimeId @([ordered]@{path='child\payload.bin';length=$source.Length;sha256=$source.Sha256}))|Out-Null
+        $live=Join-Path $fixture.Install "runtime\$runtimeId";$beforeSddl=(Get-Acl -LiteralPath $live).Sddl;$retirement=Retire-CcodInstallGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId -FileTransaction $generation
+        Assert-CcodEqual 'Retired' $retirement.Disposition 'bounded retirement result';Assert-CcodEqual '' (@($retirement.Capability.PSObject.Properties.Name)-join ',') 'retirement capability opaque';Assert-CcodTrue (-not [IO.Directory]::Exists($live)) 'live name disappears'
+        $retired=@(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'retired') -Directory|Where-Object Name -Like "$runtimeId.*");Assert-CcodEqual 1 $retired.Count 'one quarantine generation';Assert-CcodTrue ($retired[0].Name-cmatch('^'+[regex]::Escape($runtimeId)+'\.[0-9a-f]{32}$')) 'unique owned suffix'
+        Assert-CcodThrows {Copy-CcodInstallSealedSource -Generation $retirement.Capability -SourcePath $source.Path -Leaf 'post-retire.bin' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null} 'CCOD_INSTALL_GENERATION_RETIRED'
+        Assert-CcodTrue (-not [IO.File]::Exists((Join-Path $retired[0].FullName 'post-retire.bin'))) 'retired capability cannot mutate quarantine bytes'
+        Assert-CcodEqual $source.Sha256 (Get-CcodTestFileSha256 (Join-Path $retired[0].FullName 'child\payload.bin')) 'retired bytes unchanged';Assert-CcodEqual $beforeSddl (Get-Acl -LiteralPath $retired[0].FullName).Sddl 'no persistent DACL mutation'
+        Assert-CcodEqual 1 @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\retirements') -File -Filter '*.json').Count 'one retirement record';Assert-CcodOutsideUnchanged $fixture 'retirement'
+    } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
 Write-Host 'Install file transaction self-test passed.' -ForegroundColor Green
