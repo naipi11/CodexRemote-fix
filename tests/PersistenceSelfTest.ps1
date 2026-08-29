@@ -14,6 +14,10 @@ if ($PSVersionTable.PSEdition -eq 'Desktop') {
 }
 
 $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$requiredTransactionSelfTest = Join-Path $PSScriptRoot 'persistence\InstallFileTransaction.SelfTest.ps1'
+if (-not (Test-Path -LiteralPath $requiredTransactionSelfTest -PathType Leaf)) {
+    throw "Required install file transaction self-test is missing: $requiredTransactionSelfTest"
+}
 $tests = Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'persistence') -Filter '*.SelfTest.ps1' | Sort-Object Name
 foreach ($test in $tests) {
     $previousErrorActionPreference = $ErrorActionPreference
