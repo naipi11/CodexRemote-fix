@@ -46,6 +46,20 @@ public static class CcodInstallFileRaceProbe
         Task.WaitAll(first,second);barrier.Dispose();return createResult+"|"+closeResult;
     }
 }
+
+public sealed class CcodThrowingFileStream : FileStream
+{
+    private static int attempts;
+    public static int Attempts { get { return Volatile.Read(ref attempts); } }
+    public static void Reset(){Volatile.Write(ref attempts,0);}
+    public CcodThrowingFileStream(string path) : base(path,FileMode.CreateNew,FileAccess.ReadWrite,FileShare.Read) { }
+    protected override void Dispose(bool disposing)
+    {
+        if(!disposing){base.Dispose(false);return;}
+        Interlocked.Increment(ref attempts);
+        try{base.Dispose(true);}finally{throw new IOException("test dispose failure");}
+    }
+}
 '@
 }
 
@@ -293,6 +307,23 @@ Invoke-CcodTest 'close serializes native handle release against later relative o
         Assert-CcodThrows {New-CcodInstallGenerationLeaf -Generation $child -Leaf 'late'|Out-Null} 'CCOD_INSTALL_TRANSACTION_CLOSED'
         Assert-CcodEqual 'moved' (Invoke-CcodMoveAttempt $source.Path) 'close releases the deliberately retained source handle'
         $live=Join-Path $fixture.Install "runtime\$runtimeId";$moved=$live+'.moved';[IO.Directory]::Move($live,$moved);Assert-CcodTrue ([IO.Directory]::Exists($moved)) 'close releases generation and destination handles';Assert-CcodOutsideUnchanged $fixture 'close barrier'
+    } finally {Remove-CcodInstallFileFixture $fixture}
+}
+
+Invoke-CcodTest 'close retries a failing disposal and releases every other registered resource' {
+    $fixture=New-CcodInstallFileFixture
+    try {
+        $runtimeId='runtime-close-dispose-failure';$source=New-CcodSourceFile $fixture 'close-failure-source.bin' 'close-failure-source';$generation=Open-CcodFixtureGeneration $fixture $runtimeId;Copy-CcodInstallSealedSource -Generation $generation -SourcePath $source.Path -Leaf 'payload.bin' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null
+        $throwPath=Join-Path $fixture.Outside 'throwing-stream.bin';[CcodThrowingFileStream]::Reset();$throwing=[CcodThrowingFileStream]::new($throwPath)
+        $currentModule=Get-Module InstallFileTransaction
+        & $currentModule {param($Generation,$Throwing)$scope=Get-CcodInstallTransaction $Generation;$streams=$scope.State.Runtime.GetType().GetField('externalStreams',[Reflection.BindingFlags]'NonPublic,Instance').GetValue($scope.State.Runtime);$streams.Insert(0,$Throwing)} $generation $throwing
+        Assert-CcodThrows {Close-CcodInstallFileTransaction -Transaction $generation -Disposition Failed|Out-Null} 'CCOD_INSTALL_CLOSE_FAILED'
+        Assert-CcodEqual 1 ([CcodThrowingFileStream]::Attempts) 'first close attempts the injected failing resource once'
+        Assert-CcodEqual 'moved' (Invoke-CcodMoveAttempt $source.Path) 'first close continues past the injected failure and releases the source stream'
+        $live=Join-Path $fixture.Install "runtime\$runtimeId";$moved=$live+'.moved';[IO.Directory]::Move($live,$moved);Assert-CcodTrue ([IO.Directory]::Exists($moved)) 'first close continues past the injected failure and releases every generation pin'
+        Assert-CcodThrows {Close-CcodInstallFileTransaction -Transaction $generation -Disposition Failed|Out-Null} 'CCOD_INSTALL_CLOSE_FAILED'
+        Assert-CcodEqual 2 ([CcodThrowingFileStream]::Attempts) 'second close retries the retained failing resource instead of short-circuiting'
+        Assert-CcodOutsideUnchanged $fixture 'exception-safe close'
     } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
