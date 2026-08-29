@@ -18,6 +18,8 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
 
@@ -25,7 +27,7 @@ public sealed class CcodInstallCapabilityMarker { private CcodInstallCapabilityM
 
 internal sealed class CcodInstallRuntime : IDisposable
 {
-    private const uint READ = 0x80000000, WRITE = 0x40000000, DELETE = 0x00010000, SYNC = 0x00100000;
+    private const uint READ = 0x80000000, WRITE = 0x40000000, DELETE = 0x00010000, READ_CONTROL = 0x00020000, WRITE_DAC = 0x00040000, SYNC = 0x00100000;
     private const uint READ_ATTRIBUTES = 0x80, LIST_DIRECTORY = 0x1, ADD_FILE = 0x2, ADD_SUBDIRECTORY = 0x4;
     private const uint SHARE_READ = 1, SHARE_WRITE = 2, SHARE_DELETE = 4;
     private const uint OPEN = 1, CREATE = 2, OPEN_IF = 3;
@@ -34,6 +36,7 @@ internal sealed class CcodInstallRuntime : IDisposable
     private const uint OPEN_EXISTING = 3, OBJ_CASE_INSENSITIVE = 0x40, ATTR_DIRECTORY = 0x10, ATTR_REPARSE = 0x400;
     private const int FileRenameInformation = 10, FileDispositionInformation = 13, FileStreamInfo = 7, FileDirectoryInformation = 1;
     private const int STATUS_NO_MORE_FILES = unchecked((int)0x80000006);
+    private const uint DACL_SECURITY_INFORMATION = 0x00000004, PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000, UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000;
 
     [StructLayout(LayoutKind.Sequential)] private struct UNICODE_STRING { public ushort Length, MaximumLength; public IntPtr Buffer; }
     [StructLayout(LayoutKind.Sequential)] private struct OBJECT_ATTRIBUTES { public int Length; public IntPtr RootDirectory, ObjectName; public uint Attributes; public IntPtr SecurityDescriptor, SecurityQualityOfService; }
@@ -54,16 +57,18 @@ internal sealed class CcodInstallRuntime : IDisposable
     [DllImport("ntdll.dll")] private static extern int NtQueryDirectoryFile(SafeFileHandle h,IntPtr e,IntPtr a,IntPtr c,out IO_STATUS_BLOCK i,IntPtr f,uint l,int cl,bool one,IntPtr n,bool restart);
     [DllImport("ntdll.dll")] private static extern int NtSetInformationFile(SafeFileHandle h,out IO_STATUS_BLOCK i,IntPtr f,uint l,int cl);
     [DllImport("ntdll.dll")] private static extern uint RtlNtStatusToDosError(int s);
+    [DllImport("advapi32.dll", SetLastError=true)] private static extern bool GetKernelObjectSecurity(SafeFileHandle h,uint i,byte[] sd,uint length,out uint needed);
+    [DllImport("advapi32.dll", SetLastError=true)] private static extern bool SetKernelObjectSecurity(SafeFileHandle h,uint i,byte[] sd);
 
     private sealed class Pin : IDisposable
     {
         internal readonly object Token = new object(); internal readonly Pin Parent; internal string Leaf, Path;
-        internal readonly bool Directory, Owned; internal SafeFileHandle Handle; internal FileStream Stream;
+        internal readonly bool Directory, Owned; internal SafeFileHandle Handle; internal FileStream Stream; internal byte[] OriginalSecurity; internal bool RestoreSecurity;
         internal readonly uint Volume; internal readonly ulong Index; internal bool Closed, Sealed; internal long SealedLength; internal string SealedSha;
         internal Pin(Pin parent,string leaf,string path,bool dir,bool owned,SafeFileHandle handle,FileStream stream,FILE_INFO info)
         { Parent=parent;Leaf=leaf;Path=path;Directory=dir;Owned=owned;Handle=handle;Stream=stream;Volume=info.VolumeSerialNumber;Index=((ulong)info.FileIndexHigh<<32)|info.FileIndexLow; }
         internal SafeFileHandle Native { get { return Stream != null ? Stream.SafeFileHandle : Handle; } }
-        public void Dispose() { if(Closed)return; Closed=true; if(Stream!=null)Stream.Dispose(); else if(Handle!=null)Handle.Dispose(); }
+        public void Dispose() { if(Closed)return; Closed=true; if(RestoreSecurity&&Handle!=null)RestoreDirectorySecurity(Handle,OriginalSecurity);if(Stream!=null)Stream.Dispose(); else if(Handle!=null)Handle.Dispose(); }
     }
 
     private readonly string rootPath; private readonly Pin root;
@@ -88,7 +93,7 @@ internal sealed class CcodInstallRuntime : IDisposable
     {
         Pin parent=Require(parentToken,true); ValidateCurrent(parent); string key=Key(parent,leaf); Pin known; if(names.TryGetValue(key,out known)){ValidateCurrent(known);return known.Token;}
         OpenResult r=null;
-        if(create){try{r=OpenRelative(parent.Native,leaf,LIST_DIRECTORY|ADD_FILE|ADD_SUBDIRECTORY|READ_ATTRIBUTES|DELETE|SYNC,SHARE_READ,CREATE,DIRECTORY|BACKUP_INTENT);}catch(Win32Exception x){if(x.NativeErrorCode!=80&&x.NativeErrorCode!=183)throw;r=OpenRelative(parent.Native,leaf,LIST_DIRECTORY|ADD_FILE|ADD_SUBDIRECTORY|READ_ATTRIBUTES|DELETE|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);}}
+        if(create){try{r=OpenRelative(parent.Native,leaf,LIST_DIRECTORY|ADD_FILE|ADD_SUBDIRECTORY|READ_ATTRIBUTES|DELETE|READ_CONTROL|WRITE_DAC|SYNC,SHARE_READ,CREATE,DIRECTORY|BACKUP_INTENT);}catch(Win32Exception x){if(x.NativeErrorCode!=80&&x.NativeErrorCode!=183)throw;r=OpenRelative(parent.Native,leaf,LIST_DIRECTORY|ADD_FILE|ADD_SUBDIRECTORY|READ_ATTRIBUTES|DELETE|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);}}
         else r=OpenRelative(parent.Native,leaf,LIST_DIRECTORY|ADD_FILE|ADD_SUBDIRECTORY|READ_ATTRIBUTES|DELETE|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);
         try { FILE_INFO i=Info(r.Handle); if(!IsDirectory(i)||(i.FileAttributes&ATTR_REPARSE)!=0||!OnlyDefaultStream(r.Handle))throw new InvalidDataException("directory invalid");
             string path=Path.Combine(parent.Path,leaf); if(!SamePath(FinalPath(r.Handle),path))throw new InvalidDataException("path changed");
@@ -116,8 +121,7 @@ internal sealed class CcodInstallRuntime : IDisposable
         if(temp.Stream.Length!=temp.SealedLength||Sha(temp.Stream)!=temp.SealedSha)throw new CryptographicException("seal mismatch");
         SafeFileHandle existing=null;try{try{existing=OpenRelative(parent.Native,destination,READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,BACKUP_INTENT).Handle;}catch(Win32Exception x){if(x.NativeErrorCode!=2&&x.NativeErrorCode!=3)throw;}if(existing!=null)throw new IOException("destination exists");}
         finally{if(existing!=null)existing.Dispose();}
-        if(parent.Owned)return PublishSealedCopy(parent,temp,destination);
-        int ec=Rename(temp.Native,parent.Native,destination);if(ec==80||ec==183)throw new IOException("destination exists");if(ec!=0)throw new Win32Exception(ec);names.Remove(Key(parent,temp.Leaf));temp.Leaf=destination;temp.Path=Path.Combine(parent.Path,destination);names.Add(Key(parent,destination),temp);ValidateCurrent(temp);return temp.Token;
+        int ec=Rename(temp.Native,parent.Native,destination);if(ec==80||ec==183)throw new IOException("destination exists");if(ec!=0)throw new Win32Exception(ec);names.Remove(Key(parent,temp.Leaf));temp.Leaf=destination;temp.Path=Path.Combine(parent.Path,destination);names.Add(Key(parent,destination),temp);MakeReadable(temp);ValidateCurrent(temp);return temp.Token;
     }
     [MethodImpl(MethodImplOptions.Synchronized)] internal object WriteJson(object parentToken,string leaf,byte[] bytes)
     { Pin parent=Require(parentToken,true);ValidateCurrent(parent);object t=CreateTemporary(parentToken,".json."+Guid.NewGuid().ToString("N")+".tmp");Pin p=Require(t,false);Write(p,bytes);p.Sealed=true;p.SealedLength=bytes.LongLength;p.SealedSha=Sha(p.Stream);return Promote(parentToken,t,leaf); }
@@ -127,12 +131,15 @@ internal sealed class CcodInstallRuntime : IDisposable
         if(!names.TryGetValue(key,out p)){OpenResult r=OpenRelative(parent.Native,leaf,READ|WRITE|DELETE|SYNC,SHARE_READ,OPEN_IF,NON_DIRECTORY|WRITE_THROUGH);FileStream s=null;try{s=new FileStream(r.Handle,FileAccess.ReadWrite,65536,false);r.Handle=null;FILE_INFO i=Info(s.SafeFileHandle);ValidatePlain(i,s.SafeFileHandle);p=new Pin(parent,leaf,Path.Combine(parent.Path,leaf),false,r.Created,null,s,i);s=null;AddPin(key,p);}finally{if(s!=null)s.Dispose();if(r.Handle!=null)r.Handle.Dispose();}}
         ValidateCurrent(p);p.Stream.Position=p.Stream.Length;p.Stream.Write(bytes,0,bytes.Length);p.Stream.Flush(true);return p.Token;
     }
-    [MethodImpl(MethodImplOptions.Synchronized)] internal void RemoveOwnedTree(object parentToken,string leaf)
+    [MethodImpl(MethodImplOptions.Synchronized)] internal object RemoveOwnedTree(object parentToken,string leaf)
+    {return RemoveOwnedTreeCore(parentToken,leaf,".__ccod_retired_"+Guid.NewGuid().ToString("N"));}
+    [MethodImpl(MethodImplOptions.Synchronized)] private object RemoveOwnedTreeCore(object parentToken,string leaf,string retiredLeaf)
     {
         Pin parent=Require(parentToken,true);ValidateCurrent(parent);Pin target;string key=Key(parent,leaf);if(!names.TryGetValue(key,out target)||!target.Owned||!target.Directory)throw new InvalidDataException("unknown target");
-        List<Pin> plan=new List<Pin>();BuildPlan(target,plan);RevalidatePlan(target,plan);List<Pin> marked=new List<Pin>();
-        try{foreach(Pin p in plan){ValidateCurrent(p);int ec=SetDeleteOnClose(p.Native,true,p.Directory);if(ec!=0)throw new Win32Exception(ec);marked.Add(p);}ValidateCurrent(target);int tec=SetDeleteOnClose(target.Native,true,true);if(tec!=0)throw new Win32Exception(tec);marked.Add(target);RevalidatePlan(target,plan);foreach(Pin p in plan)RemovePin(p);RemovePin(target);}
-        catch{for(int i=marked.Count-1;i>=0;i--)if(!marked[i].Closed)SetDeleteOnClose(marked[i].Native,false,marked[i].Directory);throw;}
+        List<Pin> plan=new List<Pin>();BuildPlan(target,plan);RevalidatePlan(target,plan);
+        if(plan.Count==0){int ec=SetDeleteOnClose(target.Native,true,true);if(ec!=0)throw new Win32Exception(ec);ValidateCurrent(target);RemovePin(target);return null;}
+        SafeFileHandle collision=null;try{try{collision=OpenRelative(parent.Native,retiredLeaf,READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,BACKUP_INTENT).Handle;}catch(Win32Exception x){if(x.NativeErrorCode!=2&&x.NativeErrorCode!=3)throw;}if(collision!=null)throw new IOException("retirement destination exists");}finally{if(collision!=null)collision.Dispose();}
+        List<Pin> restricted=RestrictRetirementTree(target,plan);try{RevalidatePlan(target,plan);}catch{RestoreLiveDirectorySecurity(restricted);throw;}ReleaseDescendants(plan);ValidateCurrent(target);int rec=Rename(target.Native,parent.Native,retiredLeaf);if(rec!=0){RestoreDirectorySecurity(target.Native,target.OriginalSecurity);target.RestoreSecurity=false;RestoreReleasedChildSecurity(target);ReopenKnownTree(target);if(rec==80||rec==183)throw new IOException("retirement destination exists");throw new Win32Exception(rec);}MoveDirectoryPin(target,retiredLeaf,Path.Combine(parent.Path,retiredLeaf));RestoreReleasedChildSecurity(target);ValidateCurrent(target);return target.Token;
     }
     [MethodImpl(MethodImplOptions.Synchronized)] internal void Close(){if(disposed)return;disposed=true;List<Pin> all=new List<Pin>(pins.Values);for(int i=all.Count-1;i>=0;i--)all[i].Dispose();pins.Clear();names.Clear();}
     public void Dispose(){Close();}
@@ -141,9 +148,18 @@ internal sealed class CcodInstallRuntime : IDisposable
     private static void ProbeUnknown(Pin dir,string name){OpenResult r=OpenRelative(dir.Native,name,READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,BACKUP_INTENT);try{FILE_INFO i=Info(r.Handle);if((i.FileAttributes&ATTR_REPARSE)!=0)throw new InvalidDataException("reparse leaf");if(!OnlyDefaultStream(r.Handle))throw new InvalidDataException("alternate stream");if(!IsDirectory(i)&&i.NumberOfLinks!=1)throw new InvalidDataException("multi-link");}finally{r.Handle.Dispose();}}
     private void RevalidatePlan(Pin target,List<Pin> plan){List<Pin> second=new List<Pin>();BuildPlan(target,second);if(second.Count!=plan.Count)throw new InvalidDataException("namespace changed");for(int i=0;i<plan.Count;i++)if(!Object.ReferenceEquals(plan[i],second[i]))throw new InvalidDataException("namespace changed");foreach(Pin p in plan){ValidateCurrent(p);if(p.Directory&&(Info(p.Native).FileAttributes&1)!=0)throw new Win32Exception(5);}ValidateCurrent(target);if((Info(target.Native).FileAttributes&1)!=0)throw new Win32Exception(5);}
     private void RemovePin(Pin p){string k=Key(p.Parent,p.Leaf);p.Dispose();pins.Remove(p.Token);names.Remove(k);}
-    private object PublishSealedCopy(Pin parent,Pin temp,string destination){OpenResult r=null;FileStream stream=null;try{try{r=OpenRelative(parent.Native,destination,READ|WRITE|DELETE|SYNC,0,CREATE,NON_DIRECTORY|WRITE_THROUGH);}catch(Win32Exception x){if(x.NativeErrorCode==80||x.NativeErrorCode==183)throw new IOException("destination exists");throw;}stream=new FileStream(r.Handle,FileAccess.ReadWrite,65536,false);r.Handle=null;temp.Stream.Position=0;temp.Stream.CopyTo(stream);stream.Flush(true);if(stream.Length!=temp.SealedLength||Sha(stream)!=temp.SealedSha)throw new CryptographicException("seal mismatch");FILE_INFO i=Info(stream.SafeFileHandle);ValidatePlain(i,stream.SafeFileHandle);Pin published=new Pin(parent,destination,Path.Combine(parent.Path,destination),false,true,null,stream,i);published.Sealed=true;published.SealedLength=temp.SealedLength;published.SealedSha=temp.SealedSha;stream=null;int dec=SetDelete(temp.Native,true);if(dec!=0){SetDelete(published.Native,true);published.Dispose();throw new Win32Exception(dec);}AddPin(Key(parent,destination),published);RemovePin(temp);return published.Token;}catch{if(stream!=null){SetDelete(stream.SafeFileHandle,true);stream.Dispose();}if(r!=null&&r.Handle!=null){SetDelete(r.Handle,true);r.Handle.Dispose();}throw;}}
+    private void MoveDirectoryPin(Pin dir,string newLeaf,string newPath){string oldKey=Key(dir.Parent,dir.Leaf),oldPath=dir.Path;names.Remove(oldKey);dir.Leaf=newLeaf;dir.Path=newPath;names.Add(Key(dir.Parent,newLeaf),dir);string prefix=oldPath.TrimEnd('\\')+"\\";foreach(Pin p in pins.Values)if(!Object.ReferenceEquals(p,dir)&&p.Path.StartsWith(prefix,StringComparison.OrdinalIgnoreCase))p.Path=newPath+"\\"+p.Path.Substring(prefix.Length);}
+    private static void ReleaseDescendants(List<Pin> plan){foreach(Pin p in plan){if(p.Stream!=null){p.Stream.Dispose();p.Stream=null;}else if(p.Handle!=null){p.Handle.Dispose();p.Handle=null;}}}
+    private void ReopenKnownTree(Pin dir){List<Pin> children=new List<Pin>();foreach(Pin p in pins.Values)if(Object.ReferenceEquals(p.Parent,dir)&&!p.Closed)children.Add(p);foreach(Pin p in children){if(p.Directory){uint share=p.Owned?SHARE_READ:(SHARE_READ|SHARE_WRITE);OpenResult r=OpenRelative(dir.Native,p.Leaf,LIST_DIRECTORY|ADD_FILE|ADD_SUBDIRECTORY|READ_ATTRIBUTES|DELETE|SYNC,share,OPEN,DIRECTORY|BACKUP_INTENT);p.Handle=r.Handle;ValidateCurrent(p);ReopenKnownTree(p);}else{OpenResult r=OpenRelative(dir.Native,p.Leaf,READ|WRITE|DELETE|SYNC,SHARE_READ,OPEN,NON_DIRECTORY|WRITE_THROUGH);p.Stream=new FileStream(r.Handle,FileAccess.ReadWrite,65536,false);r.Handle=null;ValidateCurrent(p);}}}
+    private static void MakeReadable(Pin p){OpenResult bridge=OpenRelative(p.Parent.Native,p.Leaf,READ|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE|SHARE_DELETE,OPEN,NON_DIRECTORY);FILE_INFO bi=Info(bridge.Handle);if(bi.VolumeSerialNumber!=p.Volume||(((ulong)bi.FileIndexHigh<<32)|bi.FileIndexLow)!=p.Index){bridge.Handle.Dispose();throw new InvalidDataException("pin changed");}p.Stream.Dispose();p.Stream=null;OpenResult strict=OpenRelative(p.Parent.Native,p.Leaf,READ|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,NON_DIRECTORY);bridge.Handle.Dispose();p.Stream=new FileStream(strict.Handle,FileAccess.Read,65536,false);strict.Handle=null;}
     private Pin Require(object token,bool directory){if(disposed)throw new ObjectDisposedException("transaction");Pin p;if(token==null||!pins.TryGetValue(token,out p)||p.Closed||p.Directory!=directory)throw new InvalidDataException("invalid capability");return p;}
     private void AddPin(string key,Pin p){pins.Add(p.Token,p);names.Add(key,p);}
+    private static byte[] ReadDirectorySecurity(SafeFileHandle h){uint needed;GetKernelObjectSecurity(h,DACL_SECURITY_INFORMATION,null,0,out needed);int e=Marshal.GetLastWin32Error();if(needed==0)throw new Win32Exception(e);byte[] sd=new byte[needed];if(!GetKernelObjectSecurity(h,DACL_SECURITY_INFORMATION,sd,(uint)sd.Length,out needed))throw new Win32Exception(Marshal.GetLastWin32Error());return sd;}
+    private static byte[] RestrictRetirementDirectory(SafeFileHandle h){byte[] original=ReadDirectorySecurity(h);RawSecurityDescriptor raw=new RawSecurityDescriptor(original,0);RawAcl acl=raw.DiscretionaryAcl??new RawAcl(GenericAcl.AclRevision,1);int denyMask=0x00000002|0x00000004|0x00000010|0x00000040|0x00000100|0x00010000;acl.InsertAce(0,new CommonAce(AceFlags.None,AceQualifier.AccessDenied,denyMask,new SecurityIdentifier(WellKnownSidType.WorldSid,null),false,null));raw.DiscretionaryAcl=acl;raw.SetFlags(raw.ControlFlags|ControlFlags.DiscretionaryAclPresent|ControlFlags.DiscretionaryAclProtected);byte[] restricted=new byte[raw.BinaryLength];raw.GetBinaryForm(restricted,0);if(!SetKernelObjectSecurity(h,DACL_SECURITY_INFORMATION|PROTECTED_DACL_SECURITY_INFORMATION,restricted))throw new Win32Exception(Marshal.GetLastWin32Error());return original;}
+    private static void RestoreDirectorySecurity(SafeFileHandle h,byte[] original){if(original==null)return;RawSecurityDescriptor raw=new RawSecurityDescriptor(original,0);uint flags=DACL_SECURITY_INFORMATION|(((raw.ControlFlags&ControlFlags.DiscretionaryAclProtected)!=0)?PROTECTED_DACL_SECURITY_INFORMATION:UNPROTECTED_DACL_SECURITY_INFORMATION);if(!SetKernelObjectSecurity(h,flags,original))throw new Win32Exception(Marshal.GetLastWin32Error());}
+    private static List<Pin> RestrictRetirementTree(Pin target,List<Pin> plan){List<Pin> restricted=new List<Pin>();try{target.OriginalSecurity=RestrictRetirementDirectory(target.Native);target.RestoreSecurity=true;restricted.Add(target);foreach(Pin p in plan)if(p.Directory){p.OriginalSecurity=RestrictRetirementDirectory(p.Native);p.RestoreSecurity=true;restricted.Add(p);}return restricted;}catch{RestoreLiveDirectorySecurity(restricted);throw;}}
+    private static void RestoreLiveDirectorySecurity(List<Pin> restricted){for(int i=restricted.Count-1;i>=0;i--){Pin p=restricted[i];RestoreDirectorySecurity(p.Native,p.OriginalSecurity);p.RestoreSecurity=false;p.OriginalSecurity=null;}}
+    private void RestoreReleasedChildSecurity(Pin dir){List<Pin> children=new List<Pin>();foreach(Pin p in pins.Values)if(Object.ReferenceEquals(p.Parent,dir)&&p.Directory&&!p.Closed)children.Add(p);foreach(Pin child in children){OpenResult r=OpenRelative(dir.Native,child.Leaf,READ_ATTRIBUTES|READ_CONTROL|WRITE_DAC|SYNC,SHARE_READ|SHARE_WRITE|SHARE_DELETE,OPEN,DIRECTORY|BACKUP_INTENT);RestoreDirectorySecurity(r.Handle,child.OriginalSecurity);child.RestoreSecurity=false;child.OriginalSecurity=null;child.Handle=r.Handle;RestoreReleasedChildSecurity(child);child.Handle.Dispose();child.Handle=null;}}
     private static string Key(Pin p,string leaf){return p.Index.ToString("x16")+"|"+leaf.ToLowerInvariant();}
     private static void Write(Pin p,byte[] b){p.Stream.Position=0;p.Stream.SetLength(0);p.Stream.Write(b,0,b.Length);p.Stream.Flush(true);}
     private static void ValidateCurrent(Pin p){FILE_INFO i=Info(p.Native);if(i.VolumeSerialNumber!=p.Volume||(((ulong)i.FileIndexHigh<<32)|i.FileIndexLow)!=p.Index||IsDirectory(i)!=p.Directory||(i.FileAttributes&ATTR_REPARSE)!=0||!SamePath(FinalPath(p.Native),p.Path))throw new InvalidDataException("pin changed");if(!OnlyDefaultStream(p.Native))throw new InvalidDataException("alternate stream");if(!p.Directory&&i.NumberOfLinks!=1)throw new InvalidDataException("multi-link");}
@@ -184,6 +200,7 @@ function Convert-CcodRuntimeError($Action,[string]$DefaultId) {
         while ($null -ne $exception.InnerException -and $exception -is [Management.Automation.RuntimeException]) { $exception = $exception.InnerException }
         $message = [string]$exception.Message
         if ($message -ceq 'destination exists') { Throw-CcodInstallFileError 'CCOD_INSTALL_PROMOTION_DESTINATION_EXISTS' $message $null }
+        if ($message -ceq 'retirement destination exists') { Throw-CcodInstallFileError 'CCOD_INSTALL_RETIREMENT_DESTINATION_EXISTS' $message $null }
         if ($exception -is [ObjectDisposedException]) { Throw-CcodInstallFileError 'CCOD_INSTALL_TRANSACTION_CLOSED' $message $null }
         if ($exception -is [Security.Cryptography.CryptographicException] -or $message -match 'seal mismatch') { Throw-CcodInstallFileError 'CCOD_INSTALL_SEAL_MISMATCH' $message $null }
         if ($message -match 'alternate stream') { Throw-CcodInstallFileError 'CCOD_INSTALL_ADS_LEAF' $message $null }
@@ -221,7 +238,7 @@ function Test-CcodSanitized($Value,[int]$Depth=0) {
     return $false
 }
 function Append-CcodInstallPinnedLog { param([Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)]$ParentDirectory,[Parameter(Mandatory)][string]$Leaf,[Parameter(Mandatory)]$Record) Assert-CcodLeaf $Leaf;if(-not(Test-CcodSanitized $Record)){Throw-CcodInstallFileError 'CCOD_INSTALL_LOG_RECORD_INVALID' 'Invalid log record' $null};$p=Get-CcodPinToken $Transaction $ParentDirectory Directory;$bytes=[Text.UTF8Encoding]::new($false).GetBytes(($Record|ConvertTo-Json -Depth 8 -Compress)+"`n");if($bytes.Length-gt65536){Throw-CcodInstallFileError 'CCOD_INSTALL_LOG_RECORD_INVALID' 'Log record too large' $null};$token=Convert-CcodRuntimeError {Invoke-CcodRuntimeMethod $p.State.Runtime Append @($p.Token,$Leaf,$bytes)} 'CCOD_INSTALL_LOG_WRITE_FAILED';return Add-CcodPinCapability $Transaction $token File }
-function Remove-CcodInstallOwnedTree { param([Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)]$ParentDirectory,[Parameter(Mandatory)][string]$Leaf) Assert-CcodLeaf $Leaf;$p=Get-CcodPinToken $Transaction $ParentDirectory Directory;Convert-CcodRuntimeError {Invoke-CcodRuntimeMethod $p.State.Runtime RemoveOwnedTree @($p.Token,$Leaf)|Out-Null} 'CCOD_INSTALL_DELETE_FAILED' }
+function Remove-CcodInstallOwnedTree { param([Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)]$ParentDirectory,[Parameter(Mandatory)][string]$Leaf) Assert-CcodLeaf $Leaf;$p=Get-CcodPinToken $Transaction $ParentDirectory Directory;$token=Convert-CcodRuntimeError {Invoke-CcodRuntimeMethod $p.State.Runtime RemoveOwnedTree @($p.Token,$Leaf)} 'CCOD_INSTALL_RETIREMENT_FAILED';if($null -eq $token){return [pscustomobject]@{Disposition='Deleted';Object=$null}};$capability=Add-CcodPinCapability $Transaction $token Directory;return [pscustomobject]@{Disposition='Retired';Object=$capability} }
 function Close-CcodInstallFileTransaction { param([Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)][ValidateSet('Ready','Failed')][string]$Disposition) $state=$null;if($null-eq$Transaction-or-not$script:CcodTransactions.TryGetValue($Transaction,[ref]$state)){Throw-CcodInstallFileError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Invalid install transaction capability' $null};if(-not$state.Closed){Invoke-CcodRuntimeMethod $state.Runtime Close @()|Out-Null;$state.Closed=$true;$state.Disposition=$Disposition} }
 
 Export-ModuleMember -Function Open-CcodInstallFileTransaction,Open-CcodInstallPinnedDirectory,New-CcodInstallPinnedTemporaryLeaf,Copy-CcodInstallSealedFile,Commit-CcodInstallPinnedPromotion,Write-CcodInstallPinnedJson,Append-CcodInstallPinnedLog,Remove-CcodInstallOwnedTree,Close-CcodInstallFileTransaction
