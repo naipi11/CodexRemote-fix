@@ -34,6 +34,10 @@ public sealed class CcodInstallHandoffAttack : IDisposable
 
 public static class CcodInstallFileRaceProbe
 {
+    public static Task<byte[]> ObserveFirstVisibleBytes(string path)
+    {
+        return Task.Run(() => {DateTime deadline=DateTime.UtcNow.AddSeconds(15);while(DateTime.UtcNow<deadline){try{using(FileStream stream=new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete)){byte[] bytes=new byte[stream.Length];int offset=0;while(offset<bytes.Length){int read=stream.Read(bytes,offset,bytes.Length-offset);if(read==0)break;offset+=read;}return bytes;}}catch(FileNotFoundException){}catch(DirectoryNotFoundException){}catch(IOException){}Thread.Yield();}throw new TimeoutException("final leaf never became visible");});
+    }
     public static string RaceCreateAndClose(object runtime,object token,string leaf)
     {
         Type type=runtime.GetType();MethodInfo create=type.GetMethod("CreateDirectory",BindingFlags.Instance|BindingFlags.NonPublic);MethodInfo close=type.GetMethod("Close",BindingFlags.Instance|BindingFlags.NonPublic);Barrier barrier=new Barrier(2);string createResult=null,closeResult=null;
@@ -159,6 +163,34 @@ Invoke-CcodTest 'destination collisions preserve the first object byte-for-byte'
     } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
+Invoke-CcodTest 'requested final leaf is absent until private temporary bytes are sealed' {
+    $fixture=New-CcodInstallFileFixture
+    try {
+        $runtimeId='runtime-private-until-sealed';$source=New-CcodSourceFile $fixture 'large-source.bin' ('private-source-block-'*1048576);$generation=Open-CcodFixtureGeneration $fixture $runtimeId;$final=Join-Path $fixture.Install "runtime\$runtimeId\payload.bin"
+        $observer=[CcodInstallFileRaceProbe]::ObserveFirstVisibleBytes($final)
+        Copy-CcodInstallSealedSource -Generation $generation -SourcePath $source.Path -Leaf 'payload.bin' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null
+        $firstVisible=$observer.GetAwaiter().GetResult()
+        Assert-CcodEqual $source.Length ([int64]$firstVisible.LongLength) 'first observable final leaf already has the sealed length'
+        $observedPath=Join-Path $fixture.Base 'observed.bin';[IO.File]::WriteAllBytes($observedPath,$firstVisible)
+        Assert-CcodEqual $source.Sha256 (Get-CcodTestFileSha256 $observedPath) 'first observable final leaf already has the sealed digest'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Split-Path $final -Parent) -File -Filter '.ccod.*.tmp').Count 'successful publication leaves no private temporary name'
+    } finally {Remove-CcodInstallFileFixture $fixture}
+}
+
+Invoke-CcodTest 'early source verification failure publishes no final leaf and close releases every stream' {
+    $fixture=New-CcodInstallFileFixture
+    try {
+        $runtimeId='runtime-early-copy-failure';$source=New-CcodSourceFile $fixture 'bad-source.bin' 'source-owned-before-hash';$generation=Open-CcodFixtureGeneration $fixture $runtimeId;$wrong=('0'*64)
+        if($wrong-ceq$source.Sha256){$wrong='1'*64}
+        Assert-CcodThrows {Copy-CcodInstallSealedSource -Generation $generation -SourcePath $source.Path -Leaf 'payload.bin' -ExpectedLength $source.Length -ExpectedSha256 $wrong|Out-Null} 'CCOD_INSTALL_SOURCE_MISMATCH'
+        $generationPath=Join-Path $fixture.Install "runtime\$runtimeId";Assert-CcodTrue (-not[IO.File]::Exists((Join-Path $generationPath 'payload.bin'))) 'source verification failure publishes no requested final leaf'
+        Assert-CcodEqual 'blocked' (Invoke-CcodMoveAttempt $source.Path) 'early source stream is transaction-owned until close'
+        Close-CcodInstallFileTransaction -Transaction $generation -Disposition Failed|Out-Null
+        Assert-CcodEqual 'moved' (Invoke-CcodMoveAttempt $source.Path) 'Failed close releases the early source stream'
+        $temporaries=@(Get-ChildItem -LiteralPath $generationPath -File -Filter '.ccod.*.tmp');foreach($temporary in $temporaries){Assert-CcodEqual 'moved' (Invoke-CcodMoveAttempt $temporary.FullName) 'Failed close releases every private temporary handle'}
+    } finally {Remove-CcodInstallFileFixture $fixture}
+}
+
 Invoke-CcodTest 'source and destination handles remain private pinned and same-handle verified' {
     $fixture=New-CcodInstallFileFixture
     try {
@@ -168,12 +200,7 @@ Invoke-CcodTest 'source and destination handles remain private pinned and same-h
         try{$copy=Copy-CcodInstallSealedSource -Generation $generation -SourcePath $source.Path -Leaf 'payload.bin' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256}catch{$copyFailure=$_}
         $attackOutcome=$attack.Stop();$attack.Dispose()
         Assert-CcodTrue ($attackOutcome-in@('blocked','exchanged')) 'handoff attacker completes with a bounded result'
-        if($null-ne$copyFailure){
-            Assert-CcodTrue ($null-ne$copyFailure-and$copyFailure.FullyQualifiedErrorId-match'^CCOD_INSTALL_(?:PIN_CHANGED|SEAL_MISMATCH)') 'an exchange during handoff cannot become an accepted sealed generation'
-            Write-CcodInstallGenerationManifest -Generation $generation -Manifest (New-CcodGenerationManifest $runtimeId)|Out-Null
-            Assert-CcodThrows {Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -ExpectedPreviousGeneration ([uint64]0) -NewRuntimeId $runtimeId -FileTransaction $generation|Out-Null} 'CCOD_INSTALL_UNKNOWN_LEAF'
-            return
-        }
+        Assert-CcodTrue ($null-eq$copyFailure) "final-name attacker cannot cause a post-commit failure error=$($copyFailure.FullyQualifiedErrorId)"
         Assert-CcodEqual $source.Length $copy.Length 'copy returns verified length';Assert-CcodEqual $source.Sha256 $copy.Sha256 'copy returns verified digest'
         Assert-CcodEqual 'blocked' (Invoke-CcodMoveAttempt $source.Path) 'source replacement is blocked after its handle opens'
         $currentModule = Get-Module InstallFileTransaction
@@ -189,15 +216,21 @@ Invoke-CcodTest 'source and destination handles remain private pinned and same-h
             }
             $pinType = $pin.GetType()
             $stream = $pinType.GetField('Stream',$flags).GetValue($pin)
-            return [pscustomobject]@{CanWrite=$stream.CanWrite;Length=[int64]($pinType.GetField('SealedLength',$flags).GetValue($pin));Sha256=[string]($pinType.GetField('SealedSha',$flags).GetValue($pin))}
+            return [pscustomobject]@{StreamOpen=($null-ne$stream);Length=[int64]($pinType.GetField('SealedLength',$flags).GetValue($pin));Sha256=[string]($pinType.GetField('SealedSha',$flags).GetValue($pin));Published=[bool]($pinType.GetField('Published',$flags).GetValue($pin))}
         } $generation
-        Assert-CcodTrue (-not $sealedPin.CanWrite) 'handoff ends on a strict read-only private handle'
+        Assert-CcodTrue $sealedPin.Published 'handoff marks the pin published only after final rename'
+        Assert-CcodTrue (-not $sealedPin.StreamOpen) 'post-commit path performs no potentially failing stream handoff'
         Assert-CcodEqual $source.Length $sealedPin.Length 'strict handoff pin retains the same-handle verified length'
         Assert-CcodEqual $source.Sha256 $sealedPin.Sha256 'strict handoff pin retains the same-handle verified digest'
-        Assert-CcodEqual $source.Sha256 (Get-CcodTestFileSha256 $destination) 'successful sealed leaf is readable by path before transaction close'
-        try {[IO.File]::WriteAllText($destination,'attacker');throw 'ASSERT_DESTINATION_MUTABLE'} catch [IO.IOException] {}
-        Assert-CcodEqual 'blocked' (Invoke-CcodMoveAttempt $destination) 'destination name exchange remains blocked after sealing'
-        Assert-CcodEqual $source.Sha256 (Get-CcodTestFileSha256 $destination) 'destination handle blocks mutation after verification'
+        $visibleSha=Get-CcodTestFileSha256 $destination
+        if($visibleSha-cne$source.Sha256){
+            Write-CcodInstallGenerationManifest -Generation $generation -Manifest (New-CcodGenerationManifest $runtimeId)|Out-Null
+            try{Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -ExpectedPreviousGeneration ([uint64]0) -NewRuntimeId $runtimeId -FileTransaction $generation|Out-Null;throw 'ASSERT_ATTACKED_GENERATION_COMMITTED'}catch{Assert-CcodTrue ($_.FullyQualifiedErrorId-match'^CCOD_INSTALL_(?:PIN_CHANGED|SEAL_MISMATCH|UNKNOWN_LEAF)') 'post-commit same-user mutation cannot become an eligible generation'}
+            return
+        }
+        Assert-CcodEqual $source.Sha256 $visibleSha 'successful sealed leaf is readable by path before transaction close'
+        try {[IO.File]::WriteAllText($destination,'attacker');throw 'ASSERT_DESTINATION_MUTABLE'} catch [IO.IOException] {} catch [UnauthorizedAccessException] {}
+        Assert-CcodEqual $source.Sha256 (Get-CcodTestFileSha256 $destination) 'published destination protection preserves verified bytes'
         Assert-CcodOutsideUnchanged $fixture 'pinned copy'
     } finally {Remove-CcodInstallFileFixture $fixture}
 }
@@ -209,7 +242,7 @@ Invoke-CcodTest 'manifest is create-only pinned and immutable after its same-han
         Assert-CcodTrue ($result.Length-gt 0) 'manifest returns verified length';Assert-CcodTrue ($result.Sha256-cmatch'^[0-9a-f]{64}$') 'manifest returns lowercase digest'
         $path=Join-Path $fixture.Install "runtime\$runtimeId\manifest.json";$before=Get-CcodTestFileSha256 $path
         Assert-CcodThrows {Write-CcodInstallGenerationManifest -Generation $generation -Manifest (New-CcodGenerationManifest $runtimeId)|Out-Null} 'CCOD_INSTALL_LEAF_EXISTS'
-        try {[IO.File]::WriteAllText($path,'{"attacker":true}');throw 'ASSERT_MANIFEST_MUTABLE'} catch [IO.IOException] {}
+        try {[IO.File]::WriteAllText($path,'{"attacker":true}');throw 'ASSERT_MANIFEST_MUTABLE'} catch [IO.IOException] {} catch [UnauthorizedAccessException] {}
         Assert-CcodEqual $before (Get-CcodTestFileSha256 $path) 'manifest mutation changes no bytes';Assert-CcodOutsideUnchanged $fixture 'manifest immutability'
     } finally {Remove-CcodInstallFileFixture $fixture}
 }
@@ -359,9 +392,9 @@ Invoke-CcodTest 'retirement collision and record I/O failure leave generation el
             if($case-ceq'collision'){
                 Assert-CcodEqual $recordSha (Get-CcodTestFileSha256 $record) 'retirement collision preserves the existing record'
                 $temporary=@(Get-ChildItem -LiteralPath $records -File -Filter '.ccod.*.tmp');Assert-CcodEqual 1 $temporary.Count 'failed no-replace retirement deliberately retains one diagnostic temporary record'
-                Assert-CcodEqual 'blocked' (Invoke-CcodMoveAttempt $temporary[0].FullName) 'diagnostic temporary handle remains pinned until transaction close'
+                Assert-CcodEqual 'moved' (Invoke-CcodMoveAttempt $temporary[0].FullName) 'failed no-replace rename leaves no temporary stream locked'
                 Close-CcodInstallFileTransaction -Transaction $generation -Disposition Failed|Out-Null
-                Assert-CcodEqual 'moved' (Invoke-CcodMoveAttempt $temporary[0].FullName) 'Failed disposition releases the retained temporary record handle'
+                [IO.File]::SetAttributes($temporary[0].FullName+'.moved',[IO.FileAttributes]::Normal);[IO.File]::Delete($temporary[0].FullName+'.moved');Assert-CcodTrue (-not[IO.File]::Exists($temporary[0].FullName+'.moved')) 'Failed disposition leaves the released diagnostic temporary removable'
             }
         } finally {Remove-CcodInstallFileFixture $fixture}
     }
