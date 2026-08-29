@@ -506,6 +506,17 @@ Invoke-CcodExtensionRedTest 'semantic-runtime-id' 'rejects an escaped or nested 
     } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
+Invoke-CcodExtensionRedTest 'duplicate-runtime-id' 'rejects duplicate matching top-level runtimeId members in a retained manifest' {
+    $fixture=New-CcodInstallFileFixture
+    try {
+        $runtimeId='runtime-duplicate-semantic-target';$runtimePath=Join-Path $fixture.Install "runtime\$runtimeId";[IO.Directory]::CreateDirectory($runtimePath)|Out-Null
+        $manifestPath=Join-Path $runtimePath 'manifest.json';$manifestText='{"schemaVersion":1,"runtimeId":"'+$runtimeId+'","metadata":{"runtimeId":"nested-only"},"description":"escaped \"runtimeId\" marker","runtimeId":"'+$runtimeId+'","files":[]}'
+        [IO.File]::WriteAllText($manifestPath,$manifestText);$manifestSha=Get-CcodTestFileSha256 $manifestPath
+        $transaction=Open-CcodFixtureGeneration $fixture 'runtime-duplicate-semantic-validator';Write-CcodInstallGenerationManifest -Generation $transaction -Manifest (New-CcodGenerationManifest 'runtime-duplicate-semantic-validator')|Out-Null
+        Assert-CcodThrows {Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId -ExpectedManifestSha256 $manifestSha -FileTransaction $transaction|Out-Null} 'CCOD_INSTALL_RETAINED_RUNTIME_ID_MISMATCH'
+    } finally {Remove-CcodInstallFileFixture $fixture}
+}
+
 Invoke-CcodExtensionRedTest 'child-transaction' 'rejects a child directory capability as retained-open FileTransaction' {
     $fixture=New-CcodInstallFileFixture
     try {

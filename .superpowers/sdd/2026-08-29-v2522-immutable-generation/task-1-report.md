@@ -480,3 +480,58 @@ retained-alias `CCOD_INSTALL_GENERATION_READ_ONLY` assertion.
 
 - The paused uncommitted Task 2 changes in `InstallLifecycle.psm1` and
   `InstallLifecycle.SelfTest.ps1` were neither edited nor staged by this fix.
+
+## Duplicate retained-manifest identity fix
+
+### RED evidence
+
+- Targeted command:
+  `$env:CCOD_INSTALL_EXTENSION_RED_CASE='duplicate-runtime-id'; powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\InstallFileTransaction.SelfTest.ps1`
+- Targeted exit code: `1`.
+- Exact failure: case
+  `rejects-duplicate-matching-top-level-runtimeId-members-in-a-retained-manifest`
+  reached `ASSERT_THROWS`, expected
+  `CCOD_INSTALL_RETAINED_RUNTIME_ID_MISMATCH`. This proved Windows PowerShell
+  collapsed two equal top-level `runtimeId` members before the old property
+  count check.
+- Unfiltered focused command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\InstallFileTransaction.SelfTest.ps1`
+- Unfiltered RED exit code: `1` with the same exact case and assertion.
+
+### GREEN and verification evidence
+
+- The same targeted duplicate command exited `0`.
+- Full focused command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\InstallFileTransaction.SelfTest.ps1`
+- Full focused exit code: `0`; `25/25` named cases passed, including all
+  earlier retained alias, nested tree, semantic identity, transaction-root,
+  and ABI V3 regressions.
+- Parser command: explicit PowerShell parser pass over
+  `InstallFileTransaction.psm1` and
+  `InstallFileTransaction.SelfTest.ps1`.
+- Parser exit code: `0` (`TASK1_PARSER_EXIT=0`).
+- Diff command:
+  `git diff --check -- src/persistence/modules/InstallFileTransaction.psm1 tests/persistence/InstallFileTransaction.SelfTest.ps1 .superpowers/sdd/2026-08-29-v2522-immutable-generation/task-1-report.md`
+- Diff exit code: `0` (`TASK1_DIFF_CHECK_EXIT=0`; only LF-to-CRLF checkout
+  warnings).
+
+### Implementation behavior
+
+- `ConvertFrom-Json` remains the authoritative complete JSON parser and
+  decoded-value source. The identity check still requires a top-level object
+  whose decoded, case-exact `runtimeId` value is a string equal to the
+  requested runtime ID.
+- A bounded lexical pass now enumerates decoded top-level property names before
+  accepting that parsed value. It preserves duplicate member occurrences,
+  honors JSON string escaping in keys, and ignores nested objects, arrays, and
+  escaped key-like text inside values. Two matching top-level `runtimeId`
+  members are therefore rejected.
+- The regression fixture supplies the exact SHA-256 of the duplicate-key
+  manifest and exercises the real retained-open path. Native SHA-256,
+  full-tree, path, reparse, ADS, multilink, and handle checks are unchanged.
+- The paused Task 2 lifecycle files remained unstaged and were not edited by
+  this fix.
+
+### Commit
+
+- `fix: reject duplicate retained manifest identities`
