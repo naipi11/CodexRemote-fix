@@ -7,7 +7,8 @@ param(
     [string]$ActivationId,
     [string]$ExpectedVersion,
     [string]$PayloadManifestPath,
-    [string]$ExpectedPayloadManifestSha256
+    [string]$ExpectedPayloadManifestSha256,
+    [string]$SealedPackageSha256
 )
 
 $ErrorActionPreference = 'Stop'
@@ -180,6 +181,7 @@ try {
         $invoke.ExpectedPayloadManifestSha256 = $ExpectedPayloadManifestSha256
         $invoke.PayloadManifestBytesBase64 = [Convert]::ToBase64String([byte[]]$payloadSeal.ManifestBytes)
     }
+    if(-not[string]::IsNullOrWhiteSpace($SealedPackageSha256)){$invoke.SealedPackageSha256=$SealedPackageSha256}
     $receipt = Invoke-CcodInstall @invoke
 } finally {
     if ($null -ne $installerModule) { Remove-Module -Name $installerModule.Name -Force -ErrorAction SilentlyContinue }

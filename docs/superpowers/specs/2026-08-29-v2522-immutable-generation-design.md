@@ -76,6 +76,23 @@ after the active pointer is committed and the new protection has reached
 verified readiness. An upgrade does not overwrite a stable file while the new
 generation is still incomplete.
 
+### 1a. Immutable initialization evidence and operational state
+
+The install transaction writes create-only, generation-bound initialization
+evidence for settings, status, verified packages, transition state, and UI
+preference below `state\install-initializations\<runtimeId>`. Those records
+prove the exact defaults that were accepted before activation and are never
+rewritten.
+
+The existing `state\*.json` and `state\ui-preferences.json` files are a
+separate operational state plane. They are materialized from the proven
+initialization evidence only when absent, remain subject to the existing
+contained-path/reparse/ADS/single-link checks, and are changed only by the
+running Supervisor after `Ready`. An upgrade never overwrites a partial or
+existing operational state file. This separation is necessary because sealing
+the mutable runtime state files read-only would prevent normal tray settings,
+status, and recovery updates after installation.
+
 ### 2. Small pinned file layer without persistent DACL mutation
 
 `InstallFileTransaction.psm1` keeps only opaque transaction capabilities and

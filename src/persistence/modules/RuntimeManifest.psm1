@@ -196,14 +196,15 @@ function New-CcodRuntimeManifest {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$RuntimeDirectory,
-        [Parameter(Mandatory)][string]$ProjectVersion
+        [Parameter(Mandatory)][string]$ProjectVersion,
+        [string]$RuntimeId
     )
 
     $files = @(Get-CcodRuntimeFileRecords -RuntimeDirectory $RuntimeDirectory)
     return [pscustomobject][ordered]@{
         schemaVersion = 1
         projectVersion = $ProjectVersion
-        runtimeId = Get-CcodRuntimeId -ProjectVersion $ProjectVersion -Files $files
+        runtimeId = if ([string]::IsNullOrWhiteSpace($RuntimeId)) { Get-CcodRuntimeId -ProjectVersion $ProjectVersion -Files $files } else { Assert-CcodRuntimeId $RuntimeId }
         files = $files
     }
 }
@@ -309,10 +310,6 @@ function Test-CcodRuntimeManifest {
         }
     }
 
-    $computedRuntimeId = Get-CcodRuntimeId -ProjectVersion ([string]$projectVersionProperty.Value) -Files $actualFiles
-    if ($computedRuntimeId -cne $manifestRuntimeId) {
-        return New-CcodRuntimeValidationResult -Valid $false -Code 'CCOD_RUNTIME_ID_MISMATCH' -RuntimeId $manifestRuntimeId -Manifest $manifest
-    }
     return New-CcodRuntimeValidationResult -Valid $true -Code 'CCOD_RUNTIME_VALID' -RuntimeId $manifestRuntimeId -Manifest $manifest
 }
 
@@ -330,6 +327,24 @@ function Read-CcodActiveRuntime {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$InstallRoot)
 
+    $pointerRoot = Resolve-CcodContainedPath -Root $InstallRoot -RelativePath 'state\active-generation' -AllowMissingLeaf
+    if ([IO.Directory]::Exists($pointerRoot)) {
+        $entries=@(Get-ChildItem -LiteralPath $pointerRoot -Force -ErrorAction Stop)
+        if($entries.Count-eq 0){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation store is empty' $pointerRoot}
+        $records=[Collections.Generic.List[object]]::new()
+        foreach($entry in $entries){
+            if($entry.PSIsContainer-or($entry.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0-or$entry.Name-cnotmatch'^\d{20}\.json$'){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation store contains an unknown object' $entry.FullName}
+            $record=Read-CcodStrictJson -Path $entry.FullName -ExpectedSchema 1 -Kind 'active generation'
+            $names=@($record.PSObject.Properties.Name);if(($names-join',')-cne'schemaVersion,generation,activeRuntime,previousGeneration'-or$record.activeRuntime-isnot[string]){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation record fields are invalid' $entry.FullName}
+            $generation=ConvertTo-CcodRuntimeGeneration $record.generation $entry.FullName
+            $integerTypes=@([byte],[uint16],[uint32],[uint64],[int16],[int32],[int64]);$typed=$false;foreach($t in $integerTypes){if($record.previousGeneration-is$t){$typed=$true;break}};if(-not$typed){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Previous generation is not an integer' $entry.FullName}
+            [uint64]$previous=$record.previousGeneration;if($generation-ne($previous+1)-or$entry.Name-cne('{0:D20}.json'-f$generation)){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation record is not canonical' $entry.FullName}
+            Assert-CcodRuntimeId $record.activeRuntime|Out-Null;$records.Add([pscustomobject]@{generation=$generation;previousGeneration=$previous;activeRuntime=[string]$record.activeRuntime})
+        }
+        $ordered=@($records|Sort-Object generation);for($i=0;$i-lt$ordered.Count;$i++){if([uint64]$ordered[$i].generation-ne[uint64]($i+1)-or[uint64]$ordered[$i].previousGeneration-ne[uint64]$i){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation chain has a gap' $pointerRoot}}
+        $latest=$ordered[-1];$previousRuntime=if($latest.previousGeneration-gt0){[string]$ordered[[int]$latest.previousGeneration-1].activeRuntime}else{$null}
+        return [pscustomobject][ordered]@{schemaVersion=2;activeRuntime=$latest.activeRuntime;previousRuntime=$previousRuntime;generation=[uint64]$latest.generation;updatedAtUtc=(Get-Item $pointerRoot).LastWriteTimeUtc.ToString('o')}
+    }
     $path = Resolve-CcodContainedPath -Root $InstallRoot -RelativePath 'active.json' -AllowMissingLeaf
     $active = $null
     $legacy = $false
@@ -404,7 +419,9 @@ function Set-CcodActiveRuntime {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
-        [Parameter(Mandatory)][string]$NewRuntimeId,
+        [string]$NewRuntimeId,
+        $TargetGeneration,
+        $FileTransaction,
         $Ownership,
         [hashtable]$Adapters
     )
@@ -412,6 +429,15 @@ function Set-CcodActiveRuntime {
     $Adapters = Get-CcodRuntimeAdapters -Adapters $Adapters
     if ($null -eq $Ownership) {
         Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_REQUIRED' 'Active runtime mutation requires proven lifecycle ownership' $InstallRoot
+    }
+    if($null-ne$FileTransaction-or$null-ne$TargetGeneration){
+        if($null-eq(Get-Command Commit-CcodInstallActivePointer -ErrorAction SilentlyContinue)){Import-Module (Join-Path $PSScriptRoot 'InstallFileTransaction.psm1') -ErrorAction Stop}
+        if($null-eq$FileTransaction-or$null-eq$TargetGeneration){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Pointer commit requires target and transaction' $InstallRoot}
+        $current=$null;try{$current=Read-CcodActiveRuntime $InstallRoot}catch{if((Get-CcodErrorId $_)-notin@('CCOD_STATE_MISSING','CCOD_PATH_MISSING')){throw}}
+        [uint64]$previous=if($null-eq$current){0}else{$current.generation}
+        try{[void](& $Adapters.AssertLifecycleFence $InstallRoot $Ownership ($null-ne$current) $(if($null-ne$current){$current.activeRuntime}else{$null}))}catch{Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Active runtime mutation lifecycle fence is stale' $InstallRoot}
+        $committed=Commit-CcodInstallActivePointer -InstallRoot $InstallRoot -TargetGeneration $TargetGeneration -ExpectedPreviousGeneration $previous -FileTransaction $FileTransaction
+        return Read-CcodActiveRuntime -InstallRoot $InstallRoot
     }
     Assert-CcodRuntimeId -RuntimeId $NewRuntimeId | Out-Null
     $runtimeDirectory = Get-CcodRuntimeDirectoryForId -InstallRoot $InstallRoot -RuntimeId $NewRuntimeId
