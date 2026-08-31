@@ -399,9 +399,7 @@ function Initialize-CcodState {
         [Parameter(Mandatory)][string]$StateRoot,
         [string[]]$NodeCandidates = @(),
         [bool]$CandidateCompatibleOptIn = $false,
-        [hashtable]$Adapters,
-        $FileTransaction,
-        [string]$InitializationId
+        [hashtable]$Adapters
     )
 
     $adapters = Get-CcodStateAdapters -Adapters $Adapters
@@ -415,7 +413,7 @@ function Initialize-CcodState {
     if (-not (& $adapters.DirectoryExists $receiptRoot)) { & $adapters.CreateDirectory $receiptRoot }
     Read-CcodLifecycleRequest -StateRoot $StateRoot | Out-Null
     if ($existing.Count -eq $paths.Count) {
-        return
+        return [pscustomobject][ordered]@{settings=(Read-CcodSettings -StateRoot $StateRoot -Adapters $adapters);status=(Read-CcodStatus -StateRoot $StateRoot -Adapters $adapters);verifiedPackages=(Read-CcodVerifiedPackages -StateRoot $StateRoot -Adapters $adapters);transition=(Read-CcodTypedState -StateRoot $StateRoot -Leaf 'transition.json' -Kind 'transition' -Validator ${function:Assert-CcodTransitionShape} -Adapters $adapters)}
     }
     if ($existing.Count -ne 0) {
         Throw-CcodStateError 'CCOD_STATE_ALREADY_INITIALIZED' 'State initialization refuses to overwrite existing evidence; use explicit repair' $StateRoot
@@ -425,21 +423,11 @@ function Initialize-CcodState {
     $status = New-CcodStatusStore
     $verifiedPackages = New-CcodVerifiedPackagesStore
     $transition = New-CcodTransitionStore
-    if($null-ne$FileTransaction){
-      if($null-eq(Get-Command New-CcodInstallDirectory -ErrorAction SilentlyContinue)){Import-Module (Join-Path $PSScriptRoot 'InstallFileTransaction.psm1') -ErrorAction Stop}
-      if($InitializationId-cnotmatch'^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$'){Throw-CcodStateError 'CCOD_STATE_INITIALIZATION_INVALID' 'Immutable initialization identity is invalid' $InitializationId}
-      $state=New-CcodInstallDirectory -Transaction $FileTransaction -Parent $FileTransaction -Leaf 'state' -CreateIfMissing
-      $initializations=New-CcodInstallDirectory -Transaction $FileTransaction -Parent $state -Leaf 'install-initializations' -CreateIfMissing
-      $baseline=New-CcodInstallDirectory -Transaction $FileTransaction -Parent $initializations -Leaf $InitializationId -CreateIfMissing
-      Write-CcodInstallRecord -Transaction $FileTransaction -Parent $baseline -Leaf 'settings.json' -Record $settings|Out-Null
-      Write-CcodInstallRecord -Transaction $FileTransaction -Parent $baseline -Leaf 'status.json' -Record $status|Out-Null
-      Write-CcodInstallRecord -Transaction $FileTransaction -Parent $baseline -Leaf 'verified-packages.json' -Record $verifiedPackages|Out-Null
-      Write-CcodInstallRecord -Transaction $FileTransaction -Parent $baseline -Leaf 'transition.json' -Record $transition|Out-Null
-    }
     Write-CcodSettings -StateRoot $StateRoot -Settings $settings -Adapters $adapters
     Write-CcodTypedState -StateRoot $StateRoot -Leaf 'status.json' -Value $status -Validator ${function:Assert-CcodStatusShape} -Adapters $adapters
     Write-CcodVerifiedPackages -StateRoot $StateRoot -VerifiedPackages $verifiedPackages -Adapters $adapters
     Write-CcodTypedState -StateRoot $StateRoot -Leaf 'transition.json' -Value $transition -Validator ${function:Assert-CcodTransitionShape} -Adapters $adapters
+    return [pscustomobject][ordered]@{settings=$settings;status=$status;verifiedPackages=$verifiedPackages;transition=$transition}
 }
 
 function Read-CcodSettings {

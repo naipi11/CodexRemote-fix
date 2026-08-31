@@ -421,12 +421,13 @@ function Test-CcodStaticManifestPath {
 }
 
 function Get-CcodStaticRuntimeIdFromRecords {
-    param([string]$ProjectVersion,[object[]]$Files)
+    param([string]$ProjectVersion,[object[]]$Files,[string]$ExpectedRuntimeId)
     $lines=[Collections.Generic.List[string]]::new()
     foreach($file in $Files){$lines.Add(('{0}`t{1}`t{2}' -f [string]$file.path,[int64]$file.length,[string]$file.sha256))}
     $canonical=$lines -join "`n";$sha=[Security.Cryptography.SHA256]::Create()
     try{$digest=[BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
-    $runtimeId='{0}-{1}' -f $ProjectVersion,$digest.Substring(0,16)
+    $match=[regex]::Match($ExpectedRuntimeId,'^(?<version>[A-Za-z0-9][A-Za-z0-9._-]{0,45})-(?<digest>[0-9a-f]{16})-(?<nonce>[0-9a-f]{32})$');if(-not$match.Success-or$match.Groups['version'].Value-cne$ProjectVersion){Throw-CcodStaticProbeError 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Runtime identity format is invalid' $ExpectedRuntimeId}
+    $runtimeId='{0}-{1}-{2}' -f $ProjectVersion,$digest.Substring(0,16),$match.Groups['nonce'].Value
     if(-not (Test-CcodStaticRuntimeId $runtimeId)){Throw-CcodStaticProbeError 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Computed runtime ID is invalid' $null}
     return $runtimeId
 }
@@ -452,11 +453,13 @@ function Get-CcodStaticProbeRuntimeAuthorization {
         if((Split-Path $persistenceRoot -Leaf) -cne 'persistence' -or (Split-Path $srcRoot -Leaf) -cne 'src' -or (Split-Path $runtimeContainer -Leaf) -cne 'runtime' -or -not (Test-CcodStaticRuntimeId $runtimeId)){throw 'layout'}
         $installRoot=[IO.Path]::GetFullPath($installRoot);$runtimeRoot=[IO.Path]::GetFullPath($runtimeRoot)
         Assert-CcodStaticProbeNoReparse -Root $installRoot -Path $ScriptPath -Adapters $Adapters
-        $activePath=[IO.Path]::GetFullPath((Join-Path $installRoot 'active.json'));Assert-CcodStaticProbeNoReparse $installRoot $activePath -Adapters $Adapters
-        $active=Read-CcodStaticProbeLocalJson $activePath;Assert-CcodStaticExactObject $active @('schemaVersion','activeRuntime','previousRuntime','updatedAtUtc') 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active pointer'|Out-Null
-        if($active.schemaVersion -isnot [int] -or $active.schemaVersion -ne 1 -or -not(Test-CcodStaticRuntimeId $active.activeRuntime) -or
-            ($null -ne $active.previousRuntime -and (-not(Test-CcodStaticRuntimeId $active.previousRuntime) -or $active.previousRuntime -ceq $active.activeRuntime)) -or
-            -not(Test-CcodStaticCanonicalUtc $active.updatedAtUtc) -or $active.activeRuntime -cne $runtimeId){throw 'active pointer'}
+        $pointerRoot=[IO.Path]::GetFullPath((Join-Path $installRoot 'state\active-generation'))
+        if([IO.Directory]::Exists($pointerRoot)){
+            Assert-CcodStaticProbeNoReparse $installRoot $pointerRoot -Adapters $Adapters;$entries=@(Get-ChildItem -LiteralPath $pointerRoot -Force -ErrorAction Stop);if($entries.Count-eq0){throw 'empty active chain'};$records=[Collections.Generic.List[object]]::new()
+            foreach($entry in $entries){if($entry.PSIsContainer-or$entry.Name-cnotmatch'^\d{20}\.json$'){throw 'active entry'};Assert-CcodStaticProbeNoReparse $installRoot $entry.FullName -Adapters $Adapters;$record=Read-CcodStaticProbeLocalJson $entry.FullName;Assert-CcodStaticExactObject $record @('schemaVersion','generation','activeRuntime','previousGeneration') 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active generation'|Out-Null;if($record.schemaVersion-isnot[int]-or$record.generation-isnot[long]-and$record.generation-isnot[int]-or$record.previousGeneration-isnot[long]-and$record.previousGeneration-isnot[int]-or-not(Test-CcodStaticRuntimeId $record.activeRuntime)){throw 'active generation'};[uint64]$generation=$record.generation;[uint64]$previousGeneration=$record.previousGeneration;if($generation-ne($previousGeneration+1)-or$entry.Name-cne('{0:D20}.json'-f$generation)){throw 'active generation canonical'};$records.Add([pscustomobject]@{generation=$generation;previousGeneration=$previousGeneration;activeRuntime=[string]$record.activeRuntime;path=$entry.FullName})}
+            $ordered=@($records|Sort-Object generation);for($i=0;$i-lt$ordered.Count;$i++){if([uint64]$ordered[$i].generation-ne[uint64]($i+1)-or[uint64]$ordered[$i].previousGeneration-ne[uint64]$i){throw 'active chain'}};$latest=$ordered[-1];$active=[pscustomobject]@{activeRuntime=$latest.activeRuntime};$activePath=$latest.path
+        }else{$activePath=[IO.Path]::GetFullPath((Join-Path $installRoot 'active.json'));Assert-CcodStaticProbeNoReparse $installRoot $activePath -Adapters $Adapters;$active=Read-CcodStaticProbeLocalJson $activePath;Assert-CcodStaticExactObject $active @('schemaVersion','activeRuntime','previousRuntime','updatedAtUtc') 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active pointer'|Out-Null;if($active.schemaVersion -isnot [int] -or $active.schemaVersion -ne 1 -or -not(Test-CcodStaticRuntimeId $active.activeRuntime) -or($null -ne $active.previousRuntime -and (-not(Test-CcodStaticRuntimeId $active.previousRuntime) -or $active.previousRuntime -ceq $active.activeRuntime)) -or-not(Test-CcodStaticCanonicalUtc $active.updatedAtUtc)){throw 'active pointer'}}
+        if($active.activeRuntime-cne$runtimeId){throw 'active runtime'}
         $expectedRuntime=[IO.Path]::GetFullPath((Join-Path (Join-Path $installRoot 'runtime') $active.activeRuntime))
         $expectedWorker=[IO.Path]::GetFullPath((Join-Path $expectedRuntime 'src\persistence\StaticProbeWorker.ps1'))
         if($expectedRuntime -cne $runtimeRoot -or $expectedWorker -cne $ScriptPath){throw 'self binding'}
@@ -472,7 +475,7 @@ function Get-CcodStaticProbeRuntimeAuthorization {
             $previous=$file.path;$records.Add([pscustomobject][ordered]@{path=$file.path;length=[int64]$file.length;sha256=$file.sha256})
         }
         foreach($required in $script:CcodStaticProbeRequiredFiles){if(@($records|Where-Object{$_.path -ceq $required}).Count -ne 1){throw 'required file'}}
-        $computed=Get-CcodStaticRuntimeIdFromRecords $manifest.projectVersion $records.ToArray()
+        $computed=Get-CcodStaticRuntimeIdFromRecords $manifest.projectVersion $records.ToArray() $manifest.runtimeId
         if($computed -cne $manifest.runtimeId -or $computed -cne $active.activeRuntime -or $computed -cne $runtimeId){throw 'runtime id'}
         foreach($required in $script:CcodStaticProbeRequiredFiles){
             $record=@($records|Where-Object{$_.path -ceq $required})[0];$path=[IO.Path]::GetFullPath((Join-Path $runtimeRoot ($required.Replace('/','\'))))

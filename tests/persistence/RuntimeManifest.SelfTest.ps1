@@ -69,8 +69,9 @@ try {
         Write-CcodAtomicJson -Path (Join-Path $runtime 'manifest.json') -Value $first
         $second = New-CcodRuntimeManifest -RuntimeDirectory $runtime -ProjectVersion '2.0.0'
 
-        Assert-CcodTrue ($first.runtimeId -match '^[A-Za-z0-9._-]{1,96}$') 'runtime ID must be a safe name'
-        Assert-CcodEqual $first.runtimeId $second.runtimeId 'the same runtime bytes must produce the same runtime ID'
+        Assert-CcodTrue ($first.runtimeId -cmatch '^2\.0\.0-[0-9a-f]{16}-[0-9a-f]{32}$') 'runtime ID binds project version, file digest, and nonce'
+        Assert-CcodTrue ($first.runtimeId -cne $second.runtimeId) 'the same runtime bytes receive unique per-attempt nonces'
+        Assert-CcodEqual (($first.runtimeId -split '-')[-2]) (($second.runtimeId -split '-')[-2]) 'identical sorted file records retain the same deterministic digest'
         Assert-CcodEqual 'a.txt' $first.files[0].path 'files must sort ordinally'
         Assert-CcodEqual 'b.txt' $first.files[1].path 'files must sort ordinally'
         Assert-CcodEqual 2 $first.files.Count 'manifest must exclude manifest.json itself'
@@ -89,6 +90,21 @@ try {
         [IO.File]::AppendAllText((Join-Path $runtime 'a.txt'), 'tampered', [Text.UTF8Encoding]::new($false))
         $result = Test-CcodRuntimeManifest -RuntimeDirectory $runtime -ExpectedRuntimeId $manifest.runtimeId
         Assert-CcodEqual $false $result.Valid 'tampered bytes must be rejected'
+    }
+
+    Invoke-CcodTest 'rejects copied renamed and nonce-tampered generation identity' {
+        $runtime=Join-Path $root 'identity-original';New-Item -ItemType Directory -Path $runtime|Out-Null
+        [IO.File]::WriteAllText((Join-Path $runtime 'a.txt'),'alpha',[Text.UTF8Encoding]::new($false))
+        $manifest=New-CcodRuntimeManifest -RuntimeDirectory $runtime -ProjectVersion '2.5.22'
+        Write-CcodAtomicJson -Path (Join-Path $runtime 'manifest.json') -Value $manifest
+        $originalManifestSha=Get-CcodTestFileSha256 -Path (Join-Path $runtime 'manifest.json')
+        $parts=$manifest.runtimeId -split '-';$renamedId=($parts[0..($parts.Count-2)] -join '-')+'-'+('f'*32)
+        $renamed=Join-Path $root $renamedId;Copy-Item -LiteralPath $runtime -Destination $renamed -Recurse
+        $altered=Get-Content -LiteralPath (Join-Path $renamed 'manifest.json') -Raw|ConvertFrom-Json;$altered.runtimeId=$renamedId
+        Write-CcodAtomicJson -Path (Join-Path $renamed 'manifest.json') -Value $altered
+        Assert-CcodEqual $false (Test-CcodRuntimeManifest -RuntimeDirectory $renamed -ExpectedRuntimeId $renamedId -ExpectedManifestSha256 $originalManifestSha).Valid 'copied generation cannot authorize a renamed nonce by rewriting its manifest identity'
+        $altered.runtimeId=$manifest.runtimeId.Substring(0,$manifest.runtimeId.Length-1)+'A';Write-CcodAtomicJson -Path (Join-Path $renamed 'manifest.json') -Value $altered
+        Assert-CcodEqual $false (Test-CcodRuntimeManifest -RuntimeDirectory $renamed -ExpectedRuntimeId $altered.runtimeId).Valid 'wrong non-lowercase nonce is rejected'
     }
 
     Invoke-CcodTest 'rejects an unsafe manifest path instead of reading outside its runtime' {
@@ -158,6 +174,20 @@ try {
             updatedAtUtc = '2030-02-03T04:05:06.0000000Z'
         })
         Assert-CcodThrows { Read-CcodActiveRuntime -InstallRoot $installRoot } 'CCOD_RUNTIME_ID_INVALID'
+    }
+
+    Invoke-CcodTest 'append-only active selector rejects unknown reparse ADS and multi-linked leaves' {
+        foreach($kind in @('unknown','reparse','ads','multilink')){
+            $installRoot=Join-Path $root ("pointer-$kind");$pointerRoot=Join-Path $installRoot 'state\active-generation';$target=Join-Path $outside ("pointer-$kind")
+            [IO.Directory]::CreateDirectory($pointerRoot)|Out-Null;[IO.Directory]::CreateDirectory($target)|Out-Null
+            $runtimeId='2.5.22-1111111111111111-22222222222222222222222222222222';$path=Join-Path $pointerRoot '00000000000000000001.json';$json='{"schemaVersion":1,"generation":1,"activeRuntime":"'+$runtimeId+'","previousGeneration":0}'
+            if($kind-ceq'unknown'){[IO.File]::WriteAllText((Join-Path $pointerRoot 'unknown.bin'),'x',[Text.UTF8Encoding]::new($false))}
+            elseif($kind-ceq'reparse'){New-Item -ItemType Junction -Path $path -Target $target|Out-Null}
+            elseif($kind-ceq'ads'){[IO.File]::WriteAllText($path,$json,[Text.UTF8Encoding]::new($false));Set-Content -LiteralPath $path -Stream 'evidence' -Value 'x' -NoNewline}
+            else{$outsideFile=Join-Path $target 'pointer.json';[IO.File]::WriteAllText($outsideFile,$json,[Text.UTF8Encoding]::new($false));New-Item -ItemType HardLink -Path $path -Target $outsideFile|Out-Null}
+            Assert-CcodThrows {Read-CcodActiveRuntime -InstallRoot $installRoot|Out-Null} 'CCOD_RUNTIME_POINTER_INVALID'
+            if(Test-Path $installRoot){Remove-Item $installRoot -Recurse -Force};if(Test-Path $target){Remove-Item $target -Recurse -Force}
+        }
     }
 
     Invoke-CcodTest 'includes the lifecycle worker and coordinator in the staged runtime closure' {

@@ -114,7 +114,8 @@ function Add-CcodTestRuntime {
         [Parameter(Mandatory)][string]$SupervisorScript,
         [AllowNull()][string]$RuntimeId,
         [bool]$IncludeFenceModules = $true,
-        [bool]$FailLifecycleRelease = $false
+        [bool]$FailLifecycleRelease = $false,
+        [bool]$IncludeGenerationBootstrap = $false
     )
 
     if ([string]::IsNullOrWhiteSpace($RuntimeId)) {
@@ -131,6 +132,7 @@ function Add-CcodTestRuntime {
     New-Item -ItemType Directory -Path $kernelDirectory -Force | Out-Null
     $kernelPath = Join-Path $kernelDirectory 'KernelObjects.psm1'
     [IO.File]::Copy($kernelObjectsModule, $kernelPath, $true)
+    if($IncludeGenerationBootstrap){[IO.File]::Copy($bootstrapScript,(Join-Path $supervisorDirectory 'bootstrap.ps1'),$true)}
     if ($IncludeFenceModules) {
         foreach ($moduleName in @('PersistenceIO.psm1','LifecycleEpoch.psm1','LifecycleTransaction.psm1','RuntimeManifest.psm1','TrustedLogonIdentity.psm1')) {
             [IO.File]::Copy((Join-Path $repositoryRoot ('src\persistence\modules\' + $moduleName)), (Join-Path $kernelDirectory $moduleName), $true)
@@ -200,15 +202,23 @@ function Read-CcodTestActivePointer {
     return (Get-Content -LiteralPath (Join-Path $Root 'active.json') -Raw | ConvertFrom-Json)
 }
 
+function Set-CcodTestActiveGenerationPointer {
+    param([Parameter(Mandatory)][string]$Root,[Parameter(Mandatory)][string]$ActiveRuntime,[UInt64]$Generation=1)
+    $pointerRoot=Join-Path $Root 'state\active-generation';[IO.Directory]::CreateDirectory($pointerRoot)|Out-Null
+    $record=[pscustomobject][ordered]@{schemaVersion=1;generation=$Generation;activeRuntime=$ActiveRuntime;previousGeneration=($Generation-1)}
+    [IO.File]::WriteAllText((Join-Path $pointerRoot ('{0:D20}.json'-f$Generation)),($record|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+}
+
 function Invoke-CcodBootstrapUnderTest {
     param(
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$ReadyToken,
         [int]$ReadyTimeoutSeconds = 3,
-        [ValidateSet('Task','Explicit')][string]$EntryMode = 'Explicit'
+        [ValidateSet('Task','Explicit')][string]$EntryMode = 'Explicit',
+        [string]$BootstrapPath = $bootstrapScript
     )
 
-    $output = & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $bootstrapScript `
+    $output = & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $BootstrapPath `
         -InstallRoot $Root -ReadyToken $ReadyToken -ReadyTimeoutSeconds $ReadyTimeoutSeconds -EntryMode $EntryMode 2>&1
     $exitCode = [int]$LASTEXITCODE
     return $exitCode
@@ -327,6 +337,24 @@ $results += Invoke-CcodTest 'production suppression caller fails closed for unsa
     Assert-CcodThrows { Test-CcodBootstrapSafeExitSuppression @arguments -GetMarkerItem { $reparse } } 'CCOD_SAFE_EXIT_INTENT_INVALID'
 }
 
+
+$results += Invoke-CcodTest 'bootstrap append-only selector rejects unknown reparse ADS and multi-linked leaves' {
+    foreach($kind in @('unknown','reparse','ads','multilink')){$root=Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-pointer-$kind-"+[guid]::NewGuid().ToString('N'));$outside=Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-pointer-outside-$kind-"+[guid]::NewGuid().ToString('N'));try{New-CcodBootstrapFixture -Root $root|Out-Null;[IO.Directory]::CreateDirectory($outside)|Out-Null;$pointerRoot=Join-Path $root 'state\active-generation';[IO.Directory]::CreateDirectory($pointerRoot)|Out-Null;$path=Join-Path $pointerRoot '00000000000000000001.json';$id='2.5.22-1111111111111111-22222222222222222222222222222222';$json='{"schemaVersion":1,"generation":1,"activeRuntime":"'+$id+'","previousGeneration":0}';if($kind-ceq'unknown'){[IO.File]::WriteAllText((Join-Path $pointerRoot 'unknown.bin'),'x',[Text.UTF8Encoding]::new($false))}elseif($kind-ceq'reparse'){New-Item -ItemType Junction -Path $path -Target $outside|Out-Null}elseif($kind-ceq'ads'){[IO.File]::WriteAllText($path,$json,[Text.UTF8Encoding]::new($false));Set-Content -LiteralPath $path -Stream evidence -Value x -NoNewline}else{$outsideFile=Join-Path $outside 'pointer.json';[IO.File]::WriteAllText($outsideFile,$json,[Text.UTF8Encoding]::new($false));New-Item -ItemType HardLink -Path $path -Target $outsideFile|Out-Null};Assert-CcodThrows {Read-CcodBootstrapActivePointer -InstallRoot $root|Out-Null} 'CCOD_BOOTSTRAP_POINTER_INVALID'}finally{if(Test-Path $root){Remove-Item $root -Recurse -Force};if(Test-Path $outside){Remove-Item $outside -Recurse -Force}}}
+}
+
+$results += Invoke-CcodTest 'generation bootstrap launches the append-only selected runtime without root active json' {
+    $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-bootstrap-generation-'+[guid]::NewGuid().ToString('N'))
+    try{
+        New-CcodBootstrapFixture -Root $root|Out-Null
+        $marker=Join-Path $root 'generation.started'
+        $runtimeId=Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'Ready' -MarkerPath $marker) -IncludeGenerationBootstrap $true
+        Set-CcodTestActiveGenerationPointer -Root $root -ActiveRuntime $runtimeId
+        $generationBootstrap=Join-Path $root "runtime\$runtimeId\src\persistence\bootstrap.ps1"
+        Assert-CcodExactEqual $false (Test-Path -LiteralPath (Join-Path $root 'active.json')) 'fresh append-only fixture has no root active json'
+        Assert-CcodExactEqual 0 (Invoke-CcodBootstrapUnderTest -Root $root -ReadyToken (New-CcodBootstrapToken) -EntryMode Task -BootstrapPath $generationBootstrap) 'generation bootstrap launches selected Supervisor'
+        Assert-CcodTrue (Test-Path -LiteralPath $marker) 'selected generation Supervisor actually starts and signals ready'
+    }finally{if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}}
+}
 
 $results += Invoke-CcodTest 'selects previous runtime after active exits before ready and swaps pointer' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-" + [guid]::NewGuid().ToString('N'))

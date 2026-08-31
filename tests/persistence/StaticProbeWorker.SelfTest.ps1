@@ -185,7 +185,7 @@ function Get-CcodTestRuntimeId {
     $sha = [Security.Cryptography.SHA256]::Create()
     try { $digest = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))).Replace('-','').ToLowerInvariant() }
     finally { $sha.Dispose() }
-    return '{0}-{1}' -f $ProjectVersion,$digest.Substring(0,16)
+    return '{0}-{1}-{2}' -f $ProjectVersion,$digest.Substring(0,16),('c'*32)
 }
 
 function Get-CcodTestRuntimeRecords {
@@ -203,7 +203,7 @@ function Get-CcodTestRuntimeRecords {
 }
 
 function New-CcodAuthorizedRuntimeFixture {
-    param([string]$Root,[string]$ReadStrictJsonMarker)
+    param([string]$Root,[string]$ReadStrictJsonMarker,[switch]$AppendOnly)
     $install = Join-Path $Root 'install'
     $staging = Join-Path $install 'staging'
     foreach ($relative in @(
@@ -235,8 +235,8 @@ function New-CcodAuthorizedRuntimeFixture {
     [IO.Directory]::Move($staging,$runtime)
     $manifest = [pscustomobject][ordered]@{schemaVersion=1;projectVersion='2.0.0';runtimeId=$runtimeId;files=$records}
     [IO.File]::WriteAllText((Join-Path $runtime 'manifest.json'),($manifest|ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($false))
-    $active = [pscustomobject][ordered]@{schemaVersion=1;activeRuntime=$runtimeId;previousRuntime=$null;updatedAtUtc='2030-02-03T04:05:06.0000000Z'}
-    [IO.File]::WriteAllText((Join-Path $install 'active.json'),($active|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    if($AppendOnly){$pointerRoot=Join-Path $install 'state\active-generation';[IO.Directory]::CreateDirectory($pointerRoot)|Out-Null;$active=[pscustomobject][ordered]@{schemaVersion=1;generation=[uint64]1;activeRuntime=$runtimeId;previousGeneration=[uint64]0};[IO.File]::WriteAllText((Join-Path $pointerRoot '00000000000000000001.json'),($active|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))}
+    else{$active = [pscustomobject][ordered]@{schemaVersion=1;activeRuntime=$runtimeId;previousRuntime=$null;updatedAtUtc='2030-02-03T04:05:06.0000000Z'};[IO.File]::WriteAllText((Join-Path $install 'active.json'),($active|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))}
     $workers = Join-Path $install 'state\workers'
     [IO.Directory]::CreateDirectory($workers)|Out-Null
     return [pscustomobject][ordered]@{
@@ -502,6 +502,13 @@ try {
         Assert-CcodEqual 1 $requestHarness.Written.Count 'duplicate request publishes one uncorrelated safe failure'
         Assert-CcodEqual $null $requestHarness.Written[0].requestId 'duplicate request never gains correlation'
         Assert-CcodEqual 0 $requestHarness.ProbeCalls.Count 'duplicate request never probes'
+    }
+
+    Invoke-CcodTest 'authorizes append-only active generation without legacy active json' {
+        $fixture=New-CcodAuthorizedRuntimeFixture -Root (Join-Path $root 'append-only-runtime') -AppendOnly
+        Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $fixture.InstallRoot 'active.json')) 'append-only fixture has no legacy selector'
+        $context=Get-CcodStaticProbeRuntimeAuthorization -ScriptPath $fixture.WorkerPath
+        Assert-CcodEqual $fixture.RuntimeId $context.RuntimeId 'static worker binds the append-only selected runtime'
     }
 
     Invoke-CcodTest 'imports only exact private bound runtime APIs and unloads every module command surface' {

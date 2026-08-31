@@ -100,19 +100,16 @@ function Get-CcodUiPreferenceTimestamp {
 
 function Initialize-CcodUiPreference {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$StateRoot,$FileTransaction,[string]$InitializationId)
+    param([Parameter(Mandatory)][string]$StateRoot,[switch]$AllowExisting)
 
     $path = Resolve-CcodContainedPath -Root $StateRoot -RelativePath 'ui-preferences.json' -AllowMissingLeaf
+    if([IO.File]::Exists($path)){
+        if(-not$AllowExisting){Throw-CcodUiPreferenceError 'CCOD_UI_PREFERENCES_EXISTS' 'UI preferences already exist.' $path}
+        $existing=Read-CcodStrictJson -Path $path -ExpectedSchema 1 -Kind 'UI preferences';Assert-CcodUiPreferenceStore -Store $existing
+        return $existing
+    }
     $store = New-CcodUiPreferenceStore -LanguageMode 'System' -UpdatedAtUtc (Get-CcodUiPreferenceTimestamp -Adapters (Get-CcodUiPreferenceAdapters))
     Assert-CcodUiPreferenceStore -Store $store
-    if($null-ne$FileTransaction){
-        if($null-eq(Get-Command New-CcodInstallDirectory -ErrorAction SilentlyContinue)){Import-Module (Join-Path $PSScriptRoot 'InstallFileTransaction.psm1') -ErrorAction Stop}
-        if($InitializationId-cnotmatch'^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$'){Throw-CcodUiPreferenceError 'CCOD_UI_PREFERENCES_INVALID' 'Immutable initialization identity is invalid.' $InitializationId}
-        $state=New-CcodInstallDirectory -Transaction $FileTransaction -Parent $FileTransaction -Leaf 'state' -CreateIfMissing
-        $initializations=New-CcodInstallDirectory -Transaction $FileTransaction -Parent $state -Leaf 'install-initializations' -CreateIfMissing
-        $baseline=New-CcodInstallDirectory -Transaction $FileTransaction -Parent $initializations -Leaf $InitializationId -CreateIfMissing
-        try{Write-CcodInstallRecord -Transaction $FileTransaction -Parent $baseline -Leaf 'ui-preferences.json' -Record $store|Out-Null}catch{if($_.FullyQualifiedErrorId-like'CCOD_INSTALL_RECORD_EXISTS*'){Throw-CcodUiPreferenceError 'CCOD_UI_PREFERENCES_EXISTS' 'UI preference baseline already exists.' $path};throw}
-    }
     try {
         Write-CcodAtomicJsonIfAbsent -Path $path -Value $store
     } catch {
@@ -121,6 +118,7 @@ function Initialize-CcodUiPreference {
         }
         throw
     }
+    return $store
 }
 
 function Read-CcodUiPreference {

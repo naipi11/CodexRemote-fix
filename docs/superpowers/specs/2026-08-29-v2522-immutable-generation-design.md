@@ -71,10 +71,21 @@ manifest is written as the final generation file, then validated through the
 same create-only path. Existing generations are never used as a source root.
 
 Stable `bootstrap.ps1` and `Uninstall-CodexControlOtherDevices.ps1` are
-generated as new candidates inside the generation. They are made visible only
-after the active pointer is committed and the new protection has reached
-verified readiness. An upgrade does not overwrite a stable file while the new
-generation is still incomplete.
+generated as new candidates inside the generation. After pointer commit, the
+scheduled task may select that sealed generation bootstrap solely to prove
+protection readiness; user-visible registration and shortcuts are updated only
+after `Ready`. An upgrade never overwrites a root stable file while the new
+generation is incomplete.
+
+Every new runtime ID is the canonical `projectVersion-fileDigest16-nonce32`
+form: `fileDigest16` is derived from the sorted manifest file records, and the
+lowercase 32-hex nonce makes otherwise identical attempts unique. The runtime
+manifest and bootstrap independently recompute and require that form. The
+stable generation bootstrap reads the append-only active-generation chain
+before it launches Supervisor; it may read legacy `active.json` only when the
+new chain is absent. Lifecycle readiness likewise accepts the exact
+generation bootstrap selected by the scheduled task, with the fixed root
+bootstrap retained only for a proven legacy task.
 
 ### 1a. Immutable initialization evidence and operational state
 
@@ -144,6 +155,18 @@ Legacy installations without this record are treated as `Idle` after the
 existing pointer/runtime identity checks. Same-version repair is idempotent
 only when the package hash matches; a different hash returns a conflict before
 pointer mutation.
+
+The transaction records both the old and new manifest SHA-256 values before
+pointer mutation. Compensation opens the old generation only against its
+recorded old-manifest hash; it never treats a freshly read old manifest hash as
+proof. The install entrypoint first rejects any global nonterminal or
+ambiguous transaction chain, whether or not a legacy pointer is present.
+
+`Ready` terminalization never appends a `Failed` record after a visible Ready
+activation receipt. If the final transaction snapshot cannot be persisted, the
+transaction remains recoverable/nonterminal and a later recovery may finish
+the missing Ready snapshot; callers do not claim readiness until both matching
+terminal records exist.
 
 ### 4. Setup and product registration
 

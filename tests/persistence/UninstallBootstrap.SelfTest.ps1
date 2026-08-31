@@ -156,7 +156,7 @@ function Set-CcodUninstallBootstrapFixtureDirectoryOwner {
 }
 
 function New-CcodVerifiedUninstallRuntimeFixture {
-    param([Parameter(Mandatory)][string]$InstallRoot)
+    param([Parameter(Mandatory)][string]$InstallRoot,[switch]$AppendOnly)
     $runtimeRoot = Join-Path $InstallRoot 'runtime\pending'
     foreach ($entry in @(
         'src/persistence/UninstallBootstrap.ps1',
@@ -186,7 +186,8 @@ function New-CcodVerifiedUninstallRuntimeFixture {
     [IO.Directory]::CreateDirectory((Join-Path $InstallRoot 'state')) | Out-Null
     Set-CcodUninstallBootstrapFixtureDirectoryOwner -Path $InstallRoot
     $timestamp = '2030-02-03T03:04:05.0000000Z'
-    [IO.File]::WriteAllText((Join-Path $InstallRoot 'active.json'),([ordered]@{schemaVersion=2;activeRuntime=$manifest.runtimeId;previousRuntime=$null;generation=[uint64]7;updatedAtUtc=$timestamp}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+    if($AppendOnly){$pointerRoot=Join-Path $InstallRoot 'state\active-generation';[IO.Directory]::CreateDirectory($pointerRoot)|Out-Null;for($generation=1;$generation-le7;$generation++){[IO.File]::WriteAllText((Join-Path $pointerRoot ('{0:D20}.json'-f$generation)),([ordered]@{schemaVersion=1;generation=[uint64]$generation;activeRuntime=$manifest.runtimeId;previousGeneration=[uint64]($generation-1)}|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))}}
+    else{[IO.File]::WriteAllText((Join-Path $InstallRoot 'active.json'),([ordered]@{schemaVersion=2;activeRuntime=$manifest.runtimeId;previousRuntime=$null;generation=[uint64]7;updatedAtUtc=$timestamp}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))}
     [IO.File]::WriteAllText((Join-Path $InstallRoot 'state\lifecycle-epoch.json'),([ordered]@{schemaVersion=1;epoch=[uint64]11}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
     return [pscustomobject][ordered]@{RuntimeRoot=$finalRuntime;RuntimeId=$manifest.runtimeId}
 }
@@ -230,6 +231,11 @@ $results += Invoke-CcodTest 'production runtime verification binds the installed
         [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previousLocalAppData,'Process')
         if (Test-Path -LiteralPath $localAppData) { Remove-Item -LiteralPath $localAppData -Recurse -Force }
     }
+}
+
+$results += Invoke-CcodTest 'production uninstall authorization consumes append-only selector before legacy active json' {
+    $localAppData=Join-Path ([IO.Path]::GetTempPath()) ('ccod-uninstall-append-'+[guid]::NewGuid().ToString('N'));$installRoot=Join-Path $localAppData 'CodexControlOtherDevices';$previous=[Environment]::GetEnvironmentVariable('LOCALAPPDATA','Process')
+    try{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$localAppData,'Process');$fixture=New-CcodVerifiedUninstallRuntimeFixture -InstallRoot $installRoot -AppendOnly;$context=Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $repositoryRoot -InstallRoot $installRoot;Assert-CcodEqual $fixture.RuntimeId $context.runtimeId 'uninstall context binds append-only active runtime';Assert-CcodEqual 7 ([uint64]$context.runtimeGeneration) 'uninstall context binds latest append-only generation';Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $installRoot 'active.json')) 'append-only uninstall authorization needs no legacy pointer'}finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if(Test-Path $localAppData){Remove-Item $localAppData -Recurse -Force}}
 }
 
 $results += Invoke-CcodTest 'external staging refuses a cleanup source changed after runtime verification' {

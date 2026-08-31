@@ -15,7 +15,7 @@ $script:CcodLifecycleDefaultInstallRoot = Join-Path ([Environment]::GetFolderPat
 $script:CcodActivationReceiptFields = @('schemaVersion','activationId','phase','runtimeId','previousRuntimeId','startedAtUtc','updatedAtUtc','ready','errorCode')
 $script:CcodActivationPhases = @('StoppingPreviousRuntime','InstallingRuntime','ActivatingRuntime','StartingProtection','Ready','Failed')
 $script:CcodInstallTransactionPhases = @('Prepared','PackageVerified','RuntimeStaged','PreviousProtectionStopped','RuntimePromoted','PointerCommitted','StableShellCommitted','ProtectionReady','Ready')
-$script:CcodInstallTransactionFields = @('schemaVersion','transactionId','oldRuntimeId','oldGeneration','newRuntimeId','newGeneration','sealedPackageSha256','ownedObjectNames','phase','errorCode')
+$script:CcodInstallTransactionFields = @('schemaVersion','transactionId','oldRuntimeId','oldGeneration','oldManifestSha256','newRuntimeId','newGeneration','newManifestSha256','sealedPackageSha256','ownedObjectNames','phase','errorCode')
 $script:CcodInstallTransactionRoots = [Runtime.CompilerServices.ConditionalWeakTable[object,object]]::new()
 
 function Throw-CcodLifecycleError {
@@ -156,6 +156,8 @@ function Assert-CcodInstallTransactionRecord {
         -not (Test-CcodLifecycleCanonicalGuid $Record.transactionId) -or
         ($null -ne $Record.oldRuntimeId -and ($Record.oldRuntimeId -isnot [string] -or $Record.oldRuntimeId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$')) -or
         ($null -ne $Record.newRuntimeId -and ($Record.newRuntimeId -isnot [string] -or $Record.newRuntimeId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$')) -or
+        ($null-ne$Record.oldManifestSha256-and($Record.oldManifestSha256-isnot[string]-or$Record.oldManifestSha256-cnotmatch'^[0-9a-f]{64}$')) -or
+        $Record.newManifestSha256-isnot[string]-or$Record.newManifestSha256-cnotmatch'^[0-9a-f]{64}$' -or
         $Record.sealedPackageSha256 -isnot [string] -or $Record.sealedPackageSha256 -cnotmatch '^[0-9a-f]{64}$' -or
         $Record.phase -isnot [string] -or (@($script:CcodInstallTransactionPhases) + 'Failed') -cnotcontains $Record.phase -or
         (($Record.phase -ceq 'Failed') -and ($Record.errorCode -isnot [string] -or $Record.errorCode -cnotmatch '^CCOD_[A-Z0-9_]{1,96}$')) -or
@@ -171,7 +173,7 @@ function Assert-CcodInstallTransactionRecord {
         if (-not $newTypeValid -or -not $oldTypeValid) { throw 'type' }
         [uint64]$newGeneration = $Record.newGeneration
         [uint64]$oldGeneration = if ($null -eq $Record.oldGeneration) { 0 } else { $Record.oldGeneration }
-        if ($newGeneration -eq 0 -or ($null -ne $Record.oldGeneration -and $oldGeneration -eq 0) -or ($null -eq $Record.oldRuntimeId) -ne ($null -eq $Record.oldGeneration)) { throw 'generation' }
+        if ($newGeneration -eq 0 -or ($null -ne $Record.oldGeneration -and $oldGeneration -eq 0) -or ($null -eq $Record.oldRuntimeId) -ne ($null -eq $Record.oldGeneration) -or ($null-eq$Record.oldRuntimeId)-ne($null-eq$Record.oldManifestSha256)) { throw 'generation' }
     } catch {
         Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Install transaction generations are invalid' $null
     }
@@ -208,23 +210,23 @@ function Assert-CcodInstallTransactionRoot {
 function New-CcodUniqueRuntimeId {
     param(
         [Parameter(Mandatory)][string]$ProjectVersion,
-        [Parameter(Mandatory)][string]$ContentSha256,
+        [Parameter(Mandatory)][object[]]$Files,
         [scriptblock]$NewNonce = { [guid]::NewGuid().ToString('N') }
     )
     $nonce = & $NewNonce
-    if ($ProjectVersion -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$' -or
-        $ContentSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+    if ($ProjectVersion -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,45}$' -or
         $nonce -isnot [string] -or $nonce -cnotmatch '^[0-9a-f]{32}$') {
         Throw-CcodLifecycleError 'CCOD_INSTALL_RUNTIME_ID_INVALID' 'Unique runtime identity input is invalid' $null
     }
-    $hasher = [Security.Cryptography.SHA256]::Create()
-    try {
-        $identityBytes = [Text.Encoding]::UTF8.GetBytes("$ProjectVersion`0$ContentSha256")
-        $identityDigest = ([BitConverter]::ToString($hasher.ComputeHash($identityBytes))).Replace('-','').ToLowerInvariant()
-    } finally {
-        $hasher.Dispose()
+    $records=[Collections.Generic.List[object]]::new()
+    foreach($file in $Files){
+        $relative=([string]$file.Relative).Replace('\','/')
+        $length=if($null-ne$file.PSObject.Properties['ExpectedLength']){[int64]$file.ExpectedLength}else{[int64](Get-Item -LiteralPath $file.Source -Force -ErrorAction Stop).Length}
+        $sha=if($null-ne$file.PSObject.Properties['ExpectedSha256']){[string]$file.ExpectedSha256}else{Get-CcodLifecycleFileSha256 -Path $file.Source}
+        $records.Add([pscustomobject]@{path=$relative;length=$length;sha256=$sha})
     }
-    return "$identityDigest-$($nonce.Substring(0,31))"
+    $comparison=[Comparison[object]]{param($left,$right)[StringComparer]::Ordinal.Compare([string]$left.path,[string]$right.path)};$records.Sort($comparison)
+    try{return Get-CcodRuntimeId -ProjectVersion $ProjectVersion -Files $records.ToArray() -Nonce $nonce}catch{Throw-CcodLifecycleError 'CCOD_INSTALL_RUNTIME_ID_INVALID' 'Unique runtime identity input is invalid' $null}
 }
 
 function New-CcodInstallTransactionRecord {
@@ -232,8 +234,10 @@ function New-CcodInstallTransactionRecord {
         [Parameter(Mandatory)][string]$TransactionId,
         [AllowNull()]$OldRuntimeId,
         [AllowNull()]$OldGeneration,
+        [AllowNull()]$OldManifestSha256,
         [AllowNull()]$NewRuntimeId,
         [Parameter(Mandatory)][uint64]$NewGeneration,
+        [Parameter(Mandatory)][string]$NewManifestSha256,
         [Parameter(Mandatory)][string]$SealedPackageSha256,
         [string[]]$OwnedObjectNames = @()
     )
@@ -242,8 +246,10 @@ function New-CcodInstallTransactionRecord {
         transactionId = $TransactionId
         oldRuntimeId = $OldRuntimeId
         oldGeneration = if ($null -eq $OldGeneration) { $null } else { [uint64]$OldGeneration }
+        oldManifestSha256 = $OldManifestSha256
         newRuntimeId = $NewRuntimeId
         newGeneration = [uint64]$NewGeneration
+        newManifestSha256 = $NewManifestSha256
         sealedPackageSha256 = $SealedPackageSha256
         ownedObjectNames = @($OwnedObjectNames)
         phase = 'Prepared'
@@ -263,6 +269,23 @@ function Get-CcodInstallTransactionDirectory {
     param([Parameter(Mandatory)]$FileTransaction)
     $state = New-CcodInstallDirectory -Transaction $FileTransaction -Parent $FileTransaction -Leaf 'state' -CreateIfMissing
     return New-CcodInstallDirectory -Transaction $FileTransaction -Parent $state -Leaf 'install-transactions' -CreateIfMissing
+}
+
+function Initialize-CcodInstallStatePlanes {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][string]$RuntimeId,[Parameter(Mandatory)]$FileTransaction,[string[]]$NodeCandidates,[bool]$CandidateCompatibleOptIn)
+    [void](Assert-CcodInstallTransactionRoot -InstallRoot $InstallRoot -FileTransaction $FileTransaction)
+    if($RuntimeId-cnotmatch'^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$'){Throw-CcodLifecycleError 'CCOD_INSTALL_RUNTIME_ID_INVALID' 'Initialization runtime identity is invalid' $RuntimeId}
+    $state=New-CcodInstallDirectory -Transaction $FileTransaction -Parent $FileTransaction -Leaf 'state' -CreateIfMissing
+    $initializations=New-CcodInstallDirectory -Transaction $FileTransaction -Parent $state -Leaf 'install-initializations' -CreateIfMissing
+    $baseline=New-CcodInstallDirectory -Transaction $FileTransaction -Parent $initializations -Leaf $RuntimeId -CreateIfMissing
+    $stateRoot=Join-Path $InstallRoot 'state'
+    $values=Initialize-CcodState -StateRoot $stateRoot -NodeCandidates $NodeCandidates -CandidateCompatibleOptIn $CandidateCompatibleOptIn
+    Write-CcodInstallRecord -Transaction $FileTransaction -Parent $baseline -Leaf 'settings.json' -Record $values.settings|Out-Null
+    Write-CcodInstallRecord -Transaction $FileTransaction -Parent $baseline -Leaf 'status.json' -Record $values.status|Out-Null
+    Write-CcodInstallRecord -Transaction $FileTransaction -Parent $baseline -Leaf 'verified-packages.json' -Record $values.verifiedPackages|Out-Null
+    Write-CcodInstallRecord -Transaction $FileTransaction -Parent $baseline -Leaf 'transition.json' -Record $values.transition|Out-Null
+    $ui=Initialize-CcodUiPreference -StateRoot $stateRoot -AllowExisting
+    Write-CcodInstallRecord -Transaction $FileTransaction -Parent $baseline -Leaf 'ui-preferences.json' -Record $ui|Out-Null
 }
 
 function Write-CcodInstallTransactionRecord {
@@ -302,8 +325,10 @@ function Read-CcodInstallTransactionRecord {
             if(-not$oldGenerationChanged-and$null-ne$head.oldGeneration){$oldGenerationChanged=[uint64]$current.oldGeneration-ne[uint64]$head.oldGeneration}
             if ([string]$current.transactionId -cne [string]$head.transactionId -or
                 [string]$current.oldRuntimeId -cne [string]$head.oldRuntimeId -or $oldGenerationChanged -or
+                [string]$current.oldManifestSha256-cne[string]$head.oldManifestSha256 -or
                 [string]$current.newRuntimeId -cne [string]$head.newRuntimeId -or
                 [uint64]$current.newGeneration -ne [uint64]$head.newGeneration -or
+                [string]$current.newManifestSha256-cne[string]$head.newManifestSha256 -or
                 [string]$current.sealedPackageSha256 -cne [string]$head.sealedPackageSha256 -or
                 (@($current.ownedObjectNames)-join"`0") -cne (@($head.ownedObjectNames)-join"`0")) {
                 Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Install transaction identity changed across snapshots' $group.Name
@@ -1119,11 +1144,12 @@ function Get-CcodLifecycleVerifiedSupervisorFallback {
         if ($null -eq $Identity -or $Identity.UserSid -isnot [string] -or [string]::IsNullOrWhiteSpace($Identity.UserSid)) { return $null }
         $expectedSessionId = [int]$Identity.SessionId
         $root = Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
-        $bootstrapPath = [IO.Path]::GetFullPath((Join-Path $root 'bootstrap.ps1'))
-        if (-not [IO.File]::Exists($bootstrapPath) -or (Test-CcodLifecycleReparse -Path $bootstrapPath)) { return $null }
         $runtimeRoot = Get-CcodLifecycleCanonicalRoot -Path (Join-Path $root 'runtime') -Kind 'Runtime root'
         $runtimePrefix = $runtimeRoot.TrimEnd([char[]]@([char]92,[char]47)) + [IO.Path]::DirectorySeparatorChar
-        $bootstrapFilePattern = '(?i)(?:^|\s)-File\s+"' + [regex]::Escape($bootstrapPath) + '"(?=\s|$)'
+        $appendOnlySelector=[IO.Directory]::Exists((Join-Path $root 'state\active-generation'))
+        $legacyBootstrapPath=[IO.Path]::GetFullPath((Join-Path $root 'bootstrap.ps1'))
+        if(-not$appendOnlySelector-and(-not[IO.File]::Exists($legacyBootstrapPath)-or(Test-CcodLifecycleReparse $legacyBootstrapPath))){return $null}
+        $bootstrapFilePattern = '(?i)(?:^|\s)-File\s+"(?<path>[^"]+)"(?=\s|$)'
         $bootstrapRootPattern = '(?i)(?:^|\s)-InstallRoot\s+"' + [regex]::Escape($root) + '"(?=\s|$)'
         $supervisorFilePattern = '(?i)(?:^|\s)-File\s+"(?<path>' + [regex]::Escape($runtimePrefix) + '[^\\/\s"]+' + [regex]::Escape('\src\persistence\Supervisor.ps1') + ')"(?=\s|$)'
         $tokenPattern = '(?i)(?:^|\s)-ReadyToken\s+[0-9a-f]{64}(?=\s|$)'
@@ -1147,9 +1173,13 @@ function Get-CcodLifecycleVerifiedSupervisorFallback {
             $parentPid = [int]$process.ParentProcessId
             if ($parentPid -lt 1 -or -not $byPid.ContainsKey($parentPid)) { continue }
             $parent = $byPid[$parentPid]
-            if ([int]$parent.SessionId -ne $expectedSessionId -or [string]::IsNullOrWhiteSpace([string]$parent.CommandLine) -or
-                -not [regex]::IsMatch([string]$parent.CommandLine, $bootstrapFilePattern) -or
-                -not [regex]::IsMatch([string]$parent.CommandLine, $bootstrapRootPattern)) { continue }
+            if ([int]$parent.SessionId -ne $expectedSessionId -or [string]::IsNullOrWhiteSpace([string]$parent.CommandLine) -or -not [regex]::IsMatch([string]$parent.CommandLine, $bootstrapRootPattern)) { continue }
+            $parentBootstrapMatch=[regex]::Match([string]$parent.CommandLine,$bootstrapFilePattern)
+            if(-not$parentBootstrapMatch.Success){continue}
+            $runtimeId=($supervisorPath.Substring($runtimePrefix.Length)-split'[\\/]')[0]
+            $expectedBootstrap=if($appendOnlySelector){[IO.Path]::GetFullPath((Join-Path (Join-Path $runtimeRoot $runtimeId) 'src\persistence\bootstrap.ps1'))}else{$legacyBootstrapPath}
+            try{$parentBootstrap=[IO.Path]::GetFullPath($parentBootstrapMatch.Groups['path'].Value)}catch{continue}
+            if($parentBootstrap-cne$expectedBootstrap-or-not[IO.File]::Exists($expectedBootstrap)-or(Test-CcodLifecycleReparse $expectedBootstrap)){continue}
             $supervisorOwner = & $OwnerSidResolver $process
             $parentOwner = & $OwnerSidResolver $parent
             if ($null -eq $supervisorOwner -or $null -eq $parentOwner -or
@@ -1819,6 +1849,10 @@ function Get-CcodLifecycleAdapters {
             param($Source, $Destination)
             Copy-CcodLifecycleFileAtomically -Source $Source -Destination $Destination
         }
+        CommitReadyTransaction = {
+            param($InstallRoot,$TransactionId,$FileTransaction)
+            Set-CcodInstallTransactionPhase -InstallRoot $InstallRoot -TransactionId $TransactionId -ExpectedPhase 'ProtectionReady' -NewPhase 'Ready' -FileTransaction $FileTransaction
+        }
         NewRuntimeManifest = {
             param($RuntimeDirectory, $ProjectVersion)
             New-CcodRuntimeManifest -RuntimeDirectory $RuntimeDirectory -ProjectVersion $ProjectVersion
@@ -1943,7 +1977,7 @@ function Wait-CcodLifecycleNewRuntimeReady {
         if (-not $validation.Valid) { return New-CcodLifecycleNotReadyProof }
         if ($null -eq $Identity -or $Identity.UserSid -isnot [string] -or $Identity.SessionId -isnot [int]) { return New-CcodLifecycleNotReadyProof }
         $supervisorPath = [IO.Path]::GetFullPath((Join-Path $runtimeRoot 'src\persistence\Supervisor.ps1'))
-        $bootstrapPath = [IO.Path]::GetFullPath((Join-Path $root 'bootstrap.ps1'))
+        $bootstrapPath = if([IO.Directory]::Exists((Join-Path $root 'state\active-generation'))){[IO.Path]::GetFullPath((Join-Path $runtimeRoot 'src\persistence\bootstrap.ps1'))}else{[IO.Path]::GetFullPath((Join-Path $root 'bootstrap.ps1'))}
         $hostPrefix = '^\s*(?:"[^"]*powershell\.exe"|[^\s"]*powershell\.exe)'
         $supervisorPattern = $hostPrefix + '\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-STA\s+-File\s+(?:\"(?<path>[^\"]+)\"|(?<path>[^\s]+))\s+-ReadyToken\s+(?<token>[0-9a-f]{64})\s*$'
         $bootstrapPattern = $hostPrefix + '\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-STA\s+-WindowStyle\s+Hidden\s+-File\s+"(?<path>[^"]+)"\s+-InstallRoot\s+"(?<root>[^"]+)"\s+-EntryMode\s+Task\s*$'
@@ -2113,7 +2147,7 @@ function Invoke-CcodInstallCompensation {
     [void](Assert-CcodInstallTransactionRoot $InstallRoot $FileTransaction);[void](Assert-CcodInstallTransactionRecord $TransactionRecord)
     if($null-eq$TransactionRecord.oldRuntimeId-or$null-eq$TransactionRecord.oldGeneration){Throw-CcodLifecycleError 'CCOD_INSTALL_ROLLBACK_FAILED' 'No retained generation exists for compensation' $null}
     $manifestPath=Join-Path (Join-Path (Join-Path $InstallRoot 'runtime') $TransactionRecord.oldRuntimeId) 'manifest.json';if(-not[IO.File]::Exists($manifestPath)){Throw-CcodLifecycleError 'CCOD_INSTALL_ROLLBACK_FAILED' 'Retained generation manifest is missing' $null}
-    $retained=Open-CcodInstallRetainedGeneration -InstallRoot $InstallRoot -RuntimeId $TransactionRecord.oldRuntimeId -ExpectedManifestSha256 (Get-CcodLifecycleFileSha256 $manifestPath) -FileTransaction $FileTransaction
+    $retained=Open-CcodInstallRetainedGeneration -InstallRoot $InstallRoot -RuntimeId $TransactionRecord.oldRuntimeId -ExpectedManifestSha256 $TransactionRecord.oldManifestSha256 -FileTransaction $FileTransaction
     $compensationOwnership=$Ownership
     if($null-eq$compensationOwnership-or$compensationOwnership.released){
         $active=Read-CcodActiveRuntime -InstallRoot $InstallRoot
@@ -2206,12 +2240,20 @@ function Invoke-CcodInstall {
     $existingPointer = $null
     $activePath = Join-Path $root 'active.json'
     try{$existingPointer=Read-CcodActiveRuntime -InstallRoot $root}catch{if([IO.File]::Exists($activePath)-or[IO.Directory]::Exists((Join-Path $root 'state\active-generation'))){throw}}
-    if($null-ne$existingPointer-and$sealedPackageIdentitySupplied){
+    $globalTransaction=Read-CcodInstallTransactionRecord -InstallRoot $root
+    if($null-ne$globalTransaction-and$globalTransaction.phase-notin@('Ready','Failed')){Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_BUSY' 'A nonterminal install transaction must be recovered before a new attempt' $globalTransaction.transactionId}
+    $oldManifestSha256=$null;$activeValidation=$null
+    if($null-ne$existingPointer){
         $activeRuntimeRoot=[IO.Path]::GetFullPath((Join-Path (Join-Path $root 'runtime') ([string]$existingPointer.activeRuntime)))
-        $activeValidation=Test-CcodRuntimeManifest -RuntimeDirectory $activeRuntimeRoot -ExpectedRuntimeId ([string]$existingPointer.activeRuntime)
+        $activeManifestPath=Join-Path $activeRuntimeRoot 'manifest.json'
+        if(-not[IO.File]::Exists($activeManifestPath)){Throw-CcodLifecycleError 'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN' 'The active runtime manifest is missing before upgrade' $activeManifestPath}
+        $oldManifestSha256=Get-CcodLifecycleFileSha256 -Path $activeManifestPath
+        $activeValidation=Test-CcodRuntimeManifest -RuntimeDirectory $activeRuntimeRoot -ExpectedRuntimeId ([string]$existingPointer.activeRuntime) -ExpectedManifestSha256 $oldManifestSha256
+        if(-not$activeValidation.Valid){Throw-CcodLifecycleError 'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN' 'The active runtime manifest is invalid before upgrade' $activeRuntimeRoot}
+    }
+    if($null-ne$existingPointer-and$sealedPackageIdentitySupplied){
         if($activeValidation.Valid){
-            $activeTransaction=Read-CcodInstallTransactionRecord -InstallRoot $root
-            $sameIdentity=Test-CcodInstallPackageIdentity -TransactionRecord $activeTransaction -ProjectVersion ([string]$projectVersion) -ActiveProjectVersion ([string]$activeValidation.Manifest.projectVersion) -SealedPackageSha256 $SealedPackageSha256 -ActiveRuntimeId ([string]$existingPointer.activeRuntime) -ActiveGeneration ([uint64]$existingPointer.generation)
+            $sameIdentity=Test-CcodInstallPackageIdentity -TransactionRecord $globalTransaction -ProjectVersion ([string]$projectVersion) -ActiveProjectVersion ([string]$activeValidation.Manifest.projectVersion) -SealedPackageSha256 $SealedPackageSha256 -ActiveRuntimeId ([string]$existingPointer.activeRuntime) -ActiveGeneration ([uint64]$existingPointer.generation)
             if($sameIdentity){
                 return [pscustomobject][ordered]@{Outcome='AlreadyInstalled';Installed=$true;RuntimeId=[string]$existingPointer.activeRuntime;PreviousRuntimeId=$existingPointer.previousRuntime;RepairCompleted=$false}
             }
@@ -2240,10 +2282,10 @@ function Invoke-CcodInstall {
     $shutdownGate = $null
     $lifecycleOwnership = $null
     $previousProtectionStopped = $false
-    $fileTransaction=$null;$generationCapability=$null;$installRecord=$null
+    $fileTransaction=$null;$generationCapability=$null;$installRecord=$null;$readyReceiptCommitted=$false
     try {
-        $runtimeId=New-CcodUniqueRuntimeId -ProjectVersion $projectVersion -ContentSha256 $SealedPackageSha256;$generation=New-CcodLifecycleImmutableGeneration -InstallRoot $root -RuntimeId $runtimeId -ProjectVersion $projectVersion -Files $files;$fileTransaction=$generation.FileTransaction;$generationCapability=$generation.Generation;$runtimeRoot=$generation.RuntimeRoot;$runtimeCreated=$true
-        $newGeneration=if($null-eq$existingPointer){[uint64]1}else{[uint64]$existingPointer.generation+1};$installRecord=New-CcodInstallTransactionRecord -TransactionId ([guid]::NewGuid().ToString('D')) -OldRuntimeId $(if($upgrade){$existingPointer.activeRuntime}else{$null}) -OldGeneration $(if($upgrade){$existingPointer.generation}else{$null}) -NewRuntimeId $runtimeId -NewGeneration $newGeneration -SealedPackageSha256 $SealedPackageSha256 -OwnedObjectNames @($runtimeId)
+        $runtimeId=New-CcodUniqueRuntimeId -ProjectVersion $projectVersion -Files $files;$generation=New-CcodLifecycleImmutableGeneration -InstallRoot $root -RuntimeId $runtimeId -ProjectVersion $projectVersion -Files $files;$fileTransaction=$generation.FileTransaction;$generationCapability=$generation.Generation;$runtimeRoot=$generation.RuntimeRoot;$runtimeCreated=$true
+        $newGeneration=if($null-eq$existingPointer){[uint64]1}else{[uint64]$existingPointer.generation+1};$installRecord=New-CcodInstallTransactionRecord -TransactionId ([guid]::NewGuid().ToString('D')) -OldRuntimeId $(if($upgrade){$existingPointer.activeRuntime}else{$null}) -OldGeneration $(if($upgrade){$existingPointer.generation}else{$null}) -OldManifestSha256 $oldManifestSha256 -NewRuntimeId $runtimeId -NewGeneration $newGeneration -NewManifestSha256 $generation.ManifestSha256 -SealedPackageSha256 $SealedPackageSha256 -OwnedObjectNames @($runtimeId)
         Write-CcodInstallTransactionRecord -InstallRoot $root -TransactionRecord $installRecord -FileTransaction $fileTransaction|Out-Null
         foreach($phase in @('PackageVerified','RuntimeStaged')){$installRecord=Set-CcodInstallTransactionPhase -InstallRoot $root -TransactionId $installRecord.transactionId -ExpectedPhase $installRecord.phase -NewPhase $phase -FileTransaction $fileTransaction}
         if ($upgrade) {
@@ -2279,11 +2321,7 @@ function Invoke-CcodInstall {
 
         Write-CcodInstallActivationPhase -Activation $activation -Phase 'InstallingRuntime' -RuntimeId $runtimeId -PreviousRuntimeId $(if ($upgrade) { [string]$existingPointer.activeRuntime } else { $null }) -ErrorCode $null -Adapters $adapters -InstallRoot $root -FileTransaction $fileTransaction | Out-Null
         $installRecord=Set-CcodInstallTransactionPhase -InstallRoot $root -TransactionId $installRecord.transactionId -ExpectedPhase 'PreviousProtectionStopped' -NewPhase 'RuntimePromoted' -FileTransaction $fileTransaction
-        if (-not $upgrade) {
-            $stateRoot = Join-Path $root 'state'
-            Initialize-CcodState -StateRoot $stateRoot -NodeCandidates $nodeCandidates -CandidateCompatibleOptIn ([bool]$EnableCandidateCompatibleUpdates) -FileTransaction $fileTransaction -InitializationId $runtimeId
-            Initialize-CcodUiPreference -StateRoot $stateRoot -FileTransaction $fileTransaction -InitializationId $runtimeId | Out-Null
-        }
+        Initialize-CcodInstallStatePlanes -InstallRoot $root -RuntimeId $runtimeId -FileTransaction $fileTransaction -NodeCandidates $nodeCandidates -CandidateCompatibleOptIn ([bool]$EnableCandidateCompatibleUpdates)
         Write-CcodInstallActivationPhase -Activation $activation -Phase 'ActivatingRuntime' -RuntimeId $runtimeId -PreviousRuntimeId $(if ($upgrade) { [string]$existingPointer.activeRuntime } else { $null }) -ErrorCode $null -Adapters $adapters -InstallRoot $root -FileTransaction $fileTransaction | Out-Null
         $process = [Diagnostics.Process]::GetCurrentProcess()
         try {
@@ -2330,14 +2368,15 @@ function Invoke-CcodInstall {
         }
         $installRecord=Set-CcodInstallTransactionPhase -InstallRoot $root -TransactionId $installRecord.transactionId -ExpectedPhase 'StableShellCommitted' -NewPhase 'ProtectionReady' -FileTransaction $fileTransaction
         $finalPointer = Read-CcodActiveRuntime -InstallRoot $root
-        $finalValidation = Test-CcodRuntimeManifest -RuntimeDirectory $runtimeRoot -ExpectedRuntimeId $runtimeId
+        $finalValidation = Test-CcodRuntimeManifest -RuntimeDirectory $runtimeRoot -ExpectedRuntimeId $runtimeId -ExpectedManifestSha256 $installRecord.newManifestSha256
         $finalExpectedVersion = if ($payloadBound) { $ExpectedVersion } else { [string]$projectVersion }
         if ($finalPointer.activeRuntime -cne $runtimeId -or [UInt64]$finalPointer.generation -ne [UInt64]$pointer.generation -or
             -not $finalValidation.Valid -or [string]$finalValidation.Manifest.projectVersion -cne $finalExpectedVersion) {
             Throw-CcodLifecycleError 'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN' 'The final active pointer and runtime version could not be revalidated' $runtimeRoot
         }
         Write-CcodInstallActivationPhase -Activation $activation -Phase 'Ready' -RuntimeId $runtimeId -PreviousRuntimeId $pointer.previousRuntime -ErrorCode $null -Adapters $adapters -InstallRoot $root -FileTransaction $fileTransaction | Out-Null
-        $installRecord=Set-CcodInstallTransactionPhase -InstallRoot $root -TransactionId $installRecord.transactionId -ExpectedPhase 'ProtectionReady' -NewPhase 'Ready' -FileTransaction $fileTransaction
+        $readyReceiptCommitted=$true
+        $installRecord=&$adapters.CommitReadyTransaction $root $installRecord.transactionId $fileTransaction
         try {
             Write-CcodLifecycleLog -InstallRoot $root -Adapters $adapters -Stage $(if ($upgrade) { 'Upgrade' } else { 'Install' }) -Code 'CCOD_INSTALL_COMPLETED' -Outcome $(if ($upgrade) { 'Upgraded' } else { 'Installed' }) -ThrowOnFailure -FileTransaction $fileTransaction
         } catch {
@@ -2346,6 +2385,7 @@ function Invoke-CcodInstall {
     } catch {
         $caught = $_
         $errorCode = Get-CcodLifecycleErrorId $caught
+        if($readyReceiptCommitted){Throw-CcodLifecycleError 'CCOD_INSTALL_READY_FINALIZATION_PENDING' 'Ready activation is visible but the final transaction snapshot requires recovery' $installRecord.transactionId}
         if ($errorCode -notmatch '^CCOD_[A-Z0-9_]+$') {
             $errorCode = switch ([string]$activation.LastPhase) {
                 'StoppingPreviousRuntime' { 'CCOD_INSTALL_PREVIOUS_RUNTIME_BUSY' }

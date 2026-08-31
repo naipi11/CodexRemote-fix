@@ -257,7 +257,7 @@ function Get-CcodUninstallBootstrapRuntimeRecords {
 }
 
 function Get-CcodUninstallBootstrapRuntimeId {
-    param([Parameter(Mandatory)][string]$ProjectVersion,[Parameter(Mandatory)][object[]]$Records)
+    param([Parameter(Mandatory)][string]$ProjectVersion,[Parameter(Mandatory)][object[]]$Records,[Parameter(Mandatory)][string]$Nonce)
     if ($ProjectVersion -isnot [string] -or $ProjectVersion -notmatch '^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$') {
         Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The runtime manifest version is invalid' $ProjectVersion
     }
@@ -266,7 +266,8 @@ function Get-CcodUninstallBootstrapRuntimeId {
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
         $digest = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($lines -join "`n")))).Replace('-','').ToLowerInvariant()
-        return '{0}-{1}' -f $ProjectVersion,$digest.Substring(0,16)
+        if($Nonce-cnotmatch'^[0-9a-f]{32}$'){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The runtime nonce is invalid' $Nonce}
+        return '{0}-{1}-{2}' -f $ProjectVersion,$digest.Substring(0,16),$Nonce
     } finally { $sha.Dispose() }
 }
 
@@ -362,16 +363,12 @@ function Get-CcodUninstallBootstrapVerifiedRuntimeContext {
         if ([string]::IsNullOrWhiteSpace($PSCommandPath) -or (Get-CcodUninstallBootstrapFullPath -Path $PSCommandPath -Kind 'Bootstrap script') -cne $expectedScript) {
             Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'The uninstall bootstrap was not launched from the installed application root' $PSCommandPath
         }
-        $activePath = Resolve-CcodUninstallBootstrapChildPath -Root $install -RelativePath 'active.json' -RequireLeafFile
-        $active = Read-CcodUninstallBootstrapJson -Path $activePath -Kind 'Active runtime pointer'
-        if (-not (Test-CcodUninstallBootstrapExactProperties $active @('schemaVersion','activeRuntime','previousRuntime','generation','updatedAtUtc')) -or
-            $active.schemaVersion -isnot [int] -or $active.schemaVersion -ne 2 -or
-            $active.activeRuntime -isnot [string] -or $active.activeRuntime -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$' -or
-            ($null -ne $active.previousRuntime -and ($active.previousRuntime -isnot [string] -or $active.previousRuntime -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$')) -or
-            -not (Test-CcodUninstallBootstrapCanonicalUtc $active.updatedAtUtc)) {
-            Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active runtime pointer is invalid' $activePath
-        }
-        $generation = ConvertTo-CcodUninstallBootstrapUInt64 $active.generation 'active runtime generation'
+        $pointerRoot=Resolve-CcodUninstallBootstrapChildPath -Root $install -RelativePath 'state\active-generation' -AllowMissingLeaf
+        if([IO.Directory]::Exists($pointerRoot)){
+            $entries=@(Get-ChildItem -LiteralPath $pointerRoot -Force -ErrorAction Stop);if($entries.Count-eq0){throw 'empty selector'};$records=[Collections.Generic.List[object]]::new()
+            foreach($entry in $entries){if($entry.PSIsContainer-or$entry.Name-cnotmatch'^\d{20}\.json$'){throw 'selector entry'};$path=Resolve-CcodUninstallBootstrapChildPath -Root $install -RelativePath ('state\active-generation\'+$entry.Name) -RequireLeafFile;$record=Read-CcodUninstallBootstrapJson -Path $path -Kind 'Active generation';if(-not(Test-CcodUninstallBootstrapExactProperties $record @('schemaVersion','generation','activeRuntime','previousGeneration'))-or$record.schemaVersion-isnot[int]-or$record.schemaVersion-ne1-or$record.activeRuntime-isnot[string]-or$record.activeRuntime-cnotmatch'^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$'){throw 'selector record'};[uint64]$g=ConvertTo-CcodUninstallBootstrapUInt64 $record.generation 'active generation';[uint64]$p=[uint64]$record.previousGeneration;if($g-ne($p+1)-or$entry.Name-cne('{0:D20}.json'-f$g)){throw 'selector canonical'};$records.Add([pscustomobject]@{generation=$g;previousGeneration=$p;activeRuntime=[string]$record.activeRuntime})}
+            $ordered=@($records|Sort-Object generation);for($i=0;$i-lt$ordered.Count;$i++){if([uint64]$ordered[$i].generation-ne[uint64]($i+1)-or[uint64]$ordered[$i].previousGeneration-ne[uint64]$i){throw 'selector chain'}};$latest=$ordered[-1];$active=[pscustomobject]@{activeRuntime=$latest.activeRuntime};$generation=[uint64]$latest.generation
+        }else{$activePath = Resolve-CcodUninstallBootstrapChildPath -Root $install -RelativePath 'active.json' -RequireLeafFile;$active = Read-CcodUninstallBootstrapJson -Path $activePath -Kind 'Active runtime pointer';if (-not (Test-CcodUninstallBootstrapExactProperties $active @('schemaVersion','activeRuntime','previousRuntime','generation','updatedAtUtc')) -or$active.schemaVersion -isnot [int] -or $active.schemaVersion -ne 2 -or$active.activeRuntime -isnot [string] -or $active.activeRuntime -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$' -or($null -ne $active.previousRuntime -and ($active.previousRuntime -isnot [string] -or $active.previousRuntime -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$')) -or-not (Test-CcodUninstallBootstrapCanonicalUtc $active.updatedAtUtc)){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active runtime pointer is invalid' $activePath};$generation = ConvertTo-CcodUninstallBootstrapUInt64 $active.generation 'active runtime generation'}
         $runtimeRoot = Resolve-CcodUninstallBootstrapChildPath -Root $install -RelativePath ('runtime\' + $active.activeRuntime)
         $runtimeItem = Get-Item -LiteralPath $runtimeRoot -Force -ErrorAction Stop
         if (-not $runtimeItem.PSIsContainer) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active runtime directory is invalid' $runtimeRoot }
@@ -401,7 +398,8 @@ function Get-CcodUninstallBootstrapVerifiedRuntimeContext {
             }
             $recordMap[$expected.path] = $expected
         }
-        if ((Get-CcodUninstallBootstrapRuntimeId -ProjectVersion $manifest.projectVersion -Records $actualRecords) -cne $active.activeRuntime) {
+        $identityMatch=[regex]::Match([string]$active.activeRuntime,'^(?<version>[A-Za-z0-9][A-Za-z0-9._-]{0,45})-(?<digest>[0-9a-f]{16})-(?<nonce>[0-9a-f]{32})$')
+        if(-not$identityMatch.Success-or$identityMatch.Groups['version'].Value-cne[string]$manifest.projectVersion-or(Get-CcodUninstallBootstrapRuntimeId -ProjectVersion $manifest.projectVersion -Records $actualRecords -Nonce $identityMatch.Groups['nonce'].Value) -cne $active.activeRuntime) {
             Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active runtime ID does not match its verified manifest' $runtimeRoot
         }
         foreach ($entry in $script:CcodUninstallPayloadEntries) {

@@ -118,3 +118,89 @@ start/stop, WindowsApps access, DPAPI access, or external write was performed.
 ## Commit
 
 - `fix: commit lifecycle through immutable generations` (this Task 2 commit)
+
+## Fix round 1 — complete the real generation-bootstrap lifecycle
+
+### Review status and RED evidence
+
+The scoped review of `e80b829..2101485` failed with one Critical and six
+Important findings. This round keeps `2101485` and remediates all seven.
+
+- Bootstrap command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\Bootstrap.SelfTest.ps1`
+  exited `1`; the new real generation-bootstrap case expected exit `0` but
+  received `1` because production still required root `active.json`.
+- RuntimeManifest command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\RuntimeManifest.SelfTest.ps1`
+  exited `1` at the canonical identity assertion because production still
+  emitted `projectVersion-digest16` without a nonce.
+- The lifecycle review regressions then exposed: transaction-root callbacks
+  executing in the wrong module session, a sealed-source fixture failing
+  before generation creation, missing upgrade baselines, cross-root state/UI
+  writes, global nonterminal state accepted at the real entry, freshly read old
+  manifest hashes used for compensation, and contradictory Failed evidence
+  after a visible Ready receipt.
+- The first aggregate attempt exited `1` at
+  `StaticProbeWorker.SelfTest.ps1` with `CCOD_STATIC_RUNTIME_UNAUTHORIZED`;
+  that independent runtime authorizer still used the old ID and legacy-only
+  selector. The second aggregate attempt exited `1` at
+  `UiPreferences.SelfTest.ps1` because the upgrade baseline path had
+  accidentally changed the public duplicate-initialize contract.
+
+### GREEN and verification evidence
+
+- Bootstrap: `24/24`, exit `0`. Coverage includes a copied generation
+  bootstrap actually launching its selected Supervisor with no `active.json`,
+  append-only selector unknown/reparse/ADS/multilink rejection, and legacy
+  fallback only when the chain is absent.
+- InstallLifecycle: `114/114`, exit `0`. Coverage includes same-generation
+  bootstrap parent readiness, legacy-root parent rejection under append-only
+  selection, global pointer-less/ambiguous transaction exclusion, fresh and
+  upgrade baselines, cross-root rejection, partial operational state,
+  recorded-old-manifest compensation, and the Ready final-snapshot gap.
+- RuntimeManifest: 18 named cases, exit `0`, including canonical
+  `projectVersion-fileDigest16-nonce32`, copied/renamed identity with recorded
+  manifest hash, wrong nonce/content, and selector ADS/multilink checks.
+- UninstallBootstrap: `13/13`, exit `0`, including canonical-ID and
+  append-only generation-7 authorization without legacy `active.json`.
+- PersistenceIO: 24 named cases, exit `0`.
+- StaticProbeWorker: 37 named cases, exit `0`, including append-only runtime
+  authorization without legacy `active.json`.
+- UiPreferences focused suite: 9 cases, exit `0`; the default duplicate
+  initialize behavior remains `CCOD_UI_PREFERENCES_EXISTS`, while only the
+  root-bound lifecycle path opts into reading an existing upgrade baseline.
+- Parser: explicit `ParseFile` checks passed for all 12 changed PowerShell
+  code/test files.
+- Diff: `git diff --check` exited `0`; only LF-to-CRLF checkout warnings were
+  emitted.
+- Aggregate:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\PersistenceSelfTest.ps1`
+  exited `0` (`FIX1_AGGREGATE_FINAL_EXIT=0`).
+
+### Remediated behavior
+
+- The generation bootstrap and every audited runtime authorizer read a strict,
+  contiguous append-only active-generation chain first and use legacy
+  `active.json` only when that chain is absent.
+- Runtime identity is exactly
+  `projectVersion-fileDigest16-nonce32`; RuntimeManifest, bootstrap,
+  StaticProbeWorker, and UninstallBootstrap independently recompute it from
+  sorted file records.
+- The install entry rejects any global nonterminal or ambiguous transaction
+  before creating a generation, independent of pointer/package identity.
+- Every fresh or upgrade generation records all five immutable initialization
+  baselines. Complete operational state is snapshotted but not overwritten;
+  partial/malformed operational state fails closed.
+- StateStore and UiPreferences no longer accept file-transaction capabilities.
+  InstallLifecycle first validates the opaque transaction root, then writes
+  baselines itself, so root A cannot be combined with StateRoot B.
+- Active pointer readers reject unknown objects, reparse points, ADS, and
+  multi-linked leaves. Transaction records bind both old and new manifest
+  SHA-256 values; compensation uses only the recorded old hash.
+- A final transaction-snapshot failure after a visible Ready activation receipt
+  returns `CCOD_INSTALL_READY_FINALIZATION_PENDING`, leaves the transaction at
+  `ProtectionReady`, and writes no contradictory Failed receipt or snapshot.
+
+### Fix commit
+
+- `fix: complete generation bootstrap lifecycle` (this fix-round commit)
