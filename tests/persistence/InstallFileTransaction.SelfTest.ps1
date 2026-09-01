@@ -135,6 +135,18 @@ function New-CcodHardLink {
     if($exitCode-ne 0){throw "Could not create hard link: $($output -join ' ')"}
 }
 
+function Assert-CcodProductTransactionRejected {
+    param([Parameter(Mandatory)][scriptblock]$Action,[Parameter(Mandatory)]$Fixture)
+    try{
+        $unexpected=&$Action
+        if($null-ne$unexpected){$Fixture.Transactions.Add($unexpected)}
+    }catch{
+        if(([string]$_.FullyQualifiedErrorId-split',')[0]-ceq'CCOD_INSTALL_PRODUCT_SCOPE'){return}
+        throw
+    }
+    throw 'ASSERT_THROWS: expected CCOD_INSTALL_PRODUCT_SCOPE'
+}
+
 Invoke-CcodTest 'exports only immutable generation operations and an inert CLR marker' {
     $expected=@('Close-CcodInstallFileTransaction','Commit-CcodInstallActivePointer','Copy-CcodInstallProductShortcut','Copy-CcodInstallSealedSource','New-CcodInstallDirectory','New-CcodInstallGenerationLeaf','Open-CcodInstallGeneration','Open-CcodInstallProductRegistrationTransaction','Open-CcodInstallProductSpecialFolder','Open-CcodInstallRetainedFile','Open-CcodInstallRetainedGeneration','Open-CcodInstallStateTransaction','Retire-CcodInstallGeneration','Write-CcodInstallGenerationManifest','Write-CcodInstallRecord')
     Assert-CcodEqual ($expected -join '|') ((@($module.ExportedCommands.Keys)|Sort-Object)-join '|') 'module export surface is capability-only'
@@ -145,19 +157,67 @@ Invoke-CcodTest 'exports only immutable generation operations and an inert CLR m
     Assert-CcodTrue (-not $module.ExportedCommands['Copy-CcodInstallProductShortcut'].Parameters.ContainsKey('SourcePath')) 'product shortcut copy accepts no arbitrary absolute source path'
 }
 
+Invoke-CcodTest 'authority reader returns bytes and hash from one verified native file handle' {
+    $fixture=New-CcodInstallFileFixture
+    try{
+        $source=New-CcodSourceFile $fixture 'authority-reader.json' '{"schemaVersion":1,"value":"bound"}'
+        $read=&$module {param($Path)Read-CcodInstallAuthorityFile -Path $Path} $source.Path
+        Assert-CcodEqual $source.Sha256 $read.Sha256 'authority reader hashes the bytes from its verified handle'
+        Assert-CcodEqual '{"schemaVersion":1,"value":"bound"}' ([Text.Encoding]::UTF8.GetString($read.Bytes)) 'authority reader returns the same verified-handle bytes'
+        New-CcodHardLink -Path (Join-Path $fixture.Base 'authority-reader-link.json') -Existing $source.Path
+        Assert-CcodThrows {&$module {param($Path)Read-CcodInstallAuthorityFile -Path $Path|Out-Null} $source.Path} 'CCOD_INSTALL_PRODUCT_SCOPE'
+    }finally{Remove-CcodInstallFileFixture $fixture}
+}
+
+function Write-CcodProductReadyTransactionChain {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$ReadyRecord)
+    $phases=@('Prepared','PackageVerified','RuntimeStaged','PreviousProtectionStopped','RuntimePromoted','PointerCommitted','StableShellCommitted','ProtectionReady','Ready')
+    $transactions=Join-Path $InstallRoot 'state\install-transactions';[IO.Directory]::CreateDirectory($transactions)|Out-Null
+    for($index=0;$index-lt$phases.Count;$index++){
+        $record=$ReadyRecord.PSObject.Copy();$record.phase=$phases[$index]
+        $leaf='{0:D20}.{1:D2}.{2}.{3}.json'-f[uint64]$record.newGeneration,$index,$record.phase,$record.transactionId
+        [IO.File]::WriteAllText((Join-Path $transactions $leaf),($record|ConvertTo-Json -Depth 8 -Compress),[Text.UTF8Encoding]::new($false))
+    }
+    return (Join-Path $transactions ('{0:D20}.08.Ready.{1}.json'-f[uint64]$ReadyRecord.newGeneration,$ReadyRecord.transactionId))
+}
+
 # Production mutation caught: state-only recovery or an arbitrary absolute source can acquire product shortcut authority.
 Invoke-CcodTest 'product registration transaction exposes only a selected retained manifest file capability' {
     $fixture=New-CcodInstallFileFixture
     try{
         $runtimeId='runtime-product-source';$source=New-CcodSourceFile $fixture 'product-source.lnk' 'sealed shortcut bytes';$generation=Open-CcodFixtureGeneration $fixture $runtimeId;$registration=New-CcodInstallGenerationLeaf -Generation $generation -Leaf 'registration';Copy-CcodInstallSealedSource -Generation $registration -SourcePath $source.Path -Leaf 'StartMenu.CodexRemote-fix.lnk' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null;$manifest=Write-CcodInstallGenerationManifest -Generation $generation -Manifest (New-CcodGenerationManifest $runtimeId @([ordered]@{path='registration/StartMenu.CodexRemote-fix.lnk';length=$source.Length;sha256=$source.Sha256}));$pointer=Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $generation -ExpectedPreviousGeneration 0 -FileTransaction $generation;Close-CcodInstallFileTransaction -Transaction $generation -Disposition Ready
-        $readyRecord=[pscustomobject][ordered]@{schemaVersion=1;transactionId='11111111-2222-3333-4444-555555555555';oldRuntimeId=$null;oldGeneration=$null;oldManifestSha256=$null;newRuntimeId=$runtimeId;newGeneration=[uint64]1;newManifestSha256=$manifest.Sha256;sealedPackageSha256=('d'*64);ownedObjectNames=@($runtimeId);phase='Ready';errorCode=$null};$transactions=Join-Path $fixture.Install 'state\install-transactions';[IO.Directory]::CreateDirectory($transactions)|Out-Null;[IO.File]::WriteAllText((Join-Path $transactions 'ready.json'),($readyRecord|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false));$product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $readyRecord;$fixture.Transactions.Add($product);$retained=Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId -ExpectedManifestSha256 $manifest.Sha256 -FileTransaction $product;$file=Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk' -ReadyTransaction $readyRecord
+        $readyRecord=[pscustomobject][ordered]@{schemaVersion=1;transactionId='11111111-2222-3333-4444-555555555555';oldRuntimeId=$null;oldGeneration=$null;oldManifestSha256=$null;newRuntimeId=$runtimeId;newGeneration=[uint64]1;newManifestSha256=$manifest.Sha256;sealedPackageSha256=('d'*64);ownedObjectNames=@($runtimeId);phase='Ready';errorCode=$null};$readyPath=Write-CcodProductReadyTransactionChain -InstallRoot $fixture.Install -ReadyRecord $readyRecord
+        foreach($field in @('oldRuntimeId','transactionId','ownedObjectNames')){$changed=$readyRecord.PSObject.Copy();if($field-ceq'oldRuntimeId'){$changed.oldRuntimeId='runtime-old'}elseif($field-ceq'transactionId'){$changed.transactionId='aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'}else{$changed.ownedObjectNames=@($runtimeId,'unexpected-owned-object')};Assert-CcodProductTransactionRejected -Fixture $fixture -Action {Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $changed}}
+        $fabricated=[pscustomobject][ordered]@{phase='Ready';runtimeId=$runtimeId;runtimeGeneration=[uint64]1;manifestSha256=$manifest.Sha256;packageSha256=('d'*64)};Assert-CcodThrows {Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $fabricated|Out-Null} 'CCOD_INSTALL_PRODUCT_SCOPE'
+        $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $readyRecord;$fixture.Transactions.Add($product);$retained=Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId -ExpectedManifestSha256 $manifest.Sha256 -FileTransaction $product;$file=Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk' -ReadyTransaction $readyRecord
         Assert-CcodTrue ($null-ne$file) 'selected manifest file returns an opaque retained source capability'
         Assert-CcodThrows {Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'C:\outside\arbitrary.lnk' -ReadyTransaction $readyRecord|Out-Null} 'CCOD_INSTALL_PRODUCT_SHORTCUT_INVALID'
         Assert-CcodThrows {New-CcodInstallDirectory -Transaction $product -Parent $product -Leaf 'state' -CreateIfMissing|Out-Null} 'CCOD_INSTALL_PRODUCT_SCOPE'
         $preReady=$readyRecord.PSObject.Copy();$preReady.phase='ProtectionReady';Assert-CcodThrows {Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $preReady|Out-Null} 'CCOD_INSTALL_PRODUCT_SCOPE';$changed=$readyRecord.PSObject.Copy();$changed.oldRuntimeId='changed-old';Assert-CcodThrows {Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk' -ReadyTransaction $changed|Out-Null} 'CCOD_INSTALL_PRODUCT_SCOPE'
-        [IO.File]::WriteAllText((Join-Path $fixture.Install 'state\active-generation\00000000000000000002.json'),'{'+'"schemaVersion":1,"generation":2,"activeRuntime":"sibling","previousGeneration":1}',[Text.UTF8Encoding]::new($false));Assert-CcodThrows {Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $readyRecord|Out-Null} 'CCOD_INSTALL_PRODUCT_SCOPE'
+        [IO.File]::WriteAllText((Join-Path $fixture.Install 'state\active-generation\00000000000000000002.json'),'{'+'"schemaVersion":1,"generation":2,"activeRuntime":"sibling","previousGeneration":1}',[Text.UTF8Encoding]::new($false));Assert-CcodThrows {Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk' -ReadyTransaction $readyRecord|Out-Null} 'CCOD_INSTALL_PRODUCT_SCOPE'
         $state=Open-CcodInstallStateTransaction -InstallRoot $fixture.Install;$fixture.Transactions.Add($state);Assert-CcodThrows {Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId -ExpectedManifestSha256 $manifest.Sha256 -FileTransaction $state|Out-Null} 'CCOD_INSTALL_STATE_SCOPE';Assert-CcodThrows {Open-CcodInstallProductSpecialFolder -Generation $state -Kind Desktop|Out-Null} 'CCOD_INSTALL_PRODUCT_FOLDER_INVALID'
     }finally{Remove-CcodInstallFileFixture $fixture}
+}
+
+Invoke-CcodTest 'product authority rejects incomplete pointer stores and changed persisted full Ready identity' {
+    foreach($mutation in @('PointerGap','UnexpectedDirectory','HardlinkPointer','HardlinkTransaction','HardlinkManifest','ScalarOwnedSet','ChangedPersistedReady')){
+        $fixture=New-CcodInstallFileFixture
+        try{
+            $runtimeId='runtime-product-authority';$source=New-CcodSourceFile $fixture 'authority.lnk' 'authority shortcut';$generation=Open-CcodFixtureGeneration $fixture $runtimeId;$registration=New-CcodInstallGenerationLeaf -Generation $generation -Leaf 'registration';Copy-CcodInstallSealedSource -Generation $registration -SourcePath $source.Path -Leaf 'StartMenu.CodexRemote-fix.lnk' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null;$manifest=Write-CcodInstallGenerationManifest -Generation $generation -Manifest (New-CcodGenerationManifest $runtimeId @([ordered]@{path='registration/StartMenu.CodexRemote-fix.lnk';length=$source.Length;sha256=$source.Sha256}));$null=Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $generation -ExpectedPreviousGeneration 0 -FileTransaction $generation;Close-CcodInstallFileTransaction -Transaction $generation -Disposition Ready
+            $ready=[pscustomobject][ordered]@{schemaVersion=1;transactionId='22222222-3333-4444-5555-666666666666';oldRuntimeId=$null;oldGeneration=$null;oldManifestSha256=$null;newRuntimeId=$runtimeId;newGeneration=[uint64]1;newManifestSha256=$manifest.Sha256;sealedPackageSha256=('e'*64);ownedObjectNames=@($runtimeId);phase='Ready';errorCode=$null}
+            if($mutation-ceq'PointerGap'){$ready.newGeneration=[uint64]3;[IO.File]::WriteAllText((Join-Path $fixture.Install 'state\active-generation\00000000000000000003.json'),([ordered]@{schemaVersion=1;generation=[uint64]3;activeRuntime=$runtimeId;previousGeneration=[uint64]2}|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))}
+            if($mutation-ceq'UnexpectedDirectory'){[IO.Directory]::CreateDirectory((Join-Path $fixture.Install 'state\active-generation\unexpected'))|Out-Null}
+            if($mutation-ceq'ScalarOwnedSet'){$ready.ownedObjectNames=$runtimeId}
+            $readyPath=Write-CcodProductReadyTransactionChain -InstallRoot $fixture.Install -ReadyRecord $ready
+            if($mutation-ceq'HardlinkPointer'){New-CcodHardLink -Path (Join-Path $fixture.Base 'pointer-hardlink.json') -Existing (Join-Path $fixture.Install 'state\active-generation\00000000000000000001.json')}
+            elseif($mutation-ceq'HardlinkTransaction'){New-CcodHardLink -Path (Join-Path $fixture.Base 'transaction-hardlink.json') -Existing $readyPath}
+            elseif($mutation-ceq'HardlinkManifest'){New-CcodHardLink -Path (Join-Path $fixture.Base 'manifest-hardlink.json') -Existing (Join-Path $fixture.Install "runtime\$runtimeId\manifest.json")}
+            if($mutation-in@('PointerGap','UnexpectedDirectory','HardlinkPointer','HardlinkTransaction','HardlinkManifest','ScalarOwnedSet')){Assert-CcodProductTransactionRejected -Fixture $fixture -Action {Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $ready};continue}
+            $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $ready;$fixture.Transactions.Add($product);$retained=Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId -ExpectedManifestSha256 $manifest.Sha256 -FileTransaction $product
+            $changed=$ready.PSObject.Copy();$changed.sealedPackageSha256=('f'*64);[IO.File]::WriteAllText($readyPath,($changed|ConvertTo-Json -Depth 8 -Compress),[Text.UTF8Encoding]::new($false))
+            Assert-CcodThrows {Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk' -ReadyTransaction $ready|Out-Null} 'CCOD_INSTALL_PRODUCT_SCOPE'
+        }finally{Remove-CcodInstallFileFixture $fixture}
+    }
 }
 
 Invoke-CcodTest 'V4 state-only transaction writes records but cannot reach generation or pointer operations' {

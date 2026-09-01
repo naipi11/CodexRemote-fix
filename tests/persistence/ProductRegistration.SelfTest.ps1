@@ -6,7 +6,7 @@ $modulePath = Join-Path $repositoryRoot 'src\persistence\modules\ProductRegistra
 if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
     throw "ProductRegistration module is missing: $modulePath"
 }
-Import-Module $modulePath -Force
+$module=Import-Module $modulePath -Force -PassThru
 
 $runtimeId = '2.5.22-1111111111111111-22222222222222222222222222222222'
 $packageSha256 = '3' * 64
@@ -103,7 +103,7 @@ function New-CcodRegistrationWorld {
         RemoveCurrentProductEntry = { param($Entry) $world.CurrentProductRemovals++ }.GetNewClosure()
         ReadLegacySnapshot = { param($ExpectedAppId);if($world.Legacy.appId-cne$ExpectedAppId){return [pscustomobject]@{appId=$world.Legacy.appId;entries=@($world.LegacyEntries)}};if(@($world.Legacy.shortcutNames).Count-ne8){return [pscustomobject]@{appId=$ExpectedAppId;entries=@('Unexpected')}};[pscustomobject]@{appId=$ExpectedAppId;entries=@($world.LegacyEntries)} }.GetNewClosure()
         RemoveLegacyEntry = { param($Entry);$world.LegacyRemoveAttempts++;if($world.LegacyRemoveFailureAt-eq$world.LegacyRemoveAttempts){throw 'fixture legacy delete failure'};[void]$world.LegacyEntries.Remove([string]$Entry) }.GetNewClosure()
-        ReadLegacyEntry = { param($Entry);if($world.LegacyReplacementEntry-ceq[string]$Entry){return 'Replacement'};if($world.LegacyEntries.Contains([string]$Entry)){[string]$Entry}else{$null} }.GetNewClosure()
+        ReadLegacyEntry = { param($Entry);if($world.LegacyReplacementEntry-ceq[string]$Entry){return 'Mismatch'};if($world.LegacyEntries.Contains([string]$Entry)){'Exact'}else{$null} }.GetNewClosure()
         RestoreLegacyEntry = { param($Entry);if($world.LegacyRestoreFailureEntry-ceq[string]$Entry){throw 'fixture restore failed'};if(-not$world.LegacyEntries.Contains([string]$Entry)){$world.LegacyEntries.Add([string]$Entry)};$world.LegacyRestores++ }.GetNewClosure()
         WriteLegacyCompensationFailure = {param($Record)$world.LegacyUnresolvedRecords.Add($Record)}.GetNewClosure()
     }
@@ -219,6 +219,17 @@ $results += Invoke-CcodTest 'current product cleanup requires exact registry val
     Assert-CcodEqual 0 $world.CurrentProductRemovals 'coherent arbitrary target evidence cannot authorize cleanup'
 }
 
+# Production mutation caught: the registry reader starts reading shortcut evidence even though an unknown
+# product subkey already makes the entire current registration ambiguous.
+$results += Invoke-CcodTest 'current product registry preflight rejects a subkey before returning shortcut entries' {
+    $allowed=@('CcodRuntimeId','DisplayVersion')
+    $accepted=&$module {param($ValueNames,$SubKeyNames,$Allowed)Test-CcodCurrentProductRegistryPreflight -ValueNames $ValueNames -SubKeyNames $SubKeyNames -AllowedValueNames $Allowed} $allowed @('unexpected-child') $allowed
+    Assert-CcodEqual $false $accepted 'an unknown subkey invalidates the complete state before shortcut evidence is read'
+    $world=New-CcodRegistrationWorld;$world.CurrentProductState.valid=$accepted;$world.CurrentProductState.entries=@()
+    Assert-CcodThrows {Remove-CcodProductRegistration -ReadyEvidence $cleanupReady -Adapters $world.Adapters} 'CCOD_PRODUCT_CLEANUP_INVALID'
+    Assert-CcodEqual 0 $world.CurrentProductRemovals 'subkey preflight failure performs zero removals'
+}
+
 # Production mutation caught: a mid-sequence legacy deletion failure leaves earlier exact entries missing.
 $results += Invoke-CcodTest 'legacy migration restores earlier exact deletions after a later deletion failure' {
     $world=New-CcodRegistrationWorld
@@ -249,6 +260,16 @@ $results += Invoke-CcodTest 'partially removed current registry entry is include
     $world=New-CcodRegistrationWorld;$null=Commit-CcodProductRegistration -Registration $world.Registration -FileTransaction ([pscustomobject]@{}) -Adapters $world.Adapters;$world.LegacyRemoveFailureAt=1;$world.LegacyRestoreFailureEntry='Registry';$originalRemove=$world.Adapters.RemoveLegacyEntry;$world.Adapters.RemoveLegacyEntry={param($Entry)if([string]$Entry-ceq'Registry'){[void]$world.LegacyEntries.Remove('Registry');throw 'partial registry failure'};&$originalRemove $Entry}.GetNewClosure()
     Assert-CcodThrows {Remove-CcodLegacyProductRegistration -ExpectedAppId $appId -Adapters $world.Adapters} 'CCOD_LEGACY_PRODUCT_COMPENSATION_FAILED'
     Assert-CcodTrue (@($world.LegacyUnresolvedRecords[0].entries)-ccontains'Registry') 'current partially removed registry entry is recorded unresolved'
+}
+
+$results += Invoke-CcodTest 'legacy registry snapshot comparison treats a present partial key as unresolved compensation' {
+    $captured=[pscustomobject]@{kind='Registry';path='HKCU:\fixture';values=[ordered]@{DisplayName=[pscustomobject]@{value='Codex';kind='String'};NoModify=[pscustomobject]@{value=1;kind='DWord'}}}
+    $partial=[pscustomobject]@{kind='Registry';path='HKCU:\fixture';values=[ordered]@{DisplayName=[pscustomobject]@{value='Codex';kind='String'}}}
+    $state=&$module {param($Expected,$Current)Compare-CcodLegacySnapshotEntry -Expected $Expected -Current $Current} $captured $partial
+    Assert-CcodEqual 'Mismatch' $state 'a still-present key missing one captured value is not restored'
+    $world=New-CcodRegistrationWorld;$null=Commit-CcodProductRegistration -Registration $world.Registration -FileTransaction ([pscustomobject]@{}) -Adapters $world.Adapters;$world.LegacyRemoveFailureAt=1;$world.Adapters.RemoveLegacyEntry={param($Entry)if([string]$Entry-ceq'Registry'){throw 'partial registry removal and internal restore failed'}};$world.Adapters.ReadLegacyEntry={param($Entry)if([string]$Entry-ceq'Registry'){return $state};if($world.LegacyEntries.Contains([string]$Entry)){return 'Exact'};$null}.GetNewClosure()
+    Assert-CcodThrows {Remove-CcodLegacyProductRegistration -ExpectedAppId $appId -Adapters $world.Adapters} 'CCOD_LEGACY_PRODUCT_COMPENSATION_FAILED'
+    Assert-CcodTrue (@($world.LegacyUnresolvedRecords[0].entries)-ccontains'Registry') 'partial registry key is persisted in the unresolved create-only record'
 }
 
 Write-Output "Product registration self-tests passed: $($results.Count)"

@@ -13,6 +13,7 @@ if (-not (Test-Path -LiteralPath $bootstrapScript -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $installedFinalizerScript -PathType Leaf)) { throw "Installed uninstall finalizer is missing: $installedFinalizerScript" }
 . $installedFinalizerScript
 Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\RuntimeManifest.psm1') -Force
+$canonicalTaskTarget=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'schtasks.exe'))
 
 function New-CcodUninstallBootstrapContext {
     return [pscustomobject][ordered]@{
@@ -21,7 +22,7 @@ function New-CcodUninstallBootstrapContext {
         leaseEpoch = [uint64]11
         userSid = 'S-1-5-21-111-222-333-1001'
         sessionId = 1
-        readyEvidence = [pscustomobject][ordered]@{phase='Ready';installRoot='C:\install';runtimeId='2.5.0-uninstall-test';runtimeGeneration=[uint64]7;packageSha256=('0'*64);manifestSha256=('a'*64);startMenuSha256=('0'*64);desktopSha256=('0'*64);targetPath='C:\Windows\System32\schtasks.exe';arguments='/Run /TN "Codex Control Other Devices Supervisor"'}
+        readyEvidence = [pscustomobject][ordered]@{phase='Ready';installRoot='C:\install';runtimeId='2.5.0-uninstall-test';runtimeGeneration=[uint64]7;packageSha256=('0'*64);manifestSha256=('a'*64);startMenuSha256=('0'*64);desktopSha256=('0'*64);targetPath=$canonicalTaskTarget;arguments='/Run /TN "Codex Control Other Devices Supervisor"'}
         payloadRecords = New-CcodUninstallBootstrapPayloadRecords -ResumeOnly
     }
 }
@@ -41,7 +42,7 @@ function New-CcodUninstallBootstrapTestTransaction {
         leaseEpoch = [uint64]11
         userSid = 'S-1-5-21-111-222-333-1001'
         sessionId = 1
-        readyEvidence = [pscustomobject][ordered]@{phase='Ready';installRoot='C:\install';runtimeId='2.5.0-uninstall-test';runtimeGeneration=[uint64]7;packageSha256=('0'*64);manifestSha256=('a'*64);startMenuSha256=('0'*64);desktopSha256=('0'*64);targetPath='C:\Windows\System32\schtasks.exe';arguments='/Run /TN "Codex Control Other Devices Supervisor"'}
+        readyEvidence = [pscustomobject][ordered]@{phase='Ready';installRoot='C:\install';runtimeId='2.5.0-uninstall-test';runtimeGeneration=[uint64]7;packageSha256=('0'*64);manifestSha256=('a'*64);startMenuSha256=('0'*64);desktopSha256=('0'*64);targetPath=$canonicalTaskTarget;arguments='/Run /TN "Codex Control Other Devices Supervisor"'}
         installedBinding = $null
         phase = $Phase
         resumePhase = $Phase
@@ -67,7 +68,7 @@ function New-CcodUninstallBootstrapAdapters {
                 leaseEpoch = [uint64]11
                 userSid = 'S-1-5-21-111-222-333-1001'
                 sessionId = 1
-                readyEvidence = [pscustomobject][ordered]@{phase='Ready';installRoot='C:\install';runtimeId='2.5.0-uninstall-test';runtimeGeneration=[uint64]7;packageSha256=('0'*64);manifestSha256=('a'*64);startMenuSha256=('0'*64);desktopSha256=('0'*64);targetPath='C:\Windows\System32\schtasks.exe';arguments='/Run /TN "Codex Control Other Devices Supervisor"'}
+                readyEvidence = [pscustomobject][ordered]@{phase='Ready';installRoot='C:\install';runtimeId='2.5.0-uninstall-test';runtimeGeneration=[uint64]7;packageSha256=('0'*64);manifestSha256=('a'*64);startMenuSha256=('0'*64);desktopSha256=('0'*64);targetPath=$canonicalTaskTarget;arguments='/Run /TN "Codex Control Other Devices Supervisor"'}
                 payloadRecords = New-CcodUninstallBootstrapPayloadRecords -ResumeOnly
             }
         }.GetNewClosure()
@@ -433,6 +434,7 @@ $results += Invoke-CcodTest 'Prepare resumes a TaskRemoved transaction even afte
         [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$localAppData,'Process')
         $identity = Get-CcodUninstallBootstrapCurrentIdentity
         $transaction = New-CcodUninstallBootstrapTestTransaction -Phase 'TaskRemoved'
+        $transaction.readyEvidence.installRoot = $installRoot
         $transaction.userSid = $identity.userSid
         $transaction.sessionId = [int]$identity.sessionId
         $world = [pscustomobject]@{
@@ -461,6 +463,7 @@ $results += Invoke-CcodTest 'Prepare rejects a partial-deletion transaction from
     try {
         [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$localAppData,'Process')
         $transaction = New-CcodUninstallBootstrapTestTransaction -Phase 'TaskRemoved'
+        $transaction.readyEvidence.installRoot = $installRoot
         $transaction.userSid = 'S-1-5-21-999-888-777-1001'
         $world = [pscustomobject]@{
             Calls = [Collections.Generic.List[string]]::new()
@@ -615,11 +618,53 @@ $results += Invoke-CcodTest 'noncanonical Ready shortcut target is rejected befo
     Assert-CcodEqual 0 @($world.Calls|Where-Object{$_-ceq'Cleanup'}).Count 'invalid target evidence reaches no cleanup deletion'
 }
 
+# Production mutation caught: a rooted but unrelated installRoot, or an added field, survives a weaker
+# fresh/stored Ready check and reaches application cleanup.
+$results += Invoke-CcodTest 'fresh and stored Ready evidence require one exact current-install-root invariant before cleanup' {
+    foreach($source in @('Fresh','Stored')){
+        foreach($mutation in @('WrongRoot','ExtraField')){
+            $world=[pscustomobject]@{Calls=[Collections.Generic.List[string]]::new();Transaction=$null;Receipt=$null;ValidationError=$false;StageError=$false;CleanupError=$false;CleanupFailurePhase=$null;InstallRootAbsent=$false;StagedEntries=@();ProductRegistrationRemovals=0}
+            $context=New-CcodUninstallBootstrapContext
+            if($source-ceq'Stored'){$world.Transaction=New-CcodUninstallBootstrapTestTransaction -Phase 'TaskRemoved'}
+            $ready=if($source-ceq'Fresh'){$context.readyEvidence}else{$world.Transaction.readyEvidence}
+            if($mutation-ceq'WrongRoot'){$ready.installRoot='C:\unrelated\CodexControlOtherDevices'}else{$ready|Add-Member -NotePropertyName unexpectedReadyField -NotePropertyValue 'reject'}
+            $adapters=New-CcodUninstallBootstrapAdapters $world
+            $adapters.ValidateInvocation={param($InstallerRoot,$InstallRoot)$context}.GetNewClosure()
+            Assert-CcodThrows {Invoke-CcodUninstallBootstrap -InstallerRoot 'C:\runtime' -InstallRoot 'C:\install' -Mode Prepare -Adapters $adapters|Out-Null} $(if($source-ceq'Fresh'){'CCOD_UNINSTALL_BOOTSTRAP_INVALID'}else{'CCOD_UNINSTALL_TRANSACTION_INVALID'})
+            Assert-CcodEqual 0 @($world.Calls|Where-Object{$_-ceq'Cleanup'}).Count "$source $mutation Ready mutation reaches no cleanup"
+        }
+    }
+}
+
 $results += Invoke-CcodTest 'default installed finalizer validates and removes only the exact selected generation fixture' {
     $local=Join-Path ([IO.Path]::GetTempPath()) ('ccod-installed-finalizer-'+[guid]::NewGuid().ToString('N'));$previous=[Environment]::GetEnvironmentVariable('LOCALAPPDATA','Process')
     try{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$local,'Process');$install=Join-Path $local 'CodexControlOtherDevices';$fixture=New-CcodVerifiedUninstallRuntimeFixture -InstallRoot $install -AppendOnly;$identity=Get-CcodUninstallBootstrapCurrentIdentity;$transactionRoot=Get-CcodUninstallBootstrapDefaultTransactionRoot;$id='11111111-2222-3333-4444-555555555555';$directory=New-CcodUninstallBootstrapTransactionDirectory -TransactionRoot $transactionRoot -TransactionId $id -UserSid $identity.userSid;$tx=New-CcodUninstallBootstrapTestTransaction -Phase 'TaskRemoved';$tx.runtimeId=$fixture.RuntimeId;$tx.runtimeGeneration=[uint64]7;$tx.userSid=$identity.userSid;$tx.sessionId=$identity.sessionId;$tx.readyEvidence.runtimeId=$fixture.RuntimeId;$tx.readyEvidence.runtimeGeneration=[uint64]7;$tx.readyEvidence.installRoot=$install;$manifest=(Get-FileHash (Join-Path $fixture.RuntimeRoot 'manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant();$tx.readyEvidence.manifestSha256=$manifest;$tx.installedBinding=[pscustomobject][ordered]@{selectedRuntimeRoot=$fixture.RuntimeRoot;runtimeManifestSha256=$manifest;wrapperPid=42;wrapperCreationTimeUtc='2030-02-03T03:04:05.0000000Z';wrapperSessionId=$identity.sessionId;wrapperUserSid=$identity.userSid};Write-CcodUninstallBootstrapStoredTransaction -TransactionDirectory $directory -Transaction $tx;Publish-CcodUninstallBootstrapCurrentTransaction -TransactionRoot $transactionRoot -TransactionId $id -UserSid $identity.userSid
         $payload=Join-Path $directory 'payload';[IO.Directory]::CreateDirectory((Join-Path $payload 'src\persistence'))|Out-Null;Copy-Item $bootstrapScript (Join-Path $payload 'src\persistence\UninstallBootstrap.ps1');$adapters=Get-CcodInstalledFinalizerAdapters -Adapters @{WaitWrapperExit={param($I,$T)[pscustomobject]@{verifiedAtStart=$true;exited=$true}};RemoveMatchedProductRegistration={param($T)};FinalizeReceipt={param($T)[pscustomobject]@{phase='Completed'}}} -TransactionRoot $transactionRoot -PayloadRoot $payload;$receipt=Invoke-CcodInstalledUninstallFinalizer -TransactionId $id -RuntimeRoot $fixture.RuntimeRoot -InstallRoot $install -WrapperIdentity ([pscustomobject]@{pid=42;creationTimeUtc='2030-02-03T03:04:05.0000000Z';sessionId=$identity.sessionId;userSid=$identity.userSid}) -Adapters $adapters;Assert-CcodEqual 'Completed' $receipt.phase 'default finalizer reaches completion';Assert-CcodTrue (-not(Test-Path $fixture.RuntimeRoot)) 'default finalizer deletes exact selected runtime';Assert-CcodTrue (Test-Path (Join-Path $install 'state')) 'default finalizer preserves sibling install state'
     }finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if(Test-Path $local){Remove-Item $local -Recurse -Force}}
+}
+
+function Invoke-CcodDefaultInstalledFinalizerNegative {
+    param([Parameter(Mandatory)][ValidateSet('Sibling','WrongPath','StaleEpoch','WrapperIdentity','WrongReadyRoot','ExtraReadyField')][string]$Mutation)
+    $local=Join-Path ([IO.Path]::GetTempPath()) ('ccod-finalizer-negative-'+[guid]::NewGuid().ToString('N'));$previous=[Environment]::GetEnvironmentVariable('LOCALAPPDATA','Process');$wrapper=$null
+    try{
+        [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$local,'Process');$install=Join-Path $local 'CodexControlOtherDevices';$fixture=New-CcodVerifiedUninstallRuntimeFixture -InstallRoot $install -AppendOnly;$selected=$fixture.RuntimeRoot;$runtime=$selected
+        if($Mutation-ceq'Sibling'){$runtime=Join-Path $install 'runtime\same-bootstrap-sibling';Copy-Item -LiteralPath $selected -Destination $runtime -Recurse -Force}
+        elseif($Mutation-ceq'WrongPath'){$runtime=Join-Path $selected 'nested-wrong-runtime'}
+        $identity=Get-CcodUninstallBootstrapCurrentIdentity;$id=[guid]::NewGuid().ToString('D');$transactionRoot=Get-CcodUninstallBootstrapDefaultTransactionRoot;$directory=New-CcodUninstallBootstrapTransactionDirectory -TransactionRoot $transactionRoot -TransactionId $id -UserSid $identity.userSid
+        $wrapper=Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Milliseconds 1400') -WindowStyle Hidden -PassThru;$wrapperCreation=$wrapper.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)
+        $tx=New-CcodUninstallBootstrapTestTransaction -Phase 'TaskRemoved';$tx.transactionId=$id;$tx.runtimeId=[IO.Path]::GetFileName($runtime);$tx.runtimeGeneration=[uint64]7;$tx.leaseEpoch=if($Mutation-ceq'StaleEpoch'){[uint64]12}else{[uint64]11};$tx.userSid=$identity.userSid;$tx.sessionId=$identity.sessionId;$tx.readyEvidence.installRoot=$install;$tx.readyEvidence.runtimeId=$tx.runtimeId;$tx.readyEvidence.runtimeGeneration=[uint64]7;$manifest=(Get-FileHash (Join-Path $selected 'manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant();$tx.readyEvidence.manifestSha256=$manifest;$tx.installedBinding=[pscustomobject][ordered]@{selectedRuntimeRoot=$runtime;runtimeManifestSha256=$manifest;wrapperPid=[int]$wrapper.Id;wrapperCreationTimeUtc=$wrapperCreation;wrapperSessionId=$identity.sessionId;wrapperUserSid=$identity.userSid}
+        Write-CcodUninstallBootstrapStoredTransaction -TransactionDirectory $directory -Transaction $tx;Publish-CcodUninstallBootstrapCurrentTransaction -TransactionRoot $transactionRoot -TransactionId $id -UserSid $identity.userSid
+        if($Mutation-ceq'WrongReadyRoot'){$tx.readyEvidence.installRoot=Join-Path $local 'unrelated-root';[IO.File]::WriteAllText((Join-Path $directory 'transaction.json'),($tx|ConvertTo-Json -Depth 12 -Compress),[Text.UTF8Encoding]::new($false))}
+        elseif($Mutation-ceq'ExtraReadyField'){$tx.readyEvidence|Add-Member -NotePropertyName unexpectedReadyField -NotePropertyValue 'reject';[IO.File]::WriteAllText((Join-Path $directory 'transaction.json'),($tx|ConvertTo-Json -Depth 12 -Compress),[Text.UTF8Encoding]::new($false))}
+        $payload=Join-Path $directory 'payload';foreach($relative in @('src\persistence\InstalledUninstallFinalizer.ps1','src\persistence\UninstallBootstrap.ps1')){$destination=Join-Path $payload $relative;[IO.Directory]::CreateDirectory((Split-Path $destination -Parent))|Out-Null;[IO.File]::Copy((Join-Path $selected $relative),$destination,$true)}
+        $creationArgument=if($Mutation-ceq'WrapperIdentity'){'2001-02-03T04:05:06.0000000Z'}else{$wrapperCreation};$previousPreference=$ErrorActionPreference;try{$ErrorActionPreference='Continue';$output=& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $payload 'src\persistence\InstalledUninstallFinalizer.ps1') -TransactionId $id -RuntimeRoot $runtime -InstallRoot $install -WrapperProcessId $wrapper.Id -WrapperCreationTimeUtc $creationArgument 2>&1;$exit=$LASTEXITCODE}finally{$ErrorActionPreference=$previousPreference}
+        if($exit-ne3){throw("FINALIZER_DIAGNOSTIC mutation={0} exit={1} output={2}"-f$Mutation,$exit,(@($output)-join' | '))};Assert-CcodEqual 3 $exit "$Mutation default child rejects before finalization";Assert-CcodTrue (Test-Path -LiteralPath $selected -PathType Container) "$Mutation preserves the selected generation";Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install 'state') -PathType Container) "$Mutation preserves sibling/root state"
+        if($Mutation-notin@('WrongPath','WrapperIdentity')){$wrapper.Refresh();Assert-CcodTrue $wrapper.HasExited "$Mutation reaches the default wrapper wait before its later negative boundary"}
+    }finally{if($null-ne$wrapper){try{if(-not$wrapper.HasExited){$wrapper.Kill();$wrapper.WaitForExit()}}catch{};$wrapper.Dispose()};[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if(Test-Path -LiteralPath $local){Remove-Item -LiteralPath $local -Recurse -Force}}
+}
+
+$results += Invoke-CcodTest 'default staged installed finalizer child rejects the full negative authorization matrix without deletion' {
+    foreach($mutation in @('Sibling','WrongPath','StaleEpoch','WrapperIdentity','WrongReadyRoot','ExtraReadyField')){Invoke-CcodDefaultInstalledFinalizerNegative -Mutation $mutation}
 }
 
 $results | ForEach-Object { "PASS $($_.Name)" }
