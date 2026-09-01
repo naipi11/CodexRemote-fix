@@ -11,6 +11,8 @@ Import-Module $modulePath -Force
 $runtimeId = '2.5.22-1111111111111111-22222222222222222222222222222222'
 $packageSha256 = '3' * 64
 $appId = '{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}'
+$canonicalTaskTarget=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'schtasks.exe'))
+$cleanupReady=[pscustomobject][ordered]@{phase='Ready';installRoot='C:\fixture\CodexControlOtherDevices';runtimeId=$runtimeId;runtimeGeneration=[uint64]7;packageSha256=$packageSha256;manifestSha256=('a'*64);startMenuSha256=('b'*64);desktopSha256=('c'*64);targetPath=$canonicalTaskTarget;arguments='/Run /TN "Codex Control Other Devices Supervisor"'}
 
 function New-CcodRegistrationWorld {
     param([string]$InstallRoot = 'C:\fixture\CodexControlOtherDevices')
@@ -24,6 +26,12 @@ function New-CcodRegistrationWorld {
             runtimeId = $runtimeId
             version = '2.5.22'
             packageSha256 = $packageSha256
+            runtimeGeneration = [uint64]7
+            manifestSha256 = 'a'*64
+            startMenuSha256 = 'b'*64
+            desktopSha256 = 'c'*64
+            targetPath = $canonicalTaskTarget
+            arguments = '/Run /TN "Codex Control Other Devices Supervisor"'
             bootstrapPath = $registration.bootstrapPath
             uninstallerPath = $registration.uninstallerPath
         }
@@ -50,12 +58,14 @@ function New-CcodRegistrationWorld {
         LegacyRemoved = $false
         LegacyRemovalCalls = 0
         CurrentProductRemovals = 0
-        CurrentProductState = [pscustomobject]@{valid=$true;reason=$null;entries=@('Registry','StartMenu','Desktop')}
+        CurrentProductState = [pscustomobject]@{valid=$true;reason=$null;readyEvidence=$cleanupReady;entries=@('Registry','StartMenu','Desktop')}
         LegacyEntries = $legacyEntries
         LegacyRemoveFailureAt = 0
         LegacyRemoveAttempts = 0
         LegacyRestores = 0
         LegacyReplacementEntry = $null
+        LegacyRestoreFailureEntry = $null
+        LegacyUnresolvedRecords = [Collections.Generic.List[object]]::new()
         Calls = [Collections.Generic.List[string]]::new()
     }
     $world | Add-Member -NotePropertyName Adapters -NotePropertyValue @{
@@ -92,7 +102,8 @@ function New-CcodRegistrationWorld {
         ReadLegacySnapshot = { param($ExpectedAppId);if($world.Legacy.appId-cne$ExpectedAppId){return [pscustomobject]@{appId=$world.Legacy.appId;entries=@($world.LegacyEntries)}};if(@($world.Legacy.shortcutNames).Count-ne8){return [pscustomobject]@{appId=$ExpectedAppId;entries=@('Unexpected')}};[pscustomobject]@{appId=$ExpectedAppId;entries=@($world.LegacyEntries)} }.GetNewClosure()
         RemoveLegacyEntry = { param($Entry);$world.LegacyRemoveAttempts++;if($world.LegacyRemoveFailureAt-eq$world.LegacyRemoveAttempts){throw 'fixture legacy delete failure'};[void]$world.LegacyEntries.Remove([string]$Entry) }.GetNewClosure()
         ReadLegacyEntry = { param($Entry);if($world.LegacyReplacementEntry-ceq[string]$Entry){return 'Replacement'};if($world.LegacyEntries.Contains([string]$Entry)){[string]$Entry}else{$null} }.GetNewClosure()
-        RestoreLegacyEntry = { param($Entry);if(-not$world.LegacyEntries.Contains([string]$Entry)){$world.LegacyEntries.Add([string]$Entry)};$world.LegacyRestores++ }.GetNewClosure()
+        RestoreLegacyEntry = { param($Entry);if($world.LegacyRestoreFailureEntry-ceq[string]$Entry){throw 'fixture restore failed'};if(-not$world.LegacyEntries.Contains([string]$Entry)){$world.LegacyEntries.Add([string]$Entry)};$world.LegacyRestores++ }.GetNewClosure()
+        WriteLegacyCompensationFailure = {param($Record)$world.LegacyUnresolvedRecords.Add($Record)}.GetNewClosure()
     }
     return $world
 }
@@ -114,6 +125,7 @@ $results += Invoke-CcodTest 'registration performs no writes before an exact Rea
         { param($ready) $ready.runtimeId = '2.5.22-aaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' },
         { param($ready) $ready.version = '2.5.21' },
         { param($ready) $ready.packageSha256 = '4' * 64 },
+        { param($ready) $ready.targetPath = 'C:\outside\task.exe' },
         { param($ready) $ready.bootstrapPath = 'C:\outside\bootstrap.ps1' },
         { param($ready) $ready.uninstallerPath = 'C:\outside\uninstall.ps1' }
     )) {
@@ -192,14 +204,17 @@ $results += Invoke-CcodTest 'legacy migration rejects AppId and shortcut-name mi
 
 # Production mutation caught: deleting a whole product key despite unknown values or mismatched shortcut evidence.
 $results += Invoke-CcodTest 'current product cleanup requires exact registry values and shortcut bytes targets and file identity' {
-    foreach($mutation in @('UnknownRegistryValue','ShortcutHash','ShortcutTarget','ShortcutReparse','Ambiguous')){
+    foreach($mutation in @('UnknownRegistryValue','ShortcutHash','ShortcutTarget','ShortcutReparse','Ambiguous','CoherentReplacement')){
         $world=New-CcodRegistrationWorld;$world.CurrentProductState.valid=$false;$world.CurrentProductState.reason=$mutation
-        Assert-CcodThrows {Remove-CcodProductRegistration -ExpectedRuntimeId $runtimeId -Adapters $world.Adapters} 'CCOD_PRODUCT_CLEANUP_INVALID'
+        Assert-CcodThrows {Remove-CcodProductRegistration -ReadyEvidence $cleanupReady -Adapters $world.Adapters} 'CCOD_PRODUCT_CLEANUP_INVALID'
         Assert-CcodEqual 0 $world.CurrentProductRemovals "$mutation mismatch preserves every current product entry"
     }
     $world=New-CcodRegistrationWorld
-    Remove-CcodProductRegistration -ExpectedRuntimeId $runtimeId -Adapters $world.Adapters
+    Remove-CcodProductRegistration -ReadyEvidence $cleanupReady -Adapters $world.Adapters
     Assert-CcodEqual 3 $world.CurrentProductRemovals 'matched cleanup removes only the exact registry and two shortcut entries'
+    $wrong=$cleanupReady.PSObject.Copy();$wrong.targetPath='C:\outside\task.exe';$world=New-CcodRegistrationWorld;$world.CurrentProductState.readyEvidence=$wrong
+    Assert-CcodThrows {Remove-CcodProductRegistration -ReadyEvidence $wrong -Adapters $world.Adapters} 'CCOD_PRODUCT_CLEANUP_INVALID'
+    Assert-CcodEqual 0 $world.CurrentProductRemovals 'coherent arbitrary target evidence cannot authorize cleanup'
 }
 
 # Production mutation caught: a mid-sequence legacy deletion failure leaves earlier exact entries missing.
@@ -215,9 +230,17 @@ $results += Invoke-CcodTest 'legacy migration restores earlier exact deletions a
 
 $results += Invoke-CcodTest 'legacy compensation never overwrites a replacement that appeared after deletion' {
     $world=New-CcodRegistrationWorld;$null=Commit-CcodProductRegistration -Registration $world.Registration -FileTransaction ([pscustomobject]@{}) -Adapters $world.Adapters;$world.LegacyRemoveFailureAt=4;$world.LegacyReplacementEntry='StartMenu1'
-    Assert-CcodThrows {Remove-CcodLegacyProductRegistration -ExpectedAppId $appId -Adapters $world.Adapters} 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID'
+    Assert-CcodThrows {Remove-CcodLegacyProductRegistration -ExpectedAppId $appId -Adapters $world.Adapters} 'CCOD_LEGACY_PRODUCT_COMPENSATION_FAILED'
     Assert-CcodEqual 2 $world.LegacyRestores 'compensation restores only entries that remain absent'
     Assert-CcodTrue (-not$world.LegacyEntries.Contains('StartMenu1')) 'replacement occupies the removed name and is not overwritten with captured bytes'
+    Assert-CcodEqual 1 $world.LegacyUnresolvedRecords.Count 'replacement-blocked restoration is recorded explicitly'
+}
+
+$results += Invoke-CcodTest 'legacy restore failure is explicit and records the unresolved exact entries' {
+    $world=New-CcodRegistrationWorld;$null=Commit-CcodProductRegistration -Registration $world.Registration -FileTransaction ([pscustomobject]@{}) -Adapters $world.Adapters;$world.LegacyRemoveFailureAt=4;$world.LegacyRestoreFailureEntry='StartMenu2'
+    Assert-CcodThrows {Remove-CcodLegacyProductRegistration -ExpectedAppId $appId -Adapters $world.Adapters} 'CCOD_LEGACY_PRODUCT_COMPENSATION_FAILED'
+    Assert-CcodEqual 1 $world.LegacyUnresolvedRecords.Count 'failed compensation writes one explicit unresolved record'
+    Assert-CcodTrue (@($world.LegacyUnresolvedRecords[0].entries)-ccontains'StartMenu2') 'unresolved record names the exact entry whose restoration failed'
 }
 
 Write-Output "Product registration self-tests passed: $($results.Count)"
