@@ -175,3 +175,60 @@ transaction plus arbitrary absolute source path.
 
 - `2e76698d535e6e824df1c57d81314be1c2e053e8`
   (`fix: complete matched product lifecycle`).
+
+## Fix round 2: exact Ready-bound finalization and cleanup
+
+Scoped review of `97cf17d..0fdc392` found four Important gaps: installed
+finalization did not durably bind wrapper/manifest/epoch and removed too broad
+a root; coherent registration replacement could self-authorize cleanup;
+product source authority did not require latest selected Ready evidence; and
+legacy restore failures were suppressed.
+
+### RED evidence
+
+- UninstallBootstrap exited `1` with `CCOD_INSTALLED_FINALIZER_INVALID`, target
+  `RemoveSelectedGeneration`, then separately with `NamedParameterNotFound`
+  for `Invoke-CcodUninstallBootstrap -WrapperIdentity`.
+- ProductRegistration exited `1` because `Remove-CcodProductRegistration`
+  lacked `ReadyEvidence`; the fixed `schtasks.exe` negative later failed by not
+  throwing `CCOD_PRODUCT_REGISTRATION_NOT_READY`.
+- InstallFileTransaction exited `1` because
+  `Open-CcodInstallProductRegistrationTransaction` lacked `ReadyEvidence`.
+- ProductRegistration exited `1` with `CCOD_PRODUCT_ADAPTER_INVALID`, target
+  `WriteLegacyCompensationFailure`.
+
+### GREEN evidence
+
+- ProductRegistration: `10/10`, exit `0`.
+- InstallFileTransaction: `27/27`, exit `0`.
+- UninstallBootstrap: `19/19`, exit `0`.
+- InstallLifecycle: `116/116`, exit `0`.
+- Explicit parser checks: `10/10`, zero failures.
+- `git diff --check`: exit `0`; only LF-to-CRLF checkout warnings.
+- Aggregate was not run; no aggregate-pass claim is made.
+
+### Boundaries
+
+- Prepare durably records exact wrapper PID/creation/session/SID, selected
+  runtime root, manifest hash, generation, Ready evidence and lease epoch.
+  Finalizer requires an initially verified wrapper and its later exact exit,
+  current epoch, matching leaf/manifest, and deletes only that generation.
+- Registration and cleanup bind canonical install root, Ready runtime and
+  generation, package/manifest/candidate hashes, exact arguments, and the
+  canonical `%System%\schtasks.exe` target. Coherent arbitrary replacements
+  preserve every entry.
+- Product-only and retained-file capabilities require the latest append-only
+  pointer, matching manifest and one matching Ready install record; pre-Ready,
+  stale/unselected, absolute, state-only and wrong-relative sources fail.
+- Legacy compensation verifies absence before each restore. Replacement or
+  restore failure is never overwritten or swallowed: it writes an explicit
+  unresolved record and returns `CCOD_LEGACY_PRODUCT_COMPENSATION_FAILED`.
+  A normal migration failure is reported only after full restoration.
+
+No real registry, shortcut, uninstall, product process, WindowsApps, DPAPI,
+network, release, push, tag, signing, or publication action was performed.
+
+### Fix implementation commit
+
+- `283ecbe3eb012f1e78377e9336aacc7b3acc9336`
+  (`fix: bind matched product finalization`).
