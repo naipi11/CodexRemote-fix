@@ -275,3 +275,67 @@ code change.
 
 - `58bd7603fa83133d78d2f62ac045ec00d25134c9`
   (`test: exercise portable sealed race end to end`).
+
+## Fix round 4: final portable copy-barrier evidence
+
+### Review finding and RED evidence
+
+Scoped review of
+`a5d595892f134a5ef957feab4ec4e68228cec97b..9e971d1fe26c0f60d8e8519318c11006798dc493`
+remained FAIL with one Important test-compliance finding. The actual-entrypoint
+fixture changed its child during the mocked Defender gate, so the production
+post-Defender manifest revalidation returned
+`CCOD_PORTABLE_MANIFEST_INVALID`; it did not exercise the later validated
+source-to-`File.Copy` barrier.
+
+The unfinished fix-round-4 test was run before completion. The full
+`ReleaseWorkflow.SelfTest.ps1` exited `1` in
+`actual portable entrypoint rejects the final File.Copy barrier race before
+child or lifecycle state`: its
+`CCOD_PORTABLE_COPY_HASH_MISMATCH` assertion failed because the fixture never
+performed the intended source mutation and `SourceMutated` remained false.
+This was the expected RED for the missing test-local copy-boundary condition.
+
+### Remediated evidence
+
+- The fixture invokes a byte-identical temporary copy of the production
+  `Install-CodexRemote-fix.ps1` and uses a byte-identical temporary copy of the
+  production `PortableRelease.psm1`; both identities are asserted before the
+  entrypoint runs.
+- The existing test-local entrypoint breakpoint redirects only the module's
+  private expected-installer-root function to a new disposable fixture root.
+  No public production parameter or externally reachable test switch was
+  added.
+- The manifest order is asserted so the marker-capable child reaches the first
+  production payload copy boundary. A breakpoint on the copied module's unique
+  ordinary `[IO.File]::Copy($sourceFile,$destination,$false)` line writes
+  distinct child text after the module has validated its source record and
+  immediately before that production copy executes.
+- The production copy and destination SHA-256 comparison then run unchanged
+  and return `CCOD_PORTABLE_COPY_HASH_MISMATCH`. Only after the actual
+  entrypoint returns does the test prove that the child marker, fixture
+  lifecycle/install root, and published fixture installer root are all absent.
+- The separate post-Defender source-revalidation fixture remains intact and
+  continues to cover its earlier `CCOD_PORTABLE_MANIFEST_INVALID` boundary.
+
+### GREEN and verification evidence
+
+- Final `ReleaseWorkflow.SelfTest.ps1`: exit `0`; final output
+  `Release workflow self-tests passed.` The actual-entrypoint final
+  `File.Copy` barrier case passed.
+- Final `InstallLifecycle.SelfTest.ps1`: exit `0`; final output
+  `Install lifecycle self-tests passed: 113`.
+- The changed PowerShell test file parsed with zero errors (`1/1`).
+- `git diff --check` exited `0`; only the checkout LF-to-CRLF warning was
+  emitted.
+- No aggregate run was performed in this fix round; no aggregate-pass claim is
+  made.
+- No real installer, network, external action, listener, product process
+  control, release, push, tag, signing, install, WindowsApps, or DPAPI action
+  occurred. All new runtime files were temporary fixture files below a unique
+  disposable root.
+
+### Exact implementation commit
+
+- `141ab716001e7c1048db10e248101fa8cd3f54ae`
+  (`test: exercise portable copy barrier race`).
