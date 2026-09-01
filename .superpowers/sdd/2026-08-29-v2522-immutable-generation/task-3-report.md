@@ -94,5 +94,70 @@ separately from production defects so they are not mistaken for regressions.
 
 ## Commit
 
-- `fix: bootstrap sealed installer package` (the Task 3 commit containing this
-  report; resolve the exact object as this worktree's Task 3 HEAD).
+- Initial implementation commit:
+  `9e1c41c72d296c2d0c014a45561a855699ebd39b`
+  (`fix: bootstrap sealed installer package`).
+
+## Fix round 1: portable identity, exact provenance, and executed Setup proof
+
+### Review findings and RED evidence
+
+Scoped review of `46692e7..9e1c41c72d296c2d0c014a45561a855699ebd39b`
+failed with four Important findings.
+
+- Portable identity RED: `ReleaseWorkflow.SelfTest.ps1` exited `1` because
+  `Invoke-CcodPortableLifecycleInstaller` did not exist. The portable wrapper
+  revalidated its manifest after Defender but discarded that result and called
+  `Install-CodexControlOtherDevices.ps1` without `-SealedPackageSha256`.
+- Exact provenance RED: the new schema-two mutation matrix exited `1` with
+  `ASSERT_THROWS: expected CCOD_SETUP_PROVENANCE_INVALID`. The validator
+  accepted altered nested evidence because it did not require every property
+  order/type/name/length/count/hash.
+- Executed Setup RED: the deliberately wrong-package-hash production Setup
+  compiled successfully and executed its real temporary input path, but the
+  test observed exit `0`. Its runtime log proved the hash gate did run:
+  `CurStepChanged raised an exception` with
+  `CCOD_SETUP_INPUT_BINDING_INVALID`; Inno defaulted the suppressed error box
+  to OK and still returned success.
+- Report RED: the initial report said only “Task 3 HEAD”, which did not provide
+  an immutable 40-hex object identity.
+
+### Remediated behavior
+
+- Portable now retains both the initial and post-Defender verified
+  `PayloadManifestSha256`, requires an exact canonical match before invoking
+  the lifecycle child, and passes that value explicitly as
+  `-SealedPackageSha256`. A changed canonical identity fails with
+  `CCOD_PORTABLE_PACKAGE_IDENTITY_INVALID` before the child marker can run.
+- `Test-CcodSealedSetupBuildProvenance` requires exact ordered top-level and
+  nested schemas, JSON types, artifact names, actual lengths and SHA-256s,
+  manifest `fileCount` and `payloadManifestSha256`, canonical version/commit/
+  timestamp, compiler/template/inventory identity, and the complete split PE
+  contract. Twenty-four independent mutations are rejected.
+- The same `ExtractAndLockCcodInputs` gate now runs from `PrepareToInstall`.
+  A nonempty error uses Inno's actual install-failure contract; `CurStepChanged`
+  consumes only the three already-held verified handles. The executed
+  wrong-hash fixture exits nonzero, records
+  `CCOD_SETUP_INPUT_BINDING_INVALID`, never runs its inert activation marker,
+  creates no `/DIR` app output, and never logs the real LocalAppData product
+  root.
+
+### GREEN and verification evidence
+
+- Final `ReleaseWorkflow.SelfTest.ps1`: exit `0`, including the portable exact
+  identity test, 24-case provenance mutation matrix, real production ISCC
+  compile, and bounded wrong-hash Setup execution.
+- Final `InstallLifecycle.SelfTest.ps1`: exit `0`;
+  `Install lifecycle self-tests passed: 113`.
+- Explicit parser checks passed all four changed PowerShell code/test files.
+- `git diff --check` exited `0`; only checkout LF-to-CRLF warnings were emitted.
+- Static no-`{app}` boundary audit reported `FIX1_BOUNDARY_VIOLATIONS=0`.
+- No aggregate run was performed in this fix round; no aggregate-pass claim is
+  made.
+- No release build, real install, product process control, external service,
+  WindowsApps, DPAPI, signing, push, tag, or publication action occurred.
+
+### Exact implementation commit
+
+- `51def5c9ae2f5e0722b9083e478b17c507e9cee8`
+  (`fix: harden sealed setup evidence`).
