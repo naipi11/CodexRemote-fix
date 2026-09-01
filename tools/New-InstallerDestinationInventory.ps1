@@ -43,6 +43,24 @@ function Assert-CcodInstallerInnoPreprocessorLines {
         '#error InstallerPayloadDirectory must be supplied by the release builder',
         '#ifndef InstallerPayloadManifestSha256',
         '#error InstallerPayloadManifestSha256 must be supplied by the release builder',
+        '#ifndef ProjectVersion',
+        '#error ProjectVersion must be supplied by the release builder',
+        '#ifndef InstallerPackagePath',
+        '#error InstallerPackagePath must be supplied by the release builder',
+        '#ifndef InstallerPackageManifestPath',
+        '#error InstallerPackageManifestPath must be supplied by the release builder',
+        '#ifndef InstallerPackageSha256',
+        '#error InstallerPackageSha256 must be supplied by the release builder',
+        '#ifndef InstallerPackageManifestSha256',
+        '#error InstallerPackageManifestSha256 must be supplied by the release builder',
+        '#define InstallerPackageManifestSha256First Copy(InstallerPackageManifestSha256, 1, 32)',
+        '#define InstallerPackageManifestSha256Last Copy(InstallerPackageManifestSha256, 33, 32)',
+        '#ifndef ActivationBootstrapPath',
+        '#error ActivationBootstrapPath must be supplied by the release builder',
+        '#ifndef ActivationBootstrapSha256',
+        '#error ActivationBootstrapSha256 must be supplied by the release builder',
+        '#define ActivationBootstrapSha256First Copy(ActivationBootstrapSha256, 1, 32)',
+        '#define ActivationBootstrapSha256Last Copy(ActivationBootstrapSha256, 33, 32)',
         '#ifndef SetupGitCommit',
         '#error SetupGitCommit must be supplied by the release builder',
         '#ifndef SetupProvenancePath',
@@ -55,6 +73,16 @@ function Assert-CcodInstallerInnoPreprocessorLines {
         '{#PortableArtifactDirectory}',
         '{#InstallerPayloadDirectory}',
         '{#InstallerPayloadManifestSha256}',
+        '{#InstallerPackagePath}',
+        '{#InstallerPackageManifestPath}',
+        '{#InstallerPackageSha256}',
+        '{#InstallerPackageManifestSha256}',
+        '{#InstallerPackageManifestSha256First}',
+        '{#InstallerPackageManifestSha256Last}',
+        '{#ActivationBootstrapPath}',
+        '{#ActivationBootstrapSha256}',
+        '{#ActivationBootstrapSha256First}',
+        '{#ActivationBootstrapSha256Last}',
         '{#SetupGitCommit}',
         '{#SetupProvenancePath}'
     )
@@ -91,6 +119,8 @@ foreach ($line in $lines) {
     if ($line -match '^\s*\[Files\]\s*$') { $insideFiles = $true; continue }
     if ($insideFiles -and $line -match '^\[') { break }
     if (-not $insideFiles -or [string]::IsNullOrWhiteSpace($line)) { continue }
+    $temporaryInput = [regex]::Match($line,'^Source:\s*"(?<source>[^"]+)";\s*DestName:\s*"(?<name>[A-Za-z0-9._-]+)";\s*Flags:\s*dontcopy\s*$')
+    if ($temporaryInput.Success) { continue }
     $match = [regex]::Match($line,'^Source:\s*"(?<source>[^"]+)";\s*DestDir:\s*"(?<destination>[^"]+)";(?<tail>.*)$')
     if (-not $match.Success) { throw "Unsupported [Files] entry for destination inventory: $line" }
     $destination = $match.Groups['destination'].Value.Replace('{#ProjectVersion}',$ProjectVersion)
@@ -123,7 +153,7 @@ foreach ($line in $lines) {
         }
     }
 }
-if (-not $insideFiles -or $directories.Count -eq 0) { throw 'No setup destination directories were generated.' }
+if (-not $insideFiles) { throw 'No setup Files section was inspected.' }
 $ordered = [Collections.Generic.List[string]]::new()
 foreach ($directory in $directories) { $ordered.Add($directory) }
 $ordered.Sort([StringComparer]::Ordinal)

@@ -130,6 +130,24 @@ function Assert-CcodBuildInnoPreprocessorLines {
         '#error InstallerPayloadDirectory must be supplied by the release builder',
         '#ifndef InstallerPayloadManifestSha256',
         '#error InstallerPayloadManifestSha256 must be supplied by the release builder',
+        '#ifndef ProjectVersion',
+        '#error ProjectVersion must be supplied by the release builder',
+        '#ifndef InstallerPackagePath',
+        '#error InstallerPackagePath must be supplied by the release builder',
+        '#ifndef InstallerPackageManifestPath',
+        '#error InstallerPackageManifestPath must be supplied by the release builder',
+        '#ifndef InstallerPackageSha256',
+        '#error InstallerPackageSha256 must be supplied by the release builder',
+        '#ifndef InstallerPackageManifestSha256',
+        '#error InstallerPackageManifestSha256 must be supplied by the release builder',
+        '#define InstallerPackageManifestSha256First Copy(InstallerPackageManifestSha256, 1, 32)',
+        '#define InstallerPackageManifestSha256Last Copy(InstallerPackageManifestSha256, 33, 32)',
+        '#ifndef ActivationBootstrapPath',
+        '#error ActivationBootstrapPath must be supplied by the release builder',
+        '#ifndef ActivationBootstrapSha256',
+        '#error ActivationBootstrapSha256 must be supplied by the release builder',
+        '#define ActivationBootstrapSha256First Copy(ActivationBootstrapSha256, 1, 32)',
+        '#define ActivationBootstrapSha256Last Copy(ActivationBootstrapSha256, 33, 32)',
         '#ifndef SetupGitCommit',
         '#error SetupGitCommit must be supplied by the release builder',
         '#ifndef SetupProvenancePath',
@@ -142,6 +160,16 @@ function Assert-CcodBuildInnoPreprocessorLines {
         '{#PortableArtifactDirectory}',
         '{#InstallerPayloadDirectory}',
         '{#InstallerPayloadManifestSha256}',
+        '{#InstallerPackagePath}',
+        '{#InstallerPackageManifestPath}',
+        '{#InstallerPackageSha256}',
+        '{#InstallerPackageManifestSha256}',
+        '{#InstallerPackageManifestSha256First}',
+        '{#InstallerPackageManifestSha256Last}',
+        '{#ActivationBootstrapPath}',
+        '{#ActivationBootstrapSha256}',
+        '{#ActivationBootstrapSha256First}',
+        '{#ActivationBootstrapSha256Last}',
         '{#SetupGitCommit}',
         '{#SetupProvenancePath}'
     )
@@ -409,6 +437,13 @@ try {
         }
     }
     $installerPayloadManifestSha256 = Get-CcodBuildFileSha256 -Path $installerPayloadManifestPath
+    $installerPackagePath = Join-Path $installerPayloadDirectory 'installer-package.zip'
+    $installerPackageManifestPath = Join-Path $installerPayloadDirectory 'installer-package.manifest.json'
+    Import-Module (Join-Path $PSScriptRoot 'InstallerPackage.psm1') -Force
+    $installerPackage = New-CcodInstallerPackage -PayloadRoot $installerPayloadDirectory -PayloadManifestPath $installerPayloadManifestPath -Version $Version -GitCommit $gitCommit -OutputPath $installerPackagePath -ManifestOutputPath $installerPackageManifestPath
+    Test-CcodInstallerPackage -PackagePath $installerPackagePath -ManifestPath $installerPackageManifestPath -ExpectedPackageSha256 $installerPackage.PackageSha256 -ExpectedManifestSha256 $installerPackage.ManifestSha256 -ExpectedVersion $Version -ExpectedGitCommit $gitCommit | Out-Null
+    $activationBootstrapPath = Assert-CcodBuildRegularFile -Path (Join-Path $repoRoot 'Activate-CcodRemoteFix.ps1') -Kind 'Activation bootstrap'
+    $activationBootstrapSha256 = Get-CcodBuildFileSha256 -Path $activationBootstrapPath
     $destinationInventoryGenerator = Join-Path $repoRoot 'tools\New-InstallerDestinationInventory.ps1'
     if (-not [IO.File]::Exists($destinationInventoryGenerator)) { throw "Installer destination inventory generator is missing: $destinationInventoryGenerator" }
     & $destinationInventoryGenerator -RepositoryRoot $repoRoot -PayloadRoot $installerPayloadDirectory -ProjectVersion $Version -InnoScriptPath (Join-Path $PSScriptRoot 'CodexControlOtherDevices.iss') -OutputPath $installerDestinationInventoryPath | Out-Null
@@ -483,22 +518,24 @@ $iscc = $isccCandidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -
 if (-not $iscc) { throw 'Inno Setup 6 (ISCC.exe) was not found. Install it with: winget install --id JRSoftware.InnoSetup --exact' }
 $issPath = Join-Path $PSScriptRoot 'CodexControlOtherDevices.iss'
 Import-Module (Join-Path $PSScriptRoot 'SetupArtifact.psm1') -Force
-[IO.File]::Copy((Assert-CcodBuildRegularFile -Path $installerPayloadManifestPath -Kind 'Installer payload manifest'),$setupPayloadInput,$false)
+[IO.File]::Copy((Assert-CcodBuildRegularFile -Path $installerPackageManifestPath -Kind 'Installer package manifest'),$setupPayloadInput,$false)
 [IO.File]::Copy((Assert-CcodBuildRegularFile -Path $installerDestinationInventoryPath -Kind 'Installer destination inventory'),$setupInventoryInput,$false)
-$setupProvenanceRecord = New-CcodSetupBuildProvenance -Version $Version -GitCommit $gitCommit -BuildTimestampUtc $buildTimestampUtc -PayloadManifestPath $installerPayloadManifestPath -InnoTemplatePath $issPath -DestinationInventoryPath $installerDestinationInventoryPath -CompilerPath $iscc -OutputPath $setupProvenance
-Test-CcodSetupBuildProvenance -ProvenancePath $setupProvenance -ExpectedVersion $Version -ExpectedGitCommit $gitCommit -ExpectedPayloadManifestSha256 $installerPayloadManifestSha256 -ExpectedBuildTimestampUtc $buildTimestampUtc -InnoTemplatePath $issPath -DestinationInventoryPath $installerDestinationInventoryPath -CompilerPath $iscc -PayloadManifestPath $installerPayloadManifestPath | Out-Null
+$setupProvenanceRecord = New-CcodSealedSetupBuildProvenance -Version $Version -GitCommit $gitCommit -BuildTimestampUtc $buildTimestampUtc -PackagePath $installerPackagePath -PackageManifestPath $installerPackageManifestPath -ActivationBootstrapPath $activationBootstrapPath -InnoTemplatePath $issPath -DestinationInventoryPath $installerDestinationInventoryPath -CompilerPath $iscc -OutputPath $setupProvenance
+Test-CcodSealedSetupBuildProvenance -ProvenancePath $setupProvenance -ExpectedVersion $Version -ExpectedGitCommit $gitCommit -ExpectedPackageSha256 $installerPackage.PackageSha256 -ExpectedPackageManifestSha256 $installerPackage.ManifestSha256 -ExpectedActivationBootstrapSha256 $activationBootstrapSha256 -ExpectedBuildTimestampUtc $buildTimestampUtc -PackagePath $installerPackagePath -PackageManifestPath $installerPackageManifestPath -ActivationBootstrapPath $activationBootstrapPath -InnoTemplatePath $issPath -DestinationInventoryPath $installerDestinationInventoryPath -CompilerPath $iscc | Out-Null
 $isccArguments = @(
     "/DProjectVersion=$Version",
-    "/DTrayHostArtifactDirectory=$trayHostArtifact",
-    "/DPortableArtifactDirectory=$portableArtifact",
-    "/DInstallerPayloadDirectory=$installerPayloadDirectory",
-    "/DInstallerPayloadManifestSha256=$installerPayloadManifestSha256",
+    "/DInstallerPackagePath=$installerPackagePath",
+    "/DInstallerPackageManifestPath=$installerPackageManifestPath",
+    "/DInstallerPackageSha256=$($installerPackage.PackageSha256)",
+    "/DInstallerPackageManifestSha256=$($installerPackage.ManifestSha256)",
+    "/DActivationBootstrapPath=$activationBootstrapPath",
+    "/DActivationBootstrapSha256=$activationBootstrapSha256",
     "/DSetupGitCommit=$gitCommit",
     "/DSetupProvenancePath=$setupProvenance",
     "/O$dist\."
 )
 Invoke-CcodBuildInnoCompiler -TemplatePath $issPath -InventoryPath $installerDestinationInventoryPath -IsccPath $iscc -Arguments $isccArguments -SetupPath $setupExe
-$setupValidation = Test-CcodSetupArtifact -SetupPath $setupExe -ExpectedVersion $Version -ExpectedGitCommit $gitCommit -ExpectedPayloadManifestSha256 $installerPayloadManifestSha256
+$setupValidation = Test-CcodSetupArtifact -SetupPath $setupExe -ExpectedVersion $Version -ExpectedGitCommit $gitCommit -ExpectedPackageSha256 $installerPackage.PackageSha256 -ExpectedPackageManifestSha256 $installerPackage.ManifestSha256 -ExpectedActivationBootstrapSha256 $activationBootstrapSha256
 $setupHash = [string]$setupValidation.Sha256
 Write-CcodBuildUtf8 -Path $setupChecksum -Text ("{0} *{1}" -f $setupHash,[IO.Path]::GetFileName($setupExe))
 $setupRecord = [ordered]@{

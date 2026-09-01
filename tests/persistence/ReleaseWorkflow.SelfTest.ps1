@@ -295,7 +295,78 @@ Invoke-CcodTest 'production installer payload generator writes ordered version-b
     }
 }
 
-Invoke-CcodTest 'production setup template has one inventory marker, no external includes, and derives every nested directory' {
+# Production mutation caught: accepting a ZIP whose entry set or identity no longer matches the manifest bound by Setup.
+Invoke-CcodTest 'sealed installer package rejects entry and identity changes before product state exists' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-sealed-installer-package-' + [guid]::NewGuid().ToString('N'))
+    $module = $null
+    try {
+        $payload = Join-Path $root 'payload'
+        foreach ($directory in @('src\persistence\modules')) { [IO.Directory]::CreateDirectory((Join-Path $payload $directory)) | Out-Null }
+        [IO.File]::WriteAllText((Join-Path $payload 'package.json'),'{"version":"2.5.22"}',[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $payload 'Install-CodexControlOtherDevices.ps1'),'param()',[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $payload 'src\persistence\modules\InstallLifecycle.psm1'),'# lifecycle',[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $payload 'src\persistence\modules\RuntimeManifest.psm1'),'# manifest',[Text.UTF8Encoding]::new($false))
+        $payloadManifest = Join-Path $root 'installer-payload.manifest.json'
+        & (Join-Path $repositoryRoot 'tools\New-InstallerPayloadManifest.ps1') -PayloadRoot $payload -ProjectVersion '2.5.22' -OutputPath $payloadManifest | Out-Null
+        $package = Join-Path $root 'installer-package.zip'
+        $manifest = Join-Path $root 'installer-package.manifest.json'
+        $module = Import-Module (Join-Path $repositoryRoot 'build\InstallerPackage.psm1') -Force -PassThru
+        $created = New-CcodInstallerPackage -PayloadRoot $payload -PayloadManifestPath $payloadManifest -Version '2.5.22' -GitCommit ('a' * 40) -OutputPath $package -ManifestOutputPath $manifest
+        $validated = Test-CcodInstallerPackage -PackagePath $package -ManifestPath $manifest -ExpectedPackageSha256 $created.PackageSha256 -ExpectedManifestSha256 $created.ManifestSha256 -ExpectedVersion '2.5.22' -ExpectedGitCommit ('a' * 40)
+        Assert-CcodEqual $true ([bool]$validated.Valid) 'canonical sealed installer package validates'
+
+        Assert-CcodThrows {
+            Test-CcodInstallerPackage -PackagePath $package -ManifestPath $manifest -ExpectedPackageSha256 ('0' * 64) -ExpectedManifestSha256 $created.ManifestSha256 -ExpectedVersion '2.5.22' -ExpectedGitCommit ('a' * 40) | Out-Null
+        } 'CCOD_INSTALLER_PACKAGE_HASH_MISMATCH'
+        Assert-CcodThrows {
+            Test-CcodInstallerPackage -PackagePath $package -ManifestPath $manifest -ExpectedPackageSha256 $created.PackageSha256 -ExpectedManifestSha256 ('0' * 64) -ExpectedVersion '2.5.22' -ExpectedGitCommit ('a' * 40) | Out-Null
+        } 'CCOD_INSTALLER_PACKAGE_MANIFEST_HASH_MISMATCH'
+        Assert-CcodThrows {
+            Test-CcodInstallerPackage -PackagePath $package -ManifestPath $manifest -ExpectedPackageSha256 $created.PackageSha256 -ExpectedManifestSha256 $created.ManifestSha256 -ExpectedVersion '9.9.9' -ExpectedGitCommit ('a' * 40) | Out-Null
+        } 'CCOD_INSTALLER_PACKAGE_INVALID'
+        Assert-CcodThrows {
+            Test-CcodInstallerPackage -PackagePath $package -ManifestPath $manifest -ExpectedPackageSha256 $created.PackageSha256 -ExpectedManifestSha256 $created.ManifestSha256 -ExpectedVersion '2.5.22' -ExpectedGitCommit ('b' * 40) | Out-Null
+        } 'CCOD_INSTALLER_PACKAGE_INVALID'
+
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        foreach ($variant in @(
+            [pscustomobject]@{Name='missing';Mutate={param($archive)$archive.GetEntry('package.json').Delete()}},
+            [pscustomobject]@{Name='extra';Mutate={param($archive)$entry=$archive.CreateEntry('extra.txt');$writer=[IO.StreamWriter]::new($entry.Open());try{$writer.Write('extra')}finally{$writer.Dispose()}}},
+            [pscustomobject]@{Name='duplicate';Mutate={param($archive)$entry=$archive.CreateEntry('package.json');$writer=[IO.StreamWriter]::new($entry.Open());try{$writer.Write('{}')}finally{$writer.Dispose()}}},
+            [pscustomobject]@{Name='unsafe';Mutate={param($archive)$entry=$archive.CreateEntry('../escape.txt');$writer=[IO.StreamWriter]::new($entry.Open());try{$writer.Write('escape')}finally{$writer.Dispose()}}},
+            [pscustomobject]@{Name='changed';Mutate={param($archive)$archive.GetEntry('package.json').Delete();$entry=$archive.CreateEntry('package.json');$writer=[IO.StreamWriter]::new($entry.Open());try{$writer.Write('{"version":"9.9.9"}')}finally{$writer.Dispose()}}}
+        )) {
+            $variantPath = Join-Path $root ("$($variant.Name).zip")
+            [IO.File]::Copy($package,$variantPath,$false)
+            $archive = [IO.Compression.ZipFile]::Open($variantPath,[IO.Compression.ZipArchiveMode]::Update)
+            try { & $variant.Mutate $archive } finally { $archive.Dispose() }
+            $variantHash = Get-CcodTestFileSha256 -Path $variantPath
+            Assert-CcodThrows {
+                Test-CcodInstallerPackage -PackagePath $variantPath -ManifestPath $manifest -ExpectedPackageSha256 $variantHash -ExpectedManifestSha256 $created.ManifestSha256 -ExpectedVersion '2.5.22' -ExpectedGitCommit ('a' * 40) | Out-Null
+            } 'CCOD_INSTALLER_PACKAGE_INVALID'
+        }
+        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $root 'product-state'))) 'all package failures precede product state creation'
+    } finally {
+        if ($null -ne $module) { Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+# Production mutation caught: restoring any legacy recursive {app} copy or executing a writable app bootstrap before Ready.
+Invoke-CcodTest 'Setup contains only sealed temporary inputs and no pre-Ready app product write' {
+    $source = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
+    Assert-CcodTrue ($source -cmatch '(?m)^CreateAppDir=no\s*$') 'Setup never creates app before Ready'
+    Assert-CcodTrue ($source -cmatch '(?m)^Uninstallable=no\s*$') 'Setup never creates an Inno uninstaller before Ready'
+    Assert-CcodTrue ($source -cmatch 'InstallerPackageSha256' -and $source -cmatch 'InstallerPackageManifestSha256' -and $source -cmatch 'ActivationBootstrapSha256') 'Setup binds package manifest and bootstrap hashes'
+    Assert-CcodTrue ($source -cnotmatch '(?im)^\s*Source:.*DestDir:\s*"\{app\}' -and $source -cnotmatch '(?im)^\[(Icons|Registry|UninstallRun)\]\s*$') 'Setup has no pre-Ready app Files Icons Registry or UninstallRun writes'
+    Assert-CcodTrue ($source -cnotmatch 'recursesubdirs|createallsubdirs|Source:\s*"[^"]*\\\*"') 'Setup never recursively extracts an arbitrary payload tree'
+    Assert-CcodTrue ($source -cnotmatch '-File\s+"\{app\}\\Activate-CcodRemoteFix\.ps1"') 'Setup never executes activation from writable app'
+    $fileLines = @([regex]::Matches($source,'(?im)^\s*Source:\s*"[^\r\n]+$') | ForEach-Object { $_.Value })
+    Assert-CcodEqual 4 $fileLines.Count 'Setup embeds exactly package manifest bootstrap and provenance inputs'
+    foreach ($line in $fileLines) { Assert-CcodTrue ($line -cmatch 'Flags:\s*dontcopy\s*$') 'every Setup input is private temporary dontcopy data' }
+}
+
+Invoke-CcodTest 'production setup template has one inventory marker no external includes and no product destination inventory' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-installer-directory-inventory-' + [guid]::NewGuid().ToString('N'))
     try {
         $payload = Join-Path $root 'payload'
@@ -310,9 +381,8 @@ Invoke-CcodTest 'production setup template has one inventory marker, no external
         Assert-CcodEqual 0 $externalIncludes.Count 'production template has no external include directive'
         & (Join-Path $repositoryRoot 'tools\New-InstallerDestinationInventory.ps1') -RepositoryRoot $repositoryRoot -PayloadRoot $payload -ProjectVersion '2.5.22' -InnoScriptPath $innoPath -OutputPath $output | Out-Null
         $inventory = [IO.File]::ReadAllText($output,[Text.UTF8Encoding]::new($false))
-        foreach ($relative in @('src','src\persistence','src\persistence\modules','payload','payload\2.5.22','payload\2.5.22\src','payload\2.5.22\src\persistence','payload\2.5.22\src\persistence\modules')) {
-            Assert-CcodTrue ($inventory.Contains("Directories.Add('$relative');")) "generated setup inventory contains $relative"
-        }
+        Assert-CcodTrue ($inventory -cmatch '(?s)^procedure AddCcodExpectedSetupDirectories\(Directories: TStrings\);\s*begin\s*end;\s*$') 'sealed Setup produces an explicit empty product destination inventory'
+        Assert-CcodTrue ($inventory -cnotmatch 'Directories\.Add') 'no payload directory can be created before Ready'
     } finally {
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
     }
@@ -1076,8 +1146,11 @@ param(
     [string]$ActivationId,
     [string]$ExpectedVersion,
     [string]$PayloadManifestPath,
-    [string]$ExpectedPayloadManifestSha256
+    [string]$ExpectedPayloadManifestSha256,
+    [string]$SealedPackageSha256
 )
+$null = [IO.Directory]::CreateDirectory($InstallRoot)
+[IO.File]::WriteAllText((Join-Path $InstallRoot 'sealed-package-sha256.txt'),[string]$SealedPackageSha256,[Text.UTF8Encoding]::new($false))
 $manifest = [IO.File]::ReadAllText($PayloadManifestPath,[Text.Encoding]::UTF8) | ConvertFrom-Json
 Import-Module (Join-Path $PSScriptRoot 'src\persistence\modules\InstallLifecycle.psm1') -Force
 Invoke-CcodFixtureInstall -InstallRoot $InstallRoot -ActivationId $ActivationId -ManifestVersion ([string]$manifest.projectVersion)
@@ -1087,11 +1160,11 @@ exit 0
     $lifecycleSource = @'
 function Invoke-CcodFixtureInstall {
     param([string]$InstallRoot,[string]$ActivationId,[string]$ManifestVersion)
-    [IO.Directory]::CreateDirectory((Join-Path $InstallRoot 'state')) | Out-Null
+    [IO.Directory]::CreateDirectory((Join-Path $InstallRoot 'state\activation-receipts')) | Out-Null
     [IO.File]::WriteAllText((Join-Path $InstallRoot 'activation-byte-marker.txt'),('original:' + $ManifestVersion),[Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $InstallRoot 'active.json'),'{"activeRuntime":"runtime-fixture"}',[Text.UTF8Encoding]::new($false))
     $receipt=[ordered]@{schemaVersion=1;activationId=$ActivationId;phase='Ready';runtimeId='runtime-fixture';previousRuntimeId=$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=$true;errorCode=$null}
-    [IO.File]::WriteAllText((Join-Path $InstallRoot 'state\post-install-activation.json'),($receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $InstallRoot "state\activation-receipts\$ActivationId.Ready.json"),($receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
 }
 Export-ModuleMember -Function Invoke-CcodFixtureInstall
 '@
@@ -1168,6 +1241,28 @@ function Invoke-CcodActivationVerifierFixture {
     return [pscustomobject]@{ExitCode=$exitCode;Output=([IO.File]::ReadAllText($stdoutPath)+[IO.File]::ReadAllText($stderrPath))}
 }
 
+# Production mutation caught: verifying package bytes but invoking a legacy source root without propagating package identity.
+Invoke-CcodTest 'temporary bootstrap verifies the sealed package and propagates its exact hash to the installer child' {
+    $fixture = New-CcodActivationPayloadFixture
+    $module = $null
+    try {
+        $packagePath = Join-Path $fixture.AppRoot 'sealed-installer.zip'
+        $packageManifestPath = Join-Path $fixture.AppRoot 'sealed-installer.manifest.json'
+        $module = Import-Module (Join-Path $repositoryRoot 'build\InstallerPackage.psm1') -Force -PassThru
+        $created = New-CcodInstallerPackage -PayloadRoot $fixture.PayloadRoot -PayloadManifestPath $fixture.ManifestPath -Version '2.5.22' -GitCommit ('d' * 40) -OutputPath $packagePath -ManifestOutputPath $packageManifestPath
+        $installRoot = Join-Path $fixture.AppRoot 'installed-state'
+        $activationId = '77777777-6666-5555-4444-333333333333'
+        $output = @(& (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -InstallRoot $installRoot -PackagePath $packagePath -PackageManifestPath $packageManifestPath -ExpectedPackageSha256 $created.PackageSha256 -ExpectedPackageManifestSha256 $created.ManifestSha256 -ExpectedVersion '2.5.22' -ExpectedGitCommit ('d' * 40) -ActivationId $activationId 2>&1)
+        Assert-CcodEqual 0 $LASTEXITCODE "sealed package bootstrap completes: $($output -join ' ')"
+        Assert-CcodEqual $created.PackageSha256 ([IO.File]::ReadAllText((Join-Path $installRoot 'sealed-package-sha256.txt'),[Text.UTF8Encoding]::new($false))) 'child receives the exact verified package identity'
+        Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $installRoot "state\activation-receipts\$activationId.Ready.json") -PathType Leaf) 'bootstrap accepts only the append-only Ready receipt'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $installRoot 'state\post-install-activation.json'))) 'bootstrap never creates or consumes the mutable legacy receipt'
+    } finally {
+        if ($null -ne $module) { Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $fixture.AppRoot) { Remove-Item -LiteralPath $fixture.AppRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Invoke-CcodInnoPayloadCompileFixture {
     param([switch]$IncludePayloadDefines,[switch]$OmitDestinationInventory)
 
@@ -1201,11 +1296,17 @@ function Invoke-CcodInnoPayloadCompileFixture {
     if (-not $iscc) { throw 'Inno Setup 6 is required for the setup payload contract' }
     $payloadManifestSha256 = Get-CcodTestFileSha256 -Path $manifestPath
     $setupGitCommit = 'c' * 40
+    Import-Module (Join-Path $repositoryRoot 'build\InstallerPackage.psm1') -Force
+    $installerPackagePath = Join-Path $root 'installer-package.zip'
+    $installerPackageManifestPath = Join-Path $root 'installer-package.manifest.json'
+    $installerPackage = New-CcodInstallerPackage -PayloadRoot $payload -PayloadManifestPath $manifestPath -Version '2.5.21' -GitCommit $setupGitCommit -OutputPath $installerPackagePath -ManifestOutputPath $installerPackageManifestPath
+    $activationBootstrapPath = Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1'
+    $activationBootstrapSha256 = Get-CcodTestFileSha256 -Path $activationBootstrapPath
     $setupProvenancePath = Join-Path $root 'setup-provenance.json'
     [IO.File]::WriteAllText($setupProvenancePath,'{}',[Text.UTF8Encoding]::new($false))
-    $arguments = @('/DProjectVersion=2.5.21',"/DTrayHostArtifactDirectory=$tray","/DPortableArtifactDirectory=$portable","/DSetupGitCommit=$setupGitCommit","/DSetupProvenancePath=$setupProvenancePath","/O$output\")
+    $arguments = @('/DProjectVersion=2.5.21',"/DSetupGitCommit=$setupGitCommit","/DSetupProvenancePath=$setupProvenancePath","/O$output\")
     if ($IncludePayloadDefines) {
-        $arguments = @('/DProjectVersion=2.5.21',"/DTrayHostArtifactDirectory=$tray","/DPortableArtifactDirectory=$portable","/DInstallerPayloadDirectory=$payload","/DInstallerPayloadManifestSha256=$payloadManifestSha256","/DSetupGitCommit=$setupGitCommit","/DSetupProvenancePath=$setupProvenancePath")
+        $arguments = @('/DProjectVersion=2.5.21',"/DInstallerPackagePath=$installerPackagePath","/DInstallerPackageManifestPath=$installerPackageManifestPath","/DInstallerPackageSha256=$($installerPackage.PackageSha256)","/DInstallerPackageManifestSha256=$($installerPackage.ManifestSha256)","/DActivationBootstrapPath=$activationBootstrapPath","/DActivationBootstrapSha256=$activationBootstrapSha256","/DSetupGitCommit=$setupGitCommit","/DSetupProvenancePath=$setupProvenancePath")
         $arguments += "/O$output\"
     }
     . (Join-Path $repositoryRoot 'build\build.ps1') -Library
@@ -1237,6 +1338,9 @@ function Invoke-CcodInnoPayloadCompileFixture {
         GeneratedPath = $generatedPath
         GeneratedSource = $generatedSource
         PayloadManifestSha256 = $payloadManifestSha256
+        PackageSha256 = $installerPackage.PackageSha256
+        PackageManifestSha256 = $installerPackage.ManifestSha256
+        ActivationBootstrapSha256 = $activationBootstrapSha256
         SetupGitCommit = $setupGitCommit
     }
 }
@@ -1246,12 +1350,14 @@ Invoke-CcodTest 'setup build and activation bind one immutable versioned payload
     $inno = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
     $activation = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -Raw -Encoding UTF8
     $installer = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Install-CodexControlOtherDevices.ps1') -Raw -Encoding UTF8
+    $setupArtifact = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\SetupArtifact.psm1') -Raw -Encoding UTF8
 
-    Assert-CcodTrue ($build -cmatch 'New-InstallerPayloadManifest\.ps1' -and $build -cmatch 'New-InstallerDestinationInventory\.ps1' -and $build -cmatch 'InstallerPayloadManifestSha256' -and $build -cmatch 'New-CcodBuildGeneratedInnoScript') 'build invokes the tested generators and binds the inventory into generated setup compilation'
-    Assert-CcodTrue ($inno -cmatch 'InstallerPayloadDirectory' -and $inno -cmatch 'DestDir:\s*"\{app\}\\payload\\\{#ProjectVersion\}"') 'Inno copies the immutable build payload into its exact version directory'
-    Assert-CcodTrue ($inno -cmatch "ExpandConstant\('\{app\}\\payload\\\{#ProjectVersion\}'\)" -and $inno -cmatch '-ExpectedVersion\s+"\{#ProjectVersion\}') 'Inno binds activation to its compiled payload version'
-    Assert-CcodTrue ($activation -cmatch '\[string\]\$ExpectedVersion' -and $activation -cmatch '\[string\]\$ExpectedPayloadManifestSha256' -and $activation -cmatch 'installer-payload\.manifest\.json') 'activation accepts and resolves the expected payload contract'
-    Assert-CcodTrue ($installer -cmatch '\[string\]\$ExpectedVersion' -and $installer -cmatch '\[string\]\$PayloadManifestPath' -and $installer -cmatch '\[string\]\$ExpectedPayloadManifestSha256' -and $installer -cmatch 'Open-CcodInstallerPayloadSeal' -and $installer -cmatch 'PayloadManifestBytesBase64') 'installer revalidates and forwards the exact immutable payload bytes to lifecycle activation'
+    Assert-CcodTrue ($build -cmatch 'New-InstallerPayloadManifest\.ps1' -and $build -cmatch 'InstallerPackage\.psm1' -and $build -cmatch 'New-CcodInstallerPackage' -and $build -cmatch 'New-CcodBuildGeneratedInnoScript') 'build creates the sealed package and binds it into generated setup compilation'
+    Assert-CcodTrue ($inno -cmatch 'InstallerPackagePath' -and $inno -cmatch 'ExtractTemporaryFile\(.ccod-installer-package\.zip.' -and $inno -cnotmatch 'DestDir:\s*"\{app\}') 'Inno extracts only the sealed package to private temporary storage'
+    Assert-CcodTrue ($inno -cmatch '-ExpectedPackageSha256\s+"\{#InstallerPackageSha256' -and $inno -cmatch '-ExpectedVersion\s+"\{#ProjectVersion') 'Inno binds activation to its compiled package identity and version'
+    Assert-CcodTrue ($activation -cmatch '\[string\]\$PackagePath' -and $activation -cmatch '\[string\]\$ExpectedPackageSha256' -and $activation -cmatch 'Open-CcodInstallerPackageSeal') 'activation accepts and opens the sealed package contract'
+    Assert-CcodTrue ($installer -cmatch '\[string\]\$SealedPackageSha256' -and $installer -cmatch '\$invoke\.SealedPackageSha256\s*=\s*\$SealedPackageSha256') 'installer explicitly forwards the exact sealed package identity to lifecycle activation'
+    Assert-CcodTrue ($setupArtifact -cmatch 'New-CcodSealedSetupBuildProvenance' -and $setupArtifact -cmatch 'Test-CcodSealedSetupBuildProvenance' -and $build -cmatch 'New-CcodSealedSetupBuildProvenance' -and $build -cmatch 'Test-CcodSealedSetupBuildProvenance') 'Setup provenance creates and verifies package manifest and bootstrap bindings'
 }
 
 # Production mutation caught: reopening mutable payload paths after the parent accepted their manifest bytes.
@@ -1305,11 +1411,11 @@ exit 0
         $replacementModule = @'
 function Invoke-CcodFixtureInstall {
     param([string]$InstallRoot,[string]$ActivationId,[string]$ManifestVersion)
-    [IO.Directory]::CreateDirectory((Join-Path $InstallRoot 'state')) | Out-Null
+    [IO.Directory]::CreateDirectory((Join-Path $InstallRoot 'state\activation-receipts')) | Out-Null
     [IO.File]::WriteAllText((Join-Path $InstallRoot 'activation-byte-marker.txt'),('replacement:' + $ManifestVersion),[Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $InstallRoot 'active.json'),'{"activeRuntime":"runtime-fixture"}',[Text.UTF8Encoding]::new($false))
     $receipt=[ordered]@{schemaVersion=1;activationId=$ActivationId;phase='Ready';runtimeId='runtime-fixture';previousRuntimeId=$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=$true;errorCode=$null}
-    [IO.File]::WriteAllText((Join-Path $InstallRoot 'state\post-install-activation.json'),($receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $InstallRoot "state\activation-receipts\$ActivationId.Ready.json"),($receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
 }
 Export-ModuleMember -Function Invoke-CcodFixtureInstall
 '@
@@ -1505,8 +1611,8 @@ Invoke-CcodTest 'activation rejects an unlisted nested payload junction' {
 Invoke-CcodTest 'Inno compile refuses an implicit installer payload source' {
     $compile = Invoke-CcodInnoPayloadCompileFixture
     try {
-        Assert-CcodTrue ($compile.ExitCode -ne 0) 'setup compilation fails without an explicit installer payload directory and manifest hash'
-        Assert-CcodTrue ($compile.Output -cmatch 'InstallerPayloadDirectory') 'compiler identifies the missing immutable payload define'
+        Assert-CcodTrue ($compile.ExitCode -ne 0) 'setup compilation fails without an explicit sealed installer package contract'
+        Assert-CcodTrue ($compile.Output -cmatch 'InstallerPackagePath') 'compiler identifies the missing sealed package define'
         Assert-CcodTrue (-not (Test-Path -LiteralPath $compile.SetupPath)) 'missing payload define produces no setup artifact'
     } finally {
         if (Test-Path -LiteralPath $compile.Root) { Remove-Item -LiteralPath $compile.Root -Recurse -Force }
@@ -1518,28 +1624,28 @@ Invoke-CcodTest 'Inno compile packages the explicit manifest-bound installer pay
     try {
         Assert-CcodEqual 0 $compile.ExitCode "explicit setup payload contract compiles: $($compile.Output)"
         Assert-CcodTrue (Test-Path -LiteralPath $compile.SetupPath -PathType Leaf) 'explicit payload compile produces the setup artifact'
-        Assert-CcodTrue ($compile.GeneratedSource -cmatch 'procedure AddCcodExpectedSetupDirectories' -and $compile.GeneratedSource -cmatch "Directories\.Add\('payload\\2\.5\.21'") 'compiler input contains the generated destination inventory procedure'
+        Assert-CcodTrue ($compile.GeneratedSource -cmatch 'procedure AddCcodExpectedSetupDirectories' -and $compile.GeneratedSource -cnotmatch 'Directories\.Add') 'compiler input contains an explicit empty destination inventory procedure'
         Assert-CcodTrue ($compile.GeneratedSource -cnotmatch 'CCOD_INSTALLER_DESTINATION_INVENTORY' -and $compile.GeneratedSource -cnotmatch '(?m)^\s*#\s*(?:include\b|\+)') 'compiler input contains neither the marker nor an external include'
         Assert-CcodTrue (-not [IO.File]::Exists($compile.GeneratedPath)) 'payload compile cleans its generated compiler input'
-        Assert-CcodTrue ($compile.Output -cmatch 'installer-payload\.manifest\.json' -and $compile.Output -cmatch 'payload\\package\.json') 'compiler input trace contains the payload manifest and manifest-listed file'
+        Assert-CcodTrue ($compile.Output -cmatch 'installer-package\.zip' -and $compile.Output -cmatch 'installer-package\.manifest\.json' -and $compile.Output -cmatch 'Activate-CcodRemoteFix\.ps1') 'compiler input trace contains only the sealed package manifest and bootstrap inputs'
     } finally {
         if (Test-Path -LiteralPath $compile.Root) { Remove-Item -LiteralPath $compile.Root -Recurse -Force }
     }
 }
 
 # Production mutation caught: trusting ISCC exit zero and a newly computed sidecar without inspecting the final PE contract.
-Invoke-CcodTest 'compiled Setup independently binds PE versions commit and activation payload manifest hash' {
+Invoke-CcodTest 'compiled Setup independently binds PE version commit package manifest and bootstrap hashes' {
     $modulePath = Join-Path $repositoryRoot 'build\SetupArtifact.psm1'
     Assert-CcodTrue (Test-Path -LiteralPath $modulePath -PathType Leaf) 'independent Setup artifact validator exists'
     Import-Module $modulePath -Force
     $compile = Invoke-CcodInnoPayloadCompileFixture -IncludePayloadDefines
     try {
-        $validated = Test-CcodSetupArtifact -SetupPath $compile.SetupPath -ExpectedVersion '2.5.21' -ExpectedGitCommit $compile.SetupGitCommit -ExpectedPayloadManifestSha256 $compile.PayloadManifestSha256
+        $validated = Test-CcodSetupArtifact -SetupPath $compile.SetupPath -ExpectedVersion '2.5.21' -ExpectedGitCommit $compile.SetupGitCommit -ExpectedPackageSha256 $compile.PackageSha256 -ExpectedPackageManifestSha256 $compile.PackageManifestSha256 -ExpectedActivationBootstrapSha256 $compile.ActivationBootstrapSha256
         Assert-CcodEqual $true ([bool]$validated.Valid) 'real ISCC Setup PE satisfies the independent version and payload contract'
         Assert-CcodEqual '2.5.21.0' ([string]$validated.FileVersion) 'Setup PE FileVersion is exact'
-        Assert-CcodEqual '2.5.21.0' ([string]$validated.ProductVersion) 'Setup PE ProductVersion is exact'
+        Assert-CcodEqual $compile.PackageManifestSha256 ([string]$validated.PackageManifestSha256) 'Setup PE ProductVersion and description bind the full package manifest hash'
         Assert-CcodThrows {
-            Test-CcodSetupArtifact -SetupPath $compile.SetupPath -ExpectedVersion '2.5.21' -ExpectedGitCommit $compile.SetupGitCommit -ExpectedPayloadManifestSha256 ('0' * 64) | Out-Null
+            Test-CcodSetupArtifact -SetupPath $compile.SetupPath -ExpectedVersion '2.5.21' -ExpectedGitCommit $compile.SetupGitCommit -ExpectedPackageSha256 ('0' * 64) -ExpectedPackageManifestSha256 $compile.PackageManifestSha256 -ExpectedActivationBootstrapSha256 $compile.ActivationBootstrapSha256 | Out-Null
         } 'CCOD_SETUP_PAYLOAD_BINDING_INVALID'
     } finally {
         if (Test-Path -LiteralPath $compile.Root) { Remove-Item -LiteralPath $compile.Root -Recurse -Force }
@@ -1620,6 +1726,7 @@ Invoke-CcodTest 'Inno compile refuses a missing generated destination inventory'
     }
 }
 
+<# Superseded by the sealed no-product-write Setup boundary in Task 3.
 Invoke-CcodTest 'Inno exposes a pre-write payload-directory reparse gate' {
     $inno = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
     $helper = [regex]::Match($inno,'(?ms)^function IsSafeExistingPayloadDirectory\(.*?^end;')
@@ -1841,6 +1948,36 @@ end;
             $concurrentItem = Get-Item -LiteralPath $concurrentTarget -Force
             if (($concurrentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { [IO.Directory]::Delete($concurrentTarget) }
         }
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+#>
+
+# Production mutation caught: hashing one temporary bootstrap and later executing replacement bytes from the same path.
+Invoke-CcodTest 'temporary bootstrap lock makes the verified source bytes the executed bytes' {
+    $inno = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
+    Assert-CcodTrue ($inno -cmatch '(?s)function LockCcodInput.*GetSHA256OfFile\(Path\).*CreateFileW\(Path, CCOD_GENERIC_READ, CCOD_FILE_SHARE_READ.*GetSHA256OfFile\(Path\)') 'Setup hashes locks and rehashes each temporary input'
+    Assert-CcodTrue ($inno -cmatch '(?s)function GetCcodBootstrapParameters.*-File.*CcodBootstrapPath' -and $inno -cmatch '(?s)procedure CurStepChanged.*GetCcodBootstrapParameters.*Exec\(') 'Setup executes the exact locked temporary bootstrap path'
+    Assert-CcodTrue ($inno -cmatch '(?s)procedure DeinitializeSetup\(\);.*CloseCcodInputHandles') 'Setup retains input locks through terminal validation'
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-bootstrap-lock-' + [guid]::NewGuid().ToString('N'))
+    $lock = $null
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        $scriptPath = Join-Path $root 'ccod-activation-bootstrap.ps1'
+        $marker = Join-Path $root 'executed.txt'
+        [IO.File]::WriteAllText($scriptPath,"[IO.File]::WriteAllText('$($marker.Replace("'","''"))','original',[Text.UTF8Encoding]::new(`$false))",[Text.UTF8Encoding]::new($false))
+        $expected = Get-CcodTestFileSha256 -Path $scriptPath
+        $lock = [IO.File]::Open($scriptPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        Assert-CcodEqual $expected (Get-CcodTestFileSha256 -Path $scriptPath) 'locked bootstrap bytes retain the verified hash'
+        $replacementBlocked = $false
+        try { [IO.File]::WriteAllText($scriptPath,"[IO.File]::WriteAllText('$($marker.Replace("'","''"))','replacement')",[Text.UTF8Encoding]::new($false)) } catch [IO.IOException] { $replacementBlocked = $true }
+        Assert-CcodTrue $replacementBlocked 'replacement is blocked while the verified bootstrap handle is retained'
+        & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $scriptPath
+        Assert-CcodEqual 0 $LASTEXITCODE 'locked verified bootstrap executes successfully'
+        Assert-CcodEqual 'original' ([IO.File]::ReadAllText($marker,[Text.UTF8Encoding]::new($false))) 'the executed bytes are the original verified bytes'
+    } finally {
+        if ($null -ne $lock) { $lock.Dispose() }
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
     }
 }
@@ -2179,7 +2316,10 @@ Invoke-CcodTest 'package scripts build provenance and workflows retain the relea
     Assert-CcodTrue ($release -cmatch '(?ms)^  publish:\r?\n    needs: build\r?\n    runs-on: windows-latest\r?\n    permissions:\r?\n      contents: write\s*$') 'only the publish job receives release-write permission'
 }
 
-$iss = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw; Assert-CcodTrue ($iss -match 'PortableArtifactDirectory' -and $iss -match 'CodexRemote.Portable.exe' -and $iss -match 'portable-launcher-provenance.json') 'Inno installer packages the portable launcher into the verified bin set';
+$iss = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw
+$buildSource = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
+Assert-CcodTrue ($buildSource -match 'CodexRemote\.Portable\.exe' -and $buildSource -match 'Copy-CcodBuildPayloadFile' -and $buildSource -match 'New-CcodInstallerPackage') 'build places the portable launcher only in the manifest-listed sealed package'
+Assert-CcodTrue ($iss -cnotmatch 'CodexRemote\.Portable\.exe|PortableArtifactDirectory') 'Inno never copies a product launcher outside the sealed package transaction'
 Invoke-CcodTest 'release notes extraction emits only the target release English section' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-release-notes-fixture-' + [guid]::NewGuid().ToString('N'))
     try {

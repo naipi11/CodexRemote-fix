@@ -1,8 +1,13 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][string]$AppRoot,
+    [string]$AppRoot,
     [Parameter(Mandatory)][string]$InstallRoot,
     [string]$PayloadRoot,
+    [string]$PackagePath,
+    [string]$PackageManifestPath,
+    [string]$ExpectedPackageSha256,
+    [string]$ExpectedPackageManifestSha256,
+    [string]$ExpectedGitCommit,
     [string]$ExpectedVersion,
     [string]$ExpectedPayloadManifestSha256,
     [string]$ActivationId,
@@ -53,6 +58,48 @@ function Write-CcodActivationRecord {
         [IO.File]::AppendAllText((Join-Path $directory 'post-install-activation.log'),(($record|ConvertTo-Json -Compress)+"`n"),[Text.UTF8Encoding]::new($false))
     } catch { }
 }
+
+function Get-CcodActivationFileSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+    $stream=$null;$sha=[Security.Cryptography.SHA256]::Create()
+    try{$stream=[IO.File]::Open([IO.Path]::GetFullPath($Path),[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read);return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-','').ToLowerInvariant()}
+    finally{if($null-ne$stream){$stream.Dispose()};$sha.Dispose()}
+}
+
+function Test-CcodActivationPackageRelativePath {
+    param($Path)
+    return $Path-is[string]-and$Path-cmatch'^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$'-and-not$Path.Contains('//')-and-not$Path.Contains('..')-and-not$Path.Contains(':')-and-not$Path.Contains('\')-and-not$Path.EndsWith('/')
+}
+
+function Open-CcodInstallerPackageSeal {
+    param([Parameter(Mandatory)][string]$PackagePath,[Parameter(Mandatory)][string]$PackageManifestPath,[Parameter(Mandatory)][string]$ExpectedPackageSha256,[Parameter(Mandatory)][string]$ExpectedPackageManifestSha256,[Parameter(Mandatory)][string]$ExpectedVersion,[Parameter(Mandatory)][string]$ExpectedGitCommit)
+    if($ExpectedPackageSha256-cnotmatch'^[0-9a-f]{64}$'-or$ExpectedPackageManifestSha256-cnotmatch'^[0-9a-f]{64}$'-or$ExpectedVersion-cnotmatch'^\d+\.\d+\.\d+$'-or$ExpectedGitCommit-cnotmatch'^[0-9a-f]{40}$'){throw 'CCOD_INSTALLER_PACKAGE_INVALID'}
+    Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+    $package=[IO.Path]::GetFullPath($PackagePath);$manifestPath=[IO.Path]::GetFullPath($PackageManifestPath);$packageStream=$null;$manifestStream=$null;$archive=$null
+    try{
+        foreach($path in @($package,$manifestPath)){$item=Get-Item -LiteralPath $path -Force -ErrorAction Stop;if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0-or$item.Length-le 0-or$item.Length-gt 536870912){throw 'CCOD_INSTALLER_PACKAGE_INVALID'}}
+        $packageStream=[IO.File]::Open($package,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read);$sha=[Security.Cryptography.SHA256]::Create();try{$actualPackage=[BitConverter]::ToString($sha.ComputeHash($packageStream)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()};$packageStream.Position=0;if($actualPackage-cne$ExpectedPackageSha256){throw 'CCOD_INSTALLER_PACKAGE_HASH_MISMATCH'}
+        $manifestStream=[IO.File]::Open($manifestPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read);$sha=[Security.Cryptography.SHA256]::Create();try{$actualManifest=[BitConverter]::ToString($sha.ComputeHash($manifestStream)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()};$manifestStream.Position=0;if($actualManifest-cne$ExpectedPackageManifestSha256){throw 'CCOD_INSTALLER_PACKAGE_MANIFEST_HASH_MISMATCH'}
+        $reader=[IO.StreamReader]::new($manifestStream,[Text.UTF8Encoding]::new($false,$true),$true,4096,$true);try{$text=$reader.ReadToEnd()}finally{$reader.Dispose()};$manifestStream.Position=0;try{$manifest=$text|ConvertFrom-Json -ErrorAction Stop}catch{throw 'CCOD_INSTALLER_PACKAGE_INVALID'}
+        if($manifest-isnot[pscustomobject]-or(@($manifest.PSObject.Properties.Name)-join',')-cne'schemaVersion,product,version,gitCommit,payloadManifest,files'-or$manifest.schemaVersion-isnot[int]-or$manifest.schemaVersion-ne 1-or$manifest.product-cne'CodexRemote-fix'-or$manifest.version-cne$ExpectedVersion-or$manifest.gitCommit-cne$ExpectedGitCommit-or$manifest.payloadManifest.name-cne'installer-payload.manifest.json'-or$manifest.payloadManifest.sha256-cnotmatch'^[0-9a-f]{64}$'){throw 'CCOD_INSTALLER_PACKAGE_INVALID'}
+        $records=@($manifest.files);if($records.Count-eq 0){throw 'CCOD_INSTALLER_PACKAGE_INVALID'};$expected=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase);$previous=$null
+        foreach($record in $records){if($record-isnot[pscustomobject]-or(@($record.PSObject.Properties.Name)-join',')-cne'path,length,sha256'-or-not(Test-CcodActivationPackageRelativePath $record.path)-or$record.length-isnot[ValueType]-or[decimal]$record.length-ne[decimal][int64]$record.length-or[int64]$record.length-lt 0-or$record.sha256-cnotmatch'^[0-9a-f]{64}$'-or($null-ne$previous-and[StringComparer]::Ordinal.Compare($previous,[string]$record.path)-ge 0)-or$expected.ContainsKey([string]$record.path)){throw 'CCOD_INSTALLER_PACKAGE_INVALID'};$expected.Add([string]$record.path,$record);$previous=[string]$record.path}
+        $archive=[IO.Compression.ZipArchive]::new($packageStream,[IO.Compression.ZipArchiveMode]::Read,$true);$entries=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach($entry in @($archive.Entries)){if(-not(Test-CcodActivationPackageRelativePath $entry.FullName)-or$entries.ContainsKey($entry.FullName)-or$entry.Name.Length-eq 0){throw 'CCOD_INSTALLER_PACKAGE_INVALID'};$entries.Add($entry.FullName,$entry)}
+        if($entries.Count-ne$expected.Count+1-or-not$entries.ContainsKey('installer-payload.manifest.json')){throw 'CCOD_INSTALLER_PACKAGE_INVALID'}
+        foreach($pair in $expected.GetEnumerator()){$entry=$entries[$pair.Key];$record=$pair.Value;if([int64]$entry.Length-ne[int64]$record.length){throw 'CCOD_INSTALLER_PACKAGE_INVALID'};$stream=$entry.Open();$sha=[Security.Cryptography.SHA256]::Create();try{$hash=[BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose();$stream.Dispose()};if($hash-cne[string]$record.sha256){throw 'CCOD_INSTALLER_PACKAGE_INVALID'}}
+        $payloadEntry=$entries['installer-payload.manifest.json'];$stream=$payloadEntry.Open();$sha=[Security.Cryptography.SHA256]::Create();try{$payloadHash=[BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose();$stream.Dispose()};if([int64]$payloadEntry.Length-ne[int64]$manifest.payloadManifest.length-or$payloadHash-cne[string]$manifest.payloadManifest.sha256){throw 'CCOD_INSTALLER_PACKAGE_INVALID'}
+        return [pscustomobject]@{PackageStream=$packageStream;ManifestStream=$manifestStream;Archive=$archive;Manifest=$manifest;Entries=$entries;PayloadManifestSha256=$payloadHash}
+    }catch{if($null-ne$archive){$archive.Dispose()};if($null-ne$manifestStream){$manifestStream.Dispose()};if($null-ne$packageStream){$packageStream.Dispose()};throw}
+}
+
+function Expand-CcodInstallerPackageSeal {
+    param([Parameter(Mandatory)]$Seal,[Parameter(Mandatory)][string]$DestinationRoot)
+    $root=[IO.Path]::GetFullPath($DestinationRoot);if([IO.File]::Exists($root)-or[IO.Directory]::Exists($root)){throw 'CCOD_INSTALLER_PACKAGE_INVALID'};[IO.Directory]::CreateDirectory($root)|Out-Null
+    try{foreach($entry in @($Seal.Archive.Entries)){$target=[IO.Path]::GetFullPath((Join-Path $root $entry.FullName.Replace('/','\')));if(-not$target.StartsWith($root.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'CCOD_INSTALLER_PACKAGE_INVALID'};$parent=Split-Path $target -Parent;if(-not[IO.Directory]::Exists($parent)){[IO.Directory]::CreateDirectory($parent)|Out-Null};$source=$entry.Open();$destination=[IO.File]::Open($target,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None);try{$source.CopyTo($destination);$destination.Flush($true)}finally{$destination.Dispose();$source.Dispose()}};return $root}catch{if([IO.Directory]::Exists($root)){Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue};throw}
+}
+
+function Close-CcodInstallerPackageSeal { param($Seal) if($null-eq$Seal){return};foreach($name in @('Archive','ManifestStream','PackageStream')){try{if($null-ne$Seal.$name){$Seal.$name.Dispose()}}catch{}} }
 
 function Get-CcodActivationBytesSha256 {
     param([Parameter(Mandatory)][byte[]]$Bytes)
@@ -557,8 +604,21 @@ function Assert-CcodActivationReceiptPathSafe {
 
 function Read-CcodTerminalActivationReceipt {
     param([Parameter(Mandatory)][string]$Root,[Parameter(Mandatory)][string]$ExpectedActivationId)
-    $path = Join-Path $Root 'state\post-install-activation.json'
-    if (-not [IO.File]::Exists($path)) { throw 'CCOD_ACTIVATION_RECEIPT_MISSING' }
+    $directory = Join-Path $Root 'state\activation-receipts'
+    if (-not [IO.Directory]::Exists($directory)) { throw 'CCOD_ACTIVATION_RECEIPT_MISSING' }
+    try { Assert-CcodActivationReceiptPathSafe -Root $Root -Path $directory } catch { throw 'CCOD_ACTIVATION_RECEIPT_INVALID' }
+    $terminal = @(
+        foreach ($phase in @('Ready','Failed')) {
+            $candidate = Join-Path $directory ("$ExpectedActivationId.$phase.json")
+            if ([IO.File]::Exists($candidate)) { $candidate }
+        }
+    )
+    if ($terminal.Count -eq 0) {
+        if (Test-CcodActivationReceiptObserved -Root $Root -ExpectedActivationId $ExpectedActivationId) { throw 'CCOD_ACTIVATION_RECEIPT_NOT_READY' }
+        throw 'CCOD_ACTIVATION_RECEIPT_MISSING'
+    }
+    if ($terminal.Count -ne 1) { throw 'CCOD_ACTIVATION_RECEIPT_INVALID' }
+    $path = $terminal[0]
     try {
         Assert-CcodActivationReceiptPathSafe -Root $Root -Path $path
         $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
@@ -590,6 +650,7 @@ function Read-CcodTerminalActivationReceipt {
         ($receipt.phase -cnotin @('Ready','Failed') -and ($receipt.ready -or $null -ne $receipt.errorCode))) {
         throw 'CCOD_ACTIVATION_RECEIPT_INVALID'
     }
+    if ([IO.Path]::GetFileName($path) -cne ("$ExpectedActivationId.$($receipt.phase).json")) { throw 'CCOD_ACTIVATION_RECEIPT_INVALID' }
     return $receipt
 }
 
@@ -641,6 +702,7 @@ function Invoke-CcodOwnedInstallWorker {
         [Parameter(Mandatory)][string]$InstallScript,
         [Parameter(Mandatory)][string]$VerifiedPayloadRoot,
         [Parameter(Mandatory)][string]$StateRoot,
+        [string]$SealedPackageSha256,
         [Parameter(Mandatory)][int]$FirstReceiptTimeout,
         [Parameter(Mandatory)][int]$ActivationTimeout
     )
@@ -668,6 +730,9 @@ function Invoke-CcodOwnedInstallWorker {
                 '-ExpectedPayloadManifestSha256',$ExpectedPayloadManifestSha256
             )
         }
+        if (-not [string]::IsNullOrWhiteSpace($SealedPackageSha256)) {
+            $arguments += @('-SealedPackageSha256',$SealedPackageSha256)
+        }
         $startInfo = [Diagnostics.ProcessStartInfo]::new()
         $startInfo.FileName = $PowerShellPath
         $startInfo.Arguments = (($arguments | ForEach-Object { ConvertTo-CcodNativeProcessArgument ([string]$_) }) -join ' ')
@@ -680,8 +745,7 @@ function Invoke-CcodOwnedInstallWorker {
         while (-not $process.HasExited) {
             if (-not $firstReceiptObserved) {
                 try {
-                    $null = Read-CcodTerminalActivationReceipt -Root $StateRoot -ExpectedActivationId $ActivationId
-                    $firstReceiptObserved = $true
+                    $firstReceiptObserved = Test-CcodActivationReceiptObserved -Root $StateRoot -ExpectedActivationId $ActivationId
                 } catch { }
             }
             if (-not $firstReceiptObserved -and $clock.ElapsedMilliseconds -ge $FirstReceiptTimeout) {
@@ -778,10 +842,49 @@ function Show-CcodActivationFailure {
 }
 
 if ($ValidateReceiptOnly -and $ValidateReceiptWithTimeout) { Write-Error 'CCOD_ACTIVATION_VALIDATOR_MODE_INVALID' -ErrorAction Continue; exit 3 }
-if ([string]::IsNullOrWhiteSpace($PayloadRoot)) { $PayloadRoot = $AppRoot }
-$PayloadRoot = [IO.Path]::GetFullPath($PayloadRoot)
+$packageBound = -not [string]::IsNullOrWhiteSpace($PackagePath) -or -not [string]::IsNullOrWhiteSpace($PackageManifestPath) -or -not [string]::IsNullOrWhiteSpace($ExpectedPackageSha256) -or -not [string]::IsNullOrWhiteSpace($ExpectedPackageManifestSha256) -or -not [string]::IsNullOrWhiteSpace($ExpectedGitCommit)
+$packageSeal = $null
+$packageAppRoot = $null
 $payloadSeal = $null
 try {
+if ($packageBound) {
+    if ([string]::IsNullOrWhiteSpace($PackagePath) -or [string]::IsNullOrWhiteSpace($PackageManifestPath) -or [string]::IsNullOrWhiteSpace($ExpectedPackageSha256) -or [string]::IsNullOrWhiteSpace($ExpectedPackageManifestSha256) -or [string]::IsNullOrWhiteSpace($ExpectedVersion) -or [string]::IsNullOrWhiteSpace($ExpectedGitCommit)) { throw 'CCOD_INSTALLER_PACKAGE_INVALID' }
+    try {
+        $packageSeal = Open-CcodInstallerPackageSeal -PackagePath $PackagePath -PackageManifestPath $PackageManifestPath -ExpectedPackageSha256 $ExpectedPackageSha256 -ExpectedPackageManifestSha256 $ExpectedPackageManifestSha256 -ExpectedVersion $ExpectedVersion -ExpectedGitCommit $ExpectedGitCommit
+        $packageAppRoot = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-package-' + [guid]::NewGuid().ToString('N'))
+        [IO.Directory]::CreateDirectory((Join-Path $packageAppRoot 'payload')) | Out-Null
+        $PayloadRoot = Join-Path (Join-Path $packageAppRoot 'payload') $ExpectedVersion
+        [void](Expand-CcodInstallerPackageSeal -Seal $packageSeal -DestinationRoot $PayloadRoot)
+        $AppRoot = $packageAppRoot
+        $ExpectedPayloadManifestSha256 = [string]$packageSeal.PayloadManifestSha256
+    } catch {
+        $candidate = ([string]$_.FullyQualifiedErrorId -split ',')[0]
+        $code = if ($candidate -cmatch '^CCOD_[A-Z0-9_]{1,96}$') { $candidate } elseif ($_.Exception.Message -cmatch '^CCOD_[A-Z0-9_]{1,96}$') { $Matches[0] } else { 'CCOD_INSTALLER_PACKAGE_INVALID' }
+        Write-Error $code -ErrorAction Continue
+        exit 3
+    }
+} else {
+    if ([string]::IsNullOrWhiteSpace($AppRoot)) { Write-Error 'CCOD_INSTALL_INPUT_INVALID' -ErrorAction Continue; exit 3 }
+    if ([string]::IsNullOrWhiteSpace($PayloadRoot)) { $PayloadRoot = $AppRoot }
+}
+
+function Test-CcodActivationReceiptObserved {
+    param([Parameter(Mandatory)][string]$Root,[Parameter(Mandatory)][string]$ExpectedActivationId)
+    $directory = Join-Path $Root 'state\activation-receipts'
+    if (-not [IO.Directory]::Exists($directory)) { return $false }
+    try {
+        Assert-CcodActivationReceiptPathSafe -Root $Root -Path $directory
+        foreach ($phase in $script:CcodActivationReceiptPhases) {
+            $path = Join-Path $directory ("$ExpectedActivationId.$phase.json")
+            if ([IO.File]::Exists($path)) {
+                Assert-CcodActivationReceiptPathSafe -Root $Root -Path $path
+                return $true
+            }
+        }
+    } catch { return $false }
+    return $false
+}
+$PayloadRoot = [IO.Path]::GetFullPath($PayloadRoot)
 if (-not [string]::IsNullOrWhiteSpace($ExpectedVersion)) {
     try { $payloadSeal = New-CcodActivationPayloadSeal -AppRoot $AppRoot -Root $PayloadRoot -Version $ExpectedVersion -ExpectedManifestSha256 $ExpectedPayloadManifestSha256 }
     catch {
@@ -828,7 +931,7 @@ try {
     if (-not [IO.File]::Exists($installScript)) { throw 'CCOD_ACTIVATION_INSTALL_SCRIPT_MISSING' }
     $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
     Write-CcodActivationRecord -Code 'STARTED' -DurationMilliseconds $clock.ElapsedMilliseconds
-    $installExitCode = Invoke-CcodOwnedInstallWorker -PowerShellPath $powershell -InstallScript $installScript -VerifiedPayloadRoot $executionPayloadRoot -StateRoot $stateRoot -FirstReceiptTimeout $FirstReceiptTimeoutMilliseconds -ActivationTimeout $ActivationTimeoutMilliseconds
+    $installExitCode = Invoke-CcodOwnedInstallWorker -PowerShellPath $powershell -InstallScript $installScript -VerifiedPayloadRoot $executionPayloadRoot -StateRoot $stateRoot -SealedPackageSha256 $(if($packageBound){$ExpectedPackageSha256}else{$null}) -FirstReceiptTimeout $FirstReceiptTimeoutMilliseconds -ActivationTimeout $ActivationTimeoutMilliseconds
     if ($installExitCode -ne 0) {
         $reportedErrorCode = $null
         try {
@@ -873,4 +976,6 @@ Write-CcodActivationRecord -Code 'COMPLETED' -DurationMilliseconds $clock.Elapse
 exit 0
 } finally {
     Close-CcodActivationPayloadSeal -Seal $payloadSeal
+    Close-CcodInstallerPackageSeal -Seal $packageSeal
+    if ($null -ne $packageAppRoot -and [IO.Directory]::Exists($packageAppRoot)) { Remove-Item -LiteralPath $packageAppRoot -Recurse -Force -ErrorAction SilentlyContinue }
 }

@@ -55,7 +55,10 @@ function Test-CcodSetupArtifact {
         [Parameter(Mandatory)][string]$SetupPath,
         [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$ExpectedVersion,
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedGitCommit,
-        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedPayloadManifestSha256
+        [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedPayloadManifestSha256,
+        [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedPackageSha256,
+        [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedPackageManifestSha256,
+        [ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedActivationBootstrapSha256
     )
 
     $setup = Assert-CcodSetupRegularFile -Path $SetupPath -Kind 'Setup artifact'
@@ -69,12 +72,23 @@ function Test-CcodSetupArtifact {
     $fileDescription = ([string]$versionInfo.FileDescription).Trim()
     $companyName = ([string]$versionInfo.CompanyName).Trim()
     $legalCopyright = ([string]$versionInfo.LegalCopyright).Trim()
-    if ($fileVersion -cne $expectedPeVersion -or $productVersion -cne $expectedPeVersion) {
+    $originalFilename = ([string]$versionInfo.OriginalFilename).Trim()
+    $sealedContract = -not [string]::IsNullOrWhiteSpace($ExpectedPackageSha256) -or -not [string]::IsNullOrWhiteSpace($ExpectedPackageManifestSha256) -or -not [string]::IsNullOrWhiteSpace($ExpectedActivationBootstrapSha256)
+    if ($sealedContract -and ([string]::IsNullOrWhiteSpace($ExpectedPackageSha256) -or [string]::IsNullOrWhiteSpace($ExpectedPackageManifestSha256) -or [string]::IsNullOrWhiteSpace($ExpectedActivationBootstrapSha256))) {
+        Throw-CcodSetupArtifactError 'CCOD_SETUP_PAYLOAD_BINDING_INVALID' 'The sealed Setup PE contract requires all three hashes' $setup
+    }
+    $expectedProductVersion = if ($sealedContract) { $ExpectedPackageManifestSha256.Substring(0,32) } else { $expectedPeVersion }
+    if ($sealedContract) { $expectedDescription = $ExpectedPackageManifestSha256.Substring(32,32) }
+    $expectedProductName = if ($sealedContract) { $ExpectedActivationBootstrapSha256.Substring(32,32) } else { 'CodexRemote-fix' }
+    $expectedOriginalFilename = if ($sealedContract) { $ExpectedActivationBootstrapSha256.Substring(0,32) } else { $originalFilename }
+    if ($fileVersion -cne $expectedPeVersion -or $productVersion -cne $expectedProductVersion) {
         Throw-CcodSetupArtifactError 'CCOD_SETUP_PE_VERSION_INVALID' ("Setup PE FileVersion/ProductVersion do not match the release version: file={0}; product={1}; expected={2}" -f [string]$versionInfo.FileVersion,[string]$versionInfo.ProductVersion,$expectedPeVersion) $setup
     }
-    if ($productName -cne 'CodexRemote-fix' -or $fileDescription -cne $expectedDescription -or
-        $companyName -cne $ExpectedGitCommit -or $legalCopyright -cne $ExpectedPayloadManifestSha256) {
-        Throw-CcodSetupArtifactError 'CCOD_SETUP_PAYLOAD_BINDING_INVALID' ("Setup PE does not bind the expected version, commit, and activation payload manifest hash: product={0}; description={1}; company={2}; copyright={3}" -f $productName,$fileDescription,$companyName,$legalCopyright) $setup
+    $expectedCopyright = if ($sealedContract) { $ExpectedPackageSha256 } else { $ExpectedPayloadManifestSha256 }
+    if ($productName -cne $expectedProductName -or $fileDescription -cne $expectedDescription -or
+        $companyName -cne $ExpectedGitCommit -or $legalCopyright -cne $expectedCopyright -or
+        ($sealedContract -and $originalFilename -cne $expectedOriginalFilename)) {
+        Throw-CcodSetupArtifactError 'CCOD_SETUP_PAYLOAD_BINDING_INVALID' ("Setup PE does not bind the expected version, commit, package, manifest, and bootstrap hashes: product={0}; productVersion={1}; description={2}; company={3}; copyright={4}; original={5}" -f $productName,$productVersion,$fileDescription,$companyName,$legalCopyright,$originalFilename) $setup
     }
     return [pscustomobject][ordered]@{
         Valid = $true
@@ -85,6 +99,9 @@ function Test-CcodSetupArtifact {
         FileDescription = $fileDescription
         CompanyName = $companyName
         LegalCopyright = $legalCopyright
+        OriginalFilename = $originalFilename
+        PackageManifestSha256 = if ($sealedContract) { $productVersion + $fileDescription } else { $null }
+        ActivationBootstrapSha256 = if ($sealedContract) { $originalFilename + $productName } else { $null }
     }
 }
 
@@ -197,4 +214,55 @@ function Test-CcodSetupBuildProvenance {
     return $record
 }
 
-Export-ModuleMember -Function Get-CcodSetupArtifactHash,Get-CcodSetupDescription,New-CcodSetupBuildProvenance,Test-CcodSetupBuildProvenance,Test-CcodSetupArtifact
+function New-CcodSealedSetupBuildProvenance {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$GitCommit,
+        [Parameter(Mandatory)][string]$BuildTimestampUtc,
+        [Parameter(Mandatory)][string]$PackagePath,
+        [Parameter(Mandatory)][string]$PackageManifestPath,
+        [Parameter(Mandatory)][string]$ActivationBootstrapPath,
+        [Parameter(Mandatory)][string]$InnoTemplatePath,
+        [Parameter(Mandatory)][string]$DestinationInventoryPath,
+        [Parameter(Mandatory)][string]$CompilerPath,
+        [Parameter(Mandatory)][string]$OutputPath
+    )
+    if (-not (Test-CcodSetupCanonicalUtc $BuildTimestampUtc)) { Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Sealed Setup provenance timestamp is invalid' $BuildTimestampUtc }
+    $package=Assert-CcodSetupRegularFile $PackagePath 'Installer package';$manifest=Assert-CcodSetupRegularFile $PackageManifestPath 'Installer package manifest';$bootstrap=Assert-CcodSetupRegularFile $ActivationBootstrapPath 'Activation bootstrap';$template=Assert-CcodSetupRegularFile $InnoTemplatePath 'Inno template';$inventory=Assert-CcodSetupRegularFile $DestinationInventoryPath 'Destination inventory';$compiler=Assert-CcodSetupRegularFile $CompilerPath 'Inno compiler'
+    try{$manifestRecord=[IO.File]::ReadAllText($manifest,[Text.UTF8Encoding]::new($false))|ConvertFrom-Json -ErrorAction Stop}catch{Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Installer package manifest JSON is invalid' $manifest}
+    if($manifestRecord.schemaVersion-isnot[int]-or$manifestRecord.schemaVersion-ne 1-or$manifestRecord.product-cne'CodexRemote-fix'-or$manifestRecord.version-cne$Version-or$manifestRecord.gitCommit-cne$GitCommit-or@($manifestRecord.files).Count-eq0){Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Installer package manifest identity is invalid' $manifest}
+    $packageHash=Get-CcodSetupArtifactHash $package;$manifestHash=Get-CcodSetupArtifactHash $manifest;$bootstrapHash=Get-CcodSetupArtifactHash $bootstrap;$compilerInfo=[Diagnostics.FileVersionInfo]::GetVersionInfo($compiler)
+    $record=[ordered]@{
+        schemaVersion=2;product='CodexRemote-fix';version=$Version;gitCommit=$GitCommit;buildTimestampUtc=$BuildTimestampUtc
+        installerPackage=[ordered]@{name='installer-package.zip';length=[int64](Get-Item $package -Force).Length;sha256=$packageHash}
+        installerPackageManifest=[ordered]@{name='installer-package.manifest.json';length=[int64](Get-Item $manifest -Force).Length;sha256=$manifestHash;fileCount=[int]@($manifestRecord.files).Count;payloadManifestSha256=[string]$manifestRecord.payloadManifest.sha256}
+        activationBootstrap=[ordered]@{name='Activate-CcodRemoteFix.ps1';length=[int64](Get-Item $bootstrap -Force).Length;sha256=$bootstrapHash}
+        buildInputs=[ordered]@{innoTemplateSha256=Get-CcodSetupArtifactHash $template;destinationInventorySha256=Get-CcodSetupArtifactHash $inventory;compilerSha256=Get-CcodSetupArtifactHash $compiler;compilerFileVersion=[string]$compilerInfo.FileVersion}
+        peContract=[ordered]@{fileVersion="$Version.0";packageManifestFirst=$manifestHash.Substring(0,32);packageManifestLast=$manifestHash.Substring(32,32);bootstrapFirst=$bootstrapHash.Substring(0,32);bootstrapLast=$bootstrapHash.Substring(32,32);companyName=$GitCommit;legalCopyright=$packageHash}
+    }
+    $output=[IO.Path]::GetFullPath($OutputPath);if([IO.File]::Exists($output)-or[IO.Directory]::Exists($output)){Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Refusing to overwrite sealed Setup provenance' $output}
+    [IO.File]::WriteAllText($output,(($record|ConvertTo-Json -Depth 8)+[Environment]::NewLine),[Text.UTF8Encoding]::new($false));return [pscustomobject]$record
+}
+
+function Test-CcodSealedSetupBuildProvenance {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ProvenancePath,[Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$ExpectedVersion,[Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedGitCommit,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedPackageSha256,[Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedPackageManifestSha256,[Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedActivationBootstrapSha256,[Parameter(Mandatory)][string]$ExpectedBuildTimestampUtc,
+        [Parameter(Mandatory)][string]$PackagePath,[Parameter(Mandatory)][string]$PackageManifestPath,[Parameter(Mandatory)][string]$ActivationBootstrapPath,[Parameter(Mandatory)][string]$InnoTemplatePath,[Parameter(Mandatory)][string]$DestinationInventoryPath,[Parameter(Mandatory)][string]$CompilerPath
+    )
+    $path=Assert-CcodSetupRegularFile $ProvenancePath 'Sealed Setup provenance';$package=Assert-CcodSetupRegularFile $PackagePath 'Installer package';$manifest=Assert-CcodSetupRegularFile $PackageManifestPath 'Installer package manifest';$bootstrap=Assert-CcodSetupRegularFile $ActivationBootstrapPath 'Activation bootstrap';$template=Assert-CcodSetupRegularFile $InnoTemplatePath 'Inno template';$inventory=Assert-CcodSetupRegularFile $DestinationInventoryPath 'Destination inventory';$compiler=Assert-CcodSetupRegularFile $CompilerPath 'Inno compiler'
+    try{$record=[IO.File]::ReadAllText($path,[Text.UTF8Encoding]::new($false))|ConvertFrom-Json -ErrorAction Stop}catch{Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Sealed Setup provenance JSON is invalid' $path}
+    $fields='schemaVersion,product,version,gitCommit,buildTimestampUtc,installerPackage,installerPackageManifest,activationBootstrap,buildInputs,peContract'
+    $actualCompilerVersion=([string][Diagnostics.FileVersionInfo]::GetVersionInfo($compiler).FileVersion).Trim()
+    if((@($record.PSObject.Properties.Name)-join',')-cne$fields-or$record.schemaVersion-ne 2-or$record.product-cne'CodexRemote-fix'-or$record.version-cne$ExpectedVersion-or$record.gitCommit-cne$ExpectedGitCommit-or$record.buildTimestampUtc-cne$ExpectedBuildTimestampUtc-or-not(Test-CcodSetupCanonicalUtc ([string]$record.buildTimestampUtc))-or
+       $record.installerPackage.sha256-cne$ExpectedPackageSha256-or$record.installerPackage.sha256-cne(Get-CcodSetupArtifactHash $package)-or[long]$record.installerPackage.length-ne(Get-Item $package -Force).Length-or
+       $record.installerPackageManifest.sha256-cne$ExpectedPackageManifestSha256-or$record.installerPackageManifest.sha256-cne(Get-CcodSetupArtifactHash $manifest)-or
+       $record.activationBootstrap.sha256-cne$ExpectedActivationBootstrapSha256-or$record.activationBootstrap.sha256-cne(Get-CcodSetupArtifactHash $bootstrap)-or
+       $record.buildInputs.innoTemplateSha256-cne(Get-CcodSetupArtifactHash $template)-or$record.buildInputs.destinationInventorySha256-cne(Get-CcodSetupArtifactHash $inventory)-or$record.buildInputs.compilerSha256-cne(Get-CcodSetupArtifactHash $compiler)-or([string]$record.buildInputs.compilerFileVersion).Trim()-cne$actualCompilerVersion-or
+       $record.peContract.fileVersion-cne"$ExpectedVersion.0"-or$record.peContract.packageManifestFirst-cne$ExpectedPackageManifestSha256.Substring(0,32)-or$record.peContract.packageManifestLast-cne$ExpectedPackageManifestSha256.Substring(32,32)-or$record.peContract.bootstrapFirst-cne$ExpectedActivationBootstrapSha256.Substring(0,32)-or$record.peContract.bootstrapLast-cne$ExpectedActivationBootstrapSha256.Substring(32,32)-or$record.peContract.companyName-cne$ExpectedGitCommit-or$record.peContract.legalCopyright-cne$ExpectedPackageSha256){Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Sealed Setup provenance is not exactly bound' $path}
+    return $record
+}
+
+Export-ModuleMember -Function Get-CcodSetupArtifactHash,Get-CcodSetupDescription,New-CcodSetupBuildProvenance,Test-CcodSetupBuildProvenance,New-CcodSealedSetupBuildProvenance,Test-CcodSealedSetupBuildProvenance,Test-CcodSetupArtifact

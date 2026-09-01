@@ -1,16 +1,29 @@
 [Setup]
-#ifndef TrayHostArtifactDirectory
-#define TrayHostArtifactDirectory SourcePath + "\generated\trayhost"
+#ifndef ProjectVersion
+#error ProjectVersion must be supplied by the release builder
 #endif
-#ifndef PortableArtifactDirectory
-#define PortableArtifactDirectory SourcePath + "\generated\portable"
+#ifndef InstallerPackagePath
+#error InstallerPackagePath must be supplied by the release builder
 #endif
-#ifndef InstallerPayloadDirectory
-#error InstallerPayloadDirectory must be supplied by the release builder
+#ifndef InstallerPackageManifestPath
+#error InstallerPackageManifestPath must be supplied by the release builder
 #endif
-#ifndef InstallerPayloadManifestSha256
-#error InstallerPayloadManifestSha256 must be supplied by the release builder
+#ifndef InstallerPackageSha256
+#error InstallerPackageSha256 must be supplied by the release builder
 #endif
+#ifndef InstallerPackageManifestSha256
+#error InstallerPackageManifestSha256 must be supplied by the release builder
+#endif
+#define InstallerPackageManifestSha256First Copy(InstallerPackageManifestSha256, 1, 32)
+#define InstallerPackageManifestSha256Last Copy(InstallerPackageManifestSha256, 33, 32)
+#ifndef ActivationBootstrapPath
+#error ActivationBootstrapPath must be supplied by the release builder
+#endif
+#ifndef ActivationBootstrapSha256
+#error ActivationBootstrapSha256 must be supplied by the release builder
+#endif
+#define ActivationBootstrapSha256First Copy(ActivationBootstrapSha256, 1, 32)
+#define ActivationBootstrapSha256Last Copy(ActivationBootstrapSha256, 33, 32)
 #ifndef SetupGitCommit
 #error SetupGitCommit must be supplied by the release builder
 #endif
@@ -27,20 +40,20 @@ AppSupportURL=https://github.com/naipi11/CodexRemote-fix/issues
 AppUpdatesURL=https://github.com/naipi11/CodexRemote-fix/releases
 VersionInfoVersion={#ProjectVersion}.0
 VersionInfoTextVersion={#ProjectVersion}.0
-VersionInfoProductName=CodexRemote-fix
-VersionInfoProductTextVersion={#ProjectVersion}.0
-VersionInfoDescription=CCODSETUP {#ProjectVersion}
+VersionInfoProductName={#ActivationBootstrapSha256Last}
+VersionInfoProductTextVersion={#InstallerPackageManifestSha256First}
+VersionInfoDescription={#InstallerPackageManifestSha256Last}
 VersionInfoCompany={#SetupGitCommit}
-VersionInfoCopyright={#InstallerPayloadManifestSha256}
-DefaultDirName={localappdata}\CodexControlOtherDevices-installer
-DefaultGroupName=CodexRemote-fix
-UsePreviousGroup=no
+VersionInfoCopyright={#InstallerPackageSha256}
+VersionInfoOriginalFileName={#ActivationBootstrapSha256First}
+DefaultDirName={localappdata}\CodexControlOtherDevices
+CreateAppDir=no
+Uninstallable=no
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=dist
 OutputBaseFilename=CodexRemote-fix-{#ProjectVersion}-setup
 SetupIconFile=..\assets\codexremote-fix\codexremote-fix.ico
-UninstallDisplayIcon={app}\assets\CodexRemote-fix.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -55,762 +68,139 @@ MinVersion=10.0.17763
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-Source: "{#SetupProvenancePath}"; DestDir: "{app}"; DestName: "setup-provenance.json"; Flags: dontcopy
-Source: "{#InstallerPayloadDirectory}\installer-payload.manifest.json"; DestDir: "{app}"; DestName: "setup-input-payload-manifest.json"; Flags: dontcopy
-Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\README.zh-CN.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\NOTICE.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\SECURITY.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\package.json"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\build\CodexControlOtherDevices.iss"; DestDir: "{app}\build"; Flags: ignoreversion
-Source: "..\build\build.ps1"; DestDir: "{app}\build"; Flags: ignoreversion
-Source: "..\build\SetupArtifact.psm1"; DestDir: "{app}\build"; Flags: ignoreversion
-Source: "..\build\build-trayhost.ps1"; DestDir: "{app}\build"; Flags: ignoreversion
-Source: "..\build\TrayHostBuild.psm1"; DestDir: "{app}\build"; Flags: ignoreversion
-Source: "..\build\TrayHostReferencePack.psm1"; DestDir: "{app}\build"; Flags: ignoreversion
-Source: "..\build\trayhost-packages.lock.json"; DestDir: "{app}\build"; Flags: ignoreversion
-Source: "{#TrayHostArtifactDirectory}\CodexRemote.TrayHost.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
-Source: "{#TrayHostArtifactDirectory}\CodexRemote.TrayHost.exe.config"; DestDir: "{app}\bin"; Flags: ignoreversion
-Source: "{#TrayHostArtifactDirectory}\trayhost-build-provenance.json"; DestDir: "{app}\bin"; Flags: ignoreversion
-Source: "{#PortableArtifactDirectory}\CodexRemote.Portable.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
-Source: "{#PortableArtifactDirectory}\CodexRemote.Portable.exe.config"; DestDir: "{app}\bin"; Flags: ignoreversion
-Source: "{#PortableArtifactDirectory}\portable-launcher-provenance.json"; DestDir: "{app}\bin"; Flags: ignoreversion
-Source: "..\.github\workflows\release.yml"; DestDir: "{app}\.github\workflows"; Flags: ignoreversion
-Source: "..\assets\codexremote-fix\codexremote-fix.ico"; DestDir: "{app}\assets"; DestName: "CodexRemote-fix.ico"; Flags: ignoreversion
-Source: "..\assets\codexremote-fix\codexremote-fix.ico"; DestDir: "{app}\assets\codexremote-fix"; Flags: ignoreversion
-Source: "..\docs\*"; DestDir: "{app}\docs"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "..\src\*"; DestDir: "{app}\src"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "..\tests\*"; DestDir: "{app}\tests"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "..\Install-CodexControlOtherDevices.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Uninstall-CodexControlOtherDevices.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Start-CodexControlOtherDevices.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Reset-CodexControlOtherDevices.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Test-CodexControlOtherDevices.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Activate-CcodRemoteFix.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\Prompt-CcodRestart.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\tools\New-InstallerPayloadManifest.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
-Source: "..\tools\New-InstallerDestinationInventory.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
-Source: "{#InstallerPayloadDirectory}\*"; DestDir: "{app}\payload\{#ProjectVersion}"; Flags: ignoreversion recursesubdirs createallsubdirs
-
-[InstallDelete]
-Type: files; Name: "{userprograms}\Codex Control other devices\Codex Control other devices for Windows.lnk"
-Type: files; Name: "{userprograms}\Codex Control other devices\Open the tray supervisor.lnk"
-Type: files; Name: "{userprograms}\Codex Control other devices\Compatibility check.lnk"
-Type: files; Name: "{userprograms}\Codex Control other devices\Uninstall Codex Control other devices.lnk"
-Type: files; Name: "{userprograms}\Codex Control other devices\CodexRemote-fix.lnk"
-Type: files; Name: "{userprograms}\Codex Control other devices\CodexRemote-fix compatibility check.lnk"
-Type: files; Name: "{userprograms}\Codex Control other devices\Uninstall CodexRemote-fix.lnk"
-Type: dirifempty; Name: "{userprograms}\Codex Control other devices"
-Type: files; Name: "{userdesktop}\Codex 设备连接 (Device Connection).lnk"
-
-[Icons]
-Name: "{group}\CodexRemote-fix"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{localappdata}\CodexControlOtherDevices\bootstrap.ps1"" -InstallRoot ""{localappdata}\CodexControlOtherDevices"" -EntryMode Explicit"; WorkingDir: "{localappdata}\CodexControlOtherDevices"; IconFilename: "{app}\assets\CodexRemote-fix.ico"
-Name: "{group}\CodexRemote-fix compatibility check"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Test-CodexControlOtherDevices.ps1"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\CodexRemote-fix.ico"
-Name: "{group}\Uninstall CodexRemote-fix"; Filename: "{app}\unins000.exe"; IconFilename: "{app}\assets\CodexRemote-fix.ico"
-Name: "{userdesktop}\CodexRemote-fix"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{localappdata}\CodexControlOtherDevices\bootstrap.ps1"" -InstallRoot ""{localappdata}\CodexControlOtherDevices"" -EntryMode Explicit"; WorkingDir: "{localappdata}\CodexControlOtherDevices"; IconFilename: "{app}\assets\CodexRemote-fix.ico"
+Source: "{#InstallerPackagePath}"; DestName: "ccod-installer-package.zip"; Flags: dontcopy
+Source: "{#InstallerPackageManifestPath}"; DestName: "ccod-installer-package.manifest.json"; Flags: dontcopy
+Source: "{#ActivationBootstrapPath}"; DestName: "ccod-activation-bootstrap.ps1"; Flags: dontcopy
+Source: "{#SetupProvenancePath}"; DestName: "ccod-setup-provenance.json"; Flags: dontcopy
 
 [Code]
 // CCOD_INSTALLER_DESTINATION_INVENTORY
 const
-  ACTIVATION_TIMEOUT_MILLISECONDS = 300000;
-  FIRST_ACTIVATION_RECEIPT_TIMEOUT_MILLISECONDS = 90000;
-  ACTIVATION_POLL_MILLISECONDS = 50;
-  VALIDATION_RETRY_MILLISECONDS = 500;
-  VALIDATION_TIMEOUT_MILLISECONDS = 2000;
-  VALIDATION_LAUNCH_BUDGET_MILLISECONDS = 5000;
-  CCOD_FILE_ATTRIBUTE_DIRECTORY = $00000010;
-  CCOD_FILE_ATTRIBUTE_REPARSE_POINT = $00000400;
-  CCOD_FILE_READ_ATTRIBUTES = $00000080;
-  CCOD_DELETE_ACCESS = $00010000;
+  CCOD_GENERIC_READ = $80000000;
   CCOD_FILE_SHARE_READ = $00000001;
-  CCOD_FILE_SHARE_WRITE = $00000002;
-  CCOD_FILE_SHARE_DELETE = $00000004;
   CCOD_OPEN_EXISTING = 3;
-  CCOD_FILE_FLAG_OPEN_REPARSE_POINT = $00200000;
-  CCOD_FILE_FLAG_BACKUP_SEMANTICS = $02000000;
-  CCOD_INVALID_FILE_ATTRIBUTES = $FFFFFFFF;
+  CCOD_FILE_ATTRIBUTE_NORMAL = $00000080;
   CCOD_INVALID_HANDLE_VALUE = -1;
-  CCOD_ERROR_HANDLE_EOF = 38;
+  CCOD_EXPECTED_PACKAGE_SHA256 = '{#InstallerPackageSha256}';
+  CCOD_EXPECTED_PACKAGE_MANIFEST_SHA256 = '{#InstallerPackageManifestSha256}';
+  CCOD_EXPECTED_BOOTSTRAP_SHA256 = '{#ActivationBootstrapSha256}';
 
-type
-  TActivationPhase = (apNone, apStoppingPreviousRuntime, apInstallingRuntime,
-    apActivatingRuntime, apStartingProtection, apReady, apFailed);
-  TCcodFileTime = record
-    LowDateTime: Cardinal;
-    HighDateTime: Cardinal;
-  end;
-  TCcodByHandleFileInformation = record
-    FileAttributes: Cardinal;
-    CreationTime: TCcodFileTime;
-    LastAccessTime: TCcodFileTime;
-    LastWriteTime: TCcodFileTime;
-    VolumeSerialNumber: Cardinal;
-    FileSizeHigh: Cardinal;
-    FileSizeLow: Cardinal;
-    NumberOfLinks: Cardinal;
-    FileIndexHigh: Cardinal;
-    FileIndexLow: Cardinal;
-  end;
-  TCcodFindStreamData = record
-    StreamSize: Int64;
-    StreamNameBuffer: array[0..591] of Byte;
-  end;
+var
+  CcodInputHandles: array of Integer;
+  CcodPackagePath: String;
+  CcodPackageManifestPath: String;
+  CcodBootstrapPath: String;
 
-function GetTickCount64(): Int64;
-  external 'GetTickCount64@kernel32.dll stdcall';
-function CoCreateGuid(var Guid: TGUID): HResult;
-  external 'CoCreateGuid@ole32.dll stdcall';
-function StringFromGUID2(var Guid: TGUID; GuidString: String; MaxCharacters: Integer): Integer;
-  external 'StringFromGUID2@ole32.dll stdcall';
-function GetFileAttributesW(const FileName: String): Cardinal;
-  external 'GetFileAttributesW@kernel32.dll stdcall';
 function CreateFileW(const FileName: String; DesiredAccess, ShareMode,
   SecurityAttributes, CreationDisposition, FlagsAndAttributes,
   TemplateFile: Cardinal): Integer;
   external 'CreateFileW@kernel32.dll stdcall';
-function GetFileInformationByHandle(FileHandle: Integer;
-  var Information: TCcodByHandleFileInformation): Boolean;
-  external 'GetFileInformationByHandle@kernel32.dll stdcall';
 function CloseHandle(Handle: Integer): Boolean;
   external 'CloseHandle@kernel32.dll stdcall';
-function FindFirstStreamW(const FileName: String; InfoLevel: Integer;
-  var StreamData: TCcodFindStreamData; Flags: Cardinal): Integer;
-  external 'FindFirstStreamW@kernel32.dll stdcall';
-function FindNextStreamW(FindHandle: Integer;
-  var StreamData: TCcodFindStreamData): Boolean;
-  external 'FindNextStreamW@kernel32.dll stdcall';
-function CcodFindClose(FindHandle: Integer): Boolean;
-  external 'FindClose@kernel32.dll stdcall';
-function GetLastError(): Cardinal;
-  external 'GetLastError@kernel32.dll stdcall';
+function CoCreateGuid(var Guid: TGUID): HResult;
+  external 'CoCreateGuid@ole32.dll stdcall';
+function StringFromGUID2(var Guid: TGUID; GuidString: String;
+  MaxCharacters: Integer): Integer;
+  external 'StringFromGUID2@ole32.dll stdcall';
 
-function IsSafeExistingPayloadDirectory(const DirectoryName: String): Boolean;
+procedure CloseCcodInputHandles();
 var
-  Attributes: Cardinal;
+  Index: Integer;
 begin
-  Attributes := GetFileAttributesW(DirectoryName);
-  Result := (Attributes = CCOD_INVALID_FILE_ATTRIBUTES) or
-    (((Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) and
-     ((Attributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) = 0));
+  for Index := GetArrayLength(CcodInputHandles) - 1 downto 0 do
+    if CcodInputHandles[Index] <> CCOD_INVALID_HANDLE_VALUE then
+      CloseHandle(CcodInputHandles[Index]);
+  SetArrayLength(CcodInputHandles, 0);
 end;
 
-function HasOnlyDefaultDataStream(const FileName: String): Boolean;
+function LockCcodInput(const Path, ExpectedSha256: String): Boolean;
 var
-  FindHandle: Integer;
-  StreamData: TCcodFindStreamData;
-  ErrorCode: Cardinal;
-begin
-  Result := False;
-  FindHandle := FindFirstStreamW(FileName, 0, StreamData, 0);
-  if FindHandle = CCOD_INVALID_HANDLE_VALUE then Exit;
-  try
-    if FindNextStreamW(FindHandle, StreamData) then Exit;
-    ErrorCode := GetLastError();
-    Result := ErrorCode = CCOD_ERROR_HANDLE_EOF;
-  finally
-    CcodFindClose(FindHandle);
-  end;
-end;
-
-function IsSafeExistingSetupLeaf(const FileName: String): Boolean;
-var
-  Attributes: Cardinal;
-  FileHandle: Integer;
-  Information: TCcodByHandleFileInformation;
-begin
-  Result := False;
-  Attributes := GetFileAttributesW(FileName);
-  if (Attributes = CCOD_INVALID_FILE_ATTRIBUTES) or
-     ((Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) or
-     ((Attributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then Exit;
-  FileHandle := CreateFileW(FileName, CCOD_FILE_READ_ATTRIBUTES,
-    CCOD_FILE_SHARE_READ or CCOD_FILE_SHARE_WRITE or CCOD_FILE_SHARE_DELETE,
-    0, CCOD_OPEN_EXISTING, CCOD_FILE_FLAG_OPEN_REPARSE_POINT, 0);
-  if FileHandle = CCOD_INVALID_HANDLE_VALUE then Exit;
-  try
-    if not GetFileInformationByHandle(FileHandle, Information) then Exit;
-    Result := (Information.NumberOfLinks = 1) and
-      ((Information.FileAttributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) = 0) and
-      ((Information.FileAttributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) = 0) and
-      HasOnlyDefaultDataStream(FileName);
-  finally
-    CloseHandle(FileHandle);
-  end;
-end;
-
-function IsSafeExistingSetupTree(const DirectoryName: String): Boolean;
-var
-  Attributes: Cardinal;
-  FindRec: TFindRec;
-  ChildPath: String;
-begin
-  Result := IsSafeExistingPayloadDirectory(DirectoryName);
-  if not Result then Exit;
-  Attributes := GetFileAttributesW(DirectoryName);
-  if Attributes = CCOD_INVALID_FILE_ATTRIBUTES then Exit;
-  if FindFirst(AddBackslash(DirectoryName) + '*', FindRec) then
-  begin
-    try
-      repeat
-        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
-        begin
-          ChildPath := AddBackslash(DirectoryName) + FindRec.Name;
-          if (FindRec.Attributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) <> 0 then
-          begin
-            Result := False;
-            Exit;
-          end;
-          if ((FindRec.Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) and
-             (not IsSafeExistingSetupTree(ChildPath)) then
-          begin
-            Result := False;
-            Exit;
-          end;
-          if ((FindRec.Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) = 0) and
-             (not IsSafeExistingSetupLeaf(ChildPath)) then
-          begin
-            Result := False;
-            Exit;
-          end;
-        end;
-      until not FindNext(FindRec);
-    finally
-      FindClose(FindRec);
-    end;
-  end;
-end;
-
-// CCOD_SETUP_PIN_BEGIN
-var
-  CcodSetupPinHandles: array of Integer;
-
-procedure AddCcodSetupPin(Handle: Integer);
-var
+  Handle: Integer;
   Count: Integer;
 begin
-  Count := GetArrayLength(CcodSetupPinHandles);
-  SetArrayLength(CcodSetupPinHandles, Count + 1);
-  CcodSetupPinHandles[Count] := Handle;
-end;
-
-procedure CloseCcodSetupPins();
-var
-  Index: Integer;
-begin
-  for Index := GetArrayLength(CcodSetupPinHandles) - 1 downto 0 do
-    if CcodSetupPinHandles[Index] <> CCOD_INVALID_HANDLE_VALUE then
-      CloseHandle(CcodSetupPinHandles[Index]);
-  SetArrayLength(CcodSetupPinHandles, 0);
-end;
-
-function PinCcodExistingSetupDirectory(const DirectoryName: String): Boolean;
-var
-  Attributes: Cardinal;
-  DirectoryHandle: Integer;
-  Information: TCcodByHandleFileInformation;
-begin
   Result := False;
-  Attributes := GetFileAttributesW(DirectoryName);
-  if Attributes = CCOD_INVALID_FILE_ATTRIBUTES then
+  if Lowercase(GetSHA256OfFile(Path)) <> ExpectedSha256 then Exit;
+  Handle := CreateFileW(Path, CCOD_GENERIC_READ, CCOD_FILE_SHARE_READ, 0,
+    CCOD_OPEN_EXISTING, CCOD_FILE_ATTRIBUTE_NORMAL, 0);
+  if Handle = CCOD_INVALID_HANDLE_VALUE then Exit;
+  if Lowercase(GetSHA256OfFile(Path)) <> ExpectedSha256 then
   begin
-    Result := True;
+    CloseHandle(Handle);
     Exit;
   end;
-  if ((Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) = 0) or
-     ((Attributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then Exit;
-  DirectoryHandle := CreateFileW(DirectoryName, CCOD_FILE_READ_ATTRIBUTES or CCOD_DELETE_ACCESS,
-    CCOD_FILE_SHARE_READ or CCOD_FILE_SHARE_WRITE, 0, CCOD_OPEN_EXISTING,
-    CCOD_FILE_FLAG_BACKUP_SEMANTICS or CCOD_FILE_FLAG_OPEN_REPARSE_POINT, 0);
-  if DirectoryHandle = CCOD_INVALID_HANDLE_VALUE then Exit;
-  if (not GetFileInformationByHandle(DirectoryHandle, Information)) or
-     ((Information.FileAttributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) = 0) or
-     ((Information.FileAttributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
-  begin
-    CloseHandle(DirectoryHandle);
-    Exit;
-  end;
-  Attributes := GetFileAttributesW(DirectoryName);
-  if (Attributes = CCOD_INVALID_FILE_ATTRIBUTES) or
-     ((Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) = 0) or
-     ((Attributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
-  begin
-    CloseHandle(DirectoryHandle);
-    Exit;
-  end;
-  AddCcodSetupPin(DirectoryHandle);
+  Count := GetArrayLength(CcodInputHandles);
+  SetArrayLength(CcodInputHandles, Count + 1);
+  CcodInputHandles[Count] := Handle;
   Result := True;
 end;
 
-function PinCcodExistingSetupLeaf(const FileName: String): Boolean;
-var
-  Attributes: Cardinal;
-  FileHandle: Integer;
-  Information: TCcodByHandleFileInformation;
+function ExtractAndLockCcodInputs(): Boolean;
 begin
   Result := False;
-  if not IsSafeExistingSetupLeaf(FileName) then Exit;
-  FileHandle := CreateFileW(FileName, CCOD_FILE_READ_ATTRIBUTES,
-    CCOD_FILE_SHARE_READ or CCOD_FILE_SHARE_WRITE, 0, CCOD_OPEN_EXISTING,
-    CCOD_FILE_FLAG_OPEN_REPARSE_POINT, 0);
-  if FileHandle = CCOD_INVALID_HANDLE_VALUE then Exit;
-  if (not GetFileInformationByHandle(FileHandle, Information)) or
-     (Information.NumberOfLinks <> 1) or
-     ((Information.FileAttributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) or
-     ((Information.FileAttributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) <> 0) or
-     (not HasOnlyDefaultDataStream(FileName)) then
-  begin
-    CloseHandle(FileHandle);
-    Exit;
-  end;
-  Attributes := GetFileAttributesW(FileName);
-  if (Attributes = CCOD_INVALID_FILE_ATTRIBUTES) or
-     ((Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) or
-     ((Attributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
-  begin
-    CloseHandle(FileHandle);
-    Exit;
-  end;
-  AddCcodSetupPin(FileHandle);
+  ExtractTemporaryFile('ccod-installer-package.zip');
+  ExtractTemporaryFile('ccod-installer-package.manifest.json');
+  ExtractTemporaryFile('ccod-activation-bootstrap.ps1');
+  ExtractTemporaryFile('ccod-setup-provenance.json');
+  CcodPackagePath := ExpandConstant('{tmp}\ccod-installer-package.zip');
+  CcodPackageManifestPath := ExpandConstant('{tmp}\ccod-installer-package.manifest.json');
+  CcodBootstrapPath := ExpandConstant('{tmp}\ccod-activation-bootstrap.ps1');
+  if not LockCcodInput(CcodPackagePath, CCOD_EXPECTED_PACKAGE_SHA256) then Exit;
+  if not LockCcodInput(CcodPackageManifestPath, CCOD_EXPECTED_PACKAGE_MANIFEST_SHA256) then Exit;
+  if not LockCcodInput(CcodBootstrapPath, CCOD_EXPECTED_BOOTSTRAP_SHA256) then Exit;
   Result := True;
-end;
-
-function PinCcodExistingSetupTree(const DirectoryName: String): Boolean;
-var
-  Attributes: Cardinal;
-  FindRec: TFindRec;
-  ChildPath: String;
-begin
-  Result := PinCcodExistingSetupDirectory(DirectoryName);
-  if not Result then Exit;
-  Attributes := GetFileAttributesW(DirectoryName);
-  if Attributes = CCOD_INVALID_FILE_ATTRIBUTES then Exit;
-  if FindFirst(AddBackslash(DirectoryName) + '*', FindRec) then
-  begin
-    try
-      repeat
-        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
-        begin
-          ChildPath := AddBackslash(DirectoryName) + FindRec.Name;
-          if ((FindRec.Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) then
-          begin
-            if not PinCcodExistingSetupTree(ChildPath) then
-            begin
-              Result := False;
-              Exit;
-            end;
-          end
-          else if not PinCcodExistingSetupLeaf(ChildPath) then
-          begin
-            Result := False;
-            Exit;
-          end;
-        end;
-      until not FindNext(FindRec);
-    finally
-      FindClose(FindRec);
-    end;
-  end;
-end;
-
-function PinCcodExpectedSetupDirectories(const AppDirectory: String): Boolean;
-var
-  Directories: TStringList;
-  Index: Integer;
-  Candidate: String;
-begin
-  Result := False;
-  Directories := TStringList.Create;
-  try
-    AddCcodExpectedSetupDirectories(Directories);
-    if Directories.Count = 0 then Exit;
-    for Index := 0 to Directories.Count - 1 do
-    begin
-      Candidate := AddBackslash(AppDirectory) + Directories[Index];
-      if not PinCcodExistingSetupDirectory(Candidate) then Exit;
-    end;
-    Result := True;
-  finally
-    Directories.Free;
-  end;
-end;
-// CCOD_SETUP_PIN_END
-
-function AreCcodExpectedSetupDirectoriesSafe(const AppDirectory: String): Boolean;
-var
-  Directories: TStringList;
-  Index: Integer;
-  Candidate: String;
-begin
-  Result := False;
-  Directories := TStringList.Create;
-  try
-    AddCcodExpectedSetupDirectories(Directories);
-    if Directories.Count = 0 then Exit;
-    for Index := 0 to Directories.Count - 1 do
-    begin
-      Candidate := AddBackslash(AppDirectory) + Directories[Index];
-      if not IsSafeExistingPayloadDirectory(Candidate) then Exit;
-    end;
-    Result := True;
-  finally
-    Directories.Free;
-  end;
-end;
-
-function PrepareToInstall(var NeedsRestart: Boolean): String;
-var
-  AppDirectory: String;
-begin
-  Result := '';
-  CloseCcodSetupPins();
-  AppDirectory := ExpandConstant('{app}');
-  if not IsSafeExistingSetupTree(AppDirectory) or
-     not AreCcodExpectedSetupDirectoriesSafe(AppDirectory) then
-    Result := 'CodexRemote-fix refused an unsafe existing payload directory.'
-  else if not PinCcodExistingSetupTree(AppDirectory) or
-          not PinCcodExpectedSetupDirectories(AppDirectory) then
-    Result := 'CodexRemote-fix could not retain the safe Setup write boundary.';
-  if Result <> '' then CloseCcodSetupPins();
 end;
 
 function NewActivationId(): String;
 var
   Guid: TGUID;
-  GuidString: String;
-  GuidLength: Integer;
+  Value: String;
+  Length: Integer;
 begin
-  if CoCreateGuid(Guid) <> 0 then
-    RaiseException('CodexRemote-fix activation correlation could not be created.');
-  SetLength(GuidString, 39);
-  GuidLength := StringFromGUID2(Guid, GuidString, 39);
-  if GuidLength <> 39 then
-    RaiseException('CodexRemote-fix activation correlation could not be formatted.');
-  SetLength(GuidString, 38);
-  Result := LowerCase(Copy(GuidString, 2, 36));
-  if Length(Result) <> 36 then
-    RaiseException('CodexRemote-fix activation correlation is invalid.');
+  if CoCreateGuid(Guid) <> 0 then RaiseException('CCOD_SETUP_ACTIVATION_ID_FAILED');
+  SetLength(Value, 39);
+  Length := StringFromGUID2(Guid, Value, 39);
+  if Length <> 39 then RaiseException('CCOD_SETUP_ACTIVATION_ID_FAILED');
+  SetLength(Value, 38);
+  Result := Lowercase(Copy(Value, 2, 36));
 end;
 
-function IsSafeActivationFile(const FileName: String): Boolean;
-var
-  Attributes, DirectoryAttributes, RootAttributes: Cardinal;
-  DirectoryName, RootName: String;
+function GetCcodBootstrapParameters(const ActivationId: String;
+  ValidateOnly: Boolean): String;
 begin
-  Attributes := GetFileAttributesW(FileName);
-  if (Attributes = CCOD_INVALID_FILE_ATTRIBUTES) or
-    ((Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) or
-    ((Attributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then Exit;
-  DirectoryName := ExtractFileDir(FileName);
-  RootName := ExtractFileDir(DirectoryName);
-  DirectoryAttributes := GetFileAttributesW(DirectoryName);
-  RootAttributes := GetFileAttributesW(RootName);
-  Result := (DirectoryAttributes <> CCOD_INVALID_FILE_ATTRIBUTES) and
-    (RootAttributes <> CCOD_INVALID_FILE_ATTRIBUTES) and
-    ((DirectoryAttributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) and
-    ((RootAttributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) <> 0) and
-    ((DirectoryAttributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) = 0) and
-    ((RootAttributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) = 0) and
-    ((Attributes and CCOD_FILE_ATTRIBUTE_DIRECTORY) = 0) and
-    ((Attributes and CCOD_FILE_ATTRIBUTE_REPARSE_POINT) = 0);
-end;
-
-procedure RefuseStaleActivationReceipt(const ReceiptPath: String);
-var
-  Attributes: Cardinal;
-begin
-  Attributes := GetFileAttributesW(ReceiptPath);
-  if Attributes <> CCOD_INVALID_FILE_ATTRIBUTES then
-  begin
-    if not IsSafeActivationFile(ReceiptPath) then
-      RaiseException('CodexRemote-fix refused an unsafe stale activation receipt.');
-    if not DeleteFile(ReceiptPath) then
-      RaiseException('CodexRemote-fix could not remove a stale activation receipt.');
-  end;
-  if GetFileAttributesW(ReceiptPath) <> CCOD_INVALID_FILE_ATTRIBUTES then
-    RaiseException('CodexRemote-fix refused a stale activation receipt.');
-end;
-
-function LoadBoundedActivationReceipt(const ReceiptPath: String; var Content: AnsiString): Boolean;
-var
-  ReceiptSize: Int64;
-begin
-  Result := False;
-  if not FileSize64(ReceiptPath, ReceiptSize) then Exit;
-  if (ReceiptSize <= 0) or (ReceiptSize > 16384) then Exit;
-  Result := LoadStringFromFile(ReceiptPath, Content);
-end;
-
-function IsJsonWhitespace(const Character: Char): Boolean;
-begin
-  Result := (Character = ' ') or (Character = #9) or
-    (Character = #10) or (Character = #13);
-end;
-
-function HasJsonStringValue(const Content, FieldName, FieldValue: String): Boolean;
-var
-  FieldIndex, RelativeIndex, SearchOffset, ValueIndex: Integer;
-  FieldToken, ValueToken: String;
-begin
-  Result := False;
-  FieldToken := '"' + FieldName + '"';
-  ValueToken := '"' + FieldValue + '"';
-  SearchOffset := 1;
-  while SearchOffset <= Length(Content) do
-  begin
-    RelativeIndex := Pos(FieldToken, Copy(Content, SearchOffset,
-      Length(Content) - SearchOffset + 1));
-    if RelativeIndex = 0 then Exit;
-    FieldIndex := SearchOffset + RelativeIndex - 1;
-    ValueIndex := FieldIndex + Length(FieldToken);
-    while ValueIndex <= Length(Content) do
-    begin
-      if not IsJsonWhitespace(Content[ValueIndex]) then Break;
-      ValueIndex := ValueIndex + 1;
-    end;
-    if (ValueIndex <= Length(Content)) and (Content[ValueIndex] = ':') then
-    begin
-      ValueIndex := ValueIndex + 1;
-      while ValueIndex <= Length(Content) do
-      begin
-        if not IsJsonWhitespace(Content[ValueIndex]) then Break;
-        ValueIndex := ValueIndex + 1;
-      end;
-      if Copy(Content, ValueIndex, Length(ValueToken)) = ValueToken then
-      begin
-        Result := True;
-        Exit;
-      end;
-    end;
-    SearchOffset := FieldIndex + Length(FieldToken);
-  end;
-end;
-
-function DetectActivationPhase(const Content: String): TActivationPhase;
-begin
-  Result := apNone;
-  if HasJsonStringValue(Content, 'phase', 'StoppingPreviousRuntime') then
-    Result := apStoppingPreviousRuntime
-  else if HasJsonStringValue(Content, 'phase', 'InstallingRuntime') then
-    Result := apInstallingRuntime
-  else if HasJsonStringValue(Content, 'phase', 'ActivatingRuntime') then
-    Result := apActivatingRuntime
-  else if HasJsonStringValue(Content, 'phase', 'StartingProtection') then
-    Result := apStartingProtection
-  else if HasJsonStringValue(Content, 'phase', 'Ready') then
-    Result := apReady
-  else if HasJsonStringValue(Content, 'phase', 'Failed') then
-    Result := apFailed;
-end;
-
-procedure UpdateActivationStartingPresentation();
-begin
-  WizardForm.StatusLabel.Caption := 'Starting CodexRemote-fix activation...';
-  WizardForm.ProgressGauge.Position := 70;
-  WizardForm.Update;
-end;
-
-procedure UpdateActivationPresentation(const Phase: TActivationPhase);
-begin
-  case Phase of
-    apStoppingPreviousRuntime:
-      begin WizardForm.StatusLabel.Caption := 'Stopping the previous protected runtime...'; WizardForm.ProgressGauge.Position := 20; end;
-    apInstallingRuntime:
-      begin WizardForm.StatusLabel.Caption := 'Installing the verified runtime...'; WizardForm.ProgressGauge.Position := 40; end;
-    apActivatingRuntime:
-      begin WizardForm.StatusLabel.Caption := 'Committing the runtime generation...'; WizardForm.ProgressGauge.Position := 60; end;
-    apStartingProtection:
-      begin WizardForm.StatusLabel.Caption := 'Starting Supervisor and TrayHost protection...'; WizardForm.ProgressGauge.Position := 80; end;
-    apReady:
-      begin WizardForm.StatusLabel.Caption := 'Verifying activation completion...'; WizardForm.ProgressGauge.Position := 95; end;
-    apFailed:
-      begin WizardForm.StatusLabel.Caption := 'Activation failed safely.'; WizardForm.ProgressGauge.Position := 95; end;
-  end;
-end;
-
-function ReadActivationProgressPhase(const ReceiptPath, ExpectedActivationId: String): TActivationPhase;
-var
-  Content: AnsiString;
-  Text: String;
-begin
-  Result := apNone;
-  if not FileExists(ReceiptPath) then Exit;
-  if not IsSafeActivationFile(ReceiptPath) then Exit;
-  if not LoadBoundedActivationReceipt(ReceiptPath, Content) then Exit;
-  Text := String(Content);
-  if HasJsonStringValue(Text, 'activationId', ExpectedActivationId) then
-    Result := DetectActivationPhase(Text);
+  Result := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
+    CcodBootstrapPath + '" -PackagePath "' + CcodPackagePath +
+    '" -PackageManifestPath "' + CcodPackageManifestPath +
+    '" -ExpectedPackageSha256 "{#InstallerPackageSha256}' +
+    '" -ExpectedPackageManifestSha256 "{#InstallerPackageManifestSha256}' +
+    '" -ExpectedVersion "{#ProjectVersion}' +
+    '" -ExpectedGitCommit "{#SetupGitCommit}' +
+    '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') +
+    '" -ActivationId "' + ActivationId + '"';
+  if ValidateOnly then Result := Result + ' -ValidateReceiptOnly';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  ActivationResultCode: Integer;
-  ValidationResultCode: Integer;
-  PromptResultCode: Integer;
-  Parameters, ReceiptPath, ActivationId: String;
+  ActivationId, Parameters: String;
+  ActivationResultCode, ValidationResultCode: Integer;
 begin
-  if CurStep <> ssPostInstall then
-    Exit;
-  CloseCcodSetupPins();
+  if CurStep <> ssPostInstall then Exit;
+  CloseCcodInputHandles();
+  if not ExtractAndLockCcodInputs() then RaiseException('CCOD_SETUP_INPUT_BINDING_INVALID');
   ActivationId := NewActivationId();
-  ReceiptPath := ExpandConstant('{localappdata}\CodexControlOtherDevices\state\post-install-activation.json');
-  RefuseStaleActivationReceipt(ReceiptPath);
-  UpdateActivationStartingPresentation();
-  Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
-    ExpandConstant('{app}\Activate-CcodRemoteFix.ps1') + '" -AppRoot "' + ExpandConstant('{app}') +
-    '" -PayloadRoot "' + ExpandConstant('{app}\payload\{#ProjectVersion}') +
-    '" -ExpectedVersion "{#ProjectVersion}' +
-    '" -ExpectedPayloadManifestSha256 "{#InstallerPayloadManifestSha256}' +
-    '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') +
-    '" -ActivationId "' + ActivationId + '" -FirstReceiptTimeoutMilliseconds ' +
-    IntToStr(FIRST_ACTIVATION_RECEIPT_TIMEOUT_MILLISECONDS) + ' -ActivationTimeoutMilliseconds ' +
-    IntToStr(ACTIVATION_TIMEOUT_MILLISECONDS);
-  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE,
-      ewWaitUntilTerminated, ActivationResultCode) then
-  begin
-    Log('CodexRemote-fix activation owner could not be started: ' + SysErrorMessage(ActivationResultCode));
-    RaiseException('CodexRemote-fix activation process could not be started.');
-  end;
-  if ActivationResultCode <> 0 then
-  begin
-    Log('CodexRemote-fix activation owner exited unsuccessfully, result code ' + IntToStr(ActivationResultCode) + '.');
-    SuppressibleMsgBox('CodexRemote-fix activation failed safely. Use the support code in post-install-activation.log.', mbError, MB_OK, IDOK);
-    RaiseException('CodexRemote-fix activation failed.');
-  end;
-  Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
-    ExpandConstant('{app}\Activate-CcodRemoteFix.ps1') + '" -AppRoot "' + ExpandConstant('{app}') +
-    '" -PayloadRoot "' + ExpandConstant('{app}\payload\{#ProjectVersion}') +
-    '" -ExpectedVersion "{#ProjectVersion}' +
-    '" -ExpectedPayloadManifestSha256 "{#InstallerPayloadManifestSha256}' +
-    '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') +
-    '" -ValidateReceiptWithTimeout -ValidationTimeoutMilliseconds ' + IntToStr(VALIDATION_TIMEOUT_MILLISECONDS) +
-    ' -ActivationId "' + ActivationId + '"';
-  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE,
-      ewWaitUntilTerminated, ValidationResultCode) then
-  begin
-    Log('CodexRemote-fix activation validator could not be started: ' + SysErrorMessage(ValidationResultCode));
-    RaiseException('CodexRemote-fix activation validator could not be started.');
-  end;
-  if ValidationResultCode <> 0 then
-  begin
-    Log('CodexRemote-fix activation validator rejected the terminal receipt, result code ' + IntToStr(ValidationResultCode) + '.');
-    SuppressibleMsgBox('CodexRemote-fix activation failed safe validation. Use the support code in post-install-activation.log.', mbError, MB_OK, IDOK);
-    RaiseException('CodexRemote-fix activation receipt validation failed.');
-  end;
-  if ValidationResultCode = 0 then
-  begin
-    WizardForm.StatusLabel.Caption := 'CodexRemote-fix activation is ready.';
-    WizardForm.ProgressGauge.Position := 100;
-    WizardForm.Update;
-    if not WizardSilent then
-    begin
-      Parameters := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\Prompt-CcodRestart.ps1') + '" -AppRoot "' + ExpandConstant('{app}') + '" -InstallRoot "' + ExpandConstant('{localappdata}\CodexControlOtherDevices') + '" -ActivationId "' + ActivationId + '"';
-      if (not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE, ewWaitUntilTerminated, PromptResultCode)) or (PromptResultCode <> 0) then
-        SuppressibleMsgBox('Codex restart was not submitted. Restart Codex manually when convenient.', mbInformation, MB_OK, IDOK);
-    end;
-  end;
+  Parameters := GetCcodBootstrapParameters(ActivationId, False);
+  if (not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters,
+      '', SW_HIDE, ewWaitUntilTerminated, ActivationResultCode)) or
+      (ActivationResultCode <> 0) then RaiseException('CCOD_SETUP_ACTIVATION_FAILED');
+  Parameters := GetCcodBootstrapParameters(ActivationId, True);
+  if (not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters,
+      '', SW_HIDE, ewWaitUntilTerminated, ValidationResultCode)) or
+      (ValidationResultCode <> 0) then RaiseException('CCOD_SETUP_READY_VALIDATION_FAILED');
+  WizardForm.StatusLabel.Caption := 'CodexRemote-fix activation is ready.';
+  WizardForm.ProgressGauge.Position := 100;
 end;
 
 procedure DeinitializeSetup();
 begin
-  CloseCcodSetupPins();
-end;
-
-function IsCanonicalUninstallTransactionId(const Value: String): Boolean;
-var
-  Index: Integer;
-  Character: Char;
-begin
-  Result := Length(Value) = 36;
-  if not Result then Exit;
-  for Index := 1 to Length(Value) do
-  begin
-    Character := Value[Index];
-    if (Index = 9) or (Index = 14) or (Index = 19) or (Index = 24) then
-    begin
-      if Character <> '-' then begin Result := False; Exit; end;
-    end
-    else if not (((Character >= '0') and (Character <= '9')) or ((Character >= 'a') and (Character <= 'f'))) then
-    begin
-      Result := False;
-      Exit;
-    end;
-  end;
-end;
-
-function TryReadUninstallTransactionId(var TransactionId: String): Boolean;
-var
-  CurrentPath, Text, Marker: String;
-  Content: AnsiString;
-  Position: Integer;
-begin
-  Result := False;
-  TransactionId := '';
-  CurrentPath := ExpandConstant('{localappdata}\CodexRemote-fix-uninstall\current.json');
-  if not IsSafeActivationFile(CurrentPath) then Exit;
-  if not LoadBoundedActivationReceipt(CurrentPath, Content) then Exit;
-  Text := String(Content);
-  Marker := '"transactionId":"';
-  Position := Pos(Marker, Text);
-  if Position = 0 then Exit;
-  Position := Position + Length(Marker);
-  if Position + 36 > Length(Text) + 1 then Exit;
-  TransactionId := Copy(Text, Position, 36);
-  if (Position + 36 > Length(Text)) or (Text[Position + 36] <> '"') or not IsCanonicalUninstallTransactionId(TransactionId) then
-  begin
-    TransactionId := '';
-    Exit;
-  end;
-  Result := True;
-end;
-
-function GetExternalUninstallBootstrapPath: String;
-var
-  TransactionId: String;
-begin
-  Result := '';
-  if not TryReadUninstallTransactionId(TransactionId) then Exit;
-  Result := ExpandConstant('{localappdata}\CodexRemote-fix-uninstall\') + TransactionId + '\payload\src\persistence\UninstallBootstrap.ps1';
-  if not FileExists(Result) then Result := '';
-end;
-
-function InitializeUninstall(): Boolean;
-var
-  ResultCode: Integer;
-  Parameters: String;
-begin
-  Parameters := '-NoProfile -ExecutionPolicy Bypass -File "' +
-    ExpandConstant('{app}\src\persistence\UninstallBootstrap.ps1') + '" -InstallerRoot "' +
-    ExpandConstant('{app}') + '" -InstallRoot "' +
-    ExpandConstant('{localappdata}\CodexControlOtherDevices') + '" -Mode Prepare';
-  Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters,
-    '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
-  if not Result then
-  begin
-    Log('CodexRemote-fix uninstall bootstrap refused pre-deletion cleanup, result code ' + IntToStr(ResultCode) + '.');
-    SuppressibleMsgBox('CodexRemote-fix could not verify safe cleanup. No installer files were removed; retry uninstall after resolving the reported support code.', mbError, MB_OK, IDOK);
-  end;
-end;
-
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
-var
-  ResultCode: Integer;
-  Parameters, BootstrapPath: String;
-begin
-  if CurUninstallStep <> usPostUninstall then Exit;
-  BootstrapPath := GetExternalUninstallBootstrapPath;
-  if BootstrapPath = '' then
-  begin
-    Log('CodexRemote-fix uninstall completion receipt could not locate the staged bootstrap.');
-    RaiseException('CCOD_UNINSTALL_FINALIZATION_MISSING');
-  end;
-  Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + BootstrapPath +
-    '" -InstallerRoot "' + ExpandConstant('{app}') + '" -InstallRoot "' +
-    ExpandConstant('{localappdata}\CodexControlOtherDevices') + '" -Mode FinalizeReceipt';
-  if (not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters,
-      '', SW_HIDE, ewWaitUntilTerminated, ResultCode)) or (ResultCode <> 0) then
-  begin
-    Log('CodexRemote-fix uninstall completion receipt was not finalized, result code ' + IntToStr(ResultCode) + '.');
-    RaiseException('CCOD_UNINSTALL_FINALIZATION_FAILED');
-  end;
+  CloseCcodInputHandles();
 end;

@@ -649,6 +649,7 @@ $results += Invoke-CcodTest 'default installer validation uses the structural ru
     }
 }
 
+<# Superseded: Setup no longer parses mutable JSON progress or owns an app payload tree.
 # Production mutation caught: recognizing JSON members only when the colon has zero or one following space.
 $results += Invoke-CcodTest 'Inno activation progress parser accepts every legal JSON whitespace form' {
     $installerPath = Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'
@@ -753,17 +754,27 @@ $results += Invoke-CcodTest 'Inno visibly starts and synchronously owns the boun
     Assert-CcodTrue ($activationWorker -cmatch '(?s)function Stop-CcodOwnedInstallProcess.*?WaitForExit\(5000\).*?while \(\$true\).*?\.Kill\(\).*?\.WaitForExit\(\).*?\.HasExited.*?return') 'an unproven bounded stop escalates to waiting until exact child exit instead of returning to Setup'
 }
 
+#>
+
+$results += Invoke-CcodTest 'sealed Setup delegates strict append-only receipt validation to the locked bootstrap' {
+    $installerScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
+    $activationWorker = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -Raw -Encoding UTF8
+    Assert-CcodTrue ($installerScript -cmatch '(?s)ExtractAndLockCcodInputs.*GetCcodBootstrapParameters.*ewWaitUntilTerminated, ActivationResultCode.*GetCcodBootstrapParameters\(ActivationId, True\).*ewWaitUntilTerminated, ValidationResultCode') 'Setup retains one locked bootstrap across activation and strict validation'
+    Assert-CcodTrue ($installerScript -cmatch '-PackagePath' -and $installerScript -cmatch '-ExpectedPackageSha256' -and $installerScript -cnotmatch 'post-install-activation\.json') 'Setup passes the compile-bound sealed package and owns no mutable receipt path'
+    Assert-CcodTrue ($activationWorker -cmatch 'state\\activation-receipts' -and $activationWorker -cmatch '\$ExpectedActivationId\.\$phase\.json' -and $activationWorker -cnotmatch "Join-Path \`$Root 'state\\post-install-activation\.json'") 'bootstrap validates only append-only activation receipts'
+}
+
 $results += Invoke-CcodTest 'activation owner kills and proves exit before a timed-out child can change the receipt' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-owned-timeout-' + [guid]::NewGuid().ToString('N'))
     try {
-        [IO.Directory]::CreateDirectory((Join-Path $root 'state')) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $root 'state\activation-receipts')) | Out-Null
         $lateMarker = Join-Path $root 'late-write.txt'
         $installScript = Join-Path $root 'Install-CodexControlOtherDevices.ps1'
         $installSource = @"
 param([string]`$InstallRoot,[string]`$ActivationId,[switch]`$EnableCandidateCompatibleUpdates)
 Start-Sleep -Milliseconds 1200
 `$receipt=[ordered]@{schemaVersion=1;activationId=`$ActivationId;phase='Ready';runtimeId='late-runtime';previousRuntimeId=`$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=`$true;errorCode=`$null}
-[IO.File]::WriteAllText((Join-Path `$InstallRoot 'state\post-install-activation.json'),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
+[IO.File]::WriteAllText((Join-Path `$InstallRoot "state\activation-receipts\`$ActivationId.Ready.json"),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
 [IO.File]::WriteAllText('$lateMarker','late',[Text.UTF8Encoding]::new(`$false))
 exit 0
 "@
@@ -773,7 +784,7 @@ exit 0
         Assert-CcodEqual 1 $LASTEXITCODE 'missing first receipt makes the owned activation fail'
         Start-Sleep -Milliseconds 1400
         Assert-CcodTrue (-not (Test-Path -LiteralPath $lateMarker)) 'the exact install child cannot write after the activation owner returns'
-        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $root 'state\post-install-activation.json'))) 'the killed child cannot later publish Ready'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $root "state\activation-receipts\$activationId.Ready.json"))) 'the killed child cannot later publish Ready'
         $log = Get-Content -LiteralPath (Join-Path $root 'logs\post-install-activation.log') -Raw -Encoding UTF8
         Assert-CcodTrue ($log -cmatch 'CCOD_ACTIVATION_FIRST_RECEIPT_TIMEOUT') 'the owner records the stable first-receipt timeout code'
         Assert-CcodTrue (($output -join "`n") -cmatch 'CCOD_ACTIVATION_FIRST_RECEIPT_TIMEOUT') 'the owner reports the bounded timeout without a safe terminal receipt'
@@ -785,16 +796,16 @@ exit 0
 $results += Invoke-CcodTest 'activation owner freezes a correlated progress receipt at the total deadline' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-owned-total-timeout-' + [guid]::NewGuid().ToString('N'))
     try {
-        [IO.Directory]::CreateDirectory((Join-Path $root 'state')) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $root 'state\activation-receipts')) | Out-Null
         $lateMarker = Join-Path $root 'late-total-write.txt'
         $installScript = Join-Path $root 'Install-CodexControlOtherDevices.ps1'
         $installSource = @"
 param([string]`$InstallRoot,[string]`$ActivationId,[switch]`$EnableCandidateCompatibleUpdates)
 `$receipt=[ordered]@{schemaVersion=1;activationId=`$ActivationId;phase='StartingProtection';runtimeId='pending-runtime';previousRuntimeId=`$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=`$false;errorCode=`$null}
-[IO.File]::WriteAllText((Join-Path `$InstallRoot 'state\post-install-activation.json'),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
+[IO.File]::WriteAllText((Join-Path `$InstallRoot "state\activation-receipts\`$ActivationId.StartingProtection.json"),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
 Start-Sleep -Milliseconds 3000
 `$receipt.phase='Ready';`$receipt.ready=`$true;`$receipt.updatedAtUtc='2030-02-03T04:05:08.0000000Z'
-[IO.File]::WriteAllText((Join-Path `$InstallRoot 'state\post-install-activation.json'),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
+[IO.File]::WriteAllText((Join-Path `$InstallRoot "state\activation-receipts\`$ActivationId.Ready.json"),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
 [IO.File]::WriteAllText('$lateMarker','late',[Text.UTF8Encoding]::new(`$false))
 exit 0
 "@
@@ -804,7 +815,7 @@ exit 0
         Assert-CcodEqual 1 $LASTEXITCODE 'total deadline makes the owned activation fail after correlated progress'
         Start-Sleep -Milliseconds 3200
         Assert-CcodTrue (-not (Test-Path -LiteralPath $lateMarker)) 'the exact install child cannot write after the total deadline owner return'
-        $receipt = Get-Content -LiteralPath (Join-Path $root 'state\post-install-activation.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        $receipt = Get-Content -LiteralPath (Join-Path $root "state\activation-receipts\$activationId.StartingProtection.json") -Raw -Encoding UTF8 | ConvertFrom-Json
         Assert-CcodEqual 'StartingProtection' $receipt.phase 'the killed child cannot change progress into Ready after Setup regains control'
         $log = Get-Content -LiteralPath (Join-Path $root 'logs\post-install-activation.log') -Raw -Encoding UTF8
         Assert-CcodTrue ($log -cmatch 'CCOD_ACTIVATION_TIMEOUT') 'the owner records the stable total timeout code'
@@ -818,14 +829,14 @@ exit 0
 $results += Invoke-CcodTest 'activation worker reports the strict Failed receipt support code without prompting' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-failed-report-' + [guid]::NewGuid().ToString('N'))
     try {
-        [IO.Directory]::CreateDirectory((Join-Path $root 'state')) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $root 'state\activation-receipts')) | Out-Null
         $promptMarker = Join-Path $root 'prompt-marker.txt'
         $installScript = Join-Path $root 'Install-CodexControlOtherDevices.ps1'
         $promptScript = Join-Path $root 'Prompt-CcodRestart.ps1'
         $installSource = @"
 param([string]`$InstallRoot,[string]`$ActivationId,[switch]`$EnableCandidateCompatibleUpdates)
 `$receipt=[ordered]@{schemaVersion=1;activationId=`$ActivationId;phase='Failed';runtimeId='runtime-new';previousRuntimeId='runtime-old';startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=`$false;errorCode='CCOD_INSTALL_NEW_RUNTIME_NOT_READY'}
-[IO.File]::WriteAllText((Join-Path `$InstallRoot 'state\post-install-activation.json'),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
+[IO.File]::WriteAllText((Join-Path `$InstallRoot "state\activation-receipts\`$ActivationId.Failed.json"),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
 exit 1
 "@
         [IO.File]::WriteAllText($installScript,$installSource,[Text.UTF8Encoding]::new($false))
@@ -2466,10 +2477,7 @@ $results += Invoke-CcodTest 'portable release keeps the fail-closed bootstrap ha
     $inno = Get-Content -LiteralPath $innoPath -Raw
     $wrapper = Get-Content -LiteralPath $wrapperPath -Raw
     Assert-CcodTrue ($inno -notmatch '(?m)^\s*\[UninstallRun\]') 'Inno has no legacy pre-delete UninstallRun route'
-    Assert-CcodTrue ($inno -match 'function\s+InitializeUninstall\s*\(\)\s*:\s*Boolean') 'Inno has a pre-delete uninstall gate'
-    Assert-CcodTrue ($inno -match 'UninstallBootstrap\.ps1' -and $inno -match '-Mode\s+Prepare') 'Inno invokes the staged bootstrap prepare phase'
-    Assert-CcodTrue ($inno -match 'CurUninstallStepChanged' -and $inno -match '-Mode\s+FinalizeReceipt') 'Inno writes completion only after its file deletion phase'
-    Assert-CcodTrue ($inno -match 'CCOD_UNINSTALL_FINALIZATION_MISSING' -and $inno -match 'CCOD_UNINSTALL_FINALIZATION_FAILED') 'Inno propagates a missing or failed post-delete completion receipt instead of reporting a false successful uninstall'
+    Assert-CcodTrue ($inno -match '(?m)^Uninstallable=no\s*$' -and $inno -notmatch 'InitializeUninstall|CurUninstallStepChanged|UninstallBootstrap\.ps1') 'sealed Setup creates no pre-Ready Inno uninstall surface'
     Assert-CcodTrue ($inno -notmatch 'BackupDeviceKeyStore|RemoveDeviceKeyStore|KeepCurrentSpecialSession') 'Inno exposes no key or special-session uninstall options'
     Assert-CcodTrue (Test-Path -LiteralPath $finalizerPath -PathType Leaf) 'portable release includes an external finalizer'
     Assert-CcodTrue (Test-Path -LiteralPath $portableModulePath -PathType Leaf) 'portable release includes a marker-bound removal module'
@@ -2717,18 +2725,11 @@ $results += Invoke-CcodTest 'fallback rejects two verified supervisor children a
     }
 }
 
-$results += Invoke-CcodTest 'installer exposes a CodexRemote-fix desktop entry that only starts the stable tray bootstrap' {
+$results += Invoke-CcodTest 'sealed installer defers every desktop and Start menu entry until post-Ready registration' {
     $installerScript = Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'
-    $entries = @(Get-Content -LiteralPath $installerScript | Where-Object { $_ -cmatch '^Name: "\{userdesktop\}\\' })
-    Assert-CcodEqual 1 $entries.Count 'installer defines exactly one desktop entry'
-    $entry = [string]$entries[0]
-    Assert-CcodTrue ($entry -cmatch 'Name: "\{userdesktop\}\\CodexRemote-fix"') 'desktop entry has the public product name'
-    Assert-CcodTrue ($entry -cmatch 'Filename: "\{sys\}\\WindowsPowerShell\\v1\.0\\powershell\.exe"') 'desktop entry uses the Windows PowerShell host'
-    Assert-CcodTrue ($entry -cmatch '-WindowStyle Hidden') 'desktop entry hides the bootstrap host window'
-    Assert-CcodTrue ($entry -cmatch '\{localappdata\}\\CodexControlOtherDevices\\bootstrap\.ps1') 'desktop entry targets the stable bootstrap'
-    Assert-CcodTrue ($entry -cmatch '-InstallRoot ""\{localappdata\}\\CodexControlOtherDevices""') 'desktop entry supplies the stable install root'
-    Assert-CcodTrue ($entry -cmatch 'IconFilename: "\{app\}\\assets\\CodexRemote-fix\.ico"') 'desktop entry uses the public product icon'
-    Assert-CcodTrue ($entry -cnotmatch 'Start-CodexControlOtherDevices\.ps1') 'desktop entry never invokes a direct repair session'
+    $content = Get-Content -LiteralPath $installerScript -Raw
+    Assert-CcodEqual 0 @(Get-Content -LiteralPath $installerScript | Where-Object { $_ -cmatch '^Name: "\{(userdesktop|group)\}\\' }).Count 'Task 3 defines no user-visible shortcut entry'
+    Assert-CcodTrue ($content -cnotmatch '(?m)^\[Icons\]\s*$|\{userdesktop\}|\{group\}') 'no shortcut destination is reachable before strict Ready'
 }
 
 $results += Invoke-CcodTest 'installer exposes CodexRemote-fix as the searchable primary bootstrap entry' {
@@ -2739,22 +2740,11 @@ $results += Invoke-CcodTest 'installer exposes CodexRemote-fix as the searchable
     Assert-CcodTrue ($lines -ccontains 'AppId={{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}') 'installer retains the v2.1.6 AppId for in-place upgrades'
     Assert-CcodTrue ($lines -ccontains 'AppName=CodexRemote-fix') 'installed app has the public CodexRemote-fix name'
     Assert-CcodTrue ($lines -ccontains 'AppVerName=CodexRemote-fix {#ProjectVersion}') 'installed app version has the public CodexRemote-fix name'
-    Assert-CcodTrue ($lines -ccontains 'DefaultGroupName=CodexRemote-fix') 'current-user Start menu group has the public CodexRemote-fix name'
     Assert-CcodTrue ($lines -ccontains 'SetupIconFile=..\assets\codexremote-fix\codexremote-fix.ico') 'setup uses the CodexRemote-fix icon'
-    Assert-CcodTrue ($lines -ccontains 'UninstallDisplayIcon={app}\assets\CodexRemote-fix.ico') 'Apps and Features uses the installed CodexRemote-fix icon'
     Assert-CcodTrue ($lines -ccontains 'OutputBaseFilename=CodexRemote-fix-{#ProjectVersion}-setup') 'build output uses the public release name'
-    Assert-CcodEqual 2 @($lines | Where-Object { $_ -match '^Name: "\{(group|userdesktop)\}\\CodexRemote-fix";.*bootstrap\.ps1"".*-EntryMode Explicit' }).Count 'Start menu and desktop shortcuts enter bootstrap Explicit mode'
-    Assert-CcodTrue ($content -cmatch 'Activate-CcodRemoteFix\.ps1') 'installer delegates upgrades to the durable activation worker instead of relying on uninstall metadata'
-
-    $primaryEntries = @($content -split "`r?`n" | Where-Object { $_ -cmatch '^Name: "\{(group|userdesktop)\}\\CodexRemote-fix";' })
-    Assert-CcodEqual 2 $primaryEntries.Count 'Start menu and desktop each expose one primary CodexRemote-fix entry'
-    foreach ($entry in $primaryEntries) {
-        Assert-CcodTrue ($entry -cmatch 'Filename: "\{sys\}\\WindowsPowerShell\\v1\.0\\powershell\.exe"') 'primary entry uses the PowerShell host'
-        Assert-CcodTrue ($entry -cmatch '\{localappdata\}\\CodexControlOtherDevices\\bootstrap\.ps1') 'primary entry invokes the verified stable bootstrap'
-        Assert-CcodTrue ($entry -cmatch '-InstallRoot ""\{localappdata\}\\CodexControlOtherDevices""') 'primary entry supplies the stable legacy install root'
-        Assert-CcodTrue ($entry -cmatch 'IconFilename: "\{app\}\\assets\\CodexRemote-fix\.ico"') 'primary entry uses the public product icon'
-        Assert-CcodTrue ($entry -cnotmatch 'README\.md') 'primary entry never opens documentation'
-    }
+    Assert-CcodTrue ($lines -ccontains 'CreateAppDir=no' -and $lines -ccontains 'Uninstallable=no') 'Task 3 Setup has no product registration surface before Ready'
+    Assert-CcodTrue ($content -cnotmatch '(?m)^\[(Icons|Registry|UninstallRun)\]\s*$|DefaultGroupName=|UninstallDisplayIcon=') 'shortcuts registry and uninstall registration remain deferred to Task 4'
+    Assert-CcodEqual 4 @($lines | Where-Object { $_ -cmatch '^Source: .*Flags: dontcopy$' }).Count 'Setup carries only four sealed temporary inputs'
 
     $buildScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
     Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-windows-x64\.zip') 'build script locates the public portable ZIP filename'
@@ -2777,19 +2767,15 @@ $results += Invoke-CcodTest 'installer accepts success only from the exited owne
     $installerScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
     $activationWorker = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -Raw -Encoding UTF8
     $activationScript = Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1'
-    $promptScript = Join-Path $repositoryRoot 'Prompt-CcodRestart.ps1'
     Assert-CcodTrue (Test-Path -LiteralPath $activationScript -PathType Leaf) 'post-install activation worker exists'
-    Assert-CcodTrue (Test-Path -LiteralPath $promptScript -PathType Leaf) 'post-install Codex restart prompt exists'
     Assert-CcodTrue ($installerScript -cmatch '(?m)^CloseApplications=no\r?$') 'installer never lets Restart Manager close Codex'
-    Assert-CcodTrue ($installerScript -cmatch 'Activate-CcodRemoteFix\.ps1') 'installer bundles the activation worker'
-    Assert-CcodTrue ($installerScript -cmatch '(?s)RefuseStaleActivationReceipt\(ReceiptPath\).*UpdateActivationStartingPresentation\(\).*Activate-CcodRemoteFix\.ps1.*ewWaitUntilTerminated, ActivationResultCode') 'installer clears stale state, shows startup, and waits for the exact owner to exit'
-    Assert-CcodTrue ($installerScript -cmatch '(?s)if ActivationResultCode <> 0 then.*RaiseException.*?-ValidateReceiptWithTimeout.*ewWaitUntilTerminated, ValidationResultCode') 'only a normal owner exit reaches the separate bounded validator'
-    $readyBranch=[regex]::Match($installerScript,'(?s)if ValidationResultCode = 0 then\s*begin(.*?)\s*end;')
-    Assert-CcodTrue ($readyBranch.Success -and $readyBranch.Groups[1].Value-cmatch'ProgressGauge\.Position\s*:=\s*100' -and $readyBranch.Groups[1].Value-cmatch'Prompt-CcodRestart\.ps1') 'only strict validator exit zero reaches completion and prompting'
-    Assert-CcodTrue ($installerScript -cmatch 'if ValidationResultCode <> 0 then' -and $installerScript -cmatch 'RaiseException') 'every nonzero validator result fails closed'
+    Assert-CcodTrue ($installerScript -cmatch 'ActivationBootstrapPath' -and $installerScript -cmatch 'Flags: dontcopy') 'installer embeds the activation worker only as a temporary sealed input'
+    Assert-CcodTrue ($installerScript -cmatch '(?s)ExtractAndLockCcodInputs\(\).*GetCcodBootstrapParameters\(ActivationId, False\).*ewWaitUntilTerminated, ActivationResultCode') 'installer locks inputs before waiting for the exact owner to exit'
+    Assert-CcodTrue ($installerScript -cmatch '(?s)ActivationResultCode <> 0.*RaiseException.*GetCcodBootstrapParameters\(ActivationId, True\).*ewWaitUntilTerminated, ValidationResultCode') 'only a normal owner exit reaches the strict one-shot validator'
+    Assert-CcodTrue ($installerScript -cmatch 'ProgressGauge\.Position := 100' -and $installerScript -cnotmatch 'Prompt-CcodRestart\.ps1') 'strict validation alone reaches completion while Task 4 registration and prompting stay absent'
+    Assert-CcodTrue ($installerScript -cmatch '\(ValidationResultCode <> 0\) then RaiseException\(.CCOD_SETUP_READY_VALIDATION_FAILED.' ) 'every nonzero validator result fails closed'
     Assert-CcodTrue ($installerScript -cnotmatch '(?s)Activate-CcodRemoteFix\.ps1[^;]*-Prompt') 'background activation worker never owns the prompt'
     Assert-CcodTrue ($activationWorker -cmatch '(?s)if \(\$ValidateReceiptOnly\).*Read-CcodTerminalActivationReceipt.*phase -ceq .Ready.*exit 0.*phase -ceq .Failed.*exit 2' -and $activationWorker -cnotmatch 'ValidationResultPath|ValidationId|Start-Sleep') 'inner validator is a one-shot strict receipt reader with only direct terminal exit codes'
-    Assert-CcodTrue ($activationWorker -cmatch '(?s)function Invoke-CcodBoundedReceiptValidator.*WaitForExit\(\$TimeoutMilliseconds\).*\.Kill\(\).*return 3' -and $activationWorker -cmatch '(?s)if \(\$ValidateReceiptWithTimeout\).*Invoke-CcodBoundedReceiptValidator.*exit \$validationResult') 'outer validator owns a finite child wait and reduces timeout to a fail-closed direct exit'
     Assert-CcodTrue ($installerScript -cnotmatch 'ValidationResultPath|ReadValidationResultState|post-install-activation\.validation') 'Inno never accepts a file sidecar as validator authority'
     Assert-CcodTrue ($installerScript -cnotmatch 'Prepare-CcodRemoteUpgrade\.ps1') 'installer does not pre-stop the supervisor outside the gated runtime activation transaction'
     Assert-CcodTrue ($installerScript -cnotmatch '(?ms)^\[Run\]\s*\r?\nFilename: "powershell\.exe"; Parameters: ".*Install-CodexControlOtherDevices\.ps1') 'installer does not silently ignore its runtime installer exit code through a Run entry'
@@ -2799,15 +2785,14 @@ $results += Invoke-CcodTest 'installer accepts success only from the exited owne
 $results += Invoke-CcodTest 'installer waits for its process owner and accepts terminal status only from its strict validator child' {
     $installerScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
     Assert-CcodTrue ($installerScript -cmatch 'CoCreateGuid@ole32\.dll' -and $installerScript -cmatch 'StringFromGUID2@ole32\.dll') 'installer generates a canonical activation GUID before worker launch'
-    Assert-CcodTrue ($installerScript -cmatch '(?s)ActivationId\s*:=\s*NewActivationId\(\).*ReceiptPath\s*:=.*RefuseStaleActivationReceipt\(ReceiptPath\).*Activate-CcodRemoteFix\.ps1.*-ActivationId\s+"' ) 'installer removes or refuses the stale receipt and passes its own activation id to the worker'
-    Assert-CcodTrue ($installerScript -cmatch 'ewWaitUntilTerminated, ActivationResultCode' -and $installerScript -cmatch 'ewWaitUntilTerminated, ValidationResultCode' -and $installerScript -cmatch '-ValidateReceiptWithTimeout' -and $installerScript -cmatch 'VALIDATION_TIMEOUT_MILLISECONDS') 'Inno waits for both the activation owner and bounded validator exit codes'
+    Assert-CcodTrue ($installerScript -cmatch '(?s)ActivationId\s*:=\s*NewActivationId\(\).*GetCcodBootstrapParameters\(ActivationId, False\).*GetCcodBootstrapParameters\(ActivationId, True\)' ) 'installer passes one fresh activation id to owner and validator without deleting append-only receipts'
+    Assert-CcodTrue ($installerScript -cmatch 'ewWaitUntilTerminated, ActivationResultCode' -and $installerScript -cmatch 'ewWaitUntilTerminated, ValidationResultCode' -and $installerScript -cmatch '-ValidateReceiptOnly') 'Inno waits for both owner and strict validator exit codes'
     Assert-CcodTrue ($installerScript -cnotmatch 'ewNoWait') 'Inno never releases an unowned activation worker'
     foreach($forbidden in @('OpenProcess@kernel32.dll','WaitForSingleObject@kernel32.dll','GetExitCodeProcess@kernel32.dll','PROCESS_QUERY_INFORMATION','ProcessHandle := OpenProcess')){Assert-CcodTrue ($installerScript -cnotmatch [regex]::Escape($forbidden)) "installer never uses $forbidden to infer worker identity"}
-    Assert-CcodTrue ($installerScript -cmatch '(?s)if ActivationResultCode <> 0 then.*RaiseException.*?-ValidateReceiptWithTimeout.*ewWaitUntilTerminated, ValidationResultCode.*if ValidationResultCode <> 0 then.*RaiseException') 'owner failure cannot reach validation and every nonzero validator result fails closed'
-    Assert-CcodTrue ($installerScript -cmatch '(?s)function IsSafeActivationFile.*ExtractFileDir.*DirectoryAttributes.*RootAttributes.*FILE_ATTRIBUTE_REPARSE_POINT') 'Inno rejects reparse-point state ancestors even for raw presentation reads'
+    Assert-CcodTrue ($installerScript -cmatch '(?s)ActivationResultCode <> 0.*RaiseException.*GetCcodBootstrapParameters\(ActivationId, True\).*ValidationResultCode <> 0.*RaiseException') 'owner failure cannot reach validation and every nonzero validator result fails closed'
+    Assert-CcodTrue ($installerScript -cnotmatch 'ReadActivationProgressPhase|LoadBoundedActivationReceipt') 'Inno delegates all receipt authority to the locked bootstrap'
     Assert-CcodTrue ($installerScript -cnotmatch 'ValidationResultPath|ReadValidationResultState|post-install-activation\.validation') 'no writable sidecar can impersonate the strict validator'
-    $readyBranch=[regex]::Match($installerScript,'(?s)if ValidationResultCode = 0 then\s*begin(.*?)\s+end;')
-    Assert-CcodTrue ($readyBranch.Groups[1].Value-cmatch'Prompt-CcodRestart\.ps1') 'only strict Ready exit zero reaches the restart prompt'
+    Assert-CcodTrue ($installerScript -cnotmatch 'Prompt-CcodRestart\.ps1') 'Task 3 does not create a post-Ready product prompt or registration path'
 }
 
 # Production mutation caught: compiling a script with an unrecognized built-in identifier, or leaving the bounded validator route uncompiled.
@@ -2847,8 +2832,8 @@ $results += Invoke-CcodTest 'activation terminal validator enforces the complete
     $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-validator-'+[guid]::NewGuid().ToString('N'))
     $reparseTarget=Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-validator-target-'+[guid]::NewGuid().ToString('N'))
     try{
-        [IO.Directory]::CreateDirectory((Join-Path $root 'state'))|Out-Null
-        $activationId='77777777-6666-5555-4444-333333333333';$receiptPath=Join-Path $root 'state\post-install-activation.json'
+        $receiptDirectory=Join-Path $root 'state\activation-receipts';[IO.Directory]::CreateDirectory($receiptDirectory)|Out-Null
+        $activationId='77777777-6666-5555-4444-333333333333'
         $activationScript=Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1';$powershellExecutable=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $invokeValidator={param([string]$ErrorPath)
             $outputPath="$ErrorPath.stdout"
@@ -2872,6 +2857,8 @@ $results += Invoke-CcodTest 'activation terminal validator enforces the complete
         )
         foreach($case in $cases){
             $receipt=[ordered]@{};foreach($key in $valid.Keys){$receipt[$key]=$valid[$key]};&$case.Mutate $receipt
+            Get-ChildItem -LiteralPath $receiptDirectory -File -Force -ErrorAction SilentlyContinue|Remove-Item -Force
+            $receiptPath=Join-Path $receiptDirectory ("$activationId.$($receipt.phase).json")
             [IO.File]::WriteAllText($receiptPath,($receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
             $stderrPath=Join-Path $root (('validator-{0}.err' -f ($case.Name-replace'[^A-Za-z0-9]','-')))
             $invocation=&$invokeValidator $stderrPath
@@ -2879,6 +2866,7 @@ $results += Invoke-CcodTest 'activation terminal validator enforces the complete
             Assert-CcodEqual 0 $invocation.Stdout.Count "$($case.Name) emits no receipt data to stdout"
             if($case.Exit-ne0-and$case.Exit-ne2){Assert-CcodTrue ((Get-Content -LiteralPath $stderrPath -Raw)-cmatch'CCOD_ACTIVATION_RECEIPT_') "$($case.Name) retains a bounded support code on stderr"}
         }
+        $receiptPath=Join-Path $receiptDirectory "$activationId.Ready.json"
         [IO.File]::WriteAllText($receiptPath,'{"schemaVersion":1,"activationId":"77777777-6666-5555-4444-333333333333","phase":"Ready","runtimeId":"runtime-new"',[Text.UTF8Encoding]::new($false))
         $stderrPath=Join-Path $root 'validator-truncated.err';$invocation=&$invokeValidator $stderrPath
         Assert-CcodEqual 3 $invocation.ExitCode 'truncated Ready JSON is rejected by the executable validator'
@@ -2888,8 +2876,8 @@ $results += Invoke-CcodTest 'activation terminal validator enforces the complete
         Assert-CcodEqual 3 $invocation.ExitCode 'oversized receipt is refused before JSON parsing'
         Assert-CcodEqual 0 $invocation.Stdout.Count 'oversized receipt emits no data to stdout'
         Remove-Item -LiteralPath (Join-Path $root 'state') -Recurse -Force
-        [IO.Directory]::CreateDirectory($reparseTarget)|Out-Null
-        [IO.File]::WriteAllText((Join-Path $reparseTarget 'post-install-activation.json'),($valid|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+        [IO.Directory]::CreateDirectory((Join-Path $reparseTarget 'activation-receipts'))|Out-Null
+        [IO.File]::WriteAllText((Join-Path $reparseTarget "activation-receipts\$activationId.Ready.json"),($valid|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
         New-Item -ItemType Junction -Path (Join-Path $root 'state') -Target $reparseTarget|Out-Null
         $stderrPath=Join-Path $root 'validator-reparse.err';$invocation=&$invokeValidator $stderrPath
         Assert-CcodEqual 3 $invocation.ExitCode 'receipt beneath a reparse-point parent is refused before parsing'
@@ -2907,25 +2895,28 @@ $results += Invoke-CcodTest 'activation terminal validator enforces the complete
 $results += Invoke-CcodTest 'activation validator watchdog preserves direct terminal exits and bounds a slow child' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-watchdog-' + [guid]::NewGuid().ToString('N'))
     try {
-        [IO.Directory]::CreateDirectory((Join-Path $root 'state')) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $root 'state\activation-receipts')) | Out-Null
         $activationId = '88888888-7777-6666-5555-444444444444'
-        $receiptPath = Join-Path $root 'state\post-install-activation.json'
+        $readyPath = Join-Path $root "state\activation-receipts\$activationId.Ready.json"
+        $failedPath = Join-Path $root "state\activation-receipts\$activationId.Failed.json"
         $stderrPath = Join-Path $root 'watchdog.err'
         $activationScript = Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1'
         $ready = [ordered]@{schemaVersion=1;activationId=$activationId;phase='Ready';runtimeId='runtime-watchdog';previousRuntimeId=$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=$true;errorCode=$null}
-        [IO.File]::WriteAllText($receiptPath,($ready | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($readyPath,($ready | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
 
         $stdout = @(& $activationScript -AppRoot $repositoryRoot -InstallRoot $root -ActivationId $activationId -ValidateReceiptWithTimeout -ValidationTimeoutMilliseconds 10000 2>$stderrPath)
         Assert-CcodEqual 0 $LASTEXITCODE 'watchdog returns the strict Ready child exit directly'
         Assert-CcodEqual 0 $stdout.Count 'watchdog Ready path emits no receipt data to stdout'
 
         $failed = [ordered]@{}; foreach ($key in $ready.Keys) { $failed[$key] = $ready[$key] }; $failed.phase = 'Failed'; $failed.ready = $false; $failed.errorCode = 'CCOD_INSTALL_FAILED'
-        [IO.File]::WriteAllText($receiptPath,($failed | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+        Remove-Item -LiteralPath $readyPath -Force
+        [IO.File]::WriteAllText($failedPath,($failed | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
         $stdout = @(& $activationScript -AppRoot $repositoryRoot -InstallRoot $root -ActivationId $activationId -ValidateReceiptWithTimeout -ValidationTimeoutMilliseconds 10000 2>$stderrPath)
         Assert-CcodEqual 2 $LASTEXITCODE 'watchdog returns the strict Failed child exit directly'
         Assert-CcodEqual 0 $stdout.Count 'watchdog Failed path emits no receipt data to stdout'
 
-        [IO.File]::WriteAllText($receiptPath,($ready | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+        Remove-Item -LiteralPath $failedPath -Force
+        [IO.File]::WriteAllText($readyPath,($ready | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
         $stopwatch = [Diagnostics.Stopwatch]::StartNew()
         try {
             $stdout = @(& $activationScript -AppRoot $repositoryRoot -InstallRoot $root -ActivationId $activationId -ValidateReceiptWithTimeout -ValidationTimeoutMilliseconds 1 2>$stderrPath)
@@ -2966,11 +2957,11 @@ $results += Invoke-CcodTest 'post-install restart prompt does nothing when the u
 $results += Invoke-CcodTest 'activation worker installs first and prompts only after a successful runtime activation' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-worker-' + [guid]::NewGuid().ToString('N'))
     try {
-        [IO.Directory]::CreateDirectory((Join-Path $root 'state')) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $root 'state\activation-receipts')) | Out-Null
         $marker = Join-Path $root 'marker.txt'
         $installScript = Join-Path $root 'Install-CodexControlOtherDevices.ps1'
         $promptScript = Join-Path $root 'Prompt-CcodRestart.ps1'
-        $installSource = "param([string]`$InstallRoot,[string]`$ActivationId,[switch]`$EnableCandidateCompatibleUpdates);[IO.File]::AppendAllText('$marker','install,',[Text.UTF8Encoding]::new(`$false));`$r=[ordered]@{schemaVersion=1;activationId=`$ActivationId;phase='Ready';runtimeId='runtime-new';previousRuntimeId=`$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=`$true;errorCode=`$null};[IO.File]::WriteAllText((Join-Path `$InstallRoot 'state\post-install-activation.json'),(`$r|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false));exit 0"
+        $installSource = "param([string]`$InstallRoot,[string]`$ActivationId,[switch]`$EnableCandidateCompatibleUpdates);[IO.File]::AppendAllText('$marker','install,',[Text.UTF8Encoding]::new(`$false));`$r=[ordered]@{schemaVersion=1;activationId=`$ActivationId;phase='Ready';runtimeId='runtime-new';previousRuntimeId=`$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=`$true;errorCode=`$null};[IO.File]::WriteAllText((Join-Path `$InstallRoot `"state\activation-receipts\`$ActivationId.Ready.json`"),(`$r|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false));exit 0"
         [IO.File]::WriteAllText($installScript, $installSource, [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText($promptScript, "param([string]`$AppRoot,[string]`$InstallRoot,[string]`$ActivationId,[switch]`$NoUi);[IO.File]::AppendAllText('$marker','prompt',[Text.UTF8Encoding]::new(`$false)); exit 0", [Text.UTF8Encoding]::new($false))
         $output = @(& (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -AppRoot $root -InstallRoot $root -Prompt 2>&1)
@@ -2985,11 +2976,11 @@ $results += Invoke-CcodTest 'activation worker installs first and prompts only a
 $results += Invoke-CcodTest 'activation worker preserves an activated runtime when optional restart confirmation fails' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-restart-warning-' + [guid]::NewGuid().ToString('N'))
     try {
-        [IO.Directory]::CreateDirectory((Join-Path $root 'state')) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $root 'state\activation-receipts')) | Out-Null
         $marker = Join-Path $root 'marker.txt'
         $installScript = Join-Path $root 'Install-CodexControlOtherDevices.ps1'
         $promptScript = Join-Path $root 'Prompt-CcodRestart.ps1'
-        $installSource = "param([string]`$InstallRoot,[string]`$ActivationId,[switch]`$EnableCandidateCompatibleUpdates);[IO.File]::AppendAllText('$marker','install,',[Text.UTF8Encoding]::new(`$false));`$r=[ordered]@{schemaVersion=1;activationId=`$ActivationId;phase='Ready';runtimeId='runtime-new';previousRuntimeId=`$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=`$true;errorCode=`$null};[IO.File]::WriteAllText((Join-Path `$InstallRoot 'state\post-install-activation.json'),(`$r|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false));exit 0"
+        $installSource = "param([string]`$InstallRoot,[string]`$ActivationId,[switch]`$EnableCandidateCompatibleUpdates);[IO.File]::AppendAllText('$marker','install,',[Text.UTF8Encoding]::new(`$false));`$r=[ordered]@{schemaVersion=1;activationId=`$ActivationId;phase='Ready';runtimeId='runtime-new';previousRuntimeId=`$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=`$true;errorCode=`$null};[IO.File]::WriteAllText((Join-Path `$InstallRoot `"state\activation-receipts\`$ActivationId.Ready.json`"),(`$r|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false));exit 0"
         [IO.File]::WriteAllText($installScript, $installSource, [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText($promptScript, "param([string]`$AppRoot,[string]`$InstallRoot,[string]`$ActivationId,[switch]`$NoUi);[IO.File]::AppendAllText('$marker','prompt',[Text.UTF8Encoding]::new(`$false)); exit 1", [Text.UTF8Encoding]::new($false))
         $output = @(& (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -AppRoot $root -InstallRoot $root -Prompt -NoUi 2>&1)
@@ -3008,14 +2999,14 @@ $results += Invoke-CcodTest 'activation worker preserves an activated runtime wh
 $results += Invoke-CcodTest 'activation worker requires a strict Ready receipt before prompting' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-nonterminal-' + [guid]::NewGuid().ToString('N'))
     try {
-        [IO.Directory]::CreateDirectory((Join-Path $root 'state')) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $root 'state\activation-receipts')) | Out-Null
         $marker = Join-Path $root 'prompt-marker.txt'
         $installScript = Join-Path $root 'Install-CodexControlOtherDevices.ps1'
         $promptScript = Join-Path $root 'Prompt-CcodRestart.ps1'
         $installSource = @"
 param([string]`$InstallRoot,[string]`$ActivationId,[switch]`$EnableCandidateCompatibleUpdates)
 `$receipt=[ordered]@{schemaVersion=1;activationId=`$ActivationId;phase='StartingProtection';runtimeId='runtime-new';previousRuntimeId='runtime-old';startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=`$false;errorCode=`$null}
-[IO.File]::WriteAllText((Join-Path `$InstallRoot 'state\post-install-activation.json'),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
+[IO.File]::WriteAllText((Join-Path `$InstallRoot "state\activation-receipts\`$ActivationId.StartingProtection.json"),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
 exit 0
 "@
         [IO.File]::WriteAllText($installScript,$installSource,[Text.UTF8Encoding]::new($false))
@@ -3098,21 +3089,11 @@ $results += Invoke-CcodTest 'CodexRemote-fix icon is a bounded multi-resolution 
     }
 }
 
-$results += Invoke-CcodTest 'setup uninstall Start menu and desktop use one installed CodexRemote-fix icon' {
+$results += Invoke-CcodTest 'sealed Setup uses its wizard icon without installing product icons or shortcuts' {
     $installerScript = Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'
     $lines = @(Get-Content -LiteralPath $installerScript)
-    $installedIcon = '{app}\assets\CodexRemote-fix.ico'
     Assert-CcodTrue ($lines -ccontains 'SetupIconFile=..\assets\codexremote-fix\codexremote-fix.ico') 'setup uses the source product icon'
-    Assert-CcodTrue ($lines -ccontains "UninstallDisplayIcon=$installedIcon") 'uninstall registration uses the installed product icon'
-    Assert-CcodTrue ($lines -ccontains 'Source: "..\assets\codexremote-fix\codexremote-fix.ico"; DestDir: "{app}\assets"; DestName: "CodexRemote-fix.ico"; Flags: ignoreversion') 'installer carries the source icon to the common installed icon path'
-    Assert-CcodTrue ($lines -ccontains 'Source: "..\assets\codexremote-fix\codexremote-fix.ico"; DestDir: "{app}\assets\codexremote-fix"; Flags: ignoreversion') 'installer preserves the hermetic source icon path for installed validation'
-    Assert-CcodTrue ($lines -ccontains 'Source: "..\.github\workflows\release.yml"; DestDir: "{app}\.github\workflows"; Flags: ignoreversion') 'installer carries the release workflow required by installed validation'
-
-    $shortcutEntries = @($lines | Where-Object { $_ -cmatch '^Name: "\{(group|userdesktop)\}\\' })
-    Assert-CcodTrue ($shortcutEntries.Count -ge 3) 'installer exposes Start menu and desktop shortcuts'
-    foreach ($entry in $shortcutEntries) {
-        Assert-CcodTrue ($entry -cmatch ('IconFilename: "' + [regex]::Escape($installedIcon) + '"')) 'every Start menu and desktop shortcut uses the common installed icon'
-    }
+    Assert-CcodTrue (($lines -join "`n") -cnotmatch 'UninstallDisplayIcon=|DestDir:\s*"\{app\}|^Name:\s*"\{(group|userdesktop)\}') 'Task 3 installs no product icon registration workflow or shortcut before Ready'
 }
 
 $results += Invoke-CcodTest 'README and release workflow publish current portable-release branding' {
@@ -3161,6 +3142,7 @@ $results += Invoke-CcodTest 'README and release workflow publish current portabl
     }
 }
 
+<# Superseded by Task 3 sealed package and Task 4 post-Ready registration.
 $results += Invoke-CcodTest 'installer carries the Inno contract needed by its self-validation' {
     $installerScript = Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'
     $sourceEntries = @(Get-Content -LiteralPath $installerScript | Where-Object { $_ -cmatch '^Source: "\.\.\\build\\CodexControlOtherDevices\.iss"; DestDir: "\{app\}\\build";' })
@@ -3200,6 +3182,13 @@ $results += Invoke-CcodTest 'installer carries build.ps1 so installed self-valid
     $installerScript = Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'
     $sourceEntries = @(Get-Content -LiteralPath $installerScript | Where-Object { $_ -cmatch '^Source: "\.\.\\build\\build\.ps1"; DestDir: "\{app\}\\build";' })
     Assert-CcodEqual 1 $sourceEntries.Count 'installer carries build.ps1 required by Validate.ps1'
+}
+#>
+
+$results += Invoke-CcodTest 'sealed Setup carries no mutable validation or legacy shortcut migration payload' {
+    $installerScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
+    Assert-CcodTrue ($installerScript -cnotmatch 'DestDir:\s*"\{app\}|\[InstallDelete\]|CodexControlOtherDevices\.iss"; DestDir|build\.ps1"; DestDir') 'Task 3 leaves installed validation and legacy registration migration to immutable payload and Task 4'
+    Assert-CcodTrue ($installerScript -cmatch '(?m)^CreateAppDir=no\s*$' -and $installerScript -cmatch '(?m)^Uninstallable=no\s*$') 'Setup cannot create the old mutable validation root'
 }
 
 Write-Output "Install lifecycle self-tests passed: $($results.Count)"
