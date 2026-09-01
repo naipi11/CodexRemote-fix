@@ -161,3 +161,68 @@ failed with four Important findings.
 
 - `51def5c9ae2f5e0722b9083e478b17c507e9cee8`
   (`fix: harden sealed setup evidence`).
+
+## Fix round 2: copied portable identity and raw evidence binding
+
+### Review findings and RED evidence
+
+Scoped review of
+`9e1c41c72d296c2d0c014a45561a855699ebd39b..728b62710c0729b40908e92887d3fe70903edbba`
+remained FAIL with three Important findings.
+
+- Copied portable identity RED: `ReleaseWorkflow.SelfTest.ps1` exited `1`
+  with `NamedParameterNotFound` for `CopiedSealedPackageSha256`. The wrapper
+  still used a source identity and `Copy-CcodPortablePayload` returned its
+  pre-copy manifest result rather than an identity revalidated from the
+  published target.
+- Raw provenance RED: a top-level duplicate `schemaVersion` member remained
+  accepted because Windows PowerShell `ConvertFrom-Json` collapsed it before
+  the parsed-object exact-schema checks.
+- Product-state evidence RED: the executed wrong-hash Setup fixture exited `1`
+  because `Get-CcodReadOnlyProductTreeSnapshot` did not exist. The prior test
+  checked only its isolated `/DIR`, marker, and log rather than comparing the
+  actual current-user product root.
+
+### Remediated behavior
+
+- `Copy-CcodPortablePayload` now validates the moved published installer tree
+  and returns that copied manifest identity. The portable wrapper requires the
+  initial source, post-Defender source, and copied identities to be the same
+  canonical SHA-256, and only the copied value reaches the lifecycle child.
+- A production-module breakpoint regression changes source bytes exactly
+  between manifest validation and `File.Copy`. Destination rehashing returns
+  `CCOD_PORTABLE_COPY_HASH_MISMATCH`; no installer root, lifecycle child, or
+  lifecycle state becomes visible.
+- A bounded raw JSON scanner walks objects and arrays before any provenance or
+  package-manifest `ConvertFrom-Json`, decodes escaped property names, rejects
+  duplicate semantic member names at every depth, and enforces 1 MiB / depth
+  32 limits. Duplicate mutations at the top level and all five nested
+  provenance objects fail with `CCOD_SETUP_PROVENANCE_INVALID` while the prior
+  24 exact-schema mutations remain covered.
+- The wrong-hash production Setup fixture now snapshots the exact LocalAppData
+  product root before and after execution. The read-only snapshot manually
+  traverses without following reparse points, rejects alternate streams, is
+  bounded to 8192 entries / 256 MiB per file / 1 GiB total, and records root/
+  directory metadata plus file metadata and SHA-256. Before and after canonical
+  snapshots are identical. Fixture cleanup still targets only its unique temp
+  root and never creates, modifies, or removes the real product root.
+
+### GREEN and verification evidence
+
+- Final `ReleaseWorkflow.SelfTest.ps1`: exit `0`, including copied-identity,
+  full copy-race, six-level raw duplicate, and actual product-tree snapshot
+  coverage.
+- Final `InstallLifecycle.SelfTest.ps1`: exit `0`;
+  `Install lifecycle self-tests passed: 113`.
+- Explicit parser checks passed all four changed PowerShell code/test files.
+- `git diff --check` exited `0`; only checkout LF-to-CRLF warnings were emitted.
+- Static no-`{app}` audit reported `FIX2_BOUNDARY_VIOLATIONS=0`.
+- No aggregate run was performed in this fix round; no aggregate-pass claim is
+  made.
+- No release build, real install, product-process control, external service,
+  WindowsApps, DPAPI operation, signing, push, tag, or publication occurred.
+
+### Exact implementation commit
+
+- `1cb91621f2565318143dffe08844a91a350a36d9`
+  (`fix: bind portable sealed execution`).
