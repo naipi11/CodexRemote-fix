@@ -87,10 +87,15 @@ new chain is absent. Lifecycle readiness likewise accepts the exact
 generation bootstrap selected by the scheduled task, with the fixed root
 bootstrap retained only for a proven legacy task.
 
-Absence of the append-only selector is a positive lookup result: only an exact
-ItemNotFound outcome permits legacy fallback. A selector-root file, reparse
-point, access or I/O failure, malformed store, or unsupported record fails the
-component's bounded authorization contract instead of consulting `active.json`.
+Absence of the append-only selector is a positive lookup result. Legacy
+fallback is permitted only when `state` itself has an exact ItemNotFound
+outcome, or when `state` is a proven plain nonreparse directory and its
+`active-generation` child has an exact ItemNotFound outcome. A file, reparse
+point, access or I/O failure, malformed store, or unsupported record at either
+boundary fails the component's bounded authorization contract instead of
+consulting `active.json`. StaticProbe carries the lookup through an exact
+discriminated `Found`/`Missing` result; null, empty, malformed, or exceptional
+adapter output cannot represent absence.
 
 ### 1a. Immutable initialization evidence and operational state
 

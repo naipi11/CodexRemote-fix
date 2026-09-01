@@ -248,6 +248,15 @@ function Get-CcodStaticProbePathAdapters {
         DirectoryExists={param($Path)[IO.Directory]::Exists($Path)}
     }
     if($null -ne $Adapters){foreach($key in @('GetItem','FileExists','DirectoryExists')){if($Adapters.ContainsKey($key)){$resolved[$key]=$Adapters[$key]}}}
+    if($null-ne$Adapters-and$Adapters.ContainsKey('GetSelectorRootResult')){$resolved.GetSelectorRootResult=$Adapters.GetSelectorRootResult}
+    else{
+        $getItem=$resolved.GetItem
+        $resolved.GetSelectorRootResult={
+            param($Path)
+            try{$item=&$getItem $Path $false}catch [Management.Automation.ItemNotFoundException]{return [pscustomobject][ordered]@{Status='Missing';Item=$null}}
+            return [pscustomobject][ordered]@{Status='Found';Item=$item}
+        }.GetNewClosure()
+    }
     return $resolved
 }
 
@@ -462,9 +471,22 @@ function Get-CcodStaticProbeRuntimeAuthorization {
         if((Split-Path $persistenceRoot -Leaf) -cne 'persistence' -or (Split-Path $srcRoot -Leaf) -cne 'src' -or (Split-Path $runtimeContainer -Leaf) -cne 'runtime' -or -not (Test-CcodStaticRuntimeId $runtimeId)){throw 'layout'}
         $installRoot=[IO.Path]::GetFullPath($installRoot);$runtimeRoot=[IO.Path]::GetFullPath($runtimeRoot)
         Assert-CcodStaticProbeNoReparse -Root $installRoot -Path $ScriptPath -Adapters $Adapters
+        $stateRoot=[IO.Path]::GetFullPath((Join-Path $installRoot 'state'))
         $pointerRoot=[IO.Path]::GetFullPath((Join-Path $installRoot 'state\active-generation'))
         $pathAdapters=Get-CcodStaticProbePathAdapters $Adapters
-        $pointerRootItem=Invoke-CcodStaticAdapter $pathAdapters.GetItem @($pointerRoot,$true) OptionalSingle 'CCOD_STATIC_RUNTIME_UNAUTHORIZED'
+        $stateResult=Invoke-CcodStaticAdapter $pathAdapters.GetSelectorRootResult @($stateRoot) Single 'CCOD_STATIC_RUNTIME_UNAUTHORIZED'
+        Assert-CcodStaticExactObject $stateResult @('Status','Item') 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active selector state lookup'|Out-Null
+        if($stateResult.Status -isnot [string]){throw 'state lookup status'}
+        if($stateResult.Status-ceq'Missing'){if($null-ne$stateResult.Item){throw 'state missing item'};$pointerRootItem=$null}
+        elseif($stateResult.Status-ceq'Found'){
+            if($null-eq$stateResult.Item-or-not$stateResult.Item.PSIsContainer-or($stateResult.Item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){throw 'state root type'}
+            $selectorResult=Invoke-CcodStaticAdapter $pathAdapters.GetSelectorRootResult @($pointerRoot) Single 'CCOD_STATIC_RUNTIME_UNAUTHORIZED'
+            Assert-CcodStaticExactObject $selectorResult @('Status','Item') 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active selector lookup'|Out-Null
+            if($selectorResult.Status -isnot [string]){throw 'selector lookup status'}
+            if($selectorResult.Status-ceq'Missing'){if($null-ne$selectorResult.Item){throw 'selector missing item'};$pointerRootItem=$null}
+            elseif($selectorResult.Status-ceq'Found'){if($null-eq$selectorResult.Item){throw 'selector found item'};$pointerRootItem=$selectorResult.Item}
+            else{throw 'selector lookup status'}
+        }else{throw 'state lookup status'}
         if($null-ne$pointerRootItem-and-not$pointerRootItem.PSIsContainer){throw 'selector root type'}
         if($null-ne$pointerRootItem){
             Assert-CcodStaticProbeNoReparse $installRoot $pointerRoot -Adapters $Adapters;$entries=@(Get-ChildItem -LiteralPath $pointerRoot -Force -ErrorAction Stop);if($entries.Count-eq0){throw 'empty active chain'};$records=[Collections.Generic.List[object]]::new()

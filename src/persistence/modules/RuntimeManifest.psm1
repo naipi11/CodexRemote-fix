@@ -361,9 +361,12 @@ function Read-CcodActiveRuntime {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$InstallRoot,[hashtable]$Adapters)
 
-    $pointerRoot = Resolve-CcodContainedPath -Root $InstallRoot -RelativePath 'state\active-generation' -AllowMissingLeaf
+    try{$stateRoot=Resolve-CcodContainedPath -Root $InstallRoot -RelativePath 'state' -AllowMissingLeaf;$pointerRoot=Resolve-CcodContainedPath -Root $InstallRoot -RelativePath 'state\active-generation' -AllowMissingLeaf}catch{Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation selector path is unsafe' $InstallRoot}
     $selectorRootItem=$null;$selectorRootAbsent=$false;$selectorRootReader=if($null-ne$Adapters-and$Adapters.ContainsKey('GetSelectorRootItem')){$Adapters.GetSelectorRootItem}else{{param($Path)Get-Item -LiteralPath $Path -Force -ErrorAction Stop}}
-    try{$selectorRootItem=&$selectorRootReader $pointerRoot;if($null-eq$selectorRootItem){throw [IO.InvalidDataException]::new('selector lookup returned no proof')}}catch [Management.Automation.ItemNotFoundException]{$selectorRootAbsent=$true}catch{Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation selector root lookup failed' $pointerRoot}
+    $stateRootItem=$null;$stateRootAbsent=$false
+    try{$stateRootItem=&$selectorRootReader $stateRoot;if($null-eq$stateRootItem){throw [IO.InvalidDataException]::new('state lookup returned no proof')}}catch [Management.Automation.ItemNotFoundException]{$stateRootAbsent=$true}catch{Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation state ancestor lookup failed' $stateRoot}
+    if(-not$stateRootAbsent){if(-not$stateRootItem.PSIsContainer-or($stateRootItem.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation state ancestor is not a plain directory' $stateRoot}}
+    if($stateRootAbsent){$selectorRootAbsent=$true}else{try{$selectorRootItem=&$selectorRootReader $pointerRoot;if($null-eq$selectorRootItem){throw [IO.InvalidDataException]::new('selector lookup returned no proof')}}catch [Management.Automation.ItemNotFoundException]{$selectorRootAbsent=$true}catch{Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation selector root lookup failed' $pointerRoot}}
     if (-not$selectorRootAbsent) {
         if(-not$selectorRootItem.PSIsContainer-or($selectorRootItem.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation selector root is not a plain directory' $pointerRoot}
         $entries=@(Get-ChildItem -LiteralPath $pointerRoot -Force -ErrorAction Stop)

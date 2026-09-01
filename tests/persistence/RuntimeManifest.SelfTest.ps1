@@ -222,6 +222,15 @@ try {
         }
     }
 
+    Invoke-CcodTest 'legacy fallback rejects a state ancestor file before active runtime authorization' {
+        $installRoot=Join-Path $root 'pointer-state-file';[IO.Directory]::CreateDirectory($installRoot)|Out-Null
+        $runtimeId='2.5.22-1111111111111111-22222222222222222222222222222222'
+        $active=[ordered]@{schemaVersion=2;activeRuntime=$runtimeId;previousRuntime=$null;generation=[uint64]1;updatedAtUtc='2030-02-03T04:05:06.0000000Z'}
+        [IO.File]::WriteAllText((Join-Path $installRoot 'active.json'),($active|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $installRoot 'state'),'not-a-directory',[Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows {Read-CcodActiveRuntime -InstallRoot $installRoot|Out-Null} 'CCOD_RUNTIME_POINTER_INVALID'
+    }
+
     Invoke-CcodTest 'includes the lifecycle worker and coordinator in the staged runtime closure' {
         $sourceFiles=@(& $installLifecycleModule {param($sourceRoot)Get-CcodLifecycleSourceFiles -SourceRoot $sourceRoot} $repositoryRoot)
         foreach($relative in @('src\persistence\LifecycleWorker.ps1','src\persistence\SessionController.ps1','src\persistence\modules\LifecycleCoordinator.psm1','src\persistence\modules\LifecycleEpoch.psm1','src\persistence\modules\ProcessControl.psm1','src\persistence\modules\SessionEngine.psm1','src\persistence\modules\WorkerRuntime.psm1')){

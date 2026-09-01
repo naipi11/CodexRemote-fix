@@ -366,3 +366,75 @@ Important findings. This round keeps `2101485` and remediates all seven.
 - The documented current-user ordinary-race boundary remains unchanged.
 - Failed and superseded immutable generations remain retained until the
   separately proven reclamation path runs.
+
+## Fix round 4 — prove selector absence safely
+
+### RED and root-cause evidence
+
+- RuntimeManifest exited `1` at
+  `legacy-fallback-rejects-a-state-ancestor-file-before-active-runtime-authorization`
+  with `ASSERT_THROWS: expected CCOD_RUNTIME_POINTER_INVALID`. A valid legacy
+  pointer was accepted when the intermediate `state` object was a regular file.
+- Bootstrap exited `1` at
+  `bootstrap-legacy-fallback-rejects-a-state-ancestor-file` with
+  `ASSERT_THROWS: expected CCOD_BOOTSTRAP_POINTER_INVALID`; the child lookup's
+  ItemNotFound result hid the invalid parent object.
+- StaticProbeWorker exited `1` at
+  `selector-lookup-requires-an-explicit-discriminated-absence-proof` with
+  `CCOD_STATIC_RUNTIME_UNAUTHORIZED`: an actual ItemNotFound adapter result was
+  collapsed into generic adapter failure. After the discriminated lookup was
+  added, the next RED run reached
+  `legacy-authorization-rejects-a-state-ancestor-file` and exited `1` with
+  `ASSERT_THROWS`, proving that the parent check remained independently absent.
+- UninstallBootstrap exited `1` at
+  `uninstall-legacy-fallback-rejects-a-state-ancestor-file-at-the-selector-boundary`
+  with `ASSERT_TRUE`; it did not reject the malformed parent at the bounded
+  selector authorization boundary.
+
+### GREEN and final verification evidence
+
+- InstallFileTransaction exited `0`; all 26 named cases passed, including the
+  V4 state-only no-escape and V3-first re-import evidence.
+- Bootstrap exited `0` with `Bootstrap self-test passed: 26`.
+- RuntimeManifest exited `0`; all 21 named cases reported `True`.
+- StaticProbeWorker exited `0`; all 41 named cases reported `True`, including
+  actual ItemNotFound fallback, null/empty/malformed/unknown result rejection,
+  and the `state`-file boundary.
+- UninstallBootstrap exited `0` with
+  `Uninstall bootstrap self-tests passed: 16`.
+- InstallLifecycle exited `0` with
+  `Install lifecycle self-tests passed: 116`.
+- PersistenceIO exited `0`; all 24 named cases reported `True`.
+- UiPreferences exited `0`; all 9 named cases reported `PASS`.
+- Explicit PowerShell parser checks passed all 8 changed `.ps1`/`.psm1` files
+  (`PARSER_COUNT=8`).
+- `git diff --check` exited `0`; it emitted only checkout LF-to-CRLF warnings.
+- Aggregate command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\PersistenceSelfTest.ps1`
+  exited `0` and emitted no suite failure text.
+
+### Behavior and boundaries
+
+- RuntimeManifest/default fence, Bootstrap, StaticProbeWorker, and
+  UninstallBootstrap now consult legacy `active.json` only when `state` itself
+  has an exact ItemNotFound outcome, or when `state` is a proven plain
+  nonreparse directory and `state\active-generation` has an exact ItemNotFound
+  outcome. A parent file, reparse point, inaccessible object, lookup failure,
+  or other non-directory fails the component's bounded authorization contract.
+- StaticProbe selector lookup now returns one exact discriminated
+  `{ Status, Item }` object. Only `Status='Missing'` with a null item, produced
+  from an exact ItemNotFound exception, represents absence; `Found` requires a
+  nonnull item, and null, empty, malformed, unknown, diagnostic, or exceptional
+  adapter results fail before runtime import.
+- Every earlier Task 2 invariant remains covered, including V4 state-only
+  recovery containment, append-only Ready finalization, canonical runtime
+  identity, the real default pointer fence, recorded-manifest compensation,
+  strict selector leaf validation, and no root-shell overwrite.
+- No push, tag, release, build, installation, product-process action,
+  WindowsApps access, DPAPI access, or external write was performed.
+
+### Remaining concerns
+
+- The documented current-user ordinary-race boundary remains unchanged.
+- Failed and superseded immutable generations remain retained until the
+  separately proven reclamation path runs.

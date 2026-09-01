@@ -537,6 +537,29 @@ try {
         Assert-CcodThrows {Get-CcodStaticProbeRuntimeAuthorization -ScriptPath $fixture.WorkerPath -Adapters @{GetItem=$getItem}|Out-Null} 'CCOD_STATIC_RUNTIME_UNAUTHORIZED'
     }
 
+    Invoke-CcodTest 'selector lookup requires an explicit discriminated absence proof' {
+        $fixture=New-CcodAuthorizedRuntimeFixture -Root (Join-Path $root 'append-explicit-absence')
+        $pointerRoot=Join-Path $fixture.InstallRoot 'state\active-generation'
+        $getItem={param($Path,$AllowMissing)if([IO.Path]::GetFullPath($Path)-ceq[IO.Path]::GetFullPath($pointerRoot)){throw [Management.Automation.ItemNotFoundException]::new('selector is absent')};Get-Item -LiteralPath $Path -Force -ErrorAction Stop}.GetNewClosure()
+        $context=Get-CcodStaticProbeRuntimeAuthorization -ScriptPath $fixture.WorkerPath -Adapters @{GetItem=$getItem}
+        Assert-CcodEqual $fixture.RuntimeId $context.RuntimeId 'an exact ItemNotFound result permits legacy fallback'
+        foreach($case in @(
+            @{Name='null';Callback={return $null}},
+            @{Name='empty';Callback={}},
+            @{Name='malformed';Callback={[pscustomobject]@{Status='Missing'}}},
+            @{Name='unknown';Callback={[pscustomobject][ordered]@{Status='Unknown';Item=$null}}}
+        )){
+            Assert-CcodThrows {Get-CcodStaticProbeRuntimeAuthorization -ScriptPath $fixture.WorkerPath -Adapters @{GetSelectorRootResult=$case.Callback}|Out-Null} 'CCOD_STATIC_RUNTIME_UNAUTHORIZED'
+        }
+    }
+
+    Invoke-CcodTest 'legacy authorization rejects a state ancestor file' {
+        $fixture=New-CcodAuthorizedRuntimeFixture -Root (Join-Path $root 'legacy-state-file')
+        $state=Join-Path $fixture.InstallRoot 'state';Remove-Item -LiteralPath $state -Recurse -Force
+        [IO.File]::WriteAllText($state,'not-a-directory',[Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows {Get-CcodStaticProbeRuntimeAuthorization -ScriptPath $fixture.WorkerPath|Out-Null} 'CCOD_STATIC_RUNTIME_UNAUTHORIZED'
+    }
+
     Invoke-CcodTest 'imports only exact private bound runtime APIs and unloads every module command surface' {
         $fixture=New-CcodAuthorizedRuntimeFixture -Root (Join-Path $root 'private-runtime-api')
         $context=Get-CcodStaticProbeRuntimeAuthorization -ScriptPath $fixture.WorkerPath

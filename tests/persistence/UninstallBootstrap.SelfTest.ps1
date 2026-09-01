@@ -248,6 +248,17 @@ $results += Invoke-CcodTest 'uninstall selector fallback requires proven ItemNot
     try{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$local,'Process');New-CcodVerifiedUninstallRuntimeFixture -InstallRoot $install|Out-Null;Assert-CcodThrows {Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $repositoryRoot -InstallRoot $install -SelectorAdapters @{GetSelectorRootItem={param($Path)throw [UnauthorizedAccessException]::new('selector lookup denied')}}|Out-Null} 'CCOD_UNINSTALL_RUNTIME_INVALID'}finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if(Test-Path $local){Remove-Item $local -Recurse -Force}}
 }
 
+$results += Invoke-CcodTest 'uninstall legacy fallback rejects a state ancestor file at the selector boundary' {
+    $local=Join-Path ([IO.Path]::GetTempPath()) ('ccod-uninstall-state-file-'+[guid]::NewGuid().ToString('N'));$install=Join-Path $local 'CodexControlOtherDevices';$previous=[Environment]::GetEnvironmentVariable('LOCALAPPDATA','Process')
+    try{
+        [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$local,'Process');New-CcodVerifiedUninstallRuntimeFixture -InstallRoot $install|Out-Null
+        $state=Join-Path $install 'state';Remove-Item -LiteralPath $state -Recurse -Force;[IO.File]::WriteAllText($state,'not-a-directory',[Text.UTF8Encoding]::new($false))
+        $failure=$null;try{Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $repositoryRoot -InstallRoot $install|Out-Null}catch{$failure=$_}
+        Assert-CcodTrue ($null-ne$failure-and$failure.FullyQualifiedErrorId-like'CCOD_UNINSTALL_RUNTIME_INVALID*') 'state ancestor file fails uninstall authorization'
+        Assert-CcodTrue ($failure.Exception.Message-like'*selector*') 'state ancestor file is rejected at the selector boundary'
+    }finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if(Test-Path $local){Remove-Item $local -Recurse -Force}}
+}
+
 $results += Invoke-CcodTest 'external staging refuses a cleanup source changed after runtime verification' {
     $localAppData = Join-Path ([IO.Path]::GetTempPath()) ('ccod-uninstall-race-' + [guid]::NewGuid().ToString('N'))
     $installRoot = Join-Path $localAppData 'CodexControlOtherDevices'

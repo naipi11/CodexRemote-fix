@@ -347,6 +347,17 @@ $results += Invoke-CcodTest 'bootstrap selector fallback requires proven ItemNot
     try{New-CcodBootstrapFixture -Root $root|Out-Null;Assert-CcodThrows {Read-CcodBootstrapActivePointer -InstallRoot $root -SelectorAdapters @{GetSelectorRootItem={param($Path)throw [UnauthorizedAccessException]::new('selector lookup denied')}}|Out-Null} 'CCOD_BOOTSTRAP_POINTER_INVALID'}finally{if(Test-Path $root){Remove-Item $root -Recurse -Force}}
 }
 
+$results += Invoke-CcodTest 'bootstrap legacy fallback rejects a state ancestor file' {
+    $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-bootstrap-pointer-state-file-'+[guid]::NewGuid().ToString('N'))
+    try{
+        [IO.Directory]::CreateDirectory($root)|Out-Null
+        $runtimeId='2.5.22-1111111111111111-22222222222222222222222222222222'
+        Set-CcodTestActivePointer -Root $root -ActiveRuntime $runtimeId
+        [IO.File]::WriteAllText((Join-Path $root 'state'),'not-a-directory',[Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows {Read-CcodBootstrapActivePointer -InstallRoot $root|Out-Null} 'CCOD_BOOTSTRAP_POINTER_INVALID'
+    }finally{if(Test-Path $root){Remove-Item $root -Recurse -Force}}
+}
+
 $results += Invoke-CcodTest 'generation bootstrap launches the append-only selected runtime without root active json' {
     $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-bootstrap-generation-'+[guid]::NewGuid().ToString('N'))
     try{
