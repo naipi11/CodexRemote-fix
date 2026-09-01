@@ -244,3 +244,57 @@ resume transactions, and rejects before cleanup. Fresh UninstallBootstrap is
 
 - Supplemental commit: `67c79d82e18c805f27aec8e05553938f1f706380`
   (`fix: reject invalid Ready evidence before cleanup`).
+
+## Fix round 3: strict retained authority and default finalizer proof
+
+Independent review found five Important gaps in stored Ready validation,
+retained authority, current-state preflight, the current partially removed
+legacy entry, and mock-only finalizer coverage.
+
+### RED evidence
+
+- Stored noncanonical Ready target returned the expected error but observed
+  `Cleanup=1`; failed fresh validation retained its context.
+- Product authority accepted a fabricated five-field Ready object and did not
+  bind non-derived fields such as `oldRuntimeId`.
+- Current product inspection did not reject an unknown registry subkey before
+  returning deletable entries.
+- A partially mutated current Registry entry was absent from the outer
+  unresolved compensation set.
+- Installed finalizer tests replaced all five filesystem/identity boundaries
+  rather than exercising their defaults.
+
+### GREEN evidence
+
+- ProductRegistration: `11/11`, exit `0`.
+- InstallFileTransaction: `27/27`, exit `0`.
+- UninstallBootstrap: `21/21`, exit `0`.
+- InstallLifecycle: `116/116`, exit `0`.
+- Full `tests\PersistenceSelfTest.ps1` aggregate: exit `0` after about
+  7 minutes 15 seconds; it emitted no failure output.
+- Parser: `8/8`, zero failures. `git diff --check`: exit `0`.
+
+### Remediated boundaries
+
+- Product authority accepts the complete ordered 12-field lifecycle Ready
+  record. The product capability stores its canonical complete identity; each
+  retained-file open compares the caller's complete record, including
+  `oldRuntimeId`, then rechecks the latest append-only selector and unique
+  strict Ready record.
+- Current cleanup rejects registry subkeys before returning any entry.
+- Legacy compensation includes the entry whose removal itself failed; partial
+  Registry restore failure is recorded unresolved and cannot be reported as a
+  fully restored migration failure.
+- A disposable default finalizer fixture preserves the production transaction
+  reader, selected-generation/manifest validator, epoch reader, selected-root
+  remover, and absence proof. Only wrapper wait, product registry cleanup and
+  receipt finalization are replaced. It deletes the selected runtime while
+  preserving sibling install state.
+- Normal/recovery registration retry and durable Ready preservation remain
+  green. No real registry, shortcut, uninstall, product, network, release,
+  signing, tag, push, or publication action occurred.
+
+### Implementation commit
+
+- `1ff17bb8759e3d5312c11336ca3b2188bb3a4fe2`
+  (`fix: enforce strict retained product authority`).
