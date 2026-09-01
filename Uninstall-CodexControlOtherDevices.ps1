@@ -29,6 +29,24 @@ if ([string]::IsNullOrWhiteSpace($localAppData) -or -not [IO.Path]::IsPathRooted
 }
 $expectedInstallerRoot = [IO.Path]::GetFullPath((Join-Path $localAppData 'CodexControlOtherDevices-installer'))
 $expectedInstallRoot = [IO.Path]::GetFullPath((Join-Path $localAppData 'CodexControlOtherDevices'))
+$runtimeParent = [IO.Path]::GetFullPath((Join-Path $expectedInstallRoot 'runtime'))
+$runtimePrefix = $runtimeParent.TrimEnd('\') + '\'
+$installedRuntimeId = if ($installerRoot.StartsWith($runtimePrefix,[StringComparison]::OrdinalIgnoreCase)) { $installerRoot.Substring($runtimePrefix.Length) } else { $null }
+if ($null -ne $installedRuntimeId -and $installedRuntimeId -cmatch '^2\.5\.22-[0-9a-f]{16}-[0-9a-f]{32}$' -and $installedRuntimeId.IndexOf('\') -lt 0) {
+    $bootstrapPath = [IO.Path]::GetFullPath((Join-Path $installerRoot 'src\persistence\UninstallBootstrap.ps1'))
+    if (-not [IO.File]::Exists($bootstrapPath)) { Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_INSTALLED_INVALID' 'The sealed generation uninstall bootstrap is missing.' $bootstrapPath }
+    $bootstrapItem = Get-Item -LiteralPath $bootstrapPath -Force -ErrorAction Stop
+    if ($bootstrapItem.PSIsContainer -or (($bootstrapItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_INSTALLED_INVALID' 'The sealed generation uninstall bootstrap is unsafe.' $bootstrapPath }
+    if (-not $PSCmdlet.ShouldProcess($expectedInstallRoot,'Run manifest-bound cleanup from the selected sealed generation')) { return [pscustomobject][ordered]@{Outcome='WhatIf';KeptDeviceKeyStore=$true} }
+    try { $prepared=& $bootstrapPath -InstallerRoot $installerRoot -InstallRoot $expectedInstallRoot -Mode Prepare }
+    catch { Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_INSTALLED_PREPARE_FAILED' 'Sealed generation cleanup did not reach its external finalization boundary.' $_ }
+    if($null-eq$prepared-or$prepared.transactionId-isnot[string]-or$prepared.transactionId-cnotmatch'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'-or$prepared.phase-cne'ReadyForInno'-or$prepared.runtimeId-cne$installedRuntimeId){Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_INSTALLED_PREPARE_FAILED' 'Sealed generation cleanup returned an invalid receipt.' $prepared}
+    $transactionRoot=[IO.Path]::GetFullPath((Join-Path $localAppData 'CodexRemote-fix-uninstall'))
+    $stagedBootstrap=[IO.Path]::GetFullPath((Join-Path (Join-Path (Join-Path $transactionRoot $prepared.transactionId) 'payload') 'src\persistence\UninstallBootstrap.ps1'))
+    if(-not[IO.File]::Exists($stagedBootstrap)){Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_INSTALLED_FINALIZER_MISSING' 'The verified external finalization bootstrap is missing.' $stagedBootstrap}
+    & $stagedBootstrap -InstallerRoot $installerRoot -InstallRoot $expectedInstallRoot -Mode FinalizeReceipt
+    Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_INSTALLED_FINALIZATION_FAILED' 'The external finalization bootstrap returned without completing the uninstall receipt.' $prepared.transactionId
+}
 $portableMarkerPath = Join-Path $installerRoot 'portable-release.json'
 if ([IO.File]::Exists($portableMarkerPath) -or [IO.Directory]::Exists($portableMarkerPath)) {
     if ($installerRoot -cne $expectedInstallerRoot) {

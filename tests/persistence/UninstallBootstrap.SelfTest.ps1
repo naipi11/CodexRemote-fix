@@ -130,6 +130,12 @@ function New-CcodUninstallBootstrapAdapters {
             & $WriteTransaction $TransactionRoot $Transaction
             return $Transaction
         }.GetNewClosure()
+        RemoveProductRegistration = {
+            param($Context)
+            [void]$World.Calls.Add('RemoveProduct')
+            if($null-eq$World.PSObject.Properties['ProductRegistrationRemovals']){$World|Add-Member -NotePropertyName ProductRegistrationRemovals -NotePropertyValue 0}
+            [void]($World.ProductRegistrationRemovals++)
+        }.GetNewClosure()
         TestInstallRootAbsent = {
             param($InstallRoot)
             [void]$World.Calls.Add('RootAbsent')
@@ -205,10 +211,12 @@ $results += Invoke-CcodTest 'Prepare stages only the manifest-bound cleanup payl
         CleanupFailurePhase = $null
         InstallRootAbsent = $false
         StagedEntries = @()
+        ProductRegistrationRemovals = 0
     }
     $receipt = Invoke-CcodUninstallBootstrap -InstallerRoot 'C:\installer' -InstallRoot 'C:\install' -Mode Prepare -Adapters (New-CcodUninstallBootstrapAdapters $world)
     Assert-CcodEqual 'ReadyForInno' $receipt.phase 'verified cleanup reaches the Inno boundary'
-    Assert-CcodEqual 'Validate,GetRoot,Read,NewId,Create,Write:Requested,Publish,Stage,Cleanup,Write:ReadyForInno,Receipt:ReadyForInno' ($world.Calls -join ',') 'Prepare publishes a recoverable transaction only after its durable transaction record exists'
+    Assert-CcodEqual 'Validate,GetRoot,Read,NewId,Create,Write:Requested,Publish,Stage,Cleanup,Write:ReadyForInno,RemoveProduct,Receipt:ReadyForInno' ($world.Calls -join ',') 'Prepare removes only verified product registration after protected application cleanup'
+    Assert-CcodEqual 1 $world.ProductRegistrationRemovals 'verified uninstall removes current product registration exactly once'
     Assert-CcodEqual 'src/persistence/UninstallBootstrap.ps1,src/persistence/PortableUninstallFinalizer.ps1,src/persistence/modules/InstallLifecycle.psm1,src/persistence/modules/PortableRelease.psm1,src/persistence/modules/PersistenceIO.psm1,src/persistence/modules/RuntimeManifest.psm1,src/persistence/modules/LifecycleEpoch.psm1,src/persistence/modules/StateStore.psm1,src/persistence/modules/TrustedLogonIdentity.psm1,src/persistence/modules/ScheduledTask.psm1,src/persistence/modules/KernelObjects.psm1,src/persistence/modules/CompatibilityProbe.psm1,src/persistence/modules/UiPreferences.psm1,src/persistence/modules/LifecycleTransaction.psm1' ($world.StagedEntries -join ',') 'staging has no device-key material'
     Assert-CcodEqual $null $receipt.errorCode 'ReadyForInno carries no failure code'
 }
@@ -405,7 +413,7 @@ $results += Invoke-CcodTest 'Prepare resumes only the exact durable transaction 
     }
     $receipt = Invoke-CcodUninstallBootstrap -InstallerRoot 'C:\installer' -InstallRoot 'C:\install' -Mode Prepare -Adapters (New-CcodUninstallBootstrapAdapters $world)
     Assert-CcodEqual 'ReadyForInno' $receipt.phase 'interrupted cleanup resumes to the Inno boundary'
-    Assert-CcodEqual 'Validate,GetRoot,Read,Cleanup,Write:ReadyForInno,Receipt:ReadyForInno' ($world.Calls -join ',') 'resume reuses the durable transaction and never makes a second payload'
+    Assert-CcodEqual 'Validate,GetRoot,Read,Cleanup,Write:ReadyForInno,RemoveProduct,Receipt:ReadyForInno' ($world.Calls -join ',') 'resume reuses the durable transaction and never makes a second payload'
 }
 
 $results += Invoke-CcodTest 'Prepare resumes a TaskRemoved transaction even after the runtime root and active pointer have been deleted' {
@@ -430,7 +438,7 @@ $results += Invoke-CcodTest 'Prepare resumes a TaskRemoved transaction even afte
         }
         $receipt = Invoke-CcodUninstallBootstrap -InstallerRoot $repositoryRoot -InstallRoot $installRoot -Mode Prepare -Adapters (New-CcodUninstallBootstrapAdapters $world)
         Assert-CcodEqual 'ReadyForInno' $receipt.phase 'partial application deletion can resume without an active runtime pointer'
-        Assert-CcodEqual 'Validate,GetRoot,Read,Cleanup,Write:ReadyForInno,Receipt:ReadyForInno' ($world.Calls -join ',') 'partial deletion resume neither creates another transaction nor restages payload'
+        Assert-CcodEqual 'Validate,GetRoot,Read,Cleanup,Write:ReadyForInno,RemoveProduct,Receipt:ReadyForInno' ($world.Calls -join ',') 'partial deletion resume neither creates another transaction nor restages payload'
     } finally {
         [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previousLocalAppData,'Process')
         if (Test-Path -LiteralPath $localAppData) { Remove-Item -LiteralPath $localAppData -Recurse -Force }
@@ -484,7 +492,7 @@ $results += Invoke-CcodTest 'failed recovery writes Failed and leaves the staged
     $world.CleanupError = $false
     $receipt = Invoke-CcodUninstallBootstrap -InstallerRoot 'C:\installer' -InstallRoot 'C:\install' -Mode Prepare -Adapters (New-CcodUninstallBootstrapAdapters $world)
     Assert-CcodEqual 'ReadyForInno' $receipt.phase 'a recovery failure can resume after the proof becomes available'
-    Assert-CcodEqual 'Validate,GetRoot,Read,Cleanup,Write:ReadyForInno,Receipt:ReadyForInno' ($world.Calls -join ',') 'recovery retry reuses the same payload without a second staging pass'
+    Assert-CcodEqual 'Validate,GetRoot,Read,Cleanup,Write:ReadyForInno,RemoveProduct,Receipt:ReadyForInno' ($world.Calls -join ',') 'recovery retry reuses the same payload without a second staging pass'
 }
 
 $results += Invoke-CcodTest 'payload staging failure writes a durable Failed transaction and receipt before Inno can delete files' {
@@ -508,7 +516,7 @@ $results += Invoke-CcodTest 'payload staging failure writes a durable Failed tra
     $world.StageError = $false
     $receipt = Invoke-CcodUninstallBootstrap -InstallerRoot 'C:\installer' -InstallRoot 'C:\install' -Mode Prepare -Adapters (New-CcodUninstallBootstrapAdapters $world)
     Assert-CcodEqual 'ReadyForInno' $receipt.phase 'a payload staging failure can retry the same durable transaction'
-    Assert-CcodEqual 'Validate,GetRoot,Read,Stage,Cleanup,Write:ReadyForInno,Receipt:ReadyForInno' ($world.Calls -join ',') 'staging retry restages only the existing transaction payload and never republishes a new locator'
+    Assert-CcodEqual 'Validate,GetRoot,Read,Stage,Cleanup,Write:ReadyForInno,RemoveProduct,Receipt:ReadyForInno' ($world.Calls -join ',') 'staging retry restages only the existing transaction payload and never republishes a new locator'
 }
 
 $results += Invoke-CcodTest 'FinalizeReceipt marks completion only after Inno has removed the application root' {

@@ -924,6 +924,10 @@ function Get-CcodUninstallBootstrapAdapters {
                 Invoke-CcodUninstallCleanup -InstallRoot $Root -Transaction $Value -WriteTransaction $Writer
             } $InstallRoot $Transaction $writer)
         }
+        RemoveProductRegistration = {
+            param($Context)
+            Remove-CcodUninstallBootstrapProductRegistration -Context $Context
+        }
         TestInstallRootAbsent = { param($InstallerRoot) -not ([IO.Directory]::Exists($InstallerRoot) -or [IO.File]::Exists($InstallerRoot)) }
         GetUtcNow = { [DateTime]::UtcNow }
     }
@@ -938,6 +942,20 @@ function Get-CcodUninstallBootstrapAdapters {
         $resolved[$key] = $Adapters[$key]
     }
     return $resolved
+}
+
+function Remove-CcodUninstallBootstrapProductRegistration {
+    param([Parameter(Mandatory)]$Context)
+    Assert-CcodUninstallBootstrapContext $Context
+    $registryPath='HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexRemote-fix'
+    $programs=[Environment]::GetFolderPath([Environment+SpecialFolder]::Programs);$desktop=[Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)
+    if([string]::IsNullOrWhiteSpace($programs)-or[string]::IsNullOrWhiteSpace($desktop)-or-not[IO.Path]::IsPathRooted($programs)-or-not[IO.Path]::IsPathRooted($desktop)){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PRODUCT_REGISTRATION_INVALID' 'Current-user product special folders are unavailable' $null}
+    $shortcuts=@([IO.Path]::GetFullPath((Join-Path (Join-Path $programs 'CodexRemote-fix') 'CodexRemote-fix.lnk')),[IO.Path]::GetFullPath((Join-Path $desktop 'CodexRemote-fix.lnk')))
+    $registryPresent=Test-Path -LiteralPath $registryPath -PathType Container
+    if($registryPresent){$value=Get-ItemProperty -LiteralPath $registryPath -ErrorAction Stop;if($value.CcodRuntimeId-isnot[string]-or[string]$value.CcodRuntimeId-cne[string]$Context.runtimeId){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PRODUCT_REGISTRATION_INVALID' 'Current product registration does not match the verified runtime' $registryPath}}
+    foreach($path in $shortcuts){if([IO.File]::Exists($path)-or[IO.Directory]::Exists($path)){$item=Get-Item -LiteralPath $path -Force -ErrorAction Stop;if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PRODUCT_REGISTRATION_INVALID' 'Current product shortcut is not an exact regular file' $path}}}
+    foreach($path in $shortcuts){if([IO.File]::Exists($path)){Remove-Item -LiteralPath $path -Force -ErrorAction Stop}}
+    if($registryPresent){Remove-Item -LiteralPath $registryPath -Force -ErrorAction Stop}
 }
 
 function Set-CcodUninstallBootstrapFailedTransaction {
@@ -1042,6 +1060,7 @@ function Invoke-CcodUninstallBootstrap {
         if ($null -eq $result) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PREPARE_FAILED' 'The staged cleanup returned no transaction receipt' $stageRoot }
         Assert-CcodUninstallBootstrapTransactionMatchesContext $result $context
         if ($result.phase -ne 'ReadyForInno') { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PREPARE_FAILED' 'The staged cleanup did not reach the Inno boundary' $result }
+        & $adapter.RemoveProductRegistration $context
         & $adapter.WriteReceipt $stageRoot $result
         return $result
     } catch {

@@ -185,6 +185,9 @@ function New-CcodLifecycleFake {
         FailLogCode = $null
         CopyOverride = $null
         TaskRuntimeIds = [Collections.Generic.List[string]]::new()
+        ProductRegistrationCalls = 0
+        ProductRegistrationFailure = $false
+        ProductRegistrationReadyObserved = $false
     }
     $adapters = @{}
     $adapters.ValidateSource = { param($SourceRoot) $world.Calls.Add("Validate:$([IO.Path]::GetFileName($SourceRoot))"); [bool]$world.ValidateSource }.GetNewClosure()
@@ -306,6 +309,15 @@ function New-CcodLifecycleFake {
         }
         $world.LogRecords.Add($Record)
     }.GetNewClosure()
+    $adapters.RegisterProduct = {
+        param($InstallRoot,$RuntimeId,$Version,$PackageSha256,$FileTransaction,$TransactionRecord)
+        $world.Calls.Add("RegisterProduct:$RuntimeId")
+        $world.ProductRegistrationCalls++
+        $world.ProductRegistrationReadyObserved = $null -ne $TransactionRecord -and $TransactionRecord.phase -ceq 'Ready'
+        if ($world.ProductRegistrationFailure) { throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('fixture registration failed'),'CCOD_PRODUCT_REGISTRATION_FAILED',[Management.Automation.ErrorCategory]::InvalidData,$RuntimeId) }
+        [pscustomobject]@{ verified=$true; legacyRemoved=$true }
+    }.GetNewClosure()
+    $adapters.AddProductShortcutCandidates = { param($Files) [pscustomobject]@{Files=@($Files);TemporaryRoot=$null} }
     [pscustomobject]@{ World = $world; Adapters = $adapters }
 }
 
@@ -314,7 +326,7 @@ function New-CcodReadyFinalizationGapFixture {
     $install=New-CcodLifecycleTempRoot
     $nodeRoot=New-CcodLifecycleTempRoot
     try {
-        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22-finalization-recovery' | Out-Null
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
         $node=New-CcodLifecycleFakeNode -Root $nodeRoot
         $fake=New-CcodLifecycleFake -NodePath $node
         $fake.Adapters.CommitReadyTransaction={throw 'PRIVATE_FINAL_SNAPSHOT_FAILURE'}
@@ -1686,6 +1698,7 @@ $results += Invoke-CcodTest 'a later invocation recovers one missing Ready trans
         $recoveryFake=New-CcodLifecycleFake -NodePath $fixture.Node
         $result=Invoke-CcodInstall -SourceRoot $fixture.Source -InstallRoot $fixture.Install -Adapters $recoveryFake.Adapters
         Assert-CcodEqual 'Recovered' $result.Outcome 'finalization recovery reports a bounded recovered outcome'
+        Assert-CcodEqual 1 $recoveryFake.World.ProductRegistrationCalls 'Ready-finalization recovery completes post-Ready product registration exactly once'
         Assert-CcodEqual $fixture.Transaction.newRuntimeId $result.RuntimeId 'recovery result binds the pending transaction runtime'
         Assert-CcodEqual $runtimeCount @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'runtime') -Directory -Force).Count 'recovery creates no runtime generation'
         Assert-CcodEqual $pointerCount @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\active-generation') -File -Force).Count 'recovery appends no active pointer'
@@ -3189,6 +3202,32 @@ $results += Invoke-CcodTest 'sealed Setup carries no mutable validation or legac
     $installerScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
     Assert-CcodTrue ($installerScript -cnotmatch 'DestDir:\s*"\{app\}|\[InstallDelete\]|CodexControlOtherDevices\.iss"; DestDir|build\.ps1"; DestDir') 'Task 3 leaves installed validation and legacy registration migration to immutable payload and Task 4'
     Assert-CcodTrue ($installerScript -cmatch '(?m)^CreateAppDir=no\s*$' -and $installerScript -cmatch '(?m)^Uninstallable=no\s*$') 'Setup cannot create the old mutable validation root'
+}
+
+# Production mutation caught: product state written from ProtectionReady or before the terminal transaction snapshot.
+$results += Invoke-CcodTest 'product registration runs exactly once only after the Task 2 Ready transaction is durable' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $result=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('3'*64) -Adapters $fake.Adapters
+        Assert-CcodEqual 1 $fake.World.ProductRegistrationCalls 'successful install commits product registration exactly once'
+        Assert-CcodTrue $fake.World.ProductRegistrationReadyObserved 'registration adapter receives only the durable Ready transaction'
+        Assert-CcodTrue $result.ProductRegistrationVerified 'install result reports verified post-Ready registration'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
+}
+
+# Production mutation caught: treating post-Ready registration failure as an install rollback or Failed lifecycle snapshot.
+$results += Invoke-CcodTest 'registration failure preserves durable Ready without rollback or Failed transaction' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node;$fake.World.ProductRegistrationFailure=$true
+        Assert-CcodThrows { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('3'*64) -Adapters $fake.Adapters|Out-Null } 'CCOD_PRODUCT_REGISTRATION_FAILED'
+        $module=Get-Module InstallLifecycle;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Ready' $head.phase 'post-Ready registration failure cannot downgrade the lifecycle transaction'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'registration failure appends no Failed transaction snapshot'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
 }
 
 Write-Output "Install lifecycle self-tests passed: $($results.Count)"
