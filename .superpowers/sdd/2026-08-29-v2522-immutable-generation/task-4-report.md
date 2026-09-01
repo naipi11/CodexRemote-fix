@@ -95,3 +95,83 @@ performed.
 
 - `e43d9ce18c5d79bb438e08c9ff2973be592277aa`
   (`feat: register product only after readiness`).
+
+## Fix round 1: matched uninstall and retriable registration
+
+Scoped review of `70bc231..97cf17d` found one Critical and four Important
+issues. The installed wrapper could synchronously continue after deleting its
+own generation; product cleanup could remove an entire key without exact
+value/shortcut evidence; `AlreadyInstalled` skipped registration retry;
+legacy removal was not compensating; and shortcut copy accepted a state-only
+transaction plus arbitrary absolute source path.
+
+### RED evidence
+
+- UninstallBootstrap first exited `1` because
+  `src\persistence\InstalledUninstallFinalizer.ps1` did not exist.
+- ProductRegistration exited `1` with `CCOD_PRODUCT_ADAPTER_INVALID`, target
+  `ReadLegacyEntry`, before exact current-state and per-entry legacy
+  compensation adapters existed.
+- InstallLifecycle exited `1` in the exact Ready/package idempotence case:
+  registration calls expected `1`, actual `0`.
+- InstallFileTransaction exited `1` because the export surface lacked
+  `Open-CcodInstallProductRegistrationTransaction` and
+  `Open-CcodInstallRetainedFile`; product shortcut copy still exposed
+  `SourcePath`.
+
+### GREEN and verification evidence
+
+- ProductRegistration exited `0` with
+  `Product registration self-tests passed: 9`. Coverage includes exact
+  registry/shortcut evidence, unknown/replaced/reparse/ambiguous no-delete,
+  mid-sequence legacy restoration, and replacement-preserving compensation.
+- InstallFileTransaction exited `0`; all 27 named cases passed. The new case
+  proves product-only retained-file authority, no arbitrary shortcut source
+  path, state-only denial, and product-scope denial for state writes.
+- UninstallBootstrap exited `0` with
+  `Uninstall bootstrap self-tests passed: 19`. The installed path now stops at
+  `TaskRemoved`; its staged finalizer waits for exact wrapper exit, validates
+  transaction and selected generation, performs matched removal, proves root
+  absence, removes only matched product state, and then finalizes. Wrong
+  wrapper/generation/transaction cases delete nothing.
+- InstallLifecycle exited `0` with
+  `Install lifecycle self-tests passed: 116`. Both normal and missing-Ready
+  recovery registration failures remain outside rollback/Failed and are
+  reconciled by a later exact same-package `AlreadyInstalled` invocation.
+- Explicit parser checks passed all 11 changed PowerShell source/test files
+  (`PARSER_COUNT=11`, `FAILURES=0`).
+- `git diff --check` exited `0`; only checkout LF-to-CRLF warnings were
+  emitted.
+- The aggregate `tests\PersistenceSelfTest.ps1` was not run in this fix round;
+  no aggregate-pass claim is made.
+
+### Remediated boundaries
+
+- The selected-generation wrapper launches a hidden external finalizer from
+  the ACL-bound staged payload and returns. Application removal cannot begin
+  until the exact wrapper PID/creation-time identity has exited.
+- Current product cleanup accepts only the exact allowed registry value names,
+  kinds and values plus both shortcut hashes, targets, arguments, and regular
+  file identities. Registry values are revalidated and removed individually;
+  a key is deleted only after it is empty and has no subkeys.
+- Legacy migration captures exact registry kinds/values and shortcut bytes,
+  deletes entries one by one, and restores prior removals in reverse order
+  only while their names remain absent. A replacement is never overwritten.
+- Product shortcut promotion now accepts only an opaque file capability opened
+  from one selected generation at either fixed manifest-relative candidate.
+  Product-only transactions cannot write state, generations, manifests,
+  pointers, or retirements; state-only transactions cannot acquire shortcut
+  authority.
+
+### Compatibility and external boundaries
+
+- Conservative mismatch behavior may leave current or legacy registration for
+  diagnosis instead of partially deleting it.
+- No real registry, shortcut, installer, uninstaller, product process,
+  WindowsApps, DPAPI, network, release, push, tag, signing, or publication
+  action was performed.
+
+### Fix implementation commit
+
+- `2e76698d535e6e824df1c57d81314be1c2e053e8`
+  (`fix: complete matched product lifecycle`).
