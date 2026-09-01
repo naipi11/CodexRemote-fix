@@ -1264,7 +1264,7 @@ Invoke-CcodTest 'temporary bootstrap verifies the sealed package and propagates 
 }
 
 function Invoke-CcodInnoPayloadCompileFixture {
-    param([switch]$IncludePayloadDefines,[switch]$OmitDestinationInventory)
+    param([switch]$IncludePayloadDefines,[switch]$OmitDestinationInventory,[switch]$BindWrongPackageHash,[switch]$UseInertActivationMarker)
 
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-inno-payload-contract-' + [guid]::NewGuid().ToString('N'))
     $tray = Join-Path $root 'tray'
@@ -1300,13 +1300,20 @@ function Invoke-CcodInnoPayloadCompileFixture {
     $installerPackagePath = Join-Path $root 'installer-package.zip'
     $installerPackageManifestPath = Join-Path $root 'installer-package.manifest.json'
     $installerPackage = New-CcodInstallerPackage -PayloadRoot $payload -PayloadManifestPath $manifestPath -Version '2.5.21' -GitCommit $setupGitCommit -OutputPath $installerPackagePath -ManifestOutputPath $installerPackageManifestPath
-    $activationBootstrapPath = Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1'
+    $activationMarker = Join-Path $root 'activation-executed.txt'
+    $activationBootstrapPath = if($UseInertActivationMarker){
+        $path=Join-Path $root 'inert-activation-bootstrap.ps1'
+        [IO.File]::WriteAllText($path,"[IO.File]::WriteAllText('$($activationMarker.Replace("'","''"))','executed',[Text.UTF8Encoding]::new(`$false));exit 97",[Text.UTF8Encoding]::new($false))
+        $path
+    }else{Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1'}
     $activationBootstrapSha256 = Get-CcodTestFileSha256 -Path $activationBootstrapPath
     $setupProvenancePath = Join-Path $root 'setup-provenance.json'
     [IO.File]::WriteAllText($setupProvenancePath,'{}',[Text.UTF8Encoding]::new($false))
+    $boundPackageHash=$null
     $arguments = @('/DProjectVersion=2.5.21',"/DSetupGitCommit=$setupGitCommit","/DSetupProvenancePath=$setupProvenancePath","/O$output\")
     if ($IncludePayloadDefines) {
-        $arguments = @('/DProjectVersion=2.5.21',"/DInstallerPackagePath=$installerPackagePath","/DInstallerPackageManifestPath=$installerPackageManifestPath","/DInstallerPackageSha256=$($installerPackage.PackageSha256)","/DInstallerPackageManifestSha256=$($installerPackage.ManifestSha256)","/DActivationBootstrapPath=$activationBootstrapPath","/DActivationBootstrapSha256=$activationBootstrapSha256","/DSetupGitCommit=$setupGitCommit","/DSetupProvenancePath=$setupProvenancePath")
+        $boundPackageHash=if($BindWrongPackageHash){'0'*64}else{[string]$installerPackage.PackageSha256}
+        $arguments = @('/DProjectVersion=2.5.21',"/DInstallerPackagePath=$installerPackagePath","/DInstallerPackageManifestPath=$installerPackageManifestPath","/DInstallerPackageSha256=$boundPackageHash","/DInstallerPackageManifestSha256=$($installerPackage.ManifestSha256)","/DActivationBootstrapPath=$activationBootstrapPath","/DActivationBootstrapSha256=$activationBootstrapSha256","/DSetupGitCommit=$setupGitCommit","/DSetupProvenancePath=$setupProvenancePath")
         $arguments += "/O$output\"
     }
     . (Join-Path $repositoryRoot 'build\build.ps1') -Library
@@ -1342,6 +1349,14 @@ function Invoke-CcodInnoPayloadCompileFixture {
         PackageManifestSha256 = $installerPackage.ManifestSha256
         ActivationBootstrapSha256 = $activationBootstrapSha256
         SetupGitCommit = $setupGitCommit
+        PackagePath = $installerPackagePath
+        PackageManifestPath = $installerPackageManifestPath
+        ActivationBootstrapPath = $activationBootstrapPath
+        InventoryPath = $inventoryPath
+        TemplatePath = $templatePath
+        CompilerPath = $iscc
+        ActivationMarker = $activationMarker
+        BoundPackageSha256 = $boundPackageHash
     }
 }
 
@@ -1652,6 +1667,36 @@ Invoke-CcodTest 'compiled Setup independently binds PE version commit package ma
     }
 }
 
+# Production mutation caught: compiled Setup metadata looks safe while CurStepChanged skips its runtime package hash/lock barrier.
+Invoke-CcodTest 'compiled production Setup rejects a wrong package hash before activation and product state' {
+    $fixture=Invoke-CcodInnoPayloadCompileFixture -IncludePayloadDefines -BindWrongPackageHash -UseInertActivationMarker
+    $process=$null
+    try {
+        Assert-CcodEqual 0 $fixture.ExitCode "wrong-hash production Setup fixture compiles: $($fixture.Output)"
+        Assert-CcodTrue (Test-Path -LiteralPath $fixture.SetupPath -PathType Leaf) 'wrong-hash compiled Setup exists'
+        Assert-CcodEqual ('0'*64) ([string]$fixture.BoundPackageSha256) 'fixture binds the deliberate wrong package hash'
+        Assert-CcodEqual ('0'*64) ([string][Diagnostics.FileVersionInfo]::GetVersionInfo($fixture.SetupPath).LegalCopyright).Trim() 'compiled PE independently retains the wrong expected package hash'
+        $appRoot=Join-Path $fixture.Root 'forbidden-app-output'
+        $logPath=Join-Path $fixture.Root 'executed-setup.log'
+        $arguments=@('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',("/DIR=$appRoot"),("/LOG=$logPath"))
+        $startInfo=[Diagnostics.ProcessStartInfo]::new();$startInfo.FileName=$fixture.SetupPath;$startInfo.Arguments=(($arguments|ForEach-Object{'"'+([string]$_).Replace('"','\"')+'"'})-join' ');$startInfo.UseShellExecute=$false;$startInfo.CreateNoWindow=$true
+        $process=[Diagnostics.Process]::new();$process.StartInfo=$startInfo
+        Assert-CcodTrue $process.Start() 'wrong-hash compiled Setup starts'
+        Assert-CcodTrue $process.WaitForExit(20000) 'wrong-hash compiled Setup exits within the pre-activation bound'
+        Assert-CcodTrue (Test-Path -LiteralPath $logPath -PathType Leaf) 'executed Setup emits its isolated runtime log'
+        $log=[IO.File]::ReadAllText($logPath,[Text.UTF8Encoding]::new($false))
+        Assert-CcodTrue ([int]$process.ExitCode-ne0) "wrong-hash compiled Setup fails closed: exit=$([int]$process.ExitCode) log=$($log.Substring([Math]::Max(0,$log.Length-1000)))"
+        Assert-CcodTrue ($log-cmatch 'CCOD_SETUP_INPUT_BINDING_INVALID') 'runtime CurStepChanged reports the package hash/lock barrier failure'
+        Assert-CcodTrue (-not(Test-Path -LiteralPath $fixture.ActivationMarker)) 'temporary activation bootstrap never executes'
+        Assert-CcodTrue (-not(Test-Path -LiteralPath $appRoot)) 'CreateAppDir=no leaves no app product output'
+        $realProductRoot=Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'CodexControlOtherDevices'
+        Assert-CcodTrue ($log.IndexOf($realProductRoot,[StringComparison]::OrdinalIgnoreCase)-lt0) 'failure log never reaches the real LocalAppData product root'
+    } finally {
+        if($null-ne$process){try{if(-not$process.HasExited){$process.Kill();[void]$process.WaitForExit(5000)}}catch{};$process.Dispose()}
+        if(Test-Path -LiteralPath $fixture.Root){Remove-Item -LiteralPath $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue}
+    }
+}
+
 # Production mutation caught: accepting self-consistent but false Setup build-input hashes without comparing canonical files.
 Invoke-CcodTest 'Setup provenance rejects self-consistent wrong canonical build input hashes' {
     Import-Module (Join-Path $repositoryRoot 'build\SetupArtifact.psm1') -Force
@@ -1689,6 +1734,59 @@ Invoke-CcodTest 'Setup provenance rejects self-consistent wrong canonical build 
         } 'CCOD_SETUP_PROVENANCE_INVALID'
     } finally {
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+# Production mutation caught: schema-two provenance accepts cosmetic nested evidence not bound to the actual inputs.
+Invoke-CcodTest 'sealed Setup provenance rejects every field type name length count hash and property-order mutation' {
+    Import-Module (Join-Path $repositoryRoot 'build\SetupArtifact.psm1') -Force
+    $fixture=Invoke-CcodInnoPayloadCompileFixture -IncludePayloadDefines
+    try {
+        Assert-CcodEqual 0 $fixture.ExitCode "sealed provenance fixture compiles: $($fixture.Output)"
+        $provenance=Join-Path $fixture.Root 'sealed-setup-provenance.json'
+        $timestamp='2030-02-03T04:05:06.0000000Z'
+        $created=New-CcodSealedSetupBuildProvenance -Version '2.5.21' -GitCommit $fixture.SetupGitCommit -BuildTimestampUtc $timestamp -PackagePath $fixture.PackagePath -PackageManifestPath $fixture.PackageManifestPath -ActivationBootstrapPath $fixture.ActivationBootstrapPath -InnoTemplatePath $fixture.TemplatePath -DestinationInventoryPath $fixture.InventoryPath -CompilerPath $fixture.CompilerPath -OutputPath $provenance
+        $arguments=@{ExpectedVersion='2.5.21';ExpectedGitCommit=$fixture.SetupGitCommit;ExpectedPackageSha256=$fixture.PackageSha256;ExpectedPackageManifestSha256=$fixture.PackageManifestSha256;ExpectedActivationBootstrapSha256=$fixture.ActivationBootstrapSha256;ExpectedBuildTimestampUtc=$timestamp;PackagePath=$fixture.PackagePath;PackageManifestPath=$fixture.PackageManifestPath;ActivationBootstrapPath=$fixture.ActivationBootstrapPath;InnoTemplatePath=$fixture.TemplatePath;DestinationInventoryPath=$fixture.InventoryPath;CompilerPath=$fixture.CompilerPath}
+        $valid=Test-CcodSealedSetupBuildProvenance -ProvenancePath $provenance @arguments
+        Assert-CcodEqual 2 ([int]$valid.schemaVersion) 'canonical schema-two provenance validates'
+        $mutations=@(
+            [pscustomobject]@{Name='top-level-order';Apply={param($r)$copy=[ordered]@{product=$r.product;schemaVersion=$r.schemaVersion;version=$r.version;gitCommit=$r.gitCommit;buildTimestampUtc=$r.buildTimestampUtc;installerPackage=$r.installerPackage;installerPackageManifest=$r.installerPackageManifest;activationBootstrap=$r.activationBootstrap;buildInputs=$r.buildInputs;peContract=$r.peContract};return [pscustomobject]$copy}},
+            [pscustomobject]@{Name='schema-type';Apply={param($r)$r.schemaVersion='2';$r}},
+            [pscustomobject]@{Name='version-type';Apply={param($r)$r.version=2521;$r}},
+            [pscustomobject]@{Name='commit';Apply={param($r)$r.gitCommit='e'*40;$r}},
+            [pscustomobject]@{Name='package-order';Apply={param($r)$r.installerPackage=[pscustomobject][ordered]@{sha256=$r.installerPackage.sha256;name=$r.installerPackage.name;length=$r.installerPackage.length};$r}},
+            [pscustomobject]@{Name='package-name';Apply={param($r)$r.installerPackage.name='renamed.zip';$r}},
+            [pscustomobject]@{Name='package-length';Apply={param($r)$r.installerPackage.length=[long]$r.installerPackage.length+1;$r}},
+            [pscustomobject]@{Name='package-length-type';Apply={param($r)$r.installerPackage.length=[string]$r.installerPackage.length;$r}},
+            [pscustomobject]@{Name='manifest-order';Apply={param($r)$r.installerPackageManifest=[pscustomobject][ordered]@{name=$r.installerPackageManifest.name;sha256=$r.installerPackageManifest.sha256;length=$r.installerPackageManifest.length;fileCount=$r.installerPackageManifest.fileCount;payloadManifestSha256=$r.installerPackageManifest.payloadManifestSha256};$r}},
+            [pscustomobject]@{Name='manifest-name';Apply={param($r)$r.installerPackageManifest.name='renamed.json';$r}},
+            [pscustomobject]@{Name='manifest-length';Apply={param($r)$r.installerPackageManifest.length=[long]$r.installerPackageManifest.length+1;$r}},
+            [pscustomobject]@{Name='file-count';Apply={param($r)$r.installerPackageManifest.fileCount=[int]$r.installerPackageManifest.fileCount+1;$r}},
+            [pscustomobject]@{Name='file-count-type';Apply={param($r)$r.installerPackageManifest.fileCount=[string]$r.installerPackageManifest.fileCount;$r}},
+            [pscustomobject]@{Name='payload-manifest-sha';Apply={param($r)$r.installerPackageManifest.payloadManifestSha256='0'*64;$r}},
+            [pscustomobject]@{Name='bootstrap-order';Apply={param($r)$r.activationBootstrap=[pscustomobject][ordered]@{length=$r.activationBootstrap.length;name=$r.activationBootstrap.name;sha256=$r.activationBootstrap.sha256};$r}},
+            [pscustomobject]@{Name='bootstrap-name';Apply={param($r)$r.activationBootstrap.name='stale.ps1';$r}},
+            [pscustomobject]@{Name='bootstrap-length';Apply={param($r)$r.activationBootstrap.length=[long]$r.activationBootstrap.length+1;$r}},
+            [pscustomobject]@{Name='build-input-order';Apply={param($r)$r.buildInputs=[pscustomobject][ordered]@{compilerSha256=$r.buildInputs.compilerSha256;innoTemplateSha256=$r.buildInputs.innoTemplateSha256;destinationInventorySha256=$r.buildInputs.destinationInventorySha256;compilerFileVersion=$r.buildInputs.compilerFileVersion};$r}},
+            [pscustomobject]@{Name='template-hash';Apply={param($r)$r.buildInputs.innoTemplateSha256='1'*64;$r}},
+            [pscustomobject]@{Name='inventory-hash';Apply={param($r)$r.buildInputs.destinationInventorySha256='2'*64;$r}},
+            [pscustomobject]@{Name='compiler-hash';Apply={param($r)$r.buildInputs.compilerSha256='3'*64;$r}},
+            [pscustomobject]@{Name='compiler-version';Apply={param($r)$r.buildInputs.compilerFileVersion='9.9.9.9';$r}},
+            [pscustomobject]@{Name='pe-order';Apply={param($r)$r.peContract=[pscustomobject][ordered]@{legalCopyright=$r.peContract.legalCopyright;fileVersion=$r.peContract.fileVersion;packageManifestFirst=$r.peContract.packageManifestFirst;packageManifestLast=$r.peContract.packageManifestLast;bootstrapFirst=$r.peContract.bootstrapFirst;bootstrapLast=$r.peContract.bootstrapLast;companyName=$r.peContract.companyName};$r}},
+            [pscustomobject]@{Name='nested-extra';Apply={param($r)$r.activationBootstrap|Add-Member attacker 'x';$r}}
+        )
+        foreach($mutation in $mutations){
+            $record=([IO.File]::ReadAllText($provenance,[Text.UTF8Encoding]::new($false))|ConvertFrom-Json)
+            $record=&$mutation.Apply $record
+            $mutated=Join-Path $fixture.Root ("provenance-$($mutation.Name).json")
+            [IO.File]::WriteAllText($mutated,(($record|ConvertTo-Json -Depth 8)+[Environment]::NewLine),[Text.UTF8Encoding]::new($false))
+            $failure=$null
+            try{Test-CcodSealedSetupBuildProvenance -ProvenancePath $mutated @arguments|Out-Null}catch{$failure=$_}
+            Assert-CcodTrue ($null-ne$failure) "provenance mutation is rejected: $($mutation.Name)"
+            Assert-CcodTrue ($failure.FullyQualifiedErrorId-like'CCOD_SETUP_PROVENANCE_INVALID*') "provenance mutation has the bounded code: $($mutation.Name)"
+        }
+    } finally {
+        if(Test-Path -LiteralPath $fixture.Root){Remove-Item -LiteralPath $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue}
     }
 }
 
@@ -2501,6 +2599,43 @@ Invoke-CcodTest 'portable release manifest binds the ZIP payload manifest and ea
         } 'CCOD_RELEASE_ASSET_HASH_MISMATCH'
     } finally {
         if (Test-Path -LiteralPath $fixture.Root) { Remove-Item -LiteralPath $fixture.Root -Recurse -Force }
+    }
+}
+
+# Production mutation caught: portable validates a payload identity but omits or changes it at the lifecycle child boundary.
+Invoke-CcodTest 'portable installer propagates only the exact revalidated sealed identity to its lifecycle child' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-portable-sealed-identity-' + [guid]::NewGuid().ToString('N'))
+    $module = $null
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        $scriptPath = Join-Path $repositoryRoot 'Install-CodexRemote-fix.ps1'
+        $tokens=$null;$parseErrors=$null
+        $ast=[Management.Automation.Language.Parser]::ParseFile($scriptPath,[ref]$tokens,[ref]$parseErrors)
+        Assert-CcodEqual 0 @($parseErrors).Count 'portable installer parses before production function extraction'
+        $definitions=@($ast.EndBlock.Statements|Where-Object{$_-is[Management.Automation.Language.FunctionDefinitionAst]}|ForEach-Object{$_.Extent.Text})
+        $libraryPath=Join-Path $root 'PortableInstallerFunctions.psm1'
+        [IO.File]::WriteAllText($libraryPath,(($definitions-join"`r`n`r`n")+"`r`n"),[Text.UTF8Encoding]::new($false))
+        $module=Import-Module $libraryPath -Force -PassThru
+        $marker=Join-Path $root 'child-identity.txt'
+        $child=Join-Path $root 'Install-CodexControlOtherDevices.ps1'
+        $childSource=@"
+param([string]`$InstallRoot,[switch]`$EnableCandidateCompatibleUpdates,[switch]`$DoNotStart,[string]`$SealedPackageSha256)
+[IO.File]::WriteAllText('$($marker.Replace("'","''"))',[string]`$SealedPackageSha256,[Text.UTF8Encoding]::new(`$false))
+[pscustomobject]@{Outcome='Installed';RuntimeId='runtime-fixture'}
+"@
+        [IO.File]::WriteAllText($child,$childSource,[Text.UTF8Encoding]::new($false))
+        $verified='a'*64
+        $receipt=&$module {param($Path,$Root,$Identity)Invoke-CcodPortableLifecycleInstaller -InstallerPath $Path -InstallRoot $Root -VerifiedSealedPackageSha256 $Identity -ExpectedSealedPackageSha256 $Identity} $child $root $verified
+        Assert-CcodEqual 'runtime-fixture' ([string]$receipt.RuntimeId) 'portable helper returns the exact child receipt'
+        Assert-CcodEqual $verified ([IO.File]::ReadAllText($marker,[Text.UTF8Encoding]::new($false))) 'exact verified identity reaches the lifecycle child'
+        Remove-Item -LiteralPath $marker -Force
+        Assert-CcodThrows {
+            &$module {param($Path,$Root,$Verified,$Expected)Invoke-CcodPortableLifecycleInstaller -InstallerPath $Path -InstallRoot $Root -VerifiedSealedPackageSha256 $Verified -ExpectedSealedPackageSha256 $Expected} $child $root ('b'*64) $verified | Out-Null
+        } 'CCOD_PORTABLE_PACKAGE_IDENTITY_INVALID'
+        Assert-CcodTrue (-not(Test-Path -LiteralPath $marker)) 'changed identity fails before lifecycle child mutation'
+    } finally {
+        if($null-ne$module){Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue}
+        if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue}
     }
 }
 

@@ -179,14 +179,27 @@ begin
   if ValidateOnly then Result := Result + ' -ValidateReceiptOnly';
 end;
 
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  CloseCcodInputHandles();
+  try
+    if not ExtractAndLockCcodInputs() then
+      Result := 'CCOD_SETUP_INPUT_BINDING_INVALID';
+  except
+    Result := 'CCOD_SETUP_INPUT_BINDING_INVALID';
+  end;
+  if Result <> '' then CloseCcodInputHandles();
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ActivationId, Parameters: String;
   ActivationResultCode, ValidationResultCode: Integer;
 begin
   if CurStep <> ssPostInstall then Exit;
-  CloseCcodInputHandles();
-  if not ExtractAndLockCcodInputs() then RaiseException('CCOD_SETUP_INPUT_BINDING_INVALID');
+  if GetArrayLength(CcodInputHandles) <> 3 then
+    RaiseException('CCOD_SETUP_INPUT_BINDING_INVALID');
   ActivationId := NewActivationId();
   Parameters := GetCcodBootstrapParameters(ActivationId, False);
   if (not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters,

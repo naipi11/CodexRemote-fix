@@ -122,6 +122,26 @@ function Get-CcodPortableInstallerActiveRuntime {
     return [pscustomobject][ordered]@{ RuntimeId=$active.activeRuntime; Generation=$generation }
 }
 
+function Invoke-CcodPortableLifecycleInstaller {
+    param(
+        [Parameter(Mandatory)][string]$InstallerPath,
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$VerifiedSealedPackageSha256,
+        [Parameter(Mandatory)][string]$ExpectedSealedPackageSha256,
+        [switch]$EnableCandidateCompatibleUpdates,
+        [switch]$DoNotStart
+    )
+    if ($VerifiedSealedPackageSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $ExpectedSealedPackageSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $VerifiedSealedPackageSha256 -cne $ExpectedSealedPackageSha256) {
+        Throw-CcodPortableInstallerError 'CCOD_PORTABLE_PACKAGE_IDENTITY_INVALID' 'The revalidated portable payload identity changed before lifecycle activation.' $VerifiedSealedPackageSha256
+    }
+    return & $InstallerPath -InstallRoot $InstallRoot `
+        -EnableCandidateCompatibleUpdates:([bool]$EnableCandidateCompatibleUpdates) `
+        -DoNotStart:([bool]$DoNotStart) `
+        -SealedPackageSha256 $VerifiedSealedPackageSha256
+}
+
 $bundleRoot = Assert-CcodPortableInstallerPlainDirectory -Path $PSScriptRoot -Kind 'Portable bundle root'
 $payloadRoot = Assert-CcodPortableInstallerPlainDirectory -Path (Join-Path $bundleRoot 'payload') -Kind 'Portable payload root'
 $payloadManifestPath = Assert-CcodPortableInstallerRegularFile -Path (Join-Path $bundleRoot 'payload-manifest.json') -Kind 'Portable payload manifest'
@@ -137,7 +157,7 @@ if ($null -eq $package -or $package.version -isnot [string] -or $package.version
 
 $payload = Test-CcodPortablePayloadManifest -PayloadRoot $payloadRoot -ManifestPath $payloadManifestPath -ExpectedVersion $package.version
 $defender = Invoke-CcodPortableInstallerDefenderGate -PayloadRoot $payloadRoot
-Test-CcodPortablePayloadManifest -PayloadRoot $payloadRoot -ManifestPath $payloadManifestPath -ExpectedVersion $package.version -ExpectedGitCommit $payload.GitCommit | Out-Null
+$revalidatedPayload = Test-CcodPortablePayloadManifest -PayloadRoot $payloadRoot -ManifestPath $payloadManifestPath -ExpectedVersion $package.version -ExpectedGitCommit $payload.GitCommit
 
 $localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
 if ([string]::IsNullOrWhiteSpace($localAppData) -or -not [IO.Path]::IsPathRooted($localAppData)) {
@@ -151,7 +171,10 @@ if (-not $PSCmdlet.ShouldProcess($installRoot,'Install the verified CodexRemote-
 $copied = Copy-CcodPortablePayload -PayloadRoot $payloadRoot -ManifestPath $payloadManifestPath
 $installerPath = Assert-CcodPortableInstallerRegularFile -Path (Join-Path $copied.InstallerRoot 'Install-CodexControlOtherDevices.ps1') -Kind 'Installed lifecycle installer'
 try {
-    $installReceipt = & $installerPath -InstallRoot $installRoot -EnableCandidateCompatibleUpdates:([bool]$EnableCandidateCompatibleUpdates) -DoNotStart:([bool]$DoNotStart)
+    $installReceipt = Invoke-CcodPortableLifecycleInstaller -InstallerPath $installerPath -InstallRoot $installRoot `
+        -VerifiedSealedPackageSha256 ([string]$revalidatedPayload.PayloadManifestSha256) `
+        -ExpectedSealedPackageSha256 ([string]$payload.PayloadManifestSha256) `
+        -EnableCandidateCompatibleUpdates:$EnableCandidateCompatibleUpdates -DoNotStart:$DoNotStart
 } catch {
     Throw-CcodPortableInstallerError 'CCOD_PORTABLE_INSTALL_FAILED' 'The verified portable payload could not activate the protected runtime.' $_
 }

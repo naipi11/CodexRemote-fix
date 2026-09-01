@@ -252,16 +252,92 @@ function Test-CcodSealedSetupBuildProvenance {
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedPackageSha256,[Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedPackageManifestSha256,[Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedActivationBootstrapSha256,[Parameter(Mandatory)][string]$ExpectedBuildTimestampUtc,
         [Parameter(Mandatory)][string]$PackagePath,[Parameter(Mandatory)][string]$PackageManifestPath,[Parameter(Mandatory)][string]$ActivationBootstrapPath,[Parameter(Mandatory)][string]$InnoTemplatePath,[Parameter(Mandatory)][string]$DestinationInventoryPath,[Parameter(Mandatory)][string]$CompilerPath
     )
-    $path=Assert-CcodSetupRegularFile $ProvenancePath 'Sealed Setup provenance';$package=Assert-CcodSetupRegularFile $PackagePath 'Installer package';$manifest=Assert-CcodSetupRegularFile $PackageManifestPath 'Installer package manifest';$bootstrap=Assert-CcodSetupRegularFile $ActivationBootstrapPath 'Activation bootstrap';$template=Assert-CcodSetupRegularFile $InnoTemplatePath 'Inno template';$inventory=Assert-CcodSetupRegularFile $DestinationInventoryPath 'Destination inventory';$compiler=Assert-CcodSetupRegularFile $CompilerPath 'Inno compiler'
-    try{$record=[IO.File]::ReadAllText($path,[Text.UTF8Encoding]::new($false))|ConvertFrom-Json -ErrorAction Stop}catch{Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Sealed Setup provenance JSON is invalid' $path}
-    $fields='schemaVersion,product,version,gitCommit,buildTimestampUtc,installerPackage,installerPackageManifest,activationBootstrap,buildInputs,peContract'
+    $path=Assert-CcodSetupRegularFile $ProvenancePath 'Sealed Setup provenance'
+    $package=Assert-CcodSetupRegularFile $PackagePath 'Installer package'
+    $manifest=Assert-CcodSetupRegularFile $PackageManifestPath 'Installer package manifest'
+    $bootstrap=Assert-CcodSetupRegularFile $ActivationBootstrapPath 'Activation bootstrap'
+    $template=Assert-CcodSetupRegularFile $InnoTemplatePath 'Inno template'
+    $inventory=Assert-CcodSetupRegularFile $DestinationInventoryPath 'Destination inventory'
+    $compiler=Assert-CcodSetupRegularFile $CompilerPath 'Inno compiler'
+    try {
+        $raw=[IO.File]::ReadAllText($path,[Text.UTF8Encoding]::new($false))
+        $record=$raw|ConvertFrom-Json -ErrorAction Stop
+        $manifestRaw=[IO.File]::ReadAllText($manifest,[Text.UTF8Encoding]::new($false))
+        $packageManifest=$manifestRaw|ConvertFrom-Json -ErrorAction Stop
+    } catch { Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Sealed Setup provenance or package manifest JSON is invalid' $path }
+
+    function Test-CcodExactObjectProperties {
+        param($Value,[string[]]$Names)
+        return $Value-is[pscustomobject]-and(@($Value.PSObject.Properties.Name)-join',')-ceq($Names-join',')
+    }
+    function Test-CcodJsonInteger {
+        param($Value)
+        return ($Value-is[int]-or$Value-is[long])-and[decimal]$Value-eq[decimal][long]$Value
+    }
+    function Test-CcodExactString {
+        param($Value,[string]$Expected)
+        return $Value-is[string]-and$Value-ceq$Expected
+    }
+
+    $top=@('schemaVersion','product','version','gitCommit','buildTimestampUtc','installerPackage','installerPackageManifest','activationBootstrap','buildInputs','peContract')
+    $artifactFields=@('name','length','sha256')
+    $manifestFields=@('name','length','sha256','fileCount','payloadManifestSha256')
+    $buildFields=@('innoTemplateSha256','destinationInventorySha256','compilerSha256','compilerFileVersion')
+    $peFields=@('fileVersion','packageManifestFirst','packageManifestLast','bootstrapFirst','bootstrapLast','companyName','legalCopyright')
+    $packageManifestFields=@('schemaVersion','product','version','gitCommit','payloadManifest','files')
+    $payloadManifestFields=@('name','length','sha256')
+    if(-not(Test-CcodExactObjectProperties $record $top)-or
+       -not(Test-CcodExactObjectProperties $record.installerPackage $artifactFields)-or
+       -not(Test-CcodExactObjectProperties $record.installerPackageManifest $manifestFields)-or
+       -not(Test-CcodExactObjectProperties $record.activationBootstrap $artifactFields)-or
+       -not(Test-CcodExactObjectProperties $record.buildInputs $buildFields)-or
+       -not(Test-CcodExactObjectProperties $record.peContract $peFields)-or
+       -not(Test-CcodExactObjectProperties $packageManifest $packageManifestFields)-or
+       -not(Test-CcodExactObjectProperties $packageManifest.payloadManifest $payloadManifestFields)){
+        Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Sealed Setup provenance property schema is invalid' $path
+    }
     $actualCompilerVersion=([string][Diagnostics.FileVersionInfo]::GetVersionInfo($compiler).FileVersion).Trim()
-    if((@($record.PSObject.Properties.Name)-join',')-cne$fields-or$record.schemaVersion-ne 2-or$record.product-cne'CodexRemote-fix'-or$record.version-cne$ExpectedVersion-or$record.gitCommit-cne$ExpectedGitCommit-or$record.buildTimestampUtc-cne$ExpectedBuildTimestampUtc-or-not(Test-CcodSetupCanonicalUtc ([string]$record.buildTimestampUtc))-or
-       $record.installerPackage.sha256-cne$ExpectedPackageSha256-or$record.installerPackage.sha256-cne(Get-CcodSetupArtifactHash $package)-or[long]$record.installerPackage.length-ne(Get-Item $package -Force).Length-or
-       $record.installerPackageManifest.sha256-cne$ExpectedPackageManifestSha256-or$record.installerPackageManifest.sha256-cne(Get-CcodSetupArtifactHash $manifest)-or
-       $record.activationBootstrap.sha256-cne$ExpectedActivationBootstrapSha256-or$record.activationBootstrap.sha256-cne(Get-CcodSetupArtifactHash $bootstrap)-or
-       $record.buildInputs.innoTemplateSha256-cne(Get-CcodSetupArtifactHash $template)-or$record.buildInputs.destinationInventorySha256-cne(Get-CcodSetupArtifactHash $inventory)-or$record.buildInputs.compilerSha256-cne(Get-CcodSetupArtifactHash $compiler)-or([string]$record.buildInputs.compilerFileVersion).Trim()-cne$actualCompilerVersion-or
-       $record.peContract.fileVersion-cne"$ExpectedVersion.0"-or$record.peContract.packageManifestFirst-cne$ExpectedPackageManifestSha256.Substring(0,32)-or$record.peContract.packageManifestLast-cne$ExpectedPackageManifestSha256.Substring(32,32)-or$record.peContract.bootstrapFirst-cne$ExpectedActivationBootstrapSha256.Substring(0,32)-or$record.peContract.bootstrapLast-cne$ExpectedActivationBootstrapSha256.Substring(32,32)-or$record.peContract.companyName-cne$ExpectedGitCommit-or$record.peContract.legalCopyright-cne$ExpectedPackageSha256){Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Sealed Setup provenance is not exactly bound' $path}
+    $packageLength=[long](Get-Item $package -Force).Length
+    $manifestLength=[long](Get-Item $manifest -Force).Length
+    $bootstrapLength=[long](Get-Item $bootstrap -Force).Length
+    if($record.schemaVersion-isnot[int]-or$record.schemaVersion-ne 2-or
+       -not(Test-CcodExactString $record.product 'CodexRemote-fix')-or
+       -not(Test-CcodExactString $record.version $ExpectedVersion)-or
+       -not(Test-CcodExactString $record.gitCommit $ExpectedGitCommit)-or
+       -not(Test-CcodExactString $record.buildTimestampUtc $ExpectedBuildTimestampUtc)-or
+       -not(Test-CcodSetupCanonicalUtc $record.buildTimestampUtc)-or
+       $packageManifest.schemaVersion-isnot[int]-or$packageManifest.schemaVersion-ne 1-or
+       -not(Test-CcodExactString $packageManifest.product 'CodexRemote-fix')-or
+       -not(Test-CcodExactString $packageManifest.version $ExpectedVersion)-or
+       -not(Test-CcodExactString $packageManifest.gitCommit $ExpectedGitCommit)-or
+       -not(Test-CcodExactString $packageManifest.payloadManifest.name 'installer-payload.manifest.json')-or
+       -not(Test-CcodJsonInteger $packageManifest.payloadManifest.length)-or[long]$packageManifest.payloadManifest.length-le0-or
+       @($packageManifest.files).Count-le0-or
+       -not(Test-CcodExactString $record.installerPackage.name 'installer-package.zip')-or
+       -not(Test-CcodJsonInteger $record.installerPackage.length)-or[long]$record.installerPackage.length-ne$packageLength-or
+       -not(Test-CcodExactString $record.installerPackage.sha256 $ExpectedPackageSha256)-or$record.installerPackage.sha256-cne(Get-CcodSetupArtifactHash $package)-or
+       -not(Test-CcodExactString $record.installerPackageManifest.name 'installer-package.manifest.json')-or
+       -not(Test-CcodJsonInteger $record.installerPackageManifest.length)-or[long]$record.installerPackageManifest.length-ne$manifestLength-or
+       -not(Test-CcodExactString $record.installerPackageManifest.sha256 $ExpectedPackageManifestSha256)-or$record.installerPackageManifest.sha256-cne(Get-CcodSetupArtifactHash $manifest)-or
+       $record.installerPackageManifest.fileCount-isnot[int]-or$record.installerPackageManifest.fileCount-ne@($packageManifest.files).Count-or
+       -not(Test-CcodExactString $record.installerPackageManifest.payloadManifestSha256 ([string]$packageManifest.payloadManifest.sha256))-or
+       $packageManifest.payloadManifest.sha256-isnot[string]-or$packageManifest.payloadManifest.sha256-cnotmatch'^[0-9a-f]{64}$'-or
+       -not(Test-CcodExactString $record.activationBootstrap.name 'Activate-CcodRemoteFix.ps1')-or
+       -not(Test-CcodJsonInteger $record.activationBootstrap.length)-or[long]$record.activationBootstrap.length-ne$bootstrapLength-or
+       -not(Test-CcodExactString $record.activationBootstrap.sha256 $ExpectedActivationBootstrapSha256)-or$record.activationBootstrap.sha256-cne(Get-CcodSetupArtifactHash $bootstrap)-or
+       -not(Test-CcodExactString $record.buildInputs.innoTemplateSha256 (Get-CcodSetupArtifactHash $template))-or
+       -not(Test-CcodExactString $record.buildInputs.destinationInventorySha256 (Get-CcodSetupArtifactHash $inventory))-or
+       -not(Test-CcodExactString $record.buildInputs.compilerSha256 (Get-CcodSetupArtifactHash $compiler))-or
+       -not(Test-CcodExactString $record.buildInputs.compilerFileVersion $actualCompilerVersion)-or
+       -not(Test-CcodExactString $record.peContract.fileVersion "$ExpectedVersion.0")-or
+       -not(Test-CcodExactString $record.peContract.packageManifestFirst $ExpectedPackageManifestSha256.Substring(0,32))-or
+       -not(Test-CcodExactString $record.peContract.packageManifestLast $ExpectedPackageManifestSha256.Substring(32,32))-or
+       -not(Test-CcodExactString $record.peContract.bootstrapFirst $ExpectedActivationBootstrapSha256.Substring(0,32))-or
+       -not(Test-CcodExactString $record.peContract.bootstrapLast $ExpectedActivationBootstrapSha256.Substring(32,32))-or
+       -not(Test-CcodExactString $record.peContract.companyName $ExpectedGitCommit)-or
+       -not(Test-CcodExactString $record.peContract.legalCopyright $ExpectedPackageSha256)){
+        Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Sealed Setup provenance is not exactly bound' $path
+    }
     return $record
 }
 
