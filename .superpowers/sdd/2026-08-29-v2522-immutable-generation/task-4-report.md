@@ -298,3 +298,100 @@ legacy entry, and mock-only finalizer coverage.
 
 - `1ff17bb8759e3d5312c11336ca3b2188bb3a4fe2`
   (`fix: enforce strict retained product authority`).
+
+## Fix round 4: durable Ready identity and real finalizer negatives
+
+Independent review of `7c333e0..a83840b` found five Important gaps: fresh and
+stored uninstall paths did not share one current-root Ready invariant; product
+authority still reduced a strict lifecycle record to five fields and did not
+prove a complete selector/store at every retained-file open; legacy/current
+registry negatives were adapter-shaped rather than production comparisons; and
+the installed-finalizer evidence covered only a safe adapter-assisted positive.
+
+### RED evidence
+
+- UninstallBootstrap exited `1` in
+  `fresh and stored Ready evidence require one exact current-install-root
+  invariant before cleanup`: a fresh rooted but unrelated `installRoot` was
+  accepted instead of throwing `CCOD_UNINSTALL_BOOTSTRAP_INVALID`. The same
+  case also covers stored `TaskRemoved` wrong-root and extra-field records with
+  an explicit zero-cleanup assertion.
+- InstallFileTransaction exited `1` with
+  `ASSERT_THROWS: expected CCOD_INSTALL_PRODUCT_SCOPE`: capability open first
+  accepted a caller record whose `oldRuntimeId` differed while all five derived
+  fields matched. The completed matrix also covers transaction ID/owned-set
+  mismatch, a fabricated five-field object, pointer gap/unexpected directory,
+  a stale N capability after N+1, changed persisted Ready identity, and a
+  scalar `ownedObjectNames` value.
+- ProductRegistration exited `1` because the production-private
+  `Test-CcodCurrentProductRegistryPreflight` did not exist. The regression calls
+  that same helper with an unexpected subkey and proves zero removals.
+- ProductRegistration exited `1` because the production-private
+  `Compare-CcodLegacySnapshotEntry` did not exist. Its fixture keeps the
+  Registry key present while removing one captured value; the result must be
+  `Mismatch`, the unresolved create-only record must contain `Registry`, and
+  the stable error must be `CCOD_LEGACY_PRODUCT_COMPENSATION_FAILED`.
+- The first no-adapter staged-finalizer child matrix exited `1` instead of the
+  stable `3`: `Write-Error` re-threw under the script's Stop preference. After
+  that was fixed, the wrong stored Ready root reached selected-generation
+  deletion, exposing a dot-sourced `$InstallRoot` parameter collision in the
+  default transaction reader. Both failures occurred before the final GREEN.
+- InstallFileTransaction exited `1` with
+  `ASSERT_THROWS: expected CCOD_INSTALL_PRODUCT_SCOPE` after hard-linked
+  pointer, transaction, and manifest leaves were added; the first hard-linked
+  authority leaf was accepted.
+- InstallFileTransaction exited `1` because the production-private
+  `Read-CcodInstallAuthorityFile` did not exist. The wished-for contract returns
+  bytes and SHA-256 from one verified native handle and rejects a multi-link.
+
+### GREEN and final verification evidence
+
+- ProductRegistration: `13/13`, exit `0`.
+- InstallFileTransaction: `29/29`, exit `0`.
+- UninstallBootstrap: `23/23`, exit `0`. The no-adapter child matrix stages the
+  real `InstalledUninstallFinalizer.ps1` below a fake process `LOCALAPPDATA` and
+  covers same-bootstrap sibling, wrong runtime path, stale epoch, wrapper
+  PID/creation mismatch, wrong stored Ready root, and an extra Ready field.
+  Every case preserves the selected generation and sibling/root state; cases
+  beyond the early path/identity gates also prove the disposable wrapper exited.
+- InstallLifecycle: `116/116`, exit `0`, preserving normal/recovery registration
+  retry and durable Ready behavior.
+- Explicit PowerShell parser: `8/8`, `PARSER_FAILURES=0`, exit `0`.
+- Static gates: `WEAK_SUBSTITUTE_COUNT=0` and
+  `AUTHORITY_PATH_READ_COUNT=0`, exit `0`; the default finalizer reader receives
+  and forwards `ExpectedInstallRoot`.
+- `git diff --check`: exit `0`; only checkout LF-to-CRLF warnings were emitted.
+- Full `tests\PersistenceSelfTest.ps1` aggregate: exit `0`; no failure output.
+- Final independent scoped re-review found no remaining Critical or Important
+  findings.
+
+### Remediated boundaries
+
+- One ordered ten-field Ready helper validates fresh contexts, durable stored
+  transactions/resume, and default finalizer authorization against the exact
+  current install root before selected-root deletion.
+- Product capability open validates the ordered/type-strict 12-field lifecycle
+  record, complete canonical contiguous selector, all canonical transaction
+  chains, the unique full persisted terminal Ready record, and the selected
+  manifest/package identity. Every retained-file open repeats that proof and
+  compares caller, persisted, and stored capability identities.
+- Selector JSON, lifecycle JSON, and manifest hashes are read from one native
+  no-write/no-delete-share handle. The handle rejects reparse, ADS and
+  multi-link leaves, checks final path and file identity before and after the
+  read, and hashes the returned bytes rather than reopening by path.
+- Current-product subkeys fail a production pure preflight before shortcut
+  inspection. Legacy Registry compensation distinguishes exact, absent, and
+  mismatched key/value/kind snapshots; a partial key is never called restored
+  or overwritten.
+- The installed finalizer accepts only a canonical absolute process
+  `LOCALAPPDATA` when it is present, otherwise falls back to the current-user
+  special folder. The staged default reader carries the expected install root
+  through dot-sourcing without a parameter-name collision.
+
+No real registry, shortcut, installer, uninstaller, product, network, release,
+signing, tag, push, or publication action occurred.
+
+### Fix implementation commit
+
+- `3cd891221acfd569fd29e2244b5200fa28e43106`
+  (`fix: prove durable Ready product authority`).
