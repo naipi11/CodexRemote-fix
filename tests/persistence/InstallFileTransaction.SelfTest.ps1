@@ -136,12 +136,26 @@ function New-CcodHardLink {
 }
 
 Invoke-CcodTest 'exports only immutable generation operations and an inert CLR marker' {
-    $expected=@('Close-CcodInstallFileTransaction','Commit-CcodInstallActivePointer','Copy-CcodInstallProductShortcut','Copy-CcodInstallSealedSource','New-CcodInstallDirectory','New-CcodInstallGenerationLeaf','Open-CcodInstallGeneration','Open-CcodInstallProductSpecialFolder','Open-CcodInstallRetainedGeneration','Open-CcodInstallStateTransaction','Retire-CcodInstallGeneration','Write-CcodInstallGenerationManifest','Write-CcodInstallRecord')
+    $expected=@('Close-CcodInstallFileTransaction','Commit-CcodInstallActivePointer','Copy-CcodInstallProductShortcut','Copy-CcodInstallSealedSource','New-CcodInstallDirectory','New-CcodInstallGenerationLeaf','Open-CcodInstallGeneration','Open-CcodInstallProductRegistrationTransaction','Open-CcodInstallProductSpecialFolder','Open-CcodInstallRetainedFile','Open-CcodInstallRetainedGeneration','Open-CcodInstallStateTransaction','Retire-CcodInstallGeneration','Write-CcodInstallGenerationManifest','Write-CcodInstallRecord')
     Assert-CcodEqual ($expected -join '|') ((@($module.ExportedCommands.Keys)|Sort-Object)-join '|') 'module export surface is capability-only'
     Assert-CcodEqual 4 ([CcodInstallGenerationCapabilityMarkerV4]::CapabilityAbi) 'marker exposes the current non-mutating ABI value'
     Assert-CcodEqual 'CcodInstallGenerationCapabilityMarkerV4' ((@([CcodInstallGenerationCapabilityMarkerV4].Assembly.GetExportedTypes()|ForEach-Object FullName)) -join '|') 'current CLR bridge exports only the inert marker'
     $dangerous=@([CcodInstallGenerationCapabilityMarkerV4].GetMethods([Reflection.BindingFlags]'Public,Static,DeclaredOnly')|Where-Object{@($_.GetParameters()|Where-Object{$_.ParameterType-in@([string],[IntPtr],[IO.Stream])-or[Microsoft.Win32.SafeHandles.SafeHandle].IsAssignableFrom($_.ParameterType)}).Count-ne 0})
     Assert-CcodEqual 0 $dangerous.Count 'marker accepts no path stream or bare handle'
+    Assert-CcodTrue (-not $module.ExportedCommands['Copy-CcodInstallProductShortcut'].Parameters.ContainsKey('SourcePath')) 'product shortcut copy accepts no arbitrary absolute source path'
+}
+
+# Production mutation caught: state-only recovery or an arbitrary absolute source can acquire product shortcut authority.
+Invoke-CcodTest 'product registration transaction exposes only a selected retained manifest file capability' {
+    $fixture=New-CcodInstallFileFixture
+    try{
+        $runtimeId='runtime-product-source';$source=New-CcodSourceFile $fixture 'product-source.lnk' 'sealed shortcut bytes';$generation=Open-CcodFixtureGeneration $fixture $runtimeId;$registration=New-CcodInstallGenerationLeaf -Generation $generation -Leaf 'registration';Copy-CcodInstallSealedSource -Generation $registration -SourcePath $source.Path -Leaf 'StartMenu.CodexRemote-fix.lnk' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null;$manifest=Write-CcodInstallGenerationManifest -Generation $generation -Manifest (New-CcodGenerationManifest $runtimeId @([ordered]@{path='registration/StartMenu.CodexRemote-fix.lnk';length=$source.Length;sha256=$source.Sha256}));Close-CcodInstallFileTransaction -Transaction $generation -Disposition Ready
+        $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install;$fixture.Transactions.Add($product);$retained=Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId -ExpectedManifestSha256 $manifest.Sha256 -FileTransaction $product;$file=Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk'
+        Assert-CcodTrue ($null-ne$file) 'selected manifest file returns an opaque retained source capability'
+        Assert-CcodThrows {Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'C:\outside\arbitrary.lnk'|Out-Null} 'CCOD_INSTALL_PRODUCT_SHORTCUT_INVALID'
+        Assert-CcodThrows {New-CcodInstallDirectory -Transaction $product -Parent $product -Leaf 'state' -CreateIfMissing|Out-Null} 'CCOD_INSTALL_PRODUCT_SCOPE'
+        $state=Open-CcodInstallStateTransaction -InstallRoot $fixture.Install;$fixture.Transactions.Add($state);Assert-CcodThrows {Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId -ExpectedManifestSha256 $manifest.Sha256 -FileTransaction $state|Out-Null} 'CCOD_INSTALL_STATE_SCOPE';Assert-CcodThrows {Open-CcodInstallProductSpecialFolder -Generation $state -Kind Desktop|Out-Null} 'CCOD_INSTALL_PRODUCT_FOLDER_INVALID'
+    }finally{Remove-CcodInstallFileFixture $fixture}
 }
 
 Invoke-CcodTest 'V4 state-only transaction writes records but cannot reach generation or pointer operations' {

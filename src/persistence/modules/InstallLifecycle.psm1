@@ -448,7 +448,7 @@ function Complete-CcodReadyFinalizationRecovery {
         $observed=Read-CcodInstallTransactionRecord -InstallRoot $InstallRoot -TransactionId $TransactionRecord.transactionId
         if($null-eq$observed-or$observed.phase-cne'Ready'){Throw-CcodLifecycleError 'CCOD_INSTALL_READY_FINALIZATION_PENDING' 'Ready finalization snapshot is not visible' $TransactionRecord.transactionId}
         if([string]$proof.Validation.Manifest.projectVersion-ceq$script:CcodProductVersion){
-            try{$registration=&$Adapters.RegisterProduct $InstallRoot ([string]$observed.newRuntimeId) ([string]$proof.Validation.Manifest.projectVersion) ([string]$observed.sealedPackageSha256) $fileTransaction $observed;if($null-eq$registration-or$registration.verified-isnot[bool]-or-not$registration.verified){throw 'registration receipt invalid'};$productRegistrationVerified=$true}catch{$productRegistrationFailure=$_}
+            try{$registration=&$Adapters.RegisterProduct $InstallRoot ([string]$observed.newRuntimeId) ([string]$proof.Validation.Manifest.projectVersion) ([string]$observed.sealedPackageSha256) $null $observed;if($null-eq$registration-or$registration.verified-isnot[bool]-or-not$registration.verified){throw 'registration receipt invalid'};$productRegistrationVerified=$true}catch{$productRegistrationFailure=$_}
         }
     }catch{
         try{$observed=Read-CcodInstallTransactionRecord -InstallRoot $InstallRoot -TransactionId $TransactionRecord.transactionId}catch{}
@@ -664,6 +664,7 @@ function Get-CcodLifecycleSourceFiles {
         'src\persistence\bootstrap.ps1',
         'src\persistence\UninstallBootstrap.ps1',
         'src\persistence\PortableUninstallFinalizer.ps1',
+        'src\persistence\InstalledUninstallFinalizer.ps1',
         'Test-CodexControlOtherDevices.ps1',
         'Start-CodexControlOtherDevices.ps1',
         'Reset-CodexControlOtherDevices.ps1'
@@ -1951,11 +1952,15 @@ function Get-CcodLifecycleAdapters {
         RegisterProduct = {
             param($InstallRoot,$RuntimeId,$Version,$PackageSha256,$FileTransaction,$TransactionRecord)
             $module=Import-Module (Join-Path $PSScriptRoot 'ProductRegistration.psm1') -Force -PassThru -ErrorAction Stop
-            $registration=New-CcodProductRegistration -InstallRoot $InstallRoot -RuntimeId $RuntimeId -Version $Version -PackageSha256 $PackageSha256 -FileTransaction $FileTransaction
-            $proof=[pscustomobject][ordered]@{phase=[string]$TransactionRecord.phase;runtimeId=$RuntimeId;version=$Version;packageSha256=$PackageSha256;bootstrapPath=$registration.bootstrapPath;uninstallerPath=$registration.uninstallerPath}
-            $receipt=Commit-CcodProductRegistration -Registration $registration -FileTransaction $FileTransaction -Adapters @{GetReadyProof={param($Ignored)$proof}.GetNewClosure()}
-            Remove-CcodLegacyProductRegistration -ExpectedAppId '{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}'
-            [pscustomobject]@{verified=[bool]$receipt.verified;legacyRemoved=$true}
+            $ownedTransaction=$null;$sourceCapability=$FileTransaction
+            try{
+                if($null-eq$sourceCapability){Import-Module (Join-Path $PSScriptRoot 'InstallFileTransaction.psm1') -ErrorAction Stop;$ownedTransaction=Open-CcodInstallProductRegistrationTransaction -InstallRoot $InstallRoot;$sourceCapability=Open-CcodInstallRetainedGeneration -InstallRoot $InstallRoot -RuntimeId $RuntimeId -ExpectedManifestSha256 ([string]$TransactionRecord.newManifestSha256) -FileTransaction $ownedTransaction}
+                $registration=New-CcodProductRegistration -InstallRoot $InstallRoot -RuntimeId $RuntimeId -Version $Version -PackageSha256 $PackageSha256 -FileTransaction $sourceCapability
+                $proof=[pscustomobject][ordered]@{phase=[string]$TransactionRecord.phase;runtimeId=$RuntimeId;version=$Version;packageSha256=$PackageSha256;bootstrapPath=$registration.bootstrapPath;uninstallerPath=$registration.uninstallerPath}
+                $receipt=Commit-CcodProductRegistration -Registration $registration -FileTransaction $sourceCapability -Adapters @{GetReadyProof={param($Ignored)$proof}.GetNewClosure()}
+                Remove-CcodLegacyProductRegistration -ExpectedAppId '{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}'
+                [pscustomobject]@{verified=[bool]$receipt.verified;legacyRemoved=$true}
+            }finally{if($null-ne$ownedTransaction){try{Close-CcodInstallFileTransaction -Transaction $ownedTransaction -Disposition Ready}catch{}}}
         }
         NewRuntimeManifest = {
             param($RuntimeDirectory, $ProjectVersion)
@@ -2370,7 +2375,9 @@ function Invoke-CcodInstall {
         if($activeValidation.Valid){
             $sameIdentity=Test-CcodInstallPackageIdentity -TransactionRecord $globalTransaction -ProjectVersion ([string]$projectVersion) -ActiveProjectVersion ([string]$activeValidation.Manifest.projectVersion) -SealedPackageSha256 $SealedPackageSha256 -ActiveRuntimeId ([string]$existingPointer.activeRuntime) -ActiveGeneration ([uint64]$existingPointer.generation)
             if($sameIdentity){
-                return [pscustomobject][ordered]@{Outcome='AlreadyInstalled';Installed=$true;RuntimeId=[string]$existingPointer.activeRuntime;PreviousRuntimeId=$existingPointer.previousRuntime;RepairCompleted=$false}
+                $registration=&$adapters.RegisterProduct $root ([string]$existingPointer.activeRuntime) ([string]$projectVersion) $SealedPackageSha256 $null $globalTransaction
+                if($null-eq$registration-or$registration.verified-isnot[bool]-or-not$registration.verified){Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'AlreadyInstalled product registration reconciliation did not verify' $existingPointer.activeRuntime}
+                return [pscustomobject][ordered]@{Outcome='AlreadyInstalled';Installed=$true;RuntimeId=[string]$existingPointer.activeRuntime;PreviousRuntimeId=$existingPointer.previousRuntime;RepairCompleted=$false;ProductRegistrationVerified=$true}
             }
         }
     }
@@ -2652,7 +2659,8 @@ function Invoke-CcodUninstallCleanup {
         [Parameter(Mandatory)][string]$InstallRoot,
         [Parameter(Mandatory)]$Transaction,
         [Parameter(Mandatory)][scriptblock]$WriteTransaction,
-        [hashtable]$Adapters
+        [hashtable]$Adapters,
+        [switch]$StopAfterTaskRemoval
     )
 
     $adapters = Get-CcodLifecycleAdapters -Adapters $Adapters
@@ -2759,6 +2767,7 @@ function Invoke-CcodUninstallCleanup {
             catch { Throw-CcodLifecycleError 'CCOD_UNINSTALL_TASK_REMOVAL_FAILED' 'The supervisor scheduled task could not be removed' $Transaction }
             Set-CcodUninstallTransactionPhase -Transaction $Transaction -Phase 'TaskRemoved' -WriteTransaction $WriteTransaction -Adapters $adapters
             $phase = 'TaskRemoved'
+            if($StopAfterTaskRemoval){return $Transaction}
         }
 
         if ($phase -eq 'TaskRemoved') {

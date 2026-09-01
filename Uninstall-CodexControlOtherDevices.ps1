@@ -38,14 +38,20 @@ if ($null -ne $installedRuntimeId -and $installedRuntimeId -cmatch '^2\.5\.22-[0
     $bootstrapItem = Get-Item -LiteralPath $bootstrapPath -Force -ErrorAction Stop
     if ($bootstrapItem.PSIsContainer -or (($bootstrapItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_INSTALLED_INVALID' 'The sealed generation uninstall bootstrap is unsafe.' $bootstrapPath }
     if (-not $PSCmdlet.ShouldProcess($expectedInstallRoot,'Run manifest-bound cleanup from the selected sealed generation')) { return [pscustomobject][ordered]@{Outcome='WhatIf';KeptDeviceKeyStore=$true} }
-    try { $prepared=& $bootstrapPath -InstallerRoot $installerRoot -InstallRoot $expectedInstallRoot -Mode Prepare }
+    try { $prepared=& $bootstrapPath -InstallerRoot $installerRoot -InstallRoot $expectedInstallRoot -Mode PrepareInstalled }
     catch { Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_INSTALLED_PREPARE_FAILED' 'Sealed generation cleanup did not reach its external finalization boundary.' $_ }
-    if($null-eq$prepared-or$prepared.transactionId-isnot[string]-or$prepared.transactionId-cnotmatch'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'-or$prepared.phase-cne'ReadyForInno'-or$prepared.runtimeId-cne$installedRuntimeId){Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_INSTALLED_PREPARE_FAILED' 'Sealed generation cleanup returned an invalid receipt.' $prepared}
+    if($null-eq$prepared-or$prepared.transactionId-isnot[string]-or$prepared.transactionId-cnotmatch'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'-or$prepared.phase-cne'TaskRemoved'-or$prepared.runtimeId-cne$installedRuntimeId){Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_INSTALLED_PREPARE_FAILED' 'Sealed generation cleanup returned an invalid receipt.' $prepared}
     $transactionRoot=[IO.Path]::GetFullPath((Join-Path $localAppData 'CodexRemote-fix-uninstall'))
-    $stagedBootstrap=[IO.Path]::GetFullPath((Join-Path (Join-Path (Join-Path $transactionRoot $prepared.transactionId) 'payload') 'src\persistence\UninstallBootstrap.ps1'))
-    if(-not[IO.File]::Exists($stagedBootstrap)){Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_INSTALLED_FINALIZER_MISSING' 'The verified external finalization bootstrap is missing.' $stagedBootstrap}
-    & $stagedBootstrap -InstallerRoot $installerRoot -InstallRoot $expectedInstallRoot -Mode FinalizeReceipt
-    Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_INSTALLED_FINALIZATION_FAILED' 'The external finalization bootstrap returned without completing the uninstall receipt.' $prepared.transactionId
+    $transactionDirectory=[IO.Path]::GetFullPath((Join-Path $transactionRoot $prepared.transactionId))
+    $finalizer=[IO.Path]::GetFullPath((Join-Path $transactionDirectory 'payload\src\persistence\InstalledUninstallFinalizer.ps1'))
+    if(-not[IO.File]::Exists($finalizer)){Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_INSTALLED_FINALIZER_MISSING' 'The verified external installed finalizer is missing.' $finalizer}
+    $powershellPath=Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'WindowsPowerShell\v1.0\powershell.exe'
+    if(-not[IO.File]::Exists($powershellPath)){Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_INSTALLED_FINALIZER_MISSING' 'The Windows PowerShell host is unavailable.' $powershellPath}
+    $current=[Diagnostics.Process]::GetCurrentProcess();try{$wrapperId=[int]$current.Id;$wrapperCreated=$current.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)}finally{$current.Dispose()}
+    function ConvertTo-CcodInstalledUninstallLiteral([string]$Value){"'"+$Value.Replace("'","''")+"'"}
+    $arguments='-NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0} -TransactionId {1} -RuntimeRoot {2} -InstallRoot {3} -WrapperProcessId {4} -WrapperCreationTimeUtc {5}'-f(ConvertTo-CcodInstalledUninstallLiteral $finalizer),(ConvertTo-CcodInstalledUninstallLiteral $prepared.transactionId),(ConvertTo-CcodInstalledUninstallLiteral $installerRoot),(ConvertTo-CcodInstalledUninstallLiteral $expectedInstallRoot),$wrapperId,(ConvertTo-CcodInstalledUninstallLiteral $wrapperCreated)
+    try{$process=Start-Process -FilePath $powershellPath -ArgumentList $arguments -WindowStyle Hidden -RedirectStandardOutput (Join-Path $transactionDirectory 'installed-finalizer.stdout.log') -RedirectStandardError (Join-Path $transactionDirectory 'installed-finalizer.stderr.log') -PassThru -ErrorAction Stop}catch{Throw-CcodPublicUninstallError 'CCOD_UNINSTALL_INSTALLED_FINALIZER_START_FAILED' 'The external installed finalizer could not be started; application state was retained.' $_}
+    return [pscustomobject][ordered]@{Outcome='InstalledFinalizationStarted';TransactionId=[string]$prepared.transactionId;FinalizerProcessId=[int]$process.Id;KeptDeviceKeyStore=$true}
 }
 $portableMarkerPath = Join-Path $installerRoot 'portable-release.json'
 if ([IO.File]::Exists($portableMarkerPath) -or [IO.Directory]::Exists($portableMarkerPath)) {

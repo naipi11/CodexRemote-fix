@@ -19,6 +19,7 @@ $script:CcodLegacyShortcutNames = @(
     'Programs\Codex Control other devices\Uninstall CodexRemote-fix.lnk',
     ('Desktop\Codex ' + [char]0x8BBE + [char]0x5907 + [char]0x8FDE + [char]0x63A5 + ' (Device Connection).lnk')
 )
+$script:CcodLegacyRegistryValueNames=@('DisplayName','DisplayVersion','UninstallString','QuietUninstallString','DisplayIcon','InstallLocation','Publisher','URLInfoAbout','HelpLink','URLUpdateInfo','NoModify','NoRepair','InstallDate','MajorVersion','MinorVersion','VersionMajor','VersionMinor','EstimatedSize','Language','Inno Setup: App Path','Inno Setup: Icon Group','Inno Setup: Setup Version','Inno Setup: User')
 
 function Throw-CcodProductRegistrationError {
     param([Parameter(Mandatory)][string]$Id,[Parameter(Mandatory)][string]$Message,$Target)
@@ -138,6 +139,12 @@ function Get-CcodProductRegistrationAdapters {
         ReadLegacyRegistration = { param($ExpectedAppId) Read-CcodCurrentUserLegacyRegistration -ExpectedAppId $ExpectedAppId }
         ReadVerifiedRegistration = { Read-CcodCurrentUserVerifiedRegistration }
         RemoveLegacyRegistration = { param($ExpectedAppId,$ExpectedShortcutNames) Remove-CcodCurrentUserLegacyRegistration -ExpectedAppId $ExpectedAppId -ExpectedShortcutNames $ExpectedShortcutNames }
+        ReadCurrentProductState = { param($ExpectedRuntimeId) Read-CcodCurrentProductState -ExpectedRuntimeId $ExpectedRuntimeId }
+        RemoveCurrentProductEntry = { param($Entry) Remove-CcodCurrentProductEntry -Entry $Entry }
+        ReadLegacySnapshot = { param($ExpectedAppId) Read-CcodLegacySnapshot -ExpectedAppId $ExpectedAppId }
+        RemoveLegacyEntry = { param($Entry) Remove-CcodLegacySnapshotEntry -Entry $Entry }
+        ReadLegacyEntry = { param($Entry) Read-CcodLegacySnapshotEntry -Entry $Entry }
+        RestoreLegacyEntry = { param($Entry) Restore-CcodLegacySnapshotEntry -Entry $Entry }
     }
     if ($null -eq $Adapters) { return $defaults }
     if ($Adapters -isnot [hashtable]) { Throw-CcodProductRegistrationError 'CCOD_PRODUCT_ADAPTER_INVALID' 'Product adapters must be a hashtable.' $Adapters }
@@ -163,16 +170,14 @@ function Get-CcodProductUninstallCommand($Registration) {
 function Write-CcodCurrentUserProductRegistration {
     param($Registration)
     $path=Get-CcodProductRegistryPath;$command=Get-CcodProductUninstallCommand $Registration
+    $shell=$null;$startLink=$null;$desktopLink=$null;try{$shell=New-Object -ComObject WScript.Shell;$startLink=$shell.CreateShortcut([string]$Registration.startMenuShortcut.candidatePath);$desktopLink=$shell.CreateShortcut([string]$Registration.desktopShortcut.candidatePath);$target=[IO.Path]::GetFullPath([string]$startLink.TargetPath);$arguments=[string]$startLink.Arguments;if([IO.Path]::GetFullPath([string]$desktopLink.TargetPath)-cne$target-or[string]$desktopLink.Arguments-cne$arguments){throw 'candidate target mismatch'}}finally{if($null-ne$startLink){[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($startLink)};if($null-ne$desktopLink){[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($desktopLink)};if($null-ne$shell){[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)}}
     New-Item -Path $path -Force -ErrorAction Stop|Out-Null
-    $values=[ordered]@{DisplayName='CodexRemote-fix';DisplayVersion=[string]$Registration.version;Publisher='naipi11';InstallLocation=[string]$Registration.runtimeRoot;UninstallString=$command;QuietUninstallString=($command+' -Confirm:$false');NoModify=1;NoRepair=1;CcodRuntimeId=[string]$Registration.runtimeId;CcodPackageSha256=[string]$Registration.packageSha256}
+    $values=[ordered]@{DisplayName='CodexRemote-fix';DisplayVersion=[string]$Registration.version;Publisher='naipi11';InstallLocation=[string]$Registration.runtimeRoot;UninstallString=$command;QuietUninstallString=($command+' -Confirm:$false');NoModify=1;NoRepair=1;CcodRuntimeId=[string]$Registration.runtimeId;CcodPackageSha256=[string]$Registration.packageSha256;CcodStartMenuSha256=Get-CcodProductFileSha256 ([string]$Registration.startMenuShortcut.candidatePath);CcodDesktopSha256=Get-CcodProductFileSha256 ([string]$Registration.desktopShortcut.candidatePath);CcodShortcutTarget=$target;CcodShortcutArguments=$arguments}
     foreach($name in $values.Keys){$type=if($name-in@('NoModify','NoRepair')){'DWord'}else{'String'};New-ItemProperty -LiteralPath $path -Name $name -Value $values[$name] -PropertyType $type -Force -ErrorAction Stop|Out-Null}
 }
 function Read-CcodCurrentUserProductRegistration {
     param($Registration)
-    try{$value=Get-ItemProperty -LiteralPath (Get-CcodProductRegistryPath) -ErrorAction Stop}catch{return $null}
-    $command=Get-CcodProductUninstallCommand $Registration
-    if($value.DisplayName-cne'CodexRemote-fix'-or$value.DisplayVersion-cne$Registration.version-or$value.Publisher-cne'naipi11'-or$value.InstallLocation-cne$Registration.runtimeRoot-or$value.UninstallString-cne$command-or$value.QuietUninstallString-cne($command+' -Confirm:$false')-or[int]$value.NoModify-ne1-or[int]$value.NoRepair-ne1-or$value.CcodRuntimeId-cne$Registration.runtimeId-or$value.CcodPackageSha256-cne$Registration.packageSha256){return $null}
-    $Registration
+    $state=Read-CcodCurrentProductState -ExpectedRuntimeId ([string]$Registration.runtimeId);if($null-ne$state-and$state.valid){$Registration}else{$null}
 }
 function Get-CcodProductShortcutDestination {
     param([string]$Kind)
@@ -197,11 +202,11 @@ function New-CcodProductShortcutCandidates {
 }
 function Write-CcodCurrentUserProductShortcut {
     param([string]$Kind,$Shortcut,$FileTransaction)
-    $source=[IO.Path]::GetFullPath([string]$Shortcut.candidatePath);$runtime=[IO.Path]::GetFullPath((Split-Path (Split-Path $source -Parent) -Parent));if(-not$source.StartsWith($runtime.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)-or-not[IO.File]::Exists($source)){throw 'shortcut candidate missing'}
-    $item=Get-Item -LiteralPath $source -Force -ErrorAction Stop;if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){throw 'shortcut candidate unsafe'}
     Import-Module (Join-Path $PSScriptRoot 'InstallFileTransaction.psm1') -ErrorAction Stop
-    $folder=Open-CcodInstallProductSpecialFolder -FileTransaction $FileTransaction -Kind $Kind
-    Copy-CcodInstallProductShortcut -Folder $folder -Kind $Kind -SourcePath $source -Leaf 'CodexRemote-fix.lnk' -ExpectedLength ([int64]$item.Length) -ExpectedSha256 (Get-CcodProductFileSha256 $source) -FileTransaction $FileTransaction|Out-Null
+    $relative='registration/'+$(if($Kind-ceq'StartMenu'){'StartMenu.CodexRemote-fix.lnk'}else{'Desktop.CodexRemote-fix.lnk'})
+    $source=Open-CcodInstallRetainedFile -Generation $FileTransaction -RelativePath $relative
+    $folder=Open-CcodInstallProductSpecialFolder -Generation $FileTransaction -Kind $Kind
+    Copy-CcodInstallProductShortcut -Folder $folder -Source $source -Kind $Kind -Leaf 'CodexRemote-fix.lnk'|Out-Null
 }
 function Read-CcodCurrentUserProductShortcut {
     param([string]$Kind,$Shortcut)
@@ -231,6 +236,35 @@ function Remove-CcodCurrentUserLegacyRegistration {
     foreach($name in $ExpectedShortcutNames){$relative=$name.Substring($name.IndexOf('\')+1);$candidate=if($name.StartsWith('Programs\',[StringComparison]::Ordinal)){Join-Path $programs $relative}else{Join-Path $desktop $relative};if(Test-Path -LiteralPath $candidate -PathType Leaf){Remove-Item -LiteralPath $candidate -Force -ErrorAction Stop}}
     $path=Get-CcodLegacyRegistryPath $ExpectedAppId;if(Test-Path -LiteralPath $path -PathType Container){Remove-Item -LiteralPath $path -Force -ErrorAction Stop}
 }
+
+function Get-CcodProductShortcutEvidence([string]$Kind){
+    $path=Get-CcodProductShortcutDestination $Kind;if(-not[IO.File]::Exists($path)){return $null};$item=Get-Item -LiteralPath $path -Force -ErrorAction Stop;if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){return $null};$shell=$null;$link=$null;try{$shell=New-Object -ComObject WScript.Shell;$link=$shell.CreateShortcut($path);[pscustomobject]@{kind=$Kind;path=$path;sha256=Get-CcodProductFileSha256 $path;target=[IO.Path]::GetFullPath([string]$link.TargetPath);arguments=[string]$link.Arguments}}finally{if($null-ne$link){[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($link)};if($null-ne$shell){[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)}}
+}
+function Read-CcodCurrentProductState {
+    param([string]$ExpectedRuntimeId)
+    try{
+        $subkey='Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexRemote-fix';$key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subkey,$false);if($null-eq$key){return [pscustomobject]@{valid=$true;reason=$null;entries=@()}}
+        try{$allowed=@('CcodDesktopSha256','CcodPackageSha256','CcodRuntimeId','CcodShortcutArguments','CcodShortcutTarget','CcodStartMenuSha256','DisplayName','DisplayVersion','InstallLocation','NoModify','NoRepair','Publisher','QuietUninstallString','UninstallString');$names=@($key.GetValueNames()|Sort-Object);if(($names-join'|')-cne(($allowed|Sort-Object)-join'|')){return [pscustomobject]@{valid=$false;reason='UnknownRegistryValue';entries=@()}};$runtime=[string]$key.GetValue('CcodRuntimeId',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);$installLocation=[string]$key.GetValue('InstallLocation');$expectedUninstaller=Join-Path $installLocation 'Uninstall-CodexControlOtherDevices.ps1';$expectedCommand='"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"'-f(Get-CcodProductPowerShellPath),$expectedUninstaller;if($runtime-cne$ExpectedRuntimeId-or$installLocation-cne[IO.Path]::GetFullPath((Join-Path (Join-Path (Split-Path (Split-Path $installLocation -Parent) -Parent) 'runtime') $runtime))-or[string]$key.GetValue('DisplayName')-cne'CodexRemote-fix'-or[string]$key.GetValue('DisplayVersion')-cne'2.5.22'-or[string]$key.GetValue('Publisher')-cne'naipi11'-or[string]$key.GetValue('UninstallString')-cne$expectedCommand-or[string]$key.GetValue('QuietUninstallString')-cne($expectedCommand+' -Confirm:$false')-or[int]$key.GetValue('NoModify')-ne1-or[int]$key.GetValue('NoRepair')-ne1-or[string]$key.GetValue('CcodPackageSha256')-cnotmatch'^[0-9a-f]{64}$'){return [pscustomobject]@{valid=$false;reason='RegistryMismatch';entries=@()}};foreach($dword in @('NoModify','NoRepair')){if($key.GetValueKind($dword)-ne[Microsoft.Win32.RegistryValueKind]::DWord){return [pscustomobject]@{valid=$false;reason='RegistryType';entries=@()}}};foreach($stringName in @($allowed|Where-Object{$_-notin@('NoModify','NoRepair')})){if($key.GetValueKind($stringName)-ne[Microsoft.Win32.RegistryValueKind]::String){return [pscustomobject]@{valid=$false;reason='RegistryType';entries=@()}}};$target=[string]$key.GetValue('CcodShortcutTarget');$arguments=[string]$key.GetValue('CcodShortcutArguments');$start=Get-CcodProductShortcutEvidence 'StartMenu';$desktop=Get-CcodProductShortcutEvidence 'Desktop';if($null-eq$start-or$null-eq$desktop-or$start.target-cne$target-or$desktop.target-cne$target-or$start.arguments-cne$arguments-or$desktop.arguments-cne$arguments-or$start.sha256-cne[string]$key.GetValue('CcodStartMenuSha256')-or$desktop.sha256-cne[string]$key.GetValue('CcodDesktopSha256')){return [pscustomobject]@{valid=$false;reason='ShortcutMismatch';entries=@()}};$captured=[ordered]@{};foreach($name in $names){$captured[$name]=[pscustomobject]@{value=$key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);kind=[string]$key.GetValueKind($name)}};return [pscustomobject]@{valid=$true;reason=$null;entries=@([pscustomobject]@{kind='StartMenu';path=$start.path;sha256=$start.sha256},[pscustomobject]@{kind='Desktop';path=$desktop.path;sha256=$desktop.sha256},[pscustomobject]@{kind='Registry';path=$subkey;valueNames=$names;values=$captured})}}
+        finally{$key.Dispose()}
+    }catch{return [pscustomobject]@{valid=$false;reason='Ambiguous';entries=@()}}
+}
+function Remove-CcodCurrentProductEntry {
+    param($Entry)
+    if($Entry-is[string]){return}
+    if($Entry.kind-in@('StartMenu','Desktop')){$path=[IO.Path]::GetFullPath([string]$Entry.path);if(-not[IO.File]::Exists($path)-or(Get-CcodProductFileSha256 $path)-cne[string]$Entry.sha256){throw 'shortcut changed'};Remove-Item -LiteralPath $path -Force -ErrorAction Stop;return}
+    if($Entry.kind-cne'Registry'){throw 'unknown product entry'};$key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey([string]$Entry.path,$true);if($null-eq$key){return};try{if((@($key.GetValueNames()|Sort-Object)-join'|')-cne((@($Entry.valueNames)|Sort-Object)-join'|')-or$key.GetSubKeyNames().Count-ne0){throw 'registry changed'};foreach($name in @($Entry.valueNames)){if([string]$key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)-cne[string]$Entry.values[$name].value-or[string]$key.GetValueKind($name)-cne[string]$Entry.values[$name].kind){throw 'registry value changed'}};foreach($name in @($Entry.valueNames)){$key.DeleteValue($name,$true)};if($key.GetValueNames().Count-ne0){throw 'registry not empty'}}finally{$key.Dispose()};[Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey([string]$Entry.path,$false)
+}
+function Remove-CcodProductRegistration {
+    [CmdletBinding()]param([Parameter(Mandatory)][string]$ExpectedRuntimeId,[hashtable]$Adapters)
+    if($ExpectedRuntimeId-cnotmatch'^2\.5\.22-[0-9a-f]{16}-[0-9a-f]{32}$'){Throw-CcodProductRegistrationError 'CCOD_PRODUCT_CLEANUP_INVALID' 'Expected product runtime ID is invalid' $ExpectedRuntimeId};$adapter=Get-CcodProductRegistrationAdapters $Adapters;$state=&$adapter.ReadCurrentProductState $ExpectedRuntimeId;if($null-eq$state-or$state.valid-isnot[bool]-or-not$state.valid-or$null-eq$state.entries){Throw-CcodProductRegistrationError 'CCOD_PRODUCT_CLEANUP_INVALID' 'Current product state is not an exact matched registration' $ExpectedRuntimeId};$entries=@($state.entries);if($entries.Count-notin@(0,3)){Throw-CcodProductRegistrationError 'CCOD_PRODUCT_CLEANUP_INVALID' 'Current product state is ambiguous' $ExpectedRuntimeId};foreach($entry in $entries){&$adapter.RemoveCurrentProductEntry $entry}
+}
+function Read-CcodLegacySnapshot {
+    param([string]$ExpectedAppId)
+    $legacy=Read-CcodCurrentUserLegacyRegistration $ExpectedAppId;if($null-eq$legacy){return $null};$entries=[Collections.Generic.List[object]]::new();$keyPath=Get-CcodLegacyRegistryPath $ExpectedAppId;$key=Get-Item -LiteralPath $keyPath -ErrorAction Stop;$names=@($key.GetValueNames());if($key.GetSubKeyNames().Count-ne0-or@($names|Where-Object{$script:CcodLegacyRegistryValueNames-cnotcontains$_}).Count-ne0){throw 'legacy registry contains unknown state'};$values=[ordered]@{};foreach($name in $names){$values[$name]=[pscustomobject]@{value=$key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);kind=[string]$key.GetValueKind($name)}};$entries.Add([pscustomobject]@{kind='Registry';path=$keyPath;values=$values});$programs=[Environment]::GetFolderPath([Environment+SpecialFolder]::Programs);$desktop=[Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop);foreach($name in $legacy.shortcutNames){$relative=$name.Substring($name.IndexOf('\')+1);$path=[IO.Path]::GetFullPath($(if($name.StartsWith('Programs\',[StringComparison]::Ordinal)){Join-Path $programs $relative}else{Join-Path $desktop $relative}));$item=Get-Item -LiteralPath $path -Force -ErrorAction Stop;if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){throw 'legacy shortcut unsafe'};$bytes=[IO.File]::ReadAllBytes($path);$entries.Add([pscustomobject]@{kind='Shortcut';name=$name;path=$path;sha256=Get-CcodProductFileSha256 $path;bytesBase64=[Convert]::ToBase64String($bytes)})};[pscustomobject]@{appId=$ExpectedAppId;entries=@($entries)}
+}
+function Remove-CcodLegacySnapshotEntry {param($Entry);if($Entry-is[string]){return};if($Entry.kind-ceq'Registry'){$key=$null;try{$key=Get-Item -LiteralPath $Entry.path -ErrorAction Stop;if((@($key.GetValueNames()|Sort-Object)-join'|')-cne((@($Entry.values.Keys)|Sort-Object)-join'|')-or$key.GetSubKeyNames().Count-ne0){throw 'legacy registry changed'};foreach($name in @($Entry.values.Keys)){$current=$key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);if([string]$current-cne[string]$Entry.values[$name].value-or[string]$key.GetValueKind($name)-cne[string]$Entry.values[$name].kind){throw 'legacy registry value changed'}};foreach($name in @($Entry.values.Keys)){$key.DeleteValue($name,$true)};$key.Dispose();$key=$null;Remove-Item -LiteralPath $Entry.path -Force -ErrorAction Stop;return}catch{if($null-ne$key){$key.Dispose()};if(-not(Test-Path -LiteralPath $Entry.path)){New-Item -Path $Entry.path -Force|Out-Null};foreach($name in $Entry.values.Keys){if($null-eq(Get-ItemProperty -LiteralPath $Entry.path -Name $name -ErrorAction SilentlyContinue)){$kind=[Enum]::Parse([Microsoft.Win32.RegistryValueKind],[string]$Entry.values[$name].kind);New-ItemProperty -LiteralPath $Entry.path -Name $name -Value $Entry.values[$name].value -PropertyType $kind -Force|Out-Null}};throw}};if(-not[IO.File]::Exists($Entry.path)-or(Get-CcodProductFileSha256 $Entry.path)-cne$Entry.sha256){throw 'legacy shortcut changed'};Remove-Item -LiteralPath $Entry.path -Force -ErrorAction Stop}
+function Read-CcodLegacySnapshotEntry {param($Entry);if($Entry-is[string]){return $null};if($Entry.kind-ceq'Registry'){if(Test-Path -LiteralPath $Entry.path){return 'Present'};return $null};if([IO.File]::Exists($Entry.path)){return Get-CcodProductFileSha256 $Entry.path};$null}
+function Restore-CcodLegacySnapshotEntry {param($Entry);if($Entry-is[string]){return};if($Entry.kind-ceq'Registry'){if(Test-Path -LiteralPath $Entry.path){throw 'legacy registry replacement present'};New-Item -Path $Entry.path -Force|Out-Null;foreach($name in $Entry.values.Keys){$kind=[Enum]::Parse([Microsoft.Win32.RegistryValueKind],[string]$Entry.values[$name].kind);New-ItemProperty -LiteralPath $Entry.path -Name $name -Value $Entry.values[$name].value -PropertyType $kind -Force|Out-Null};return};if([IO.File]::Exists($Entry.path)-or[IO.Directory]::Exists($Entry.path)){throw 'legacy shortcut replacement present'};[IO.Directory]::CreateDirectory((Split-Path $Entry.path -Parent))|Out-Null;$bytes=[Convert]::FromBase64String([string]$Entry.bytesBase64);$stream=[IO.File]::Open($Entry.path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read);try{$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)}finally{$stream.Dispose()};if((Get-CcodProductFileSha256 $Entry.path)-cne$Entry.sha256){throw 'legacy shortcut restore mismatch'}}
 
 function Commit-CcodProductRegistration {
     [CmdletBinding()]
@@ -284,8 +318,10 @@ function Remove-CcodLegacyProductRegistration {
         $null -eq $legacy.shortcutNames -or (@($legacy.shortcutNames) -join '|') -cne ($script:CcodLegacyShortcutNames -join '|')) {
         Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy product entry or shortcut names do not match the exact migration allowlist.' $ExpectedAppId
     }
-    try { & $adapter.RemoveLegacyRegistration $ExpectedAppId @($script:CcodLegacyShortcutNames) }
-    catch { Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy product migration failed without authorizing broader deletion.' $ExpectedAppId }
+    $snapshot=&$adapter.ReadLegacySnapshot $ExpectedAppId
+    if($null-eq$snapshot-or$snapshot.appId-cne$ExpectedAppId-or@($snapshot.entries).Count-ne9){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy snapshot is incomplete or ambiguous' $ExpectedAppId}
+    $removed=[Collections.Generic.List[object]]::new()
+    try{foreach($entry in @($snapshot.entries)){&$adapter.RemoveLegacyEntry $entry;$removed.Add($entry)}}catch{for($index=$removed.Count-1;$index-ge0;$index--){$entry=$removed[$index];try{if($null-eq(&$adapter.ReadLegacyEntry $entry)){&$adapter.RestoreLegacyEntry $entry}}catch{}};Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy product migration failed and exact prior entries were compensated where still absent.' $ExpectedAppId}
 }
 
-Export-ModuleMember -Function New-CcodProductRegistration,Test-CcodProductRegistration,Commit-CcodProductRegistration,Remove-CcodLegacyProductRegistration
+Export-ModuleMember -Function New-CcodProductRegistration,Test-CcodProductRegistration,Commit-CcodProductRegistration,Remove-CcodProductRegistration,Remove-CcodLegacyProductRegistration

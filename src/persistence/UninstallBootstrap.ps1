@@ -2,7 +2,7 @@
 param(
     [string]$InstallerRoot,
     [string]$InstallRoot,
-    [ValidateSet('Prepare','FinalizeReceipt')][string]$Mode
+    [ValidateSet('Prepare','PrepareInstalled','FinalizeReceipt')][string]$Mode
 )
 
 Set-StrictMode -Version Latest
@@ -20,7 +20,9 @@ $script:CcodUninstallContextFields = @('runtimeId','runtimeGeneration','leaseEpo
 $script:CcodUninstallPayloadEntries = @(
     'src/persistence/UninstallBootstrap.ps1',
     'src/persistence/PortableUninstallFinalizer.ps1',
+    'src/persistence/InstalledUninstallFinalizer.ps1',
     'src/persistence/modules/InstallLifecycle.psm1',
+    'src/persistence/modules/ProductRegistration.psm1',
     'src/persistence/modules/PortableRelease.psm1',
     'src/persistence/modules/PersistenceIO.psm1',
     'src/persistence/modules/RuntimeManifest.psm1',
@@ -353,7 +355,7 @@ function New-CcodUninstallBootstrapResumeContext {
 }
 
 function Get-CcodUninstallBootstrapVerifiedRuntimeContext {
-    param([Parameter(Mandatory)][string]$InstallerRoot,[Parameter(Mandatory)][string]$InstallRoot,[hashtable]$SelectorAdapters)
+    param([Parameter(Mandatory)][string]$InstallerRoot,[Parameter(Mandatory)][string]$InstallRoot,[hashtable]$SelectorAdapters,[string]$InvocationPath=$PSCommandPath)
     try {
         $installer = Get-CcodUninstallBootstrapComparablePath -Path $InstallerRoot -Kind 'Installer root'
         $install = Get-CcodUninstallBootstrapComparablePath -Path $InstallRoot -Kind 'Install root'
@@ -365,8 +367,8 @@ function Get-CcodUninstallBootstrapVerifiedRuntimeContext {
         }
         Assert-CcodUninstallBootstrapInstallRootOwner -Path $install -UserSid $identity.userSid
         $expectedScript = Resolve-CcodUninstallBootstrapChildPath -Root $installer -RelativePath 'src\persistence\UninstallBootstrap.ps1' -RequireLeafFile
-        if ([string]::IsNullOrWhiteSpace($PSCommandPath) -or (Get-CcodUninstallBootstrapFullPath -Path $PSCommandPath -Kind 'Bootstrap script') -cne $expectedScript) {
-            Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'The uninstall bootstrap was not launched from the installed application root' $PSCommandPath
+        if ([string]::IsNullOrWhiteSpace($InvocationPath) -or (Get-CcodUninstallBootstrapFullPath -Path $InvocationPath -Kind 'Bootstrap script') -cne $expectedScript) {
+            Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'The uninstall bootstrap was not launched from the installed application root' $InvocationPath
         }
         try{$stateRoot=Resolve-CcodUninstallBootstrapChildPath -Root $install -RelativePath 'state' -AllowMissingLeaf}catch{Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active generation selector path is unsafe' $install}
         $pointerRootItem=$null;$pointerRootAbsent=$false;$getSelectorRootItem=if($null-ne$SelectorAdapters-and$SelectorAdapters.ContainsKey('GetSelectorRootItem')){$SelectorAdapters.GetSelectorRootItem}else{{param($Path)Get-Item -LiteralPath $Path -Force -ErrorAction Stop}}
@@ -911,7 +913,7 @@ function Get-CcodUninstallBootstrapAdapters {
             Write-CcodUninstallBootstrapStoredReceipt -TransactionDirectory $TransactionRoot -Transaction $Transaction
         }
         RunCleanup = {
-            param($InstallerRoot,$InstallRoot,$TransactionRoot,$Transaction,$WriteTransaction)
+            param($InstallerRoot,$InstallRoot,$TransactionRoot,$Transaction,$WriteTransaction,$Mode)
             $payloadRoot = Resolve-CcodUninstallBootstrapChildPath -Root $TransactionRoot -RelativePath 'payload'
             $modulePath = Resolve-CcodUninstallBootstrapChildPath -Root $payloadRoot -RelativePath 'src\persistence\modules\InstallLifecycle.psm1' -RequireLeafFile
             $module = Import-Module -Name $modulePath -Force -PassThru -ErrorAction Stop
@@ -920,9 +922,9 @@ function Get-CcodUninstallBootstrapAdapters {
                 & $WriteTransaction $TransactionRoot $Value
             }.GetNewClosure()
             return (& $module {
-                param($Root,$Value,$Writer)
-                Invoke-CcodUninstallCleanup -InstallRoot $Root -Transaction $Value -WriteTransaction $Writer
-            } $InstallRoot $Transaction $writer)
+                param($Root,$Value,$Writer,$DeferRemoval)
+                Invoke-CcodUninstallCleanup -InstallRoot $Root -Transaction $Value -WriteTransaction $Writer -StopAfterTaskRemoval:([bool]$DeferRemoval)
+            } $InstallRoot $Transaction $writer ($Mode -ceq 'PrepareInstalled'))
         }
         RemoveProductRegistration = {
             param($Context)
@@ -947,15 +949,8 @@ function Get-CcodUninstallBootstrapAdapters {
 function Remove-CcodUninstallBootstrapProductRegistration {
     param([Parameter(Mandatory)]$Context)
     Assert-CcodUninstallBootstrapContext $Context
-    $registryPath='HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexRemote-fix'
-    $programs=[Environment]::GetFolderPath([Environment+SpecialFolder]::Programs);$desktop=[Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)
-    if([string]::IsNullOrWhiteSpace($programs)-or[string]::IsNullOrWhiteSpace($desktop)-or-not[IO.Path]::IsPathRooted($programs)-or-not[IO.Path]::IsPathRooted($desktop)){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PRODUCT_REGISTRATION_INVALID' 'Current-user product special folders are unavailable' $null}
-    $shortcuts=@([IO.Path]::GetFullPath((Join-Path (Join-Path $programs 'CodexRemote-fix') 'CodexRemote-fix.lnk')),[IO.Path]::GetFullPath((Join-Path $desktop 'CodexRemote-fix.lnk')))
-    $registryPresent=Test-Path -LiteralPath $registryPath -PathType Container
-    if($registryPresent){$value=Get-ItemProperty -LiteralPath $registryPath -ErrorAction Stop;if($value.CcodRuntimeId-isnot[string]-or[string]$value.CcodRuntimeId-cne[string]$Context.runtimeId){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PRODUCT_REGISTRATION_INVALID' 'Current product registration does not match the verified runtime' $registryPath}}
-    foreach($path in $shortcuts){if([IO.File]::Exists($path)-or[IO.Directory]::Exists($path)){$item=Get-Item -LiteralPath $path -Force -ErrorAction Stop;if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PRODUCT_REGISTRATION_INVALID' 'Current product shortcut is not an exact regular file' $path}}}
-    foreach($path in $shortcuts){if([IO.File]::Exists($path)){Remove-Item -LiteralPath $path -Force -ErrorAction Stop}}
-    if($registryPresent){Remove-Item -LiteralPath $registryPath -Force -ErrorAction Stop}
+    $modulePath=Join-Path $PSScriptRoot 'modules\ProductRegistration.psm1';if(-not[IO.File]::Exists($modulePath)){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PRODUCT_REGISTRATION_INVALID' 'Matched product registration module is missing' $modulePath}
+    try{Import-Module $modulePath -Force -ErrorAction Stop;Remove-CcodProductRegistration -ExpectedRuntimeId ([string]$Context.runtimeId)}catch{Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PRODUCT_REGISTRATION_INVALID' 'Current product registration did not match the verified uninstall runtime' $Context.runtimeId}
 }
 
 function Set-CcodUninstallBootstrapFailedTransaction {
@@ -976,7 +971,7 @@ function Invoke-CcodUninstallBootstrap {
     param(
         [Parameter(Mandatory)][string]$InstallerRoot,
         [Parameter(Mandatory)][string]$InstallRoot,
-        [Parameter(Mandatory)][ValidateSet('Prepare','FinalizeReceipt')][string]$Mode,
+        [Parameter(Mandatory)][ValidateSet('Prepare','PrepareInstalled','FinalizeReceipt')][string]$Mode,
         [hashtable]$Adapters
     )
 
@@ -1056,11 +1051,12 @@ function Invoke-CcodUninstallBootstrap {
             $stagePayload = $transaction.phase -ceq 'Requested' -or ($transaction.phase -ceq 'Failed' -and $transaction.resumePhase -ceq 'Requested')
         }
         if ($stagePayload) { & $adapter.StagePayload $InstallerRoot $InstallRoot $context $stageRoot }
-        $result = & $adapter.RunCleanup $InstallerRoot $InstallRoot $stageRoot $transaction $adapter.WriteTransaction
+        $result = & $adapter.RunCleanup $InstallerRoot $InstallRoot $stageRoot $transaction $adapter.WriteTransaction $Mode
         if ($null -eq $result) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PREPARE_FAILED' 'The staged cleanup returned no transaction receipt' $stageRoot }
         Assert-CcodUninstallBootstrapTransactionMatchesContext $result $context
-        if ($result.phase -ne 'ReadyForInno') { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PREPARE_FAILED' 'The staged cleanup did not reach the Inno boundary' $result }
-        & $adapter.RemoveProductRegistration $context
+        $expectedPhase=if($Mode-ceq'PrepareInstalled'){'TaskRemoved'}else{'ReadyForInno'}
+        if ($result.phase -cne $expectedPhase) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PREPARE_FAILED' 'The staged cleanup did not reach its expected external boundary' $result }
+        if($Mode-ceq'Prepare'){& $adapter.RemoveProductRegistration $context}
         & $adapter.WriteReceipt $stageRoot $result
         return $result
     } catch {
@@ -1078,6 +1074,7 @@ if ($MyInvocation.InvocationName -ne '.') {
     try {
         $receipt = Invoke-CcodUninstallBootstrap -InstallerRoot $InstallerRoot -InstallRoot $InstallRoot -Mode $Mode
         if ($Mode -eq 'Prepare' -and $receipt.phase -ne 'ReadyForInno') { exit 3 }
+        if ($Mode -eq 'PrepareInstalled' -and $receipt.phase -ne 'TaskRemoved') { exit 3 }
         if ($Mode -eq 'FinalizeReceipt' -and $receipt.phase -ne 'Completed') { exit 3 }
         exit 0
     } catch {

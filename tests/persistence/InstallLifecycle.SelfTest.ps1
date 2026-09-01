@@ -46,6 +46,7 @@ function New-CcodLifecycleSourceFixture {
     [IO.File]::WriteAllText((Join-Path $Root 'src\persistence\UninstallBootstrap.ps1'), "# Uninstall bootstrap fixture`r`n", [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $Root 'src\persistence\bootstrap.ps1'), ("# Stable bootstrap fixture" + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $Root 'src\persistence\PortableUninstallFinalizer.ps1'), ("# Portable finalizer fixture" + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $Root 'src\persistence\InstalledUninstallFinalizer.ps1'), ("# Installed finalizer fixture" + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
     foreach ($module in @('PersistenceIO.psm1', 'RuntimeManifest.psm1', 'CompatibilityProbe.psm1', 'ProcessControl.psm1', 'StateStore.psm1', 'TransitionJournal.psm1', 'SessionEngine.psm1', 'SupervisorEngine.psm1', 'KernelObjects.psm1', 'TrayUi.psm1', 'UiLocalization.psm1', 'UiPreferences.psm1', 'ScheduledTask.psm1', 'PortableRelease.psm1')) {
         [IO.File]::WriteAllText((Join-Path $Root "src\persistence\modules\$module"), "# $module`r`n", [Text.UTF8Encoding]::new($false))
     }
@@ -486,7 +487,7 @@ $results += Invoke-CcodTest 'same-version immutable install identity is idempote
 $results += Invoke-CcodTest 'Invoke-CcodInstall is idempotent only for the active Ready runtime and exact sealed package identity' {
     $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
     try{
-        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22-idempotent'|Out-Null
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null
         $nodePath=New-CcodLifecycleFakeNode -Root $nodeRoot
         $firstFake=New-CcodLifecycleFake -NodePath $nodePath
         $first=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters $firstFake.Adapters
@@ -500,6 +501,8 @@ $results += Invoke-CcodTest 'Invoke-CcodInstall is idempotent only for the activ
         Assert-CcodEqual 1 @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory).Count 'idempotence creates no generation'
         Assert-CcodEqual 0 $sameFake.World.TaskInstalled 'idempotence performs no task mutation'
         Assert-CcodEqual 0 $sameFake.World.TaskStarted 'idempotence starts no process'
+        Assert-CcodEqual 1 $sameFake.World.ProductRegistrationCalls 'AlreadyInstalled reconciles product registration after revalidating exact Ready identity'
+        Assert-CcodTrue $same.ProductRegistrationVerified 'AlreadyInstalled reports a fresh verified registration reconciliation'
         $conflictFake=New-CcodLifecycleFake -NodePath $nodePath
         Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('b'*64) -Adapters $conflictFake.Adapters|Out-Null} 'CCOD_INSTALL_PACKAGE_CONFLICT'
         $conflictPointer=Read-CcodActiveRuntime -InstallRoot $install
@@ -1712,6 +1715,22 @@ $results += Invoke-CcodTest 'a later invocation recovers one missing Ready trans
         Assert-CcodEqual 0 $recoveryFake.World.TaskStarted 'recovery does not restart the product'
         Assert-CcodEqual 0 @($recoveryFake.World.Calls|Where-Object{$_-like'Validate:*'}).Count 'state-only recovery does not depend on the vanished source checkout'
     } finally { Remove-CcodReadyFinalizationGapFixture $fixture }
+}
+
+$results += Invoke-CcodTest 'registration failure during Ready-finalization recovery is retried by a later same-package invocation' {
+    $fixture=New-CcodReadyFinalizationGapFixture
+    try{
+        Remove-Item -LiteralPath $fixture.Source -Recurse -Force
+        $failed=New-CcodLifecycleFake -NodePath $fixture.Node;$failed.World.ProductRegistrationFailure=$true
+        Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $fixture.Source -InstallRoot $fixture.Install -Adapters $failed.Adapters|Out-Null} 'CCOD_PRODUCT_REGISTRATION_FAILED'
+        $module=Get-Module InstallLifecycle;$ready=&$module {param($Root,$Id)Read-CcodInstallTransactionRecord -InstallRoot $Root -TransactionId $Id} $fixture.Install $fixture.Transaction.transactionId
+        Assert-CcodEqual 'Ready' $ready.phase 'recovery registration failure leaves the recovered transaction Ready'
+        New-CcodLifecycleSourceFixture -Root $fixture.Source -Version '2.5.22'|Out-Null
+        $retry=New-CcodLifecycleFake -NodePath $fixture.Node
+        $result=Invoke-CcodInstall -SourceRoot $fixture.Source -InstallRoot $fixture.Install -SealedPackageSha256 ([string]$ready.sealedPackageSha256) -Adapters $retry.Adapters
+        Assert-CcodEqual 'AlreadyInstalled' $result.Outcome 'same-package invocation reconciles registration after recovery failure'
+        Assert-CcodEqual 1 $retry.World.ProductRegistrationCalls 'recovery registration retry occurs exactly once'
+    }finally{foreach($path in @($fixture.Source,$fixture.Install,$fixture.NodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
 }
 
 # Production mutation caught: finalizing ProtectionReady when any receipt, selected pointer, or recorded manifest proof no longer matches.
@@ -3227,6 +3246,10 @@ $results += Invoke-CcodTest 'registration failure preserves durable Ready withou
         $module=Get-Module InstallLifecycle;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
         Assert-CcodEqual 'Ready' $head.phase 'post-Ready registration failure cannot downgrade the lifecycle transaction'
         Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'registration failure appends no Failed transaction snapshot'
+        $retry=New-CcodLifecycleFake -NodePath $node
+        $result=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('3'*64) -Adapters $retry.Adapters
+        Assert-CcodEqual 'AlreadyInstalled' $result.Outcome 'later same-package invocation retries after post-Ready registration failure'
+        Assert-CcodEqual 1 $retry.World.ProductRegistrationCalls 'normal Ready registration retry occurs exactly once'
     }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
 }
 

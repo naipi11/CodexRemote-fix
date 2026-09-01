@@ -3,12 +3,15 @@ $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $bootstrapScript = Join-Path $repositoryRoot 'src\persistence\UninstallBootstrap.ps1'
+$installedFinalizerScript = Join-Path $repositoryRoot 'src\persistence\InstalledUninstallFinalizer.ps1'
 
 if (-not (Test-Path -LiteralPath $bootstrapScript -PathType Leaf)) {
     throw "Uninstall bootstrap script is missing: $bootstrapScript"
 }
 
 . $bootstrapScript
+if (-not (Test-Path -LiteralPath $installedFinalizerScript -PathType Leaf)) { throw "Installed uninstall finalizer is missing: $installedFinalizerScript" }
+. $installedFinalizerScript
 Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\RuntimeManifest.psm1') -Force
 
 function New-CcodUninstallBootstrapContext {
@@ -167,7 +170,9 @@ function New-CcodVerifiedUninstallRuntimeFixture {
     foreach ($entry in @(
         'src/persistence/UninstallBootstrap.ps1',
         'src/persistence/PortableUninstallFinalizer.ps1',
+        'src/persistence/InstalledUninstallFinalizer.ps1',
         'src/persistence/modules/InstallLifecycle.psm1',
+        'src/persistence/modules/ProductRegistration.psm1',
         'src/persistence/modules/PortableRelease.psm1',
         'src/persistence/modules/PersistenceIO.psm1',
         'src/persistence/modules/RuntimeManifest.psm1',
@@ -217,7 +222,7 @@ $results += Invoke-CcodTest 'Prepare stages only the manifest-bound cleanup payl
     Assert-CcodEqual 'ReadyForInno' $receipt.phase 'verified cleanup reaches the Inno boundary'
     Assert-CcodEqual 'Validate,GetRoot,Read,NewId,Create,Write:Requested,Publish,Stage,Cleanup,Write:ReadyForInno,RemoveProduct,Receipt:ReadyForInno' ($world.Calls -join ',') 'Prepare removes only verified product registration after protected application cleanup'
     Assert-CcodEqual 1 $world.ProductRegistrationRemovals 'verified uninstall removes current product registration exactly once'
-    Assert-CcodEqual 'src/persistence/UninstallBootstrap.ps1,src/persistence/PortableUninstallFinalizer.ps1,src/persistence/modules/InstallLifecycle.psm1,src/persistence/modules/PortableRelease.psm1,src/persistence/modules/PersistenceIO.psm1,src/persistence/modules/RuntimeManifest.psm1,src/persistence/modules/LifecycleEpoch.psm1,src/persistence/modules/StateStore.psm1,src/persistence/modules/TrustedLogonIdentity.psm1,src/persistence/modules/ScheduledTask.psm1,src/persistence/modules/KernelObjects.psm1,src/persistence/modules/CompatibilityProbe.psm1,src/persistence/modules/UiPreferences.psm1,src/persistence/modules/LifecycleTransaction.psm1' ($world.StagedEntries -join ',') 'staging has no device-key material'
+    Assert-CcodEqual 'src/persistence/UninstallBootstrap.ps1,src/persistence/PortableUninstallFinalizer.ps1,src/persistence/InstalledUninstallFinalizer.ps1,src/persistence/modules/InstallLifecycle.psm1,src/persistence/modules/ProductRegistration.psm1,src/persistence/modules/PortableRelease.psm1,src/persistence/modules/PersistenceIO.psm1,src/persistence/modules/RuntimeManifest.psm1,src/persistence/modules/LifecycleEpoch.psm1,src/persistence/modules/StateStore.psm1,src/persistence/modules/TrustedLogonIdentity.psm1,src/persistence/modules/ScheduledTask.psm1,src/persistence/modules/KernelObjects.psm1,src/persistence/modules/CompatibilityProbe.psm1,src/persistence/modules/UiPreferences.psm1,src/persistence/modules/LifecycleTransaction.psm1' ($world.StagedEntries -join ',') 'staging has only bounded cleanup code and no device-key material'
     Assert-CcodEqual $null $receipt.errorCode 'ReadyForInno carries no failure code'
 }
 
@@ -232,7 +237,7 @@ $results += Invoke-CcodTest 'production runtime verification binds the installed
         Assert-CcodEqual $fixture.RuntimeId $context.runtimeId 'verified context binds the active manifest runtime'
         Assert-CcodEqual ([uint64]7) ([uint64]$context.runtimeGeneration) 'verified context binds active generation'
         Assert-CcodEqual ([uint64]11) ([uint64]$context.leaseEpoch) 'verified context binds lifecycle epoch'
-        Assert-CcodEqual 14 @($context.payloadRecords).Count 'only the cleanup entry, portable finalizer, and imported modules are staged'
+        Assert-CcodEqual 16 @($context.payloadRecords).Count 'only the cleanup entry, two bounded finalizers, matched registration module, and imported modules are staged'
         [IO.File]::AppendAllText((Join-Path $fixture.RuntimeRoot 'src\persistence\modules\InstallLifecycle.psm1'),'# altered',[Text.UTF8Encoding]::new($false))
         Assert-CcodThrows { Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $repositoryRoot -InstallRoot $installRoot | Out-Null } 'CCOD_UNINSTALL_RUNTIME_INVALID'
     } finally {
@@ -335,7 +340,7 @@ $results += Invoke-CcodTest 'real external staging uses a protected current-user
         $payloadRoot = Join-Path $transactionDirectory 'payload'
         Assert-CcodUninstallBootstrapDirectoryAcl -Path $payloadRoot -UserSid $context.userSid
         $payloadFiles = @(Get-ChildItem -LiteralPath $payloadRoot -Recurse -File -Force)
-        Assert-CcodEqual 14 $payloadFiles.Count 'external payload contains the exact cleanup entry, portable finalizer, and required modules'
+        Assert-CcodEqual 16 $payloadFiles.Count 'external payload contains the exact cleanup entry, two bounded finalizers, matched registration module, and required modules'
         foreach ($record in @($context.payloadRecords)) {
             $entry = [string]$record.path
             $source = Join-Path $fixture.RuntimeRoot ($entry.Replace('/','\'))
@@ -550,6 +555,49 @@ $results += Invoke-CcodTest 'FinalizeReceipt fails closed when installer files r
     }
     Assert-CcodThrows { Invoke-CcodUninstallBootstrap -InstallerRoot 'C:\installer' -InstallRoot 'C:\install' -Mode FinalizeReceipt -Adapters (New-CcodUninstallBootstrapAdapters $world) | Out-Null } 'CCOD_UNINSTALL_FINALIZATION_INCOMPLETE'
     Assert-CcodEqual 'GetRoot,Read,FinalizeInvocation,RootAbsent' ($world.Calls -join ',') 'Inno residue never receives a false completion receipt'
+}
+
+# Production mutation caught: deleting the selected generation while its public wrapper is still executing from it.
+$results += Invoke-CcodTest 'installed Prepare stops at TaskRemoved and external finalizer completes only after wrapper exit' {
+    $world=[pscustomobject]@{Calls=[Collections.Generic.List[string]]::new();Transaction=$null;Receipt=$null;ValidationError=$false;StageError=$false;CleanupError=$false;CleanupFailurePhase=$null;InstallRootAbsent=$false;StagedEntries=@();ProductRegistrationRemovals=0}
+    $adapters=New-CcodUninstallBootstrapAdapters $world
+    $originalCleanup=$adapters.RunCleanup
+    $adapters.RunCleanup={param($InstallerRoot,$InstallRoot,$TransactionRoot,$Transaction,$WriteTransaction,$Mode);$world.Calls.Add("Cleanup:$Mode");$Transaction.phase='TaskRemoved';$Transaction.resumePhase='TaskRemoved';&$WriteTransaction $TransactionRoot $Transaction;$Transaction}.GetNewClosure()
+    $prepared=Invoke-CcodUninstallBootstrap -InstallerRoot 'C:\runtime' -InstallRoot 'C:\install' -Mode PrepareInstalled -Adapters $adapters
+    Assert-CcodEqual 'TaskRemoved' $prepared.phase 'installed wrapper retains application state until it exits'
+    Assert-CcodEqual 0 $world.ProductRegistrationRemovals 'installed Prepare removes no product state before the external finalizer'
+
+    $final=[pscustomobject]@{Calls=[Collections.Generic.List[string]]::new();WrapperExited=$true;ContextValid=$true;Transaction=$prepared;RootAbsent=$false;Finalized=$false;Deletes=0}
+    $finalAdapters=@{
+        WaitWrapperExit={param($Identity,$Timeout)$final.Calls.Add('WaitWrapper');$final.WrapperExited}.GetNewClosure()
+        ReadPreparedTransaction={param($Id)$final.Calls.Add('ReadTransaction');$final.Transaction}.GetNewClosure()
+        ValidateSelectedGeneration={param($RuntimeRoot,$InstallRoot,$Transaction)$final.Calls.Add('ValidateGeneration');$final.ContextValid}.GetNewClosure()
+        RemoveMatchedApplicationState={param($RuntimeRoot,$InstallRoot,$Transaction)$final.Calls.Add('RemoveMatched');$final.Deletes++;$final.RootAbsent=$true;$Transaction.phase='ReadyForInno';$Transaction.resumePhase='ReadyForInno';$Transaction}.GetNewClosure()
+        TestInstallRootAbsent={param($Root)$final.Calls.Add('RootAbsent');$final.RootAbsent}.GetNewClosure()
+        RemoveMatchedProductRegistration={param($Transaction)$final.Calls.Add('RemoveProduct')}.GetNewClosure()
+        FinalizeReceipt={param($Transaction)$final.Calls.Add('Finalize');$final.Finalized=$true;[pscustomobject]@{phase='Completed'}}.GetNewClosure()
+    }
+    $receipt=Invoke-CcodInstalledUninstallFinalizer -TransactionId $prepared.transactionId -RuntimeRoot 'C:\install\runtime\2.5.0-uninstall-test' -InstallRoot 'C:\install' -WrapperIdentity ([pscustomobject]@{pid=42;creationTimeUtc='2030-02-03T03:04:05.0000000Z'}) -Adapters $finalAdapters
+    Assert-CcodEqual 'Completed' $receipt.phase 'external finalizer reaches the completion receipt'
+    Assert-CcodEqual 'WaitWrapper,ReadTransaction,ValidateGeneration,RemoveMatched,RootAbsent,RemoveProduct,Finalize' ($final.Calls -join ',') 'wrapper exit and selected generation proof precede matched removal and finalization'
+}
+
+# Production mutation caught: treating any durable transaction/path/process as authority to delete application state.
+$results += Invoke-CcodTest 'installed finalizer wrong wrapper generation path or transaction performs no deletion' {
+    foreach($kind in @('Wrapper','Generation','Transaction')){
+        $world=[pscustomobject]@{Calls=[Collections.Generic.List[string]]::new();Deletes=0}
+        $transaction=New-CcodUninstallBootstrapTestTransaction -Phase 'TaskRemoved'
+        if($kind-ceq'Transaction'){$transaction.transactionId='aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'}
+        $adapters=@{
+            WaitWrapperExit={param($Identity,$Timeout)$kind-cne'Wrapper'}.GetNewClosure()
+            ReadPreparedTransaction={param($Id)$transaction}.GetNewClosure()
+            ValidateSelectedGeneration={param($RuntimeRoot,$InstallRoot,$Transaction)$kind-cne'Generation'}.GetNewClosure()
+            RemoveMatchedApplicationState={param($RuntimeRoot,$InstallRoot,$Transaction)$world.Deletes++;$Transaction}.GetNewClosure()
+            TestInstallRootAbsent={param($Root)$false};RemoveMatchedProductRegistration={param($Transaction)};FinalizeReceipt={param($Transaction)[pscustomobject]@{phase='Completed'}}
+        }
+        Assert-CcodThrows {Invoke-CcodInstalledUninstallFinalizer -TransactionId '11111111-2222-3333-4444-555555555555' -RuntimeRoot 'C:\install\runtime\2.5.0-uninstall-test' -InstallRoot 'C:\install' -WrapperIdentity ([pscustomobject]@{pid=42;creationTimeUtc='2030-02-03T03:04:05.0000000Z'}) -Adapters $adapters|Out-Null} 'CCOD_INSTALLED_FINALIZER_INVALID'
+        Assert-CcodEqual 0 $world.Deletes "$kind mismatch deletes no application state"
+    }
 }
 
 $results | ForEach-Object { "PASS $($_.Name)" }

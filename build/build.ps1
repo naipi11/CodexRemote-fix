@@ -389,7 +389,8 @@ try {
         'src/persistence/LifecycleWorker.ps1',
         'src/persistence/bootstrap.ps1',
         'src/persistence/UninstallBootstrap.ps1',
-        'src/persistence/PortableUninstallFinalizer.ps1'
+        'src/persistence/PortableUninstallFinalizer.ps1',
+        'src/persistence/InstalledUninstallFinalizer.ps1'
     )) {
         Copy-CcodBuildPayloadFile -Source (Join-Path $repoRoot ($relative.Replace('/','\'))) -PayloadRoot $payloadRoot -Relative $relative
     }
