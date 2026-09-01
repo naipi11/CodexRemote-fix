@@ -181,6 +181,95 @@ function Write-CcodProductReadyTransactionChain {
     return (Join-Path $transactions ('{0:D20}.08.Ready.{1}.json'-f[uint64]$ReadyRecord.newGeneration,$ReadyRecord.transactionId))
 }
 
+function New-CcodProductAuthorityFixture {
+    $fixture=New-CcodInstallFileFixture
+    $runtimeId='runtime-product-canonical-authority'
+    $source=New-CcodSourceFile $fixture 'canonical-authority.lnk' 'canonical authority shortcut'
+    $generation=Open-CcodFixtureGeneration $fixture $runtimeId
+    $registration=New-CcodInstallGenerationLeaf -Generation $generation -Leaf 'registration'
+    Copy-CcodInstallSealedSource -Generation $registration -SourcePath $source.Path -Leaf 'StartMenu.CodexRemote-fix.lnk' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null
+    $manifest=Write-CcodInstallGenerationManifest -Generation $generation -Manifest (New-CcodGenerationManifest $runtimeId @([ordered]@{path='registration/StartMenu.CodexRemote-fix.lnk';length=$source.Length;sha256=$source.Sha256}))
+    Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $generation -ExpectedPreviousGeneration 0 -FileTransaction $generation|Out-Null
+    Close-CcodInstallFileTransaction -Transaction $generation -Disposition Ready
+    $ready=[pscustomobject][ordered]@{schemaVersion=1;transactionId='33333333-4444-4555-8666-777777777777';oldRuntimeId=$null;oldGeneration=$null;oldManifestSha256=$null;newRuntimeId=$runtimeId;newGeneration=[uint64]1;newManifestSha256=$manifest.Sha256;sealedPackageSha256=('a'*64);ownedObjectNames=@($runtimeId);phase='Ready';errorCode=$null}
+    $readyPath=Write-CcodProductReadyTransactionChain -InstallRoot $fixture.Install -ReadyRecord $ready
+    [pscustomobject]@{Fixture=$fixture;RuntimeId=$runtimeId;Manifest=$manifest;Ready=$ready;ReadyPath=$readyPath}
+}
+
+# Production mutation caught: a selected Ready chain cannot authorize product access while an unrelated install remains nonterminal.
+Invoke-CcodTest 'product authority uses the canonical global lifecycle head and retains no authority after unrelated Prepared rejection' {
+    $authority=New-CcodProductAuthorityFixture;$fixture=$authority.Fixture
+    try{
+        $unrelated=[pscustomobject][ordered]@{schemaVersion=1;transactionId='44444444-5555-4666-8777-888888888888';oldRuntimeId=$authority.RuntimeId;oldGeneration=[uint64]1;oldManifestSha256=$authority.Manifest.Sha256;newRuntimeId='runtime-unrelated-prepared';newGeneration=[uint64]2;newManifestSha256=('b'*64);sealedPackageSha256=('c'*64);ownedObjectNames=@('runtime-unrelated-prepared');phase='Prepared';errorCode=$null}
+        $leaf='{0:D20}.00.Prepared.{1}.json'-f[uint64]$unrelated.newGeneration,$unrelated.transactionId;$path=Join-Path $fixture.Install "state\install-transactions\$leaf"
+        [IO.File]::WriteAllText($path,($unrelated|ConvertTo-Json -Depth 8 -Compress),[Text.UTF8Encoding]::new($false))
+        Assert-CcodProductTransactionRejected -Fixture $fixture -Action {Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready}
+        Remove-Item -LiteralPath $path -Force
+        $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready;$fixture.Transactions.Add($product)
+        Assert-CcodTrue ($null-ne$product) 'rejected global head leaves no product authority or coordination lease behind'
+    }finally{Remove-CcodInstallFileFixture $fixture}
+}
+
+# Production mutation caught: Failed may not be appended after terminal Ready and must not leave product authority behind.
+Invoke-CcodTest 'product authority rejects the canonical Ready to Failed post-terminal continuation without retaining authority' {
+    $authority=New-CcodProductAuthorityFixture;$fixture=$authority.Fixture
+    try{
+        $failed=$authority.Ready.PSObject.Copy();$failed.phase='Failed';$failed.errorCode='CCOD_TEST_POST_TERMINAL'
+        $leaf='{0:D20}.99.Failed.{1}.json'-f[uint64]$failed.newGeneration,$failed.transactionId;$path=Join-Path $fixture.Install "state\install-transactions\$leaf"
+        [IO.File]::WriteAllText($path,($failed|ConvertTo-Json -Depth 8 -Compress),[Text.UTF8Encoding]::new($false))
+        Assert-CcodProductTransactionRejected -Fixture $fixture -Action {Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready}
+        Remove-Item -LiteralPath $path -Force
+        $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready;$fixture.Transactions.Add($product)
+        Assert-CcodTrue ($null-ne$product) 'post-terminal rejection leaves no product authority or coordination lease behind'
+    }finally{Remove-CcodInstallFileFixture $fixture}
+}
+
+# Production mutation caught: selector proof without the committing install's AccountTransition lease permits N+1 to commit across N proof/use.
+Invoke-CcodTest 'product authority holds the real commit coordination lease across proof and retained-file use' {
+    $authority=New-CcodProductAuthorityFixture;$fixture=$authority.Fixture;$product=$null;$commitProcess=$null
+    $readyMarker=Join-Path $fixture.Base 'commit-ready.marker';$resultPath=Join-Path $fixture.Base 'commit-result.json';$stdout=Join-Path $fixture.Base 'commit.stdout.txt';$stderr=Join-Path $fixture.Base 'commit.stderr.txt';$childScript=Join-Path $fixture.Base 'commit-next-generation.ps1'
+    $moduleRoot=Join-Path $projectRoot 'src\persistence\modules';$nextRuntime='runtime-product-canonical-authority-next'
+    $child=@'
+param([string]$ModuleRoot,[string]$InstallRoot,[string]$CurrentRuntime,[string]$NextRuntime,[string]$ReadyMarker,[string]$ResultPath)
+$ErrorActionPreference='Stop';$transaction=$null;$ownership=$null;$identity=$null;$process=$null
+try{
+    $fileModule=Import-Module (Join-Path $ModuleRoot 'InstallFileTransaction.psm1') -Force -PassThru -ErrorAction Stop
+    $runtimeModule=Import-Module (Join-Path $ModuleRoot 'RuntimeManifest.psm1') -Force -PassThru -ErrorAction Stop
+    $epochModule=Import-Module (Join-Path $ModuleRoot 'LifecycleEpoch.psm1') -Force -PassThru -ErrorAction Stop
+    $transaction=&$fileModule {param($Root,$Id)Open-CcodInstallGeneration -InstallRoot $Root -RuntimeId $Id} $InstallRoot $NextRuntime
+    &$fileModule {param($Generation,$Id)Write-CcodInstallGenerationManifest -Generation $Generation -Manifest ([ordered]@{schemaVersion=1;projectVersion='2.5.22';runtimeId=$Id;commit='0123456789abcdef0123456789abcdef01234567';files=@()})|Out-Null} $transaction $NextRuntime
+    [IO.File]::WriteAllText($ReadyMarker,'ready',[Text.UTF8Encoding]::new($false))
+    $process=[Diagnostics.Process]::GetCurrentProcess();$owner=[pscustomobject][ordered]@{pid=[int]$process.Id;creationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o')}
+    $identity=[Security.Principal.WindowsIdentity]::GetCurrent();$sid=$identity.User.Value
+    $ownership=&$epochModule {param($Root,$Runtime,$Owner,$Sid,$Session)Enter-CcodLifecycleOwnership -InstallRoot $Root -RuntimeId $Runtime -RuntimeGeneration 1 -OwnerIdentity $Owner -UserSid $Sid -SessionId $Session -TimeoutMilliseconds 15000} $InstallRoot $CurrentRuntime $owner $sid $process.SessionId
+    $pointer=&$runtimeModule {param($Root,$Runtime,$Generation,$Transaction,$Owner)Set-CcodActiveRuntime -InstallRoot $Root -NewRuntimeId $Runtime -TargetGeneration $Generation -FileTransaction $Transaction -Ownership $Owner} $InstallRoot $NextRuntime $transaction $transaction $ownership
+    [IO.File]::WriteAllText($ResultPath,($pointer|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+    exit 0
+}catch{$message=$_|Out-String;[Console]::Error.WriteLine($message);exit 3}
+finally{if($null-ne$ownership){try{&$epochModule {param($Owner)Exit-CcodLifecycleOwnership -Ownership $Owner|Out-Null} $ownership}catch{}};if($null-ne$transaction){try{&$fileModule {param($Transaction)Close-CcodInstallFileTransaction -Transaction $Transaction -Disposition Ready} $transaction}catch{}};if($null-ne$identity){$identity.Dispose()};if($null-ne$process){$process.Dispose()}}
+'@
+    [IO.File]::WriteAllText($childScript,$child,[Text.UTF8Encoding]::new($false))
+    try{
+        $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready;$fixture.Transactions.Add($product)
+        $retained=Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $authority.RuntimeId -ExpectedManifestSha256 $authority.Manifest.Sha256 -FileTransaction $product
+        $powershell=(Get-Process -Id $PID).Path
+        $commitProcess=Start-Process -FilePath $powershell -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$childScript,'-ModuleRoot',$moduleRoot,'-InstallRoot',$fixture.Install,'-CurrentRuntime',$authority.RuntimeId,'-NextRuntime',$nextRuntime,'-ReadyMarker',$readyMarker,'-ResultPath',$resultPath) -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+        $deadline=[DateTime]::UtcNow.AddSeconds(20);while(-not[IO.File]::Exists($readyMarker)-and[DateTime]::UtcNow-lt$deadline){$commitProcess.Refresh();if($commitProcess.HasExited){break};Start-Sleep -Milliseconds 25}
+        if(-not[IO.File]::Exists($readyMarker)){if(-not$commitProcess.HasExited){Stop-Process -Id $commitProcess.Id -Force};$commitProcess.WaitForExit();throw "real N+1 commit child did not reach lifecycle ownership: $($(if([IO.File]::Exists($stderr)){[IO.File]::ReadAllText($stderr)}else{'no stderr'}))"}
+        $commitBlocked=$true;$watch=[Diagnostics.Stopwatch]::StartNew();while($watch.ElapsedMilliseconds-lt1200){if([IO.File]::Exists($resultPath)-or$commitProcess.HasExited){$commitBlocked=$false;break};Start-Sleep -Milliseconds 20};$watch.Stop()
+        if($commitBlocked){$opened=Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk' -ReadyTransaction $authority.Ready;Assert-CcodTrue ($null-ne$opened) 'N retained shortcut opens while its authority lease excludes N+1'}
+        Close-CcodInstallFileTransaction -Transaction $product -Disposition Ready
+        if(-not$commitProcess.WaitForExit(20000)){Stop-Process -Id $commitProcess.Id -Force;throw 'real N+1 commit child timed out'}
+        $commitProcess.Refresh();if(-not[IO.File]::Exists($resultPath)){throw "real N+1 commit child produced no committed pointer exit=$($commitProcess.ExitCode) stdout=$([IO.File]::ReadAllText($stdout)) stderr=$([IO.File]::ReadAllText($stderr))"}
+        $pointer=[IO.File]::ReadAllText($resultPath)|ConvertFrom-Json;Assert-CcodEqual 2 ([uint64]$pointer.generation) 'real commit advances to N+1 only after N authority closes'
+        Assert-CcodThrows {Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk' -ReadyTransaction $authority.Ready|Out-Null} 'CCOD_INSTALL_TRANSACTION_CLOSED'
+        Assert-CcodTrue $commitBlocked 'N+1 commit is blocked for the complete N proof-to-use boundary'
+    }finally{
+        if($null-ne$commitProcess-and-not$commitProcess.HasExited){try{Stop-Process -Id $commitProcess.Id -Force}catch{}};if($null-ne$commitProcess){$commitProcess.Dispose()}
+        Remove-CcodInstallFileFixture $fixture
+    }
+}
+
 # Production mutation caught: state-only recovery or an arbitrary absolute source can acquire product shortcut authority.
 Invoke-CcodTest 'product registration transaction exposes only a selected retained manifest file capability' {
     $fixture=New-CcodInstallFileFixture
@@ -189,7 +278,10 @@ Invoke-CcodTest 'product registration transaction exposes only a selected retain
         $readyRecord=[pscustomobject][ordered]@{schemaVersion=1;transactionId='11111111-2222-3333-4444-555555555555';oldRuntimeId=$null;oldGeneration=$null;oldManifestSha256=$null;newRuntimeId=$runtimeId;newGeneration=[uint64]1;newManifestSha256=$manifest.Sha256;sealedPackageSha256=('d'*64);ownedObjectNames=@($runtimeId);phase='Ready';errorCode=$null};$readyPath=Write-CcodProductReadyTransactionChain -InstallRoot $fixture.Install -ReadyRecord $readyRecord
         foreach($field in @('oldRuntimeId','transactionId','ownedObjectNames')){$changed=$readyRecord.PSObject.Copy();if($field-ceq'oldRuntimeId'){$changed.oldRuntimeId='runtime-old'}elseif($field-ceq'transactionId'){$changed.transactionId='aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'}else{$changed.ownedObjectNames=@($runtimeId,'unexpected-owned-object')};Assert-CcodProductTransactionRejected -Fixture $fixture -Action {Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $changed}}
         $fabricated=[pscustomobject][ordered]@{phase='Ready';runtimeId=$runtimeId;runtimeGeneration=[uint64]1;manifestSha256=$manifest.Sha256;packageSha256=('d'*64)};Assert-CcodThrows {Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $fabricated|Out-Null} 'CCOD_INSTALL_PRODUCT_SCOPE'
-        $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $readyRecord;$fixture.Transactions.Add($product);$retained=Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId -ExpectedManifestSha256 $manifest.Sha256 -FileTransaction $product;$file=Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk' -ReadyTransaction $readyRecord
+        $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $readyRecord;$fixture.Transactions.Add($product);$retained=Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $runtimeId -ExpectedManifestSha256 $manifest.Sha256 -FileTransaction $product
+        $heldLease=&$module {param($Capability)$scope=Get-CcodInstallTransaction $Capability;$lease=$scope.State.AuthorityLease;$scope.State.AuthorityLease=$null;return $lease} $product
+        try{Assert-CcodThrows {Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk' -ReadyTransaction $readyRecord|Out-Null} 'CCOD_INSTALL_PRODUCT_SCOPE'}finally{&$module {param($Capability,$Lease)$scope=Get-CcodInstallTransaction $Capability;$scope.State.AuthorityLease=$Lease} $product $heldLease}
+        $file=Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk' -ReadyTransaction $readyRecord
         Assert-CcodTrue ($null-ne$file) 'selected manifest file returns an opaque retained source capability'
         Assert-CcodThrows {Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'C:\outside\arbitrary.lnk' -ReadyTransaction $readyRecord|Out-Null} 'CCOD_INSTALL_PRODUCT_SHORTCUT_INVALID'
         Assert-CcodThrows {New-CcodInstallDirectory -Transaction $product -Parent $product -Leaf 'state' -CreateIfMissing|Out-Null} 'CCOD_INSTALL_PRODUCT_SCOPE'

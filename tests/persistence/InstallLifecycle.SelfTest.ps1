@@ -322,6 +322,38 @@ function New-CcodLifecycleFake {
     [pscustomobject]@{ World = $world; Adapters = $adapters }
 }
 
+function New-CcodLifecycleProductSideEffectAdapters {
+    param([Parameter(Mandatory)][hashtable]$State)
+    @{
+        WriteProductRegistration={param($Registration,$ReadyEvidence)if($State.FailWrites){throw 'TEST_PRODUCT_WRITE_FAILURE'};$State.Registration=$Registration;$State.ReadyEvidence=$ReadyEvidence;$State.Writes++}.GetNewClosure()
+        ReadProductRegistration={param($Registration)$State.Registration}.GetNewClosure()
+        WriteShortcut={
+            param($Kind,$Shortcut,$FileTransaction,$ReadyEvidence)
+            $relative='registration/'+$(if($Kind-ceq'StartMenu'){'StartMenu.CodexRemote-fix.lnk'}else{'Desktop.CodexRemote-fix.lnk'})
+            try{$fileModule=Get-Module -All|Where-Object{$null-ne$_.Path-and[IO.Path]::GetFileName($_.Path)-ceq'InstallFileTransaction.psm1'}|Select-Object -First 1;if($null-eq$fileModule){throw 'install file transaction module unavailable'};$source=&$fileModule {param($Generation,$Path,$Record)Open-CcodInstallRetainedFile -Generation $Generation -RelativePath $Path -ReadyTransaction $Record} $FileTransaction $relative $ReadyEvidence.transactionRecord}catch{$State.RetainedError=([string]$_.FullyQualifiedErrorId-split',')[0];throw}
+            if($null-eq$source){throw 'retained shortcut capability missing'}
+            $State.ProductOnlyObserved=$true;$State.Shortcuts[$Kind]=$Shortcut;$State.ShortcutWrites++
+        }.GetNewClosure()
+        ReadShortcut={param($Kind,$Shortcut)$State.Shortcuts[$Kind]}.GetNewClosure()
+        ReadVerifiedRegistration={ [pscustomobject]@{verified=$true} }
+        ReadLegacyRegistration={param($ExpectedAppId)$null}
+    }
+}
+
+function Set-CcodLifecycleDefaultProductRegistrationFixture {
+    param([Parameter(Mandatory)]$Fake,[Parameter(Mandatory)][hashtable]$ProductState)
+    [void]$Fake.Adapters.Remove('RegisterProduct')
+    $sideEffects=New-CcodLifecycleProductSideEffectAdapters -State $ProductState
+    $Fake.Adapters.GetProductRegistrationAdapters={$sideEffects}.GetNewClosure()
+    $Fake.Adapters.AddProductShortcutCandidates={
+        param($Files)
+        $temporaryRoot=Join-Path ([IO.Path]::GetTempPath()) ('ccod-lifecycle-product-'+[guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($temporaryRoot)|Out-Null
+        $records=[Collections.Generic.List[object]]::new()
+        foreach($leaf in @('StartMenu.CodexRemote-fix.lnk','Desktop.CodexRemote-fix.lnk')){$path=Join-Path $temporaryRoot $leaf;[IO.File]::WriteAllText($path,"sealed $leaf",[Text.UTF8Encoding]::new($false));$item=Get-Item -LiteralPath $path;$sha=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant();$records.Add([pscustomobject]@{Relative=('registration/'+$leaf);Source=$path;ExpectedLength=[int64]$item.Length;ExpectedSha256=$sha})}
+        [pscustomobject]@{Files=@($Files)+@($records);TemporaryRoot=$temporaryRoot}
+    }
+}
+
 function New-CcodReadyFinalizationGapFixture {
     $source=New-CcodLifecycleTempRoot
     $install=New-CcodLifecycleTempRoot
@@ -3250,6 +3282,60 @@ $results += Invoke-CcodTest 'registration failure preserves durable Ready withou
         $result=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('3'*64) -Adapters $retry.Adapters
         Assert-CcodEqual 'AlreadyInstalled' $result.Outcome 'later same-package invocation retries after post-Ready registration failure'
         Assert-CcodEqual 1 $retry.World.ProductRegistrationCalls 'normal Ready registration retry occurs exactly once'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
+}
+
+# Production mutation caught: normal first install passed its writable generation transaction to the default product path instead of reopening strict Ready authority.
+$results += Invoke-CcodTest 'normal first install reaches the default registration path with only a strict product capability' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $productState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}}
+        Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $fake -ProductState $productState
+        $result=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('6'*64) -Adapters $fake.Adapters
+        Assert-CcodEqual 'Installed' $result.Outcome 'normal first install completes through the real default registration adapter'
+        Assert-CcodTrue $result.ProductRegistrationVerified 'normal first install reports verified product registration'
+        Assert-CcodTrue $productState.ProductOnlyObserved 'lower shortcut side effect receives a product-only retained capability'
+        Assert-CcodEqual 1 $productState.Writes 'registry side effect boundary is invoked once'
+        Assert-CcodEqual 2 $productState.ShortcutWrites 'both shortcut side effect boundaries are invoked once'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
+}
+
+# Production mutation caught: default registration failure after durable Ready must remain outside lifecycle failure and reconcile through AlreadyInstalled.
+$results += Invoke-CcodTest 'default first-install registration failure leaves Ready and retries with strict product authority' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$first=New-CcodLifecycleFake -NodePath $node
+        $failedState=@{FailWrites=$true;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $first -ProductState $failedState
+        Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('7'*64) -Adapters $first.Adapters|Out-Null} 'CCOD_PRODUCT_REGISTRATION_FAILED'
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Ready' $head.phase 'default registration failure leaves the lifecycle transaction durably Ready'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'default registration failure appends no Failed lifecycle snapshot'
+        $retry=New-CcodLifecycleFake -NodePath $node;$retryState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $retry -ProductState $retryState
+        $result=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('7'*64) -Adapters $retry.Adapters
+        Assert-CcodEqual 'AlreadyInstalled' $result.Outcome 'later same-package invocation retries default product registration'
+        Assert-CcodTrue $retryState.ProductOnlyObserved 'recovery retry receives only strict product authority'
+        Assert-CcodEqual 2 $retryState.ShortcutWrites 'recovery retry publishes both shortcut records through lower side effects'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
+}
+
+# Production mutation caught: failure to close the writable generation at the post-Ready handoff must not enter lifecycle rollback or prevent reconciliation.
+$results += Invoke-CcodTest 'post-Ready writable close failure preserves Ready and retries before product side effects' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$first=New-CcodLifecycleFake -NodePath $node
+        $failedState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $first -ProductState $failedState
+        $first.Adapters.CloseReadyGeneration={param($Transaction)throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('fixture Ready close failed'),'CCOD_INSTALL_CLOSE_FAILED',[Management.Automation.ErrorCategory]::InvalidData,$null)}
+        Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('8'*64) -Adapters $first.Adapters|Out-Null} 'CCOD_PRODUCT_REGISTRATION_FAILED'
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Ready' $head.phase 'post-Ready writable close failure leaves the lifecycle transaction Ready'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'post-Ready writable close failure appends no Failed snapshot'
+        Assert-CcodEqual 0 $failedState.Writes 'no product side effect begins before the writable generation closes'
+        $retry=New-CcodLifecycleFake -NodePath $node;$retryState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $retry -ProductState $retryState
+        $result=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('8'*64) -Adapters $retry.Adapters
+        Assert-CcodEqual 'AlreadyInstalled' $result.Outcome 'same-package retry reconciles after post-Ready writable close failure'
+        Assert-CcodTrue $retryState.ProductOnlyObserved 'retry uses strict product authority after cleanup succeeds'
+        Assert-CcodEqual 2 $retryState.ShortcutWrites 'retry completes both lower shortcut side effects'
     }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
 }
 

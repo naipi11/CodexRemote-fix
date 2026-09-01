@@ -178,6 +178,9 @@ function Assert-CcodInstallTransactionRecord {
     } catch {
         Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Install transaction generations are invalid' $null
     }
+    if ($Record.ownedObjectNames -isnot [Array]) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Install transaction object names must be an array' $null
+    }
     $owned = @($Record.ownedObjectNames)
     if ($owned.Count -gt 64) { Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Install transaction owns too many objects' $null }
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -307,29 +310,16 @@ function Write-CcodInstallTransactionRecord {
     return $TransactionRecord
 }
 
-function Read-CcodInstallTransactionRecord {
-    param([Parameter(Mandatory)][string]$InstallRoot,[string]$TransactionId)
-    $root = Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
-    $directory = Join-Path (Join-Path $root 'state') 'install-transactions'
-    if (-not [IO.Directory]::Exists($directory)) { return $null }
-    try { [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $root -Path $directory) }
-    catch { Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Install transaction store is unsafe' $directory }
-    $records = [Collections.Generic.List[object]]::new()
-    foreach ($file in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)) {
-        if ($file.PSIsContainer -or $file.Name -cnotmatch '^\d{20}\.\d{2}\.[A-Za-z]+\.[0-9a-f-]{36}\.json$') { Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Install transaction store contains an unknown object' $file.FullName }
-        try { $record = Read-CcodStrictJson -Path $file.FullName -ExpectedSchema 1 -Kind 'install transaction' }
-        catch { Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Install transaction snapshot is malformed' $file.FullName }
-        [void](Assert-CcodInstallTransactionRecord $record)
-        if ((Get-CcodInstallTransactionRecordLeaf $record) -cne $file.Name) { Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Install transaction snapshot name is not canonical' $file.FullName }
-        if ([string]::IsNullOrWhiteSpace($TransactionId) -or [string]$record.transactionId -ceq $TransactionId) { $records.Add($record) }
-    }
-    if ($records.Count -eq 0) { return $null }
+function Resolve-CcodInstallTransactionRecordHead {
+    param([Parameter(Mandatory)][object[]]$Records,[string]$TransactionId,$ActiveRuntime)
+    if ($Records.Count -eq 0) { return $null }
     $heads = [Collections.Generic.List[object]]::new()
-    foreach ($group in @($records | Group-Object transactionId)) {
+    foreach ($group in @($Records | Group-Object transactionId)) {
         $chain = @($group.Group | Sort-Object @{Expression={if ($_.phase -ceq 'Failed') { 99 } else { [Array]::IndexOf($script:CcodInstallTransactionPhases,[string]$_.phase) }}})
         if ($chain[0].phase -cne 'Prepared') { Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Install transaction chain does not begin at Prepared' $group.Name }
         for ($index=0; $index -lt $chain.Count; $index++) {
             $current = $chain[$index]
+            [void](Assert-CcodInstallTransactionRecord $current)
             $head=$chain[0]
             $oldGenerationChanged=($null-eq$head.oldGeneration)-ne($null-eq$current.oldGeneration)
             if(-not$oldGenerationChanged-and$null-ne$head.oldGeneration){$oldGenerationChanged=[uint64]$current.oldGeneration-ne[uint64]$head.oldGeneration}
@@ -354,12 +344,31 @@ function Read-CcodInstallTransactionRecord {
         $matched=@($heads|Where-Object{$_.transactionId -ceq $TransactionId});if($matched.Count-ne 1){return $null};return $matched[0]
     }
     $nonterminal=@($heads|Where-Object{$_.phase -notin @('Ready','Failed')})
-    if($nonterminal.Count-gt 1){Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_AMBIGUOUS' 'More than one nonterminal install transaction exists' $directory}
+    if($nonterminal.Count-gt 1){Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_AMBIGUOUS' 'More than one nonterminal install transaction exists' $null}
     if($nonterminal.Count-eq 1){return $nonterminal[0]}
-    $active=$null;try{$active=Read-CcodActiveRuntime -InstallRoot $root}catch{}
-    if($null-ne$active){$ready=@($heads|Where-Object{$_.phase-ceq'Ready'-and$_.newRuntimeId-ceq$active.activeRuntime-and[uint64]$_.newGeneration-eq[uint64]$active.generation});if($ready.Count-ne 0){if($ready.Count-ne 1){Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_AMBIGUOUS' 'Active generation has multiple Ready records' $directory};return $ready[0]}}
+    if($null-ne$ActiveRuntime){$ready=@($heads|Where-Object{$_.phase-ceq'Ready'-and$_.newRuntimeId-ceq$ActiveRuntime.activeRuntime-and[uint64]$_.newGeneration-eq[uint64]$ActiveRuntime.generation});if($ready.Count-ne 0){if($ready.Count-ne 1){Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_AMBIGUOUS' 'Active generation has multiple Ready records' $null};return $ready[0]}}
     $failed=@($heads|Where-Object{$_.phase-ceq'Failed'}|Sort-Object @{Expression={[uint64]$_.newGeneration}})
-    if($failed.Count-eq 0){return $null};$max=[uint64]$failed[-1].newGeneration;$same=@($failed|Where-Object{[uint64]$_.newGeneration-eq$max});if($same.Count-ne 1){Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_AMBIGUOUS' 'Latest failed generation is ambiguous' $directory};return $same[0]
+    if($failed.Count-eq 0){return $null};$max=[uint64]$failed[-1].newGeneration;$same=@($failed|Where-Object{[uint64]$_.newGeneration-eq$max});if($same.Count-ne 1){Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_AMBIGUOUS' 'Latest failed generation is ambiguous' $null};return $same[0]
+}
+
+function Read-CcodInstallTransactionRecord {
+    param([Parameter(Mandatory)][string]$InstallRoot,[string]$TransactionId)
+    $root = Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
+    $directory = Join-Path (Join-Path $root 'state') 'install-transactions'
+    if (-not [IO.Directory]::Exists($directory)) { return $null }
+    try { [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $root -Path $directory) }
+    catch { Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Install transaction store is unsafe' $directory }
+    $records = [Collections.Generic.List[object]]::new()
+    foreach ($file in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)) {
+        if ($file.PSIsContainer -or $file.Name -cnotmatch '^\d{20}\.\d{2}\.[A-Za-z]+\.[0-9a-f-]{36}\.json$') { Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Install transaction store contains an unknown object' $file.FullName }
+        try { $record = Read-CcodStrictJson -Path $file.FullName -ExpectedSchema 1 -Kind 'install transaction' }
+        catch { Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Install transaction snapshot is malformed' $file.FullName }
+        [void](Assert-CcodInstallTransactionRecord $record)
+        if ((Get-CcodInstallTransactionRecordLeaf $record) -cne $file.Name) { Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Install transaction snapshot name is not canonical' $file.FullName }
+        if ([string]::IsNullOrWhiteSpace($TransactionId) -or [string]$record.transactionId -ceq $TransactionId) { $records.Add($record) }
+    }
+    $active=$null;if([string]::IsNullOrWhiteSpace($TransactionId)){try{$active=Read-CcodActiveRuntime -InstallRoot $root}catch{}}
+    return Resolve-CcodInstallTransactionRecordHead -Records $records.ToArray() -TransactionId $TransactionId -ActiveRuntime $active
 }
 
 function Set-CcodInstallTransactionPhase {
@@ -448,7 +457,7 @@ function Complete-CcodReadyFinalizationRecovery {
         $observed=Read-CcodInstallTransactionRecord -InstallRoot $InstallRoot -TransactionId $TransactionRecord.transactionId
         if($null-eq$observed-or$observed.phase-cne'Ready'){Throw-CcodLifecycleError 'CCOD_INSTALL_READY_FINALIZATION_PENDING' 'Ready finalization snapshot is not visible' $TransactionRecord.transactionId}
         if([string]$proof.Validation.Manifest.projectVersion-ceq$script:CcodProductVersion){
-            try{$registration=&$Adapters.RegisterProduct $InstallRoot ([string]$observed.newRuntimeId) ([string]$proof.Validation.Manifest.projectVersion) ([string]$observed.sealedPackageSha256) $null $observed;if($null-eq$registration-or$registration.verified-isnot[bool]-or-not$registration.verified){throw 'registration receipt invalid'};$productRegistrationVerified=$true}catch{$productRegistrationFailure=$_}
+            try{&$Adapters.CloseReadyGeneration $fileTransaction;$fileTransaction=$null;$productAdapters=&$Adapters.GetProductRegistrationAdapters;$registration=&$Adapters.RegisterProduct $InstallRoot ([string]$observed.newRuntimeId) ([string]$proof.Validation.Manifest.projectVersion) ([string]$observed.sealedPackageSha256) $null $observed $productAdapters;if($null-eq$registration-or$registration.verified-isnot[bool]-or-not$registration.verified){throw 'registration receipt invalid'};$productRegistrationVerified=$true}catch{$productRegistrationFailure=$_}
         }
     }catch{
         try{$observed=Read-CcodInstallTransactionRecord -InstallRoot $InstallRoot -TransactionId $TransactionRecord.transactionId}catch{}
@@ -1942,6 +1951,10 @@ function Get-CcodLifecycleAdapters {
             param($InstallRoot,$TransactionId,$FileTransaction)
             Set-CcodInstallTransactionPhase -InstallRoot $InstallRoot -TransactionId $TransactionId -ExpectedPhase 'ProtectionReady' -NewPhase 'Ready' -FileTransaction $FileTransaction
         }
+        CloseReadyGeneration = {
+            param($FileTransaction)
+            Close-CcodInstallFileTransaction -Transaction $FileTransaction -Disposition Ready
+        }
         AddProductShortcutCandidates = {
             param($Files)
             $temporaryRoot=Join-Path ([IO.Path]::GetTempPath()) ('ccod-product-shortcuts-'+[guid]::NewGuid().ToString('N'))
@@ -1949,16 +1962,18 @@ function Get-CcodLifecycleAdapters {
             $candidates=@(& $module {param($Root)New-CcodProductShortcutCandidates -Directory $Root} $temporaryRoot)
             [pscustomobject]@{Files=@($Files)+$candidates;TemporaryRoot=$temporaryRoot}
         }
+        GetProductRegistrationAdapters = { $null }
         RegisterProduct = {
-            param($InstallRoot,$RuntimeId,$Version,$PackageSha256,$FileTransaction,$TransactionRecord)
+            param($InstallRoot,$RuntimeId,$Version,$PackageSha256,$FileTransaction,$TransactionRecord,$ProductAdapters)
             $module=Import-Module (Join-Path $PSScriptRoot 'ProductRegistration.psm1') -Force -PassThru -ErrorAction Stop
-            $ownedTransaction=$null;$sourceCapability=$FileTransaction
+            $ownedTransaction=$null;$sourceCapability=$null
             try{
-                if($null-eq$sourceCapability){Import-Module (Join-Path $PSScriptRoot 'InstallFileTransaction.psm1') -ErrorAction Stop;$ownedTransaction=Open-CcodInstallProductRegistrationTransaction -InstallRoot $InstallRoot -ReadyTransaction $TransactionRecord;$sourceCapability=Open-CcodInstallRetainedGeneration -InstallRoot $InstallRoot -RuntimeId $RuntimeId -ExpectedManifestSha256 ([string]$TransactionRecord.newManifestSha256) -FileTransaction $ownedTransaction}
+                Import-Module (Join-Path $PSScriptRoot 'InstallFileTransaction.psm1') -ErrorAction Stop;$ownedTransaction=Open-CcodInstallProductRegistrationTransaction -InstallRoot $InstallRoot -ReadyTransaction $TransactionRecord;$sourceCapability=Open-CcodInstallRetainedGeneration -InstallRoot $InstallRoot -RuntimeId $RuntimeId -ExpectedManifestSha256 ([string]$TransactionRecord.newManifestSha256) -FileTransaction $ownedTransaction
                 $registration=New-CcodProductRegistration -InstallRoot $InstallRoot -RuntimeId $RuntimeId -Version $Version -PackageSha256 $PackageSha256 -FileTransaction $sourceCapability
                 $system=[Environment]::GetFolderPath([Environment+SpecialFolder]::System);$proof=[pscustomobject][ordered]@{phase=[string]$TransactionRecord.phase;runtimeId=$RuntimeId;version=$Version;packageSha256=$PackageSha256;runtimeGeneration=[uint64]$TransactionRecord.newGeneration;manifestSha256=[string]$TransactionRecord.newManifestSha256;startMenuSha256=(Get-CcodLifecycleFileSha256 $registration.startMenuShortcut.candidatePath);desktopSha256=(Get-CcodLifecycleFileSha256 $registration.desktopShortcut.candidatePath);targetPath=[IO.Path]::GetFullPath((Join-Path $system 'schtasks.exe'));arguments='/Run /TN "Codex Control Other Devices Supervisor"';transactionRecord=$TransactionRecord;bootstrapPath=$registration.bootstrapPath;uninstallerPath=$registration.uninstallerPath}
-                $receipt=Commit-CcodProductRegistration -Registration $registration -FileTransaction $sourceCapability -Adapters @{GetReadyProof={param($Ignored)$proof}.GetNewClosure()}
-                Remove-CcodLegacyProductRegistration -ExpectedAppId '{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}'
+                $commitAdapters=@{};if($null-ne$ProductAdapters){if($ProductAdapters-isnot[hashtable]){throw 'product side-effect adapters invalid'};foreach($key in $ProductAdapters.Keys){$commitAdapters[$key]=$ProductAdapters[$key]}};$commitAdapters.GetReadyProof={param($Ignored)$proof}.GetNewClosure()
+                $receipt=Commit-CcodProductRegistration -Registration $registration -FileTransaction $sourceCapability -Adapters $commitAdapters
+                Remove-CcodLegacyProductRegistration -ExpectedAppId '{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}' -Adapters $ProductAdapters
                 [pscustomobject]@{verified=[bool]$receipt.verified;legacyRemoved=$true}
             }finally{if($null-ne$ownedTransaction){try{Close-CcodInstallFileTransaction -Transaction $ownedTransaction -Disposition Ready}catch{}}}
         }
@@ -2375,7 +2390,7 @@ function Invoke-CcodInstall {
         if($activeValidation.Valid){
             $sameIdentity=Test-CcodInstallPackageIdentity -TransactionRecord $globalTransaction -ProjectVersion ([string]$projectVersion) -ActiveProjectVersion ([string]$activeValidation.Manifest.projectVersion) -SealedPackageSha256 $SealedPackageSha256 -ActiveRuntimeId ([string]$existingPointer.activeRuntime) -ActiveGeneration ([uint64]$existingPointer.generation)
             if($sameIdentity){
-                $registration=&$adapters.RegisterProduct $root ([string]$existingPointer.activeRuntime) ([string]$projectVersion) $SealedPackageSha256 $null $globalTransaction
+                $productAdapters=&$adapters.GetProductRegistrationAdapters;$registration=&$adapters.RegisterProduct $root ([string]$existingPointer.activeRuntime) ([string]$projectVersion) $SealedPackageSha256 $null $globalTransaction $productAdapters
                 if($null-eq$registration-or$registration.verified-isnot[bool]-or-not$registration.verified){Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'AlreadyInstalled product registration reconciliation did not verify' $existingPointer.activeRuntime}
                 return [pscustomobject][ordered]@{Outcome='AlreadyInstalled';Installed=$true;RuntimeId=[string]$existingPointer.activeRuntime;PreviousRuntimeId=$existingPointer.previousRuntime;RepairCompleted=$false;ProductRegistrationVerified=$true}
             }
@@ -2506,7 +2521,8 @@ function Invoke-CcodInstall {
         }
         if([string]$projectVersion-ceq$script:CcodProductVersion){
             try{
-                $registrationReceipt=&$adapters.RegisterProduct $root $runtimeId ([string]$projectVersion) $SealedPackageSha256 $fileTransaction $installRecord
+                &$adapters.CloseReadyGeneration $fileTransaction;$fileTransaction=$null
+                $productAdapters=&$adapters.GetProductRegistrationAdapters;$registrationReceipt=&$adapters.RegisterProduct $root $runtimeId ([string]$projectVersion) $SealedPackageSha256 $fileTransaction $installRecord $productAdapters
                 if($null-eq$registrationReceipt-or$registrationReceipt.verified-isnot[bool]-or-not$registrationReceipt.verified){throw 'registration receipt invalid'}
                 $productRegistrationVerified=$true
             }catch{$productRegistrationFailure=$_}
