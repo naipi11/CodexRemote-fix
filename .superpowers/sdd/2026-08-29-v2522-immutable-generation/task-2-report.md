@@ -204,3 +204,88 @@ Important findings. This round keeps `2101485` and remediates all seven.
 ### Fix commit
 
 - `fix: complete generation bootstrap lifecycle` (this fix-round commit)
+
+## Fix round 2 — recover append-only lifecycle finalization
+
+### RED and root-cause evidence
+
+- The pre-recovery lifecycle baseline command
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\InstallLifecycle.SelfTest.ps1`
+  exited `0` with `Install lifecycle self-tests passed: 114`; this proved the
+  existing suite covered only creation of the `ProtectionReady` gap, not a
+  later invocation that completes it.
+- After adding the second-invocation recovery regression, the same command
+  exited `1` with
+  `CCOD_SELFTEST_FAILED case=a-later-invocation-recovers-one-missing-Ready-transaction-snapshot-without-another-install-mutation error=CCOD_INSTALL_SOURCE_MISSING`.
+  The real entry touched the vanished source checkout before attempting any
+  state-only recovery.
+- The first implementation run exited `1` with
+  `CCOD_INSTALL_READY_RECOVERY_INVALID`; temporary bounded diagnostics traced
+  that failure to calling the private, non-exported
+  `Get-CcodRuntimeDirectoryForId`. The final implementation derives the
+  already validated runtime path locally and applies the existing contained
+  install-path proof; the temporary diagnostic text was removed.
+
+### GREEN and final verification evidence
+
+- InstallFileTransaction command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\InstallFileTransaction.SelfTest.ps1`
+  exited `0`; all 26 named cases passed. Coverage includes V4 state-only
+  create-only records, duplicate-record rejection, generation/payload/
+  manifest/retained/pointer/retirement exclusion, and a forced re-import with
+  the V3 marker already present.
+- InstallLifecycle command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\InstallLifecycle.SelfTest.ps1`
+  exited `0` with `Install lifecycle self-tests passed: 116`. A later
+  invocation with the source checkout removed appends exactly one matching
+  Ready transaction snapshot and creates no runtime, pointer, task start, or
+  Failed record. Malformed Ready receipt, mismatched append-only pointer, and
+  changed manifest bytes each remain `ProtectionReady` and write nothing.
+- Bootstrap exited `0` with `Bootstrap self-test passed: 24`.
+- RuntimeManifest exited `0`; all 19 named cases reported `True`, including
+  real default-adapter fresh and append-only upgrade pointer commits.
+- StaticProbeWorker exited `0`; all 38 named cases reported `True`, including
+  unsafe selector root/leaf/JSON/generation rejection.
+- UninstallBootstrap exited `0` with
+  `Uninstall bootstrap self-tests passed: 14`.
+- PersistenceIO exited `0`; all 24 named cases reported `True`.
+- UiPreferences exited `0`; all 9 named cases reported `PASS`.
+- Explicit PowerShell parser checks passed for all 12 changed `.ps1`/`.psm1`
+  files (`PARSER_COUNT=12`).
+- `git diff --check` exited `0`; it emitted only checkout LF-to-CRLF warnings.
+- Aggregate command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\PersistenceSelfTest.ps1`
+  exited `0`; after expanding the forced-V3-reimport denial matrix, the final
+  aggregate rerun also exited `0`. Both aggregate runs emitted no stdout/stderr
+  result text.
+
+### Recovered behavior and boundaries
+
+- `Open-CcodInstallStateTransaction` is ABI V4 and can traverse only
+  root-to-`state` directories and publish create-only state records. It cannot
+  create/open/mutate a generation, copy payload bytes, write a generation
+  manifest, select a retained generation, commit an active pointer, or retire
+  a generation.
+- `Invoke-CcodInstall` distinguishes only the exact recoverable
+  `ProtectionReady` head from other nonterminal transactions. It revalidates
+  immutable transaction identity, the exact append-only active runtime and
+  generation, the recorded new-manifest SHA-256, the current runtime manifest,
+  and exactly one matching Ready activation receipt before and after opening
+  the state-only capability.
+- Recovery occurs before source validation and performs no install, task,
+  process, pointer, log, activation-receipt, or Failed write. A proof mismatch
+  returns `CCOD_INSTALL_READY_RECOVERY_INVALID`; a state-only append failure
+  remains retryable as `CCOD_INSTALL_READY_FINALIZATION_PENDING`.
+- Selector readers in Bootstrap, StaticProbeWorker, and UninstallBootstrap
+  reject a non-directory selector root and unsafe, malformed, duplicate,
+  non-integral, or noncanonical leaves. Legacy `active.json` fallback remains
+  available only when the append-only root is absent.
+- No push, tag, release, build, installation, product-process action,
+  WindowsApps access, DPAPI access, or external write was performed.
+
+### Remaining concerns
+
+- The documented current-user ordinary-race boundary is unchanged; this is not
+  a sandbox against unrestricted same-user or in-process code.
+- Failed and superseded immutable generations remain retained until the
+  separately proven reclamation path runs.

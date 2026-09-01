@@ -94,6 +94,23 @@ function Get-CcodBootstrapCanonicalRoot {
     return $root
 }
 
+function Skip-CcodBootstrapJsonWhitespace {param([string]$Text,[ref]$Index)while($Index.Value-lt$Text.Length-and($Text[$Index.Value]-eq' '-or$Text[$Index.Value]-eq"`t"-or$Text[$Index.Value]-eq"`r"-or$Text[$Index.Value]-eq"`n")){$Index.Value++}}
+function Read-CcodBootstrapJsonStringToken {param([string]$Text,[ref]$Index)if($Index.Value-ge$Text.Length-or$Text[$Index.Value]-ne'"'){throw'json string'};$start=$Index.Value;$Index.Value++;while($Index.Value-lt$Text.Length){$c=$Text[$Index.Value];if($c-eq'"'){$Index.Value++;return $Text.Substring($start,$Index.Value-$start)};if([int][char]$c-lt0x20){throw'json control'};if($c-eq'\'){$Index.Value++;if($Index.Value-ge$Text.Length){throw'json escape'};$escape=$Text[$Index.Value];if($escape-eq'u'){if($Index.Value+4-ge$Text.Length-or$Text.Substring($Index.Value+1,4)-cnotmatch'^[0-9A-Fa-f]{4}$'){throw'json unicode'};$Index.Value+=5;continue};if('"\/bfnrt'.IndexOf($escape)-lt0){throw'json escape'}};$Index.Value++};throw'json string end'}
+function Read-CcodBootstrapJsonValue {
+    param([string]$Text,[ref]$Index)
+    Skip-CcodBootstrapJsonWhitespace $Text $Index
+    if($Index.Value-ge$Text.Length){throw'json value'}
+    if($Text[$Index.Value]-eq'{'){
+        $Index.Value++;Skip-CcodBootstrapJsonWhitespace $Text $Index;$keys=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        if($Index.Value-lt$Text.Length-and$Text[$Index.Value]-eq'}'){$Index.Value++;return}
+        while($true){$encoded=Read-CcodBootstrapJsonStringToken $Text $Index;$key=$encoded|ConvertFrom-Json -ErrorAction Stop;if($key-isnot[string]-or-not$keys.Add($key)){throw'json duplicate'};Skip-CcodBootstrapJsonWhitespace $Text $Index;if($Index.Value-ge$Text.Length-or$Text[$Index.Value]-ne':'){throw'json separator'};$Index.Value++;Read-CcodBootstrapJsonValue $Text $Index;Skip-CcodBootstrapJsonWhitespace $Text $Index;if($Index.Value-ge$Text.Length){throw'json end'};if($Text[$Index.Value]-eq'}'){$Index.Value++;return};if($Text[$Index.Value]-ne','){throw'json delimiter'};$Index.Value++;Skip-CcodBootstrapJsonWhitespace $Text $Index}
+    }
+    if($Text[$Index.Value]-eq'['){$Index.Value++;Skip-CcodBootstrapJsonWhitespace $Text $Index;if($Index.Value-lt$Text.Length-and$Text[$Index.Value]-eq']'){$Index.Value++;return};while($true){Read-CcodBootstrapJsonValue $Text $Index;Skip-CcodBootstrapJsonWhitespace $Text $Index;if($Index.Value-ge$Text.Length){throw'json array end'};if($Text[$Index.Value]-eq']'){$Index.Value++;return};if($Text[$Index.Value]-ne','){throw'json array delimiter'};$Index.Value++}}
+    if($Text[$Index.Value]-eq'"'){[void](Read-CcodBootstrapJsonStringToken $Text $Index);return}
+    $start=$Index.Value;$delimiters=",]} `t`r`n";while($Index.Value-lt$Text.Length-and$delimiters.IndexOf([string]$Text[$Index.Value])-lt0){$Index.Value++};if($Index.Value-eq$start){throw'json scalar'}
+}
+function Assert-CcodBootstrapJsonNoDuplicateKeys {param([string]$Text)$index=0;Read-CcodBootstrapJsonValue $Text ([ref]$index);Skip-CcodBootstrapJsonWhitespace $Text ([ref]$index);if($index-ne$Text.Length){throw'json trailing'}}
+
 function Read-CcodBootstrapJson {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -105,7 +122,9 @@ function Read-CcodBootstrapJson {
     }
     $value = $null
     try {
-        $value = ([IO.File]::ReadAllText($Path) | ConvertFrom-Json)
+        $item=Get-Item -LiteralPath $Path -Force -ErrorAction Stop;if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0-or$item.Length-lt1-or$item.Length-gt1048576){throw'invalid file'}
+        $text=[Text.UTF8Encoding]::new($false,$true).GetString([IO.File]::ReadAllBytes($Path));Assert-CcodBootstrapJsonNoDuplicateKeys $text
+        $value = ($text | ConvertFrom-Json -ErrorAction Stop)
     } catch {
         Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_STATE_MALFORMED' "$Kind is malformed" $Path
     }
@@ -148,8 +167,10 @@ function Assert-CcodBootstrapPlainSelectorFile {
 function Read-CcodBootstrapActivePointer {
     param([Parameter(Mandatory)][string]$InstallRoot)
 
-    $pointerRoot=Assert-CcodBootstrapContained -Root $InstallRoot -Path (Join-Path $InstallRoot 'state\active-generation') -AllowMissingLeaf
-    if([IO.Directory]::Exists($pointerRoot)){
+    try{$pointerRoot=Assert-CcodBootstrapContained -Root $InstallRoot -Path (Join-Path $InstallRoot 'state\active-generation') -AllowMissingLeaf}catch{Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector root is unsafe' (Join-Path $InstallRoot 'state\active-generation')}
+    $pointerRootItem=$null;try{$pointerRootItem=Get-Item -LiteralPath $pointerRoot -Force -ErrorAction Stop}catch{}
+    if($null-ne$pointerRootItem-and-not$pointerRootItem.PSIsContainer){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector root is not a directory' $pointerRoot}
+    if($null-ne$pointerRootItem){
         if(Test-CcodBootstrapReparse $pointerRoot){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector root is a reparse point' $pointerRoot}
         $entries=@(Get-ChildItem -LiteralPath $pointerRoot -Force -ErrorAction Stop)
         if($entries.Count-eq0){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector is empty' $pointerRoot}
@@ -157,7 +178,7 @@ function Read-CcodBootstrapActivePointer {
         foreach($entry in $entries){
             if($entry.PSIsContainer-or$entry.Name-cnotmatch'^\d{20}\.json$'){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector contains an unknown entry' $entry.FullName}
             Assert-CcodBootstrapPlainSelectorFile $entry.FullName
-            $record=Read-CcodBootstrapJson -Path $entry.FullName -Kind 'active generation selector'
+            try{$record=Read-CcodBootstrapJson -Path $entry.FullName -Kind 'active generation selector'}catch{Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector JSON is invalid' $entry.FullName}
             $names=@($record.PSObject.Properties.Name)
             if(($names-join',')-cne'schemaVersion,generation,activeRuntime,previousGeneration'-or$record.schemaVersion-isnot[int]-or$record.schemaVersion-ne1-or$record.activeRuntime-isnot[string]){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector fields are invalid' $entry.FullName}
             $integerTypes=@([byte],[uint16],[uint32],[uint64],[int16],[int32],[int64]);$gOk=$false;$pOk=$false;foreach($t in $integerTypes){if($record.generation-is$t){$gOk=$true};if($record.previousGeneration-is$t){$pOk=$true}}

@@ -260,8 +260,8 @@ function New-CcodLifecycleFake {
     $adapters.SetActiveRuntime = {
         param($InstallRoot, $RuntimeId, $Ownership, $TargetGeneration, $FileTransaction)
         if ($null -ne $world.SetActiveFailure) { & $world.SetActiveFailure $InstallRoot $RuntimeId $Ownership $TargetGeneration $FileTransaction }
-        $assertFence = { param($Root, $Receipt, $ExpectActivePointer) if ($Receipt.released) { throw 'released lifecycle owner' }; $true }
-        Set-CcodActiveRuntime -InstallRoot $InstallRoot -TargetGeneration $TargetGeneration -FileTransaction $FileTransaction -Ownership $Ownership -Adapters @{ AssertLifecycleFence=$assertFence }
+        $assertFence = { param($Root, $Receipt, $ExpectActivePointer,$TargetRuntimeId) if ($Receipt.released) { throw 'released lifecycle owner' }; $true }
+        Set-CcodActiveRuntime -InstallRoot $InstallRoot -NewRuntimeId $RuntimeId -TargetGeneration $TargetGeneration -FileTransaction $FileTransaction -Ownership $Ownership -Adapters @{ AssertLifecycleFence=$assertFence }
     }.GetNewClosure()
     $adapters.ExitLifecycleOwnership = {
         param($Ownership)
@@ -307,6 +307,33 @@ function New-CcodLifecycleFake {
         $world.LogRecords.Add($Record)
     }.GetNewClosure()
     [pscustomobject]@{ World = $world; Adapters = $adapters }
+}
+
+function New-CcodReadyFinalizationGapFixture {
+    $source=New-CcodLifecycleTempRoot
+    $install=New-CcodLifecycleTempRoot
+    $nodeRoot=New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22-finalization-recovery' | Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot
+        $fake=New-CcodLifecycleFake -NodePath $node
+        $fake.Adapters.CommitReadyTransaction={throw 'PRIVATE_FINAL_SNAPSHOT_FAILURE'}
+        $failure=$null
+        try { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters | Out-Null } catch { $failure=$_ }
+        Assert-CcodTrue ($null-ne$failure-and$failure.FullyQualifiedErrorId-like'CCOD_INSTALL_READY_FINALIZATION_PENDING*') 'fixture reaches the exact Ready-finalization gap'
+        $module=Get-Module InstallLifecycle -ErrorAction Stop
+        $head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'ProtectionReady' $head.phase 'fixture transaction is recoverable at ProtectionReady'
+        return [pscustomobject]@{Source=$source;Install=$install;NodeRoot=$nodeRoot;Node=$node;Transaction=$head}
+    } catch {
+        foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+        throw
+    }
+}
+
+function Remove-CcodReadyFinalizationGapFixture {
+    param([Parameter(Mandatory)]$Fixture)
+    foreach($path in @($Fixture.Source,$Fixture.Install,$Fixture.NodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
 }
 
 function Read-CcodLifecycleActivePointer {
@@ -1636,6 +1663,66 @@ $results += Invoke-CcodTest 'sealed-source copy failure retains the candidate an
 $results += Invoke-CcodTest 'final transaction snapshot failure leaves Ready receipt and recoverable nonterminal without Failed ambiguity' {
     $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
     try{New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22-final-gap'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node;$fake.Adapters.CommitReadyTransaction={throw 'PRIVATE_FINAL_SNAPSHOT_FAILURE'};$failure=$null;try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters|Out-Null}catch{$failure=$_};Assert-CcodTrue ($failure.FullyQualifiedErrorId-like'CCOD_INSTALL_READY_FINALIZATION_PENDING*') 'final snapshot failure reports recoverable pending status';$ready=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\activation-receipts') -Filter '*.Ready.json' -File);$failed=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\activation-receipts') -Filter '*.Failed.json' -File);Assert-CcodEqual 1 $ready.Count 'Ready activation receipt remains visible exactly once';Assert-CcodEqual 0 $failed.Count 'no contradictory Failed activation receipt is appended';$transactionFailed=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File);$transactionReady=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Ready.*.json' -File);Assert-CcodEqual 0 $transactionFailed.Count 'no Failed transaction snapshot follows Ready receipt';Assert-CcodEqual 0 $transactionReady.Count 'missing final transaction snapshot remains absent for recovery';$module=Get-Module InstallLifecycle;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install;Assert-CcodEqual 'ProtectionReady' $head.phase 'transaction remains recoverable at ProtectionReady'}finally{foreach($p in @($source,$install,$nodeRoot)){if(Test-Path $p){Remove-Item $p -Recurse -Force}}}
+}
+
+# Production mutation caught: treating every nonterminal transaction as permanently busy instead of finalizing an already-proven Ready activation.
+$results += Invoke-CcodTest 'a later invocation recovers one missing Ready transaction snapshot without another install mutation' {
+    $fixture=New-CcodReadyFinalizationGapFixture
+    try {
+        $runtimeCount=@(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'runtime') -Directory -Force).Count
+        $pointerCount=@(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\active-generation') -File -Force).Count
+        Remove-Item -LiteralPath $fixture.Source -Recurse -Force
+        $recoveryFake=New-CcodLifecycleFake -NodePath $fixture.Node
+        $result=Invoke-CcodInstall -SourceRoot $fixture.Source -InstallRoot $fixture.Install -Adapters $recoveryFake.Adapters
+        Assert-CcodEqual 'Recovered' $result.Outcome 'finalization recovery reports a bounded recovered outcome'
+        Assert-CcodEqual $fixture.Transaction.newRuntimeId $result.RuntimeId 'recovery result binds the pending transaction runtime'
+        Assert-CcodEqual $runtimeCount @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'runtime') -Directory -Force).Count 'recovery creates no runtime generation'
+        Assert-CcodEqual $pointerCount @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\active-generation') -File -Force).Count 'recovery appends no active pointer'
+        Assert-CcodEqual 1 @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\install-transactions') -Filter '*.Ready.*.json' -File -Force).Count 'recovery appends exactly one Ready transaction snapshot'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\install-transactions') -Filter '*.Failed.*.json' -File -Force).Count 'recovery appends no Failed transaction snapshot'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\activation-receipts') -Filter '*.Failed.json' -File -Force).Count 'recovery appends no Failed activation receipt'
+        $module=Get-Module InstallLifecycle -ErrorAction Stop
+        $head=&$module {param($Root,$Id)Read-CcodInstallTransactionRecord -InstallRoot $Root -TransactionId $Id} $fixture.Install $fixture.Transaction.transactionId
+        Assert-CcodEqual 'Ready' $head.phase 'the original transaction alone becomes terminal Ready'
+        Assert-CcodEqual 0 $recoveryFake.World.TaskInstalled 'recovery does not reinstall the scheduled task'
+        Assert-CcodEqual 0 $recoveryFake.World.TaskStarted 'recovery does not restart the product'
+        Assert-CcodEqual 0 @($recoveryFake.World.Calls|Where-Object{$_-like'Validate:*'}).Count 'state-only recovery does not depend on the vanished source checkout'
+    } finally { Remove-CcodReadyFinalizationGapFixture $fixture }
+}
+
+# Production mutation caught: finalizing ProtectionReady when any receipt, selected pointer, or recorded manifest proof no longer matches.
+$results += Invoke-CcodTest 'invalid Ready receipt pointer or manifest leaves ProtectionReady without runtime pointer or Failed writes' {
+    $fixture=New-CcodReadyFinalizationGapFixture
+    $caseRoots=[Collections.Generic.List[string]]::new()
+    try {
+        Remove-Item -LiteralPath $fixture.Source -Recurse -Force
+        foreach($case in @(
+            @{Name='receipt';Mutate={param($Root,$Transaction)$path=@(Get-ChildItem -LiteralPath (Join-Path $Root 'state\activation-receipts') -Filter '*.Ready.json' -File)[0].FullName;[IO.File]::SetAttributes($path,[IO.FileAttributes]::Normal);[IO.File]::WriteAllText($path,'{',[Text.UTF8Encoding]::new($false))}},
+            @{Name='pointer';Mutate={param($Root,$Transaction)$path=@(Get-ChildItem -LiteralPath (Join-Path $Root 'state\active-generation') -Filter '*.json' -File|Sort-Object Name)[-1].FullName;$record=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json;$replacement=if($record.activeRuntime.EndsWith('0')){'1'}else{'0'};$record.activeRuntime=$record.activeRuntime.Substring(0,$record.activeRuntime.Length-1)+$replacement;[IO.File]::SetAttributes($path,[IO.FileAttributes]::Normal);[IO.File]::WriteAllText($path,($record|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))}},
+            @{Name='manifest';Mutate={param($Root,$Transaction)$path=Join-Path $Root "runtime\$($Transaction.newRuntimeId)\manifest.json";[IO.File]::SetAttributes($path,[IO.FileAttributes]::Normal);[IO.File]::AppendAllText($path,"`n",[Text.UTF8Encoding]::new($false))}}
+        )) {
+            $caseRoot=New-CcodLifecycleTempRoot
+            $caseRoots.Add($caseRoot)
+            Copy-Item -LiteralPath $fixture.Install -Destination $caseRoot -Recurse -Force
+            $runtimeCount=@(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'runtime') -Directory -Force).Count
+            $pointerCount=@(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'state\active-generation') -File -Force).Count
+            & $case.Mutate $caseRoot $fixture.Transaction
+            $failure=$null
+            try { Invoke-CcodInstall -SourceRoot $fixture.Source -InstallRoot $caseRoot -Adapters (New-CcodLifecycleFake -NodePath $fixture.Node).Adapters | Out-Null } catch { $failure=$_ }
+            Assert-CcodTrue ($null-ne$failure-and$failure.FullyQualifiedErrorId-like'CCOD_INSTALL_READY_RECOVERY_INVALID*') "$($case.Name) mismatch fails the bounded recovery contract"
+            Assert-CcodEqual $runtimeCount @(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'runtime') -Directory -Force).Count "$($case.Name) mismatch creates no runtime generation"
+            Assert-CcodEqual $pointerCount @(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'state\active-generation') -File -Force).Count "$($case.Name) mismatch appends no active pointer"
+            Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'state\install-transactions') -Filter '*.Ready.*.json' -File -Force).Count "$($case.Name) mismatch appends no Ready transaction snapshot"
+            Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'state\install-transactions') -Filter '*.Failed.*.json' -File -Force).Count "$($case.Name) mismatch appends no Failed transaction snapshot"
+            Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'state\activation-receipts') -Filter '*.Failed.json' -File -Force).Count "$($case.Name) mismatch appends no Failed activation receipt"
+            $module=Get-Module InstallLifecycle -ErrorAction Stop
+            $head=&$module {param($Root,$Id)Read-CcodInstallTransactionRecord -InstallRoot $Root -TransactionId $Id} $caseRoot $fixture.Transaction.transactionId
+            Assert-CcodEqual 'ProtectionReady' $head.phase "$($case.Name) mismatch remains recoverable and nonterminal"
+        }
+    } finally {
+        foreach($caseRoot in $caseRoots){if(Test-Path -LiteralPath $caseRoot){Remove-Item -LiteralPath $caseRoot -Recurse -Force}}
+        Remove-CcodReadyFinalizationGapFixture $fixture
+    }
 }
 
 $results += Invoke-CcodTest 'source reparse point fails closed before staging' {

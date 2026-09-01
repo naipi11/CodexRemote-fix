@@ -197,6 +197,15 @@ function Open-CcodLifecycleInstallGeneration {
     return $transaction
 }
 
+function Open-CcodLifecycleInstallStateTransaction {
+    param([Parameter(Mandatory)][string]$InstallRoot)
+    if($null-eq(Get-Command Open-CcodInstallStateTransaction -ErrorAction SilentlyContinue)){Import-Module (Join-Path $PSScriptRoot 'InstallFileTransaction.psm1') -ErrorAction Stop}
+    $canonical = Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
+    $transaction = Open-CcodInstallStateTransaction -InstallRoot $canonical
+    $script:CcodInstallTransactionRoots.Add($transaction,[pscustomobject]@{ InstallRoot=$canonical; RuntimeId=$null })
+    return $transaction
+}
+
 function Assert-CcodInstallTransactionRoot {
     param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$FileTransaction)
     $binding = $null
@@ -375,6 +384,80 @@ function Set-CcodInstallTransactionPhase {
     $next.phase = $NewPhase
     $next.errorCode = if ($NewPhase -ceq 'Failed') { $ErrorCode } else { $null }
     return Write-CcodInstallTransactionRecord -InstallRoot $InstallRoot -TransactionRecord $next -FileTransaction $FileTransaction
+}
+
+function Read-CcodReadyActivationReceiptForRecovery {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$TransactionRecord)
+    $root=Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
+    $directory=Join-Path (Join-Path $root 'state') 'activation-receipts'
+    if(-not[IO.Directory]::Exists($directory)){Throw-CcodLifecycleError 'CCOD_INSTALL_READY_RECOVERY_INVALID' 'Ready activation receipt store is missing' $directory}
+    try{[void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $root -Path $directory)}catch{Throw-CcodLifecycleError 'CCOD_INSTALL_READY_RECOVERY_INVALID' 'Ready activation receipt store is unsafe' $directory}
+    $matching=[Collections.Generic.List[object]]::new()
+    try{
+        foreach($file in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)){
+            if($file.PSIsContainer-or$file.Name-cnotmatch'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[A-Za-z]+\.json$'){throw 'unknown receipt object'}
+            $receipt=Read-CcodStrictJson -Path $file.FullName -ExpectedSchema 1 -Kind 'activation receipt'
+            [void](Assert-CcodActivationReceipt $receipt)
+            if($file.Name-cne('{0}.{1}.json'-f$receipt.activationId,$receipt.phase)){throw 'noncanonical receipt name'}
+            if($receipt.phase-ceq'Ready'-and$receipt.runtimeId-ceq$TransactionRecord.newRuntimeId-and[string]$receipt.previousRuntimeId-ceq[string]$TransactionRecord.oldRuntimeId){$matching.Add($receipt)}
+        }
+    }catch{Throw-CcodLifecycleError 'CCOD_INSTALL_READY_RECOVERY_INVALID' 'Ready activation receipt store is invalid' $directory}
+    if($matching.Count-ne1){Throw-CcodLifecycleError 'CCOD_INSTALL_READY_RECOVERY_INVALID' 'Exactly one matching Ready activation receipt is required' $TransactionRecord.transactionId}
+    return $matching[0]
+}
+
+function Assert-CcodReadyFinalizationRecoveryProof {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$TransactionRecord)
+    try{
+        [void](Assert-CcodInstallTransactionRecord $TransactionRecord)
+        if($TransactionRecord.phase-cne'ProtectionReady'-or[string]::IsNullOrWhiteSpace([string]$TransactionRecord.newRuntimeId)){throw 'transaction phase'}
+        [uint64]$expectedGeneration=if($null-eq$TransactionRecord.oldGeneration){1}else{[uint64]$TransactionRecord.oldGeneration+1}
+        if([uint64]$TransactionRecord.newGeneration-ne$expectedGeneration){throw 'transaction generation'}
+        $pointerRoot=Join-Path $InstallRoot 'state\active-generation'
+        if(-not[IO.Directory]::Exists($pointerRoot)){throw 'append-only pointer missing'}
+        $pointerItem=Get-Item -LiteralPath $pointerRoot -Force -ErrorAction Stop
+        if(-not$pointerItem.PSIsContainer-or($pointerItem.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){throw 'append-only pointer root'}
+        [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $InstallRoot -Path $pointerRoot)
+        $pointer=Read-CcodActiveRuntime -InstallRoot $InstallRoot
+        if($pointer.activeRuntime-cne$TransactionRecord.newRuntimeId-or[uint64]$pointer.generation-ne[uint64]$TransactionRecord.newGeneration-or[string]$pointer.previousRuntime-cne[string]$TransactionRecord.oldRuntimeId){throw 'active pointer mismatch'}
+        $runtimeRoot=[IO.Path]::GetFullPath((Join-Path (Join-Path $InstallRoot 'runtime') $TransactionRecord.newRuntimeId))
+        [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $runtimeRoot)
+        $validation=Test-CcodRuntimeManifest -RuntimeDirectory $runtimeRoot -ExpectedRuntimeId $TransactionRecord.newRuntimeId -ExpectedManifestSha256 $TransactionRecord.newManifestSha256
+        if($null-eq$validation-or-not$validation.Valid){throw 'runtime manifest mismatch'}
+        $receipt=Read-CcodReadyActivationReceiptForRecovery -InstallRoot $InstallRoot -TransactionRecord $TransactionRecord
+        return [pscustomobject]@{Pointer=$pointer;RuntimeRoot=$runtimeRoot;Validation=$validation;Receipt=$receipt}
+    }catch{
+        if((Get-CcodLifecycleErrorId $_)-ceq'CCOD_INSTALL_READY_RECOVERY_INVALID'){throw}
+        Throw-CcodLifecycleError 'CCOD_INSTALL_READY_RECOVERY_INVALID' 'Ready finalization recovery proof is invalid' $TransactionRecord.transactionId
+    }
+}
+
+function Complete-CcodReadyFinalizationRecovery {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$TransactionRecord)
+    [void](Assert-CcodReadyFinalizationRecoveryProof -InstallRoot $InstallRoot -TransactionRecord $TransactionRecord)
+    $fileTransaction=$null
+    $observed=$null
+    try{
+        $fileTransaction=Open-CcodLifecycleInstallStateTransaction -InstallRoot $InstallRoot
+        [void](Assert-CcodReadyFinalizationRecoveryProof -InstallRoot $InstallRoot -TransactionRecord $TransactionRecord)
+        try{[void](Set-CcodInstallTransactionPhase -InstallRoot $InstallRoot -TransactionId $TransactionRecord.transactionId -ExpectedPhase 'ProtectionReady' -NewPhase 'Ready' -FileTransaction $fileTransaction)}catch{
+            $observed=Read-CcodInstallTransactionRecord -InstallRoot $InstallRoot -TransactionId $TransactionRecord.transactionId
+            if($null-eq$observed-or$observed.phase-cne'Ready'){Throw-CcodLifecycleError 'CCOD_INSTALL_READY_FINALIZATION_PENDING' 'Ready finalization snapshot could not be appended' $TransactionRecord.transactionId}
+        }
+        $observed=Read-CcodInstallTransactionRecord -InstallRoot $InstallRoot -TransactionId $TransactionRecord.transactionId
+        if($null-eq$observed-or$observed.phase-cne'Ready'){Throw-CcodLifecycleError 'CCOD_INSTALL_READY_FINALIZATION_PENDING' 'Ready finalization snapshot is not visible' $TransactionRecord.transactionId}
+    }catch{
+        try{$observed=Read-CcodInstallTransactionRecord -InstallRoot $InstallRoot -TransactionId $TransactionRecord.transactionId}catch{}
+        if($null-eq$observed-or$observed.phase-cne'Ready'){
+            if((Get-CcodLifecycleErrorId $_)-in@('CCOD_INSTALL_READY_RECOVERY_INVALID','CCOD_INSTALL_READY_FINALIZATION_PENDING')){throw}
+            Throw-CcodLifecycleError 'CCOD_INSTALL_READY_FINALIZATION_PENDING' 'Ready finalization snapshot requires another bounded recovery attempt' $TransactionRecord.transactionId
+        }
+    }finally{
+        if($null-ne$fileTransaction){try{Close-CcodInstallFileTransaction -Transaction $fileTransaction -Disposition $(if($null-ne$observed-and$observed.phase-ceq'Ready'){'Ready'}else{'Failed'})}catch{}}
+    }
+    $ready=Read-CcodInstallTransactionRecord -InstallRoot $InstallRoot -TransactionId $TransactionRecord.transactionId
+    if($null-eq$ready-or$ready.phase-cne'Ready'){Throw-CcodLifecycleError 'CCOD_INSTALL_READY_FINALIZATION_PENDING' 'Ready finalization snapshot is not durable' $TransactionRecord.transactionId}
+    return [pscustomobject][ordered]@{Outcome='Recovered';Installed=$true;RuntimeId=[string]$ready.newRuntimeId;PreviousRuntimeId=$ready.oldRuntimeId;RepairCompleted=$false}
 }
 
 function Test-CcodInstallPackageIdentity {
@@ -1804,7 +1887,7 @@ function Get-CcodLifecycleAdapters {
         }
         SetActiveRuntime = {
             param($InstallRoot, $RuntimeId, $Ownership,$TargetGeneration,$FileTransaction)
-            Set-CcodActiveRuntime -InstallRoot $InstallRoot -TargetGeneration $TargetGeneration -FileTransaction $FileTransaction -Ownership $Ownership
+            Set-CcodActiveRuntime -InstallRoot $InstallRoot -NewRuntimeId $RuntimeId -TargetGeneration $TargetGeneration -FileTransaction $FileTransaction -Ownership $Ownership
         }
         ExitLifecycleOwnership = {
             param($Ownership)
@@ -2204,6 +2287,16 @@ function Invoke-CcodInstall {
     }
     if(-not[IO.Directory]::Exists($root)){[IO.Directory]::CreateDirectory($root)|Out-Null}
 
+    $globalTransaction=Read-CcodInstallTransactionRecord -InstallRoot $root
+    if($null-ne$globalTransaction-and$globalTransaction.phase-notin@('Ready','Failed')){
+        if($globalTransaction.phase-ceq'ProtectionReady'){return Complete-CcodReadyFinalizationRecovery -InstallRoot $root -TransactionRecord $globalTransaction}
+        Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_BUSY' 'A nonterminal install transaction must be recovered before a new attempt' $globalTransaction.transactionId
+    }
+
+    $existingPointer = $null
+    $activePath = Join-Path $root 'active.json'
+    try{$existingPointer=Read-CcodActiveRuntime -InstallRoot $root}catch{if([IO.File]::Exists($activePath)-or[IO.Directory]::Exists((Join-Path $root 'state\active-generation'))){throw}}
+
     if (-not [IO.Directory]::Exists($sourceRoot)) {
         Throw-CcodLifecycleError 'CCOD_INSTALL_SOURCE_MISSING' 'Source checkout does not exist' $sourceRoot
     }
@@ -2237,11 +2330,6 @@ function Invoke-CcodInstall {
     $nodeCandidates = @(Get-CcodLifecycleNodeCandidates -Adapters $adapters)
     if (-not $payloadBound) { $files = @(Get-CcodLifecycleSourceFiles -SourceRoot $sourceRoot -RequireTrayHost) }
 
-    $existingPointer = $null
-    $activePath = Join-Path $root 'active.json'
-    try{$existingPointer=Read-CcodActiveRuntime -InstallRoot $root}catch{if([IO.File]::Exists($activePath)-or[IO.Directory]::Exists((Join-Path $root 'state\active-generation'))){throw}}
-    $globalTransaction=Read-CcodInstallTransactionRecord -InstallRoot $root
-    if($null-ne$globalTransaction-and$globalTransaction.phase-notin@('Ready','Failed')){Throw-CcodLifecycleError 'CCOD_INSTALL_TRANSACTION_BUSY' 'A nonterminal install transaction must be recovered before a new attempt' $globalTransaction.transactionId}
     $oldManifestSha256=$null;$activeValidation=$null
     if($null-ne$existingPointer){
         $activeRuntimeRoot=[IO.Path]::GetFullPath((Join-Path (Join-Path $root 'runtime') ([string]$existingPointer.activeRuntime)))

@@ -511,6 +511,21 @@ try {
         Assert-CcodEqual $fixture.RuntimeId $context.RuntimeId 'static worker binds the append-only selected runtime'
     }
 
+    Invoke-CcodTest 'append-only authorization rejects unsafe roots leaves JSON and generations' {
+        foreach($kind in @('root-file','root-reparse','leaf-reparse','ads','multilink','duplicate','fractional','noncanonical')){
+            $fixture=New-CcodAuthorizedRuntimeFixture -Root (Join-Path $root ("append-hostile-$kind")) -AppendOnly;$pointerRoot=Join-Path $fixture.InstallRoot 'state\active-generation';$leaf=Join-Path $pointerRoot '00000000000000000001.json';$target=Join-Path $fixture.InstallRoot ("target-$kind")
+            if($kind-ceq'root-file'){Remove-Item $pointerRoot -Recurse -Force;[IO.File]::WriteAllText($pointerRoot,'x',[Text.UTF8Encoding]::new($false))}
+            elseif($kind-ceq'root-reparse'){Remove-Item $pointerRoot -Recurse -Force;[IO.Directory]::CreateDirectory($target)|Out-Null;New-Item -ItemType Junction -Path $pointerRoot -Target $target|Out-Null}
+            elseif($kind-ceq'leaf-reparse'){[IO.File]::Delete($leaf);[IO.Directory]::CreateDirectory($target)|Out-Null;New-Item -ItemType Junction -Path $leaf -Target $target|Out-Null}
+            elseif($kind-ceq'ads'){Set-Content -LiteralPath $leaf -Stream evidence -Value x -NoNewline}
+            elseif($kind-ceq'multilink'){$text=[IO.File]::ReadAllText($leaf);[IO.File]::Delete($leaf);$outside=Join-Path $fixture.InstallRoot 'outside-pointer.json';[IO.File]::WriteAllText($outside,$text,[Text.UTF8Encoding]::new($false));New-Item -ItemType HardLink -Path $leaf -Target $outside|Out-Null}
+            elseif($kind-ceq'duplicate'){$id=$fixture.RuntimeId;[IO.File]::WriteAllText($leaf,('{"schemaVersion":1,"schemaVersion":1,"generation":1,"activeRuntime":"'+$id+'","previousGeneration":0}'),[Text.UTF8Encoding]::new($false))}
+            elseif($kind-ceq'fractional'){$id=$fixture.RuntimeId;[IO.File]::WriteAllText($leaf,('{"schemaVersion":1,"generation":1.5,"activeRuntime":"'+$id+'","previousGeneration":0}'),[Text.UTF8Encoding]::new($false))}
+            else{Move-Item -LiteralPath $leaf -Destination (Join-Path $pointerRoot '00000000000000000002.json')}
+            Assert-CcodThrows {Get-CcodStaticProbeRuntimeAuthorization -ScriptPath $fixture.WorkerPath|Out-Null} 'CCOD_STATIC_RUNTIME_UNAUTHORIZED'
+        }
+    }
+
     Invoke-CcodTest 'imports only exact private bound runtime APIs and unloads every module command surface' {
         $fixture=New-CcodAuthorizedRuntimeFixture -Root (Join-Path $root 'private-runtime-api')
         $context=Get-CcodStaticProbeRuntimeAuthorization -ScriptPath $fixture.WorkerPath

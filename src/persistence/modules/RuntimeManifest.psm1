@@ -40,12 +40,13 @@ function Get-CcodRuntimeAdapters {
         UtcNow = { [DateTime]::UtcNow }
         AssertLifecycleFence = {
             param($InstallRoot, $Ownership, $ExpectActivePointer, $NewRuntimeId)
-            $path = Resolve-CcodContainedPath -Root $InstallRoot -RelativePath 'active.json' -AllowMissingLeaf
             if ([bool]$ExpectActivePointer) {
-                if (-not [IO.File]::Exists($path)) { Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Expected active pointer disappeared during lifecycle mutation' $path }
+                $selected=$null;try{$selected=Read-CcodActiveRuntime -InstallRoot $InstallRoot}catch{Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Expected active selector disappeared during lifecycle mutation' $InstallRoot}
+                if($null-eq$selected-or$selected.activeRuntime-cne$Ownership.runtimeId-or[uint64]$selected.generation-ne[uint64]$Ownership.runtimeGeneration){Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Append-only selected runtime does not match lifecycle ownership' $Ownership}
                 return Assert-CcodLifecycleFence -InstallRoot $InstallRoot -Ownership $Ownership
             }
-            if ([IO.File]::Exists($path)) { Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Unexpected active pointer appeared during lifecycle initialization' $path }
+            try{$unexpected=Read-CcodActiveRuntime -InstallRoot $InstallRoot}catch{$unexpected=$null}
+            if ($null-ne$unexpected-or[IO.Directory]::Exists((Join-Path $InstallRoot 'state\active-generation'))-or[IO.File]::Exists((Join-Path $InstallRoot 'active.json'))) { Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Unexpected active selector appeared during lifecycle initialization' $InstallRoot }
             if ([UInt64]$Ownership.runtimeGeneration -ne 1 -or [string]$Ownership.runtimeId -cne [string]$NewRuntimeId) {
                 Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Initial active pointer requires generation-one ownership of the new runtime' $Ownership
             }
@@ -468,7 +469,7 @@ function Set-CcodActiveRuntime {
         if($null-eq$FileTransaction-or$null-eq$TargetGeneration){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Pointer commit requires target and transaction' $InstallRoot}
         $current=$null;try{$current=Read-CcodActiveRuntime $InstallRoot}catch{if((Get-CcodErrorId $_)-notin@('CCOD_STATE_MISSING','CCOD_PATH_MISSING')){throw}}
         [uint64]$previous=if($null-eq$current){0}else{$current.generation}
-        try{[void](& $Adapters.AssertLifecycleFence $InstallRoot $Ownership ($null-ne$current) $(if($null-ne$current){$current.activeRuntime}else{$null}))}catch{Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Active runtime mutation lifecycle fence is stale' $InstallRoot}
+        try{[void](& $Adapters.AssertLifecycleFence $InstallRoot $Ownership ($null-ne$current) $NewRuntimeId)}catch{Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Active runtime mutation lifecycle fence is stale' $InstallRoot}
         $committed=Commit-CcodInstallActivePointer -InstallRoot $InstallRoot -TargetGeneration $TargetGeneration -ExpectedPreviousGeneration $previous -FileTransaction $FileTransaction
         return Read-CcodActiveRuntime -InstallRoot $InstallRoot
     }

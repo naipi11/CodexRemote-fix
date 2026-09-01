@@ -114,6 +114,7 @@ Required operations are create-only:
 
 ```powershell
 Open-CcodInstallGeneration -InstallRoot <absolute-root> -RuntimeId <unique-id>
+Open-CcodInstallStateTransaction -InstallRoot <absolute-root>
 Open-CcodInstallRetainedGeneration -InstallRoot <absolute-root> -RuntimeId <existing-id> -ExpectedManifestSha256 <hex>
 New-CcodInstallDirectory -Transaction <opaque-context> -Parent <opaque-directory> -Leaf <single-segment> [-CreateIfMissing]
 New-CcodInstallGenerationLeaf -Generation <opaque-generation> -Leaf <single-segment>
@@ -124,6 +125,14 @@ Commit-CcodInstallActivePointer -InstallRoot <absolute-root> -ExpectedPreviousGe
 Retire-CcodInstallGeneration -InstallRoot <absolute-root> -RuntimeId <owned-id> -FileTransaction <context>
 Close-CcodInstallFileTransaction -Transaction <opaque-context> -Disposition Ready|Failed
 ```
+
+`Open-CcodInstallStateTransaction` is an opaque state-only capability for a
+bounded recovery record after an interrupted terminalization. It can compose
+only the install-root `state` directories and create-only records; it cannot
+create a runtime generation, copy a payload, write a manifest, open a retained
+generation, or commit a pointer. A recovery uses it only after revalidating the
+already committed pointer, generation manifest, Ready receipt, and transaction
+identity.
 
 `Retire-CcodInstallGeneration` removes a generation from the active selection by
 one create-only retired-generation record; it does not rename or recursively

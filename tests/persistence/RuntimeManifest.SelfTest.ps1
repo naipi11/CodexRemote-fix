@@ -7,6 +7,7 @@ $installLifecycleModule = Import-Module (Join-Path $repositoryRoot 'src\persiste
 Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\PersistenceIO.psm1') -Force
 Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\RuntimeManifest.psm1') -Force
 Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\LifecycleEpoch.psm1') -Force
+Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\InstallFileTransaction.psm1')
 Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\PersistenceIO.psm1') -Force
 
 $root = Join-Path ([IO.Path]::GetTempPath()) ("ccod-runtime-manifest-" + [guid]::NewGuid().ToString('N'))
@@ -174,6 +175,23 @@ try {
             updatedAtUtc = '2030-02-03T04:05:06.0000000Z'
         })
         Assert-CcodThrows { Read-CcodActiveRuntime -InstallRoot $installRoot } 'CCOD_RUNTIME_ID_INVALID'
+    }
+
+    Invoke-CcodTest 'default immutable pointer fence commits fresh and append-only upgrade with real ownership' {
+        $installRoot=Join-Path $root 'default-immutable-fence';[IO.Directory]::CreateDirectory($installRoot)|Out-Null;$identity=[Security.Principal.WindowsIdentity]::GetCurrent();$process=[Diagnostics.Process]::GetCurrentProcess();$firstTx=$null;$secondTx=$null;$ownership=$null
+        $makeGeneration={param($Root,$Content,$Nonce)$source=Join-Path $Root ("source-$Nonce.txt");[IO.File]::WriteAllText($source,$Content,[Text.UTF8Encoding]::new($false));$sha=(Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant();$records=@([pscustomobject]@{path='payload.txt';length=[int64](Get-Item $source).Length;sha256=$sha});$id=Get-CcodRuntimeId -ProjectVersion '2.5.22' -Files $records -Nonce $Nonce;$tx=Open-CcodInstallGeneration -InstallRoot $Root -RuntimeId $id;Copy-CcodInstallSealedSource -Generation $tx -SourcePath $source -Leaf 'payload.txt' -ExpectedLength $records[0].length -ExpectedSha256 $sha|Out-Null;$runtime=Join-Path $Root "runtime\$id";$manifest=New-CcodRuntimeManifest -RuntimeDirectory $runtime -ProjectVersion '2.5.22' -RuntimeId $id;Write-CcodInstallGenerationManifest -Generation $tx -Manifest $manifest|Out-Null;[pscustomobject]@{Id=$id;Transaction=$tx;Generation=$tx}}
+        try{
+            $first=&$makeGeneration $installRoot 'first' ('1'*32);$firstTx=$first.Transaction
+            $owner=[pscustomobject][ordered]@{pid=[int]$process.Id;creationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o')}
+            $ownership=Enter-CcodLifecycleOwnership -InstallRoot $installRoot -RuntimeId $first.Id -RuntimeGeneration 1 -OwnerIdentity $owner -UserSid $identity.User.Value -SessionId ([int]$process.SessionId)
+            $fresh=Set-CcodActiveRuntime -InstallRoot $installRoot -NewRuntimeId $first.Id -TargetGeneration $first.Generation -FileTransaction $first.Transaction -Ownership $ownership
+            Assert-CcodEqual 1 $fresh.generation 'default fresh fence commits generation one'
+            Exit-CcodLifecycleOwnership $ownership|Out-Null;$ownership=$null;Close-CcodInstallFileTransaction $firstTx Ready;$firstTx=$null
+            $second=&$makeGeneration $installRoot 'second' ('2'*32);$secondTx=$second.Transaction
+            $ownership=Enter-CcodLifecycleOwnership -InstallRoot $installRoot -RuntimeId $fresh.activeRuntime -RuntimeGeneration $fresh.generation -OwnerIdentity $owner -UserSid $identity.User.Value -SessionId ([int]$process.SessionId)
+            $upgraded=Set-CcodActiveRuntime -InstallRoot $installRoot -NewRuntimeId $second.Id -TargetGeneration $second.Generation -FileTransaction $second.Transaction -Ownership $ownership
+            Assert-CcodEqual 2 $upgraded.generation 'default upgrade fence advances append-only generation';Assert-CcodEqual $second.Id $upgraded.activeRuntime 'default upgrade fence selects the new target'
+        }finally{if($null-ne$ownership-and-not$ownership.released){Exit-CcodLifecycleOwnership $ownership|Out-Null};if($null-ne$firstTx){Close-CcodInstallFileTransaction $firstTx Failed};if($null-ne$secondTx){Close-CcodInstallFileTransaction $secondTx Failed};$process.Dispose();$identity.Dispose()}
     }
 
     Invoke-CcodTest 'append-only active selector rejects unknown reparse ADS and multi-linked leaves' {
