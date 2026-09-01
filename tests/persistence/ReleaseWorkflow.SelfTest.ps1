@@ -2703,37 +2703,35 @@ param([string]`$InstallRoot,[switch]`$EnableCandidateCompatibleUpdates,[switch]`
     }
 }
 
-# Production mutation caught: source bytes change after manifest validation but before the full portable copy path executes.
-Invoke-CcodTest 'portable full copy path rejects a validation-to-copy source race before child or lifecycle state' {
-    $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-portable-copy-race-'+[guid]::NewGuid().ToString('N'))
-    $module=$null;$breakpoint=$null
+# Production mutation caught: the real portable entrypoint ignores a source race between initial validation and copy.
+Invoke-CcodTest 'actual portable entrypoint rejects a validation-to-copy race before child or lifecycle state' {
+    $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-portable-entry-race-'+[guid]::NewGuid().ToString('N'))
     try {
-        $payload=Join-Path $root 'payload';[IO.Directory]::CreateDirectory($payload)|Out-Null
-        $sourceFile=Join-Path $payload 'Install-CodexControlOtherDevices.ps1'
-        [IO.File]::WriteAllText($sourceFile,'original-child-bytes',[Text.UTF8Encoding]::new($false))
-        $sha=Get-CcodTestFileSha256 -Path $sourceFile
-        $manifestPath=Join-Path $root 'payload-manifest.json'
-        $manifest=[ordered]@{schemaVersion=1;product='CodexRemote-fix';version='2.5.22';gitCommit=('a'*40);buildTimestampUtc='2030-02-03T04:05:06.0000000Z';files=@([ordered]@{path='Install-CodexControlOtherDevices.ps1';length=[int64](Get-Item $sourceFile).Length;sha256=$sha})}
-        [IO.File]::WriteAllText($manifestPath,(($manifest|ConvertTo-Json -Depth 8)+[Environment]::NewLine),[Text.UTF8Encoding]::new($false))
-        $modulePath=Join-Path $repositoryRoot 'src\persistence\modules\PortableRelease.psm1'
-        $module=Import-Module $modulePath -Force -PassThru
-        $target=Join-Path $root 'copied-installer'
-        &$module {param($ExpectedRoot)Set-Item -Path Function:Get-CcodPortableReleaseExpectedInstallerRoot -Value { $ExpectedRoot }.GetNewClosure()} $target
-        $line=@(Select-String -Path $modulePath -Pattern '^\s*\[IO\.File\]::Copy\(\$sourceFile,\$destination,\$false\)'|ForEach-Object{$_.LineNumber})
-        Assert-CcodEqual 1 $line.Count 'portable production copy barrier is unique'
+        $payload=Join-Path $root 'payload';$modules=Join-Path $payload 'src\persistence\modules';[IO.Directory]::CreateDirectory($modules)|Out-Null
+        $entrypoint=Join-Path $root 'Install-CodexRemote-fix.ps1'
+        [IO.File]::Copy((Join-Path $repositoryRoot 'Install-CodexRemote-fix.ps1'),$entrypoint,$false)
+        Assert-CcodEqual (Get-CcodTestFileSha256 -Path (Join-Path $repositoryRoot 'Install-CodexRemote-fix.ps1')) (Get-CcodTestFileSha256 -Path $entrypoint) 'fixture invokes an exact copy of the production portable entrypoint'
+        [IO.File]::Copy((Join-Path $repositoryRoot 'src\persistence\modules\PortableRelease.psm1'),(Join-Path $modules 'PortableRelease.psm1'),$false)
+        [IO.File]::WriteAllText((Join-Path $payload 'package.json'),'{"version":"2.5.22"}',[Text.UTF8Encoding]::new($false))
+        $childMarker=Join-Path $root 'child-executed.txt';$lifecycleRoot=Join-Path $root 'lifecycle-state';$child=Join-Path $payload 'Install-CodexControlOtherDevices.ps1'
+        $childSource="param([string]`$InstallRoot,[string]`$SealedPackageSha256);[IO.Directory]::CreateDirectory('$($lifecycleRoot.Replace("'","''"))')|Out-Null;[IO.File]::WriteAllText('$($childMarker.Replace("'","''"))',[string]`$SealedPackageSha256,[Text.UTF8Encoding]::new(`$false));[pscustomobject]@{Outcome='Installed';RuntimeId='should-not-run'}"
+        [IO.File]::WriteAllText($child,$childSource,[Text.UTF8Encoding]::new($false))
+        $records=[Collections.Generic.List[object]]::new()
+        foreach($file in @(Get-ChildItem -LiteralPath $payload -File -Force -Recurse)){$relative=$file.FullName.Substring($payload.TrimEnd('\').Length+1).Replace('\','/');$records.Add([pscustomobject][ordered]@{path=$relative;length=[int64]$file.Length;sha256=Get-CcodTestFileSha256 -Path $file.FullName})}
+        $comparison=[System.Comparison[object]]{param($left,$right)[StringComparer]::Ordinal.Compare([string]$left.path,[string]$right.path)};$records.Sort($comparison)
+        $manifest=[ordered]@{schemaVersion=1;product='CodexRemote-fix';version='2.5.22';gitCommit=('a'*40);buildTimestampUtc='2030-02-03T04:05:06.0000000Z';files=@($records)}
+        [IO.File]::WriteAllText((Join-Path $root 'payload-manifest.json'),(($manifest|ConvertTo-Json -Depth 8)+[Environment]::NewLine),[Text.UTF8Encoding]::new($false))
         $attack=[pscustomobject]@{Ran=$false}
-        $action={if(-not$attack.Ran){$attack.Ran=$true;[IO.File]::WriteAllText($sourceFile,'raced-child-bytes',[Text.UTF8Encoding]::new($false))}}.GetNewClosure()
-        $breakpoint=Set-PSBreakpoint -Script $modulePath -Line $line[0] -Action $action
+        function Get-MpComputerStatus {[pscustomobject]@{AMProductVersion='fixture-platform';AntivirusSignatureVersion='fixture-signature';RealTimeProtectionEnabled=$true}}
+        function Get-MpThreatDetection {param($ErrorAction)@()}
+        function Start-MpScan {param($ScanType,$ScanPath,$ErrorAction)$attack.Ran=$true;[IO.File]::WriteAllText($child,'raced-child-source',[Text.UTF8Encoding]::new($false))}
         $failure=$null
-        try{Copy-CcodPortablePayload -PayloadRoot $payload -ManifestPath $manifestPath -InstallerRoot $target|Out-Null}catch{$failure=$_}
-        Assert-CcodTrue $attack.Ran 'source race runs after validation at the production copy barrier'
-        Assert-CcodTrue ($null-ne$failure-and$failure.FullyQualifiedErrorId-like'CCOD_PORTABLE_COPY_HASH_MISMATCH*') 'raced source fails with the bounded copied-byte hash code'
-        Assert-CcodTrue (-not(Test-Path -LiteralPath $target)) 'raced copy publishes no installer root'
-        Assert-CcodTrue (-not(Test-Path -LiteralPath (Join-Path $root 'child-executed.txt'))) 'raced copy executes no lifecycle child'
-        Assert-CcodTrue (-not(Test-Path -LiteralPath (Join-Path $root 'lifecycle-state'))) 'raced copy creates no lifecycle state'
+        try{&$entrypoint -DoNotStart|Out-Null}catch{$failure=$_}
+        Assert-CcodTrue $attack.Ran 'controlled source mutation runs after initial entrypoint validation during its Defender gate'
+        Assert-CcodTrue ($null-ne$failure-and$failure.FullyQualifiedErrorId-like'CCOD_PORTABLE_MANIFEST_INVALID*') 'actual entrypoint rejects the raced source at revalidation'
+        Assert-CcodTrue (-not(Test-Path -LiteralPath $childMarker)) 'actual entrypoint never executes the marker child'
+        Assert-CcodTrue (-not(Test-Path -LiteralPath $lifecycleRoot)) 'actual entrypoint creates no fixture lifecycle state'
     } finally {
-        if($null-ne$breakpoint){Remove-PSBreakpoint -Breakpoint $breakpoint -ErrorAction SilentlyContinue}
-        if($null-ne$module){Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue}
         if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue}
     }
 }
