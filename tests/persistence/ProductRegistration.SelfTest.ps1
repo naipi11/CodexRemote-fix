@@ -13,6 +13,7 @@ $packageSha256 = '3' * 64
 $appId = '{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}'
 $canonicalTaskTarget=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'schtasks.exe'))
 $cleanupReady=[pscustomobject][ordered]@{phase='Ready';installRoot='C:\fixture\CodexControlOtherDevices';runtimeId=$runtimeId;runtimeGeneration=[uint64]7;packageSha256=$packageSha256;manifestSha256=('a'*64);startMenuSha256=('b'*64);desktopSha256=('c'*64);targetPath=$canonicalTaskTarget;arguments='/Run /TN "Codex Control Other Devices Supervisor"'}
+$fullReadyRecord=[pscustomobject][ordered]@{schemaVersion=1;transactionId='11111111-2222-3333-4444-555555555555';oldRuntimeId=$null;oldGeneration=$null;oldManifestSha256=$null;newRuntimeId=$runtimeId;newGeneration=[uint64]7;newManifestSha256=('a'*64);sealedPackageSha256=$packageSha256;ownedObjectNames=@($runtimeId);phase='Ready';errorCode=$null}
 
 function New-CcodRegistrationWorld {
     param([string]$InstallRoot = 'C:\fixture\CodexControlOtherDevices')
@@ -32,6 +33,7 @@ function New-CcodRegistrationWorld {
             desktopSha256 = 'c'*64
             targetPath = $canonicalTaskTarget
             arguments = '/Run /TN "Codex Control Other Devices Supervisor"'
+            transactionRecord = $fullReadyRecord
             bootstrapPath = $registration.bootstrapPath
             uninstallerPath = $registration.uninstallerPath
         }
@@ -204,7 +206,7 @@ $results += Invoke-CcodTest 'legacy migration rejects AppId and shortcut-name mi
 
 # Production mutation caught: deleting a whole product key despite unknown values or mismatched shortcut evidence.
 $results += Invoke-CcodTest 'current product cleanup requires exact registry values and shortcut bytes targets and file identity' {
-    foreach($mutation in @('UnknownRegistryValue','ShortcutHash','ShortcutTarget','ShortcutReparse','Ambiguous','CoherentReplacement')){
+    foreach($mutation in @('UnknownRegistryValue','RegistrySubkey','ShortcutHash','ShortcutTarget','ShortcutReparse','Ambiguous','CoherentReplacement')){
         $world=New-CcodRegistrationWorld;$world.CurrentProductState.valid=$false;$world.CurrentProductState.reason=$mutation
         Assert-CcodThrows {Remove-CcodProductRegistration -ReadyEvidence $cleanupReady -Adapters $world.Adapters} 'CCOD_PRODUCT_CLEANUP_INVALID'
         Assert-CcodEqual 0 $world.CurrentProductRemovals "$mutation mismatch preserves every current product entry"
@@ -241,6 +243,12 @@ $results += Invoke-CcodTest 'legacy restore failure is explicit and records the 
     Assert-CcodThrows {Remove-CcodLegacyProductRegistration -ExpectedAppId $appId -Adapters $world.Adapters} 'CCOD_LEGACY_PRODUCT_COMPENSATION_FAILED'
     Assert-CcodEqual 1 $world.LegacyUnresolvedRecords.Count 'failed compensation writes one explicit unresolved record'
     Assert-CcodTrue (@($world.LegacyUnresolvedRecords[0].entries)-ccontains'StartMenu2') 'unresolved record names the exact entry whose restoration failed'
+}
+
+$results += Invoke-CcodTest 'partially removed current registry entry is included in unresolved compensation' {
+    $world=New-CcodRegistrationWorld;$null=Commit-CcodProductRegistration -Registration $world.Registration -FileTransaction ([pscustomobject]@{}) -Adapters $world.Adapters;$world.LegacyRemoveFailureAt=1;$world.LegacyRestoreFailureEntry='Registry';$originalRemove=$world.Adapters.RemoveLegacyEntry;$world.Adapters.RemoveLegacyEntry={param($Entry)if([string]$Entry-ceq'Registry'){[void]$world.LegacyEntries.Remove('Registry');throw 'partial registry failure'};&$originalRemove $Entry}.GetNewClosure()
+    Assert-CcodThrows {Remove-CcodLegacyProductRegistration -ExpectedAppId $appId -Adapters $world.Adapters} 'CCOD_LEGACY_PRODUCT_COMPENSATION_FAILED'
+    Assert-CcodTrue (@($world.LegacyUnresolvedRecords[0].entries)-ccontains'Registry') 'current partially removed registry entry is recorded unresolved'
 }
 
 Write-Output "Product registration self-tests passed: $($results.Count)"
