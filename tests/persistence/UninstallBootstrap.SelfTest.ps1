@@ -609,5 +609,11 @@ $results += Invoke-CcodTest 'installed finalizer wrong wrapper generation path o
     }
 }
 
+$results += Invoke-CcodTest 'noncanonical Ready shortcut target is rejected before uninstall cleanup' {
+    $world=[pscustomobject]@{Calls=[Collections.Generic.List[string]]::new();Transaction=$null;Receipt=$null;ValidationError=$false;StageError=$false;CleanupError=$false;CleanupFailurePhase=$null;InstallRootAbsent=$false;StagedEntries=@();ProductRegistrationRemovals=0};$adapters=New-CcodUninstallBootstrapAdapters $world;$context=New-CcodUninstallBootstrapContext;$context.readyEvidence.targetPath='C:\outside\task.exe';$adapters.ValidateInvocation={param($InstallerRoot,$InstallRoot)$context}.GetNewClosure()
+    Assert-CcodThrows {Invoke-CcodUninstallBootstrap -InstallerRoot 'C:\runtime' -InstallRoot 'C:\install' -Mode Prepare -Adapters $adapters|Out-Null} 'CCOD_UNINSTALL_BOOTSTRAP_INVALID'
+    Assert-CcodEqual 0 @($world.Calls|Where-Object{$_-ceq'Cleanup'}).Count 'invalid target evidence reaches no cleanup deletion'
+}
+
 $results | ForEach-Object { "PASS $($_.Name)" }
 Write-Output "Uninstall bootstrap self-tests passed: $($results.Count)"
