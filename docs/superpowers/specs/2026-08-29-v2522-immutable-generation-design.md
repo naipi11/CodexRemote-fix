@@ -97,6 +97,12 @@ consulting `active.json`. StaticProbe carries the lookup through an exact
 discriminated `Found`/`Missing` result; null, empty, malformed, or exceptional
 adapter output cannot represent absence.
 
+`UninstallBootstrap` resolves and proves the `state` ancestor before it ever
+resolves `state\active-generation`. Exact absence of `state` permits the legacy
+pointer lookup, while a proven plain `state` directory is required before the
+child lookup; this compatibility fallback does not suppress the later
+lifecycle-epoch and cleanup validation boundaries.
+
 ### 1a. Immutable initialization evidence and operational state
 
 The install transaction writes create-only, generation-bound initialization

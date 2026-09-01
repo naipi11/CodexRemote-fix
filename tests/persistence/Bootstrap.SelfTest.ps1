@@ -115,6 +115,7 @@ function Add-CcodTestRuntime {
         [AllowNull()][string]$RuntimeId,
         [bool]$IncludeFenceModules = $true,
         [bool]$FailLifecycleRelease = $false,
+        [AllowNull()][string]$LifecycleReleaseMarkerPath,
         [bool]$IncludeGenerationBootstrap = $false
     )
 
@@ -138,18 +139,22 @@ function Add-CcodTestRuntime {
             [IO.File]::Copy((Join-Path $repositoryRoot ('src\persistence\modules\' + $moduleName)), (Join-Path $kernelDirectory $moduleName), $true)
         }
         if ($FailLifecycleRelease) {
-            [IO.File]::AppendAllText((Join-Path $kernelDirectory 'LifecycleEpoch.psm1'), @'
+            if ([string]::IsNullOrWhiteSpace($LifecycleReleaseMarkerPath)) { throw 'A lifecycle release failure marker path is required' }
+            $releaseMarkerBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($LifecycleReleaseMarkerPath)))
+            $releaseFailureInjection = @'
 
 function Exit-CcodLifecycleOwnership {
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Ownership, [hashtable]$Adapters)
+    [IO.File]::WriteAllText([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CCOD_RELEASE_MARKER_BASE64__')),'release-attempted',[Text.UTF8Encoding]::new($false))
     throw [Management.Automation.ErrorRecord]::new(
         [InvalidOperationException]::new('injected lifecycle release failure'),
         'CCOD_LIFECYCLE_RELEASE_FAILED',
         [Management.Automation.ErrorCategory]::CloseError,
         $Ownership)
 }
-'@, [Text.UTF8Encoding]::new($false))
+'@
+            [IO.File]::AppendAllText((Join-Path $kernelDirectory 'LifecycleEpoch.psm1'), $releaseFailureInjection.Replace('__CCOD_RELEASE_MARKER_BASE64__',$releaseMarkerBase64), [Text.UTF8Encoding]::new($false))
         }
     }
     $manifest = New-CcodRuntimeManifest -RuntimeDirectory $runtimeDirectory -ProjectVersion '0.0.0-bootstrap-test'
@@ -228,7 +233,8 @@ function Invoke-CcodBootstrapTimed {
     param(
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$ReadyToken,
-        [int]$TimeoutMilliseconds = 4000
+        [int]$TimeoutMilliseconds = 15000,
+        [AllowNull()][string]$ReleaseAttemptMarkerPath
     )
 
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
@@ -241,7 +247,21 @@ function Invoke-CcodBootstrapTimed {
     $stopwatch = [Diagnostics.Stopwatch]::StartNew()
     try {
         [void]$process.Start()
-        $exited = $process.WaitForExit($TimeoutMilliseconds)
+        $markerObserved = $false
+        $markerAtMilliseconds = $null
+        if (-not [string]::IsNullOrWhiteSpace($ReleaseAttemptMarkerPath)) {
+            while ($stopwatch.ElapsedMilliseconds -lt $TimeoutMilliseconds) {
+                if ([IO.File]::Exists($ReleaseAttemptMarkerPath)) {
+                    $markerObserved = $true
+                    $markerAtMilliseconds = [long]$stopwatch.ElapsedMilliseconds
+                    break
+                }
+                if ($process.HasExited) { break }
+                Start-Sleep -Milliseconds 10
+            }
+        }
+        $remainingMilliseconds = [Math]::Max(0,$TimeoutMilliseconds - [int]$stopwatch.ElapsedMilliseconds)
+        $exited = if ($process.HasExited) { $true } else { $process.WaitForExit($remainingMilliseconds) }
         if (-not $exited) {
             $process.Kill()
             $process.WaitForExit()
@@ -250,6 +270,8 @@ function Invoke-CcodBootstrapTimed {
             TimedOut = -not $exited
             ExitCode = if ($exited) { [int]$process.ExitCode } else { $null }
             ElapsedMilliseconds = [long]$stopwatch.ElapsedMilliseconds
+            ReleaseAttemptObserved = $markerObserved
+            ElapsedAfterReleaseAttemptMilliseconds = if ($markerObserved) { [long]($stopwatch.ElapsedMilliseconds - $markerAtMilliseconds) } else { $null }
         }
     } finally {
         $stopwatch.Stop()
@@ -484,17 +506,22 @@ $results += Invoke-CcodTest 'fails promptly when fallback lifecycle ownership ca
         New-CcodBootstrapFixture -Root $root | Out-Null
         $activeId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'ExitEarly' -MarkerPath (Join-Path $root 'release-active.started'))
         $pidPath = Join-Path $root 'release-previous.pid'
-        $previousId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'ReadyLongLived' -MarkerPath $pidPath) -FailLifecycleRelease $true
+        $releaseAttemptPath = Join-Path $root 'release-attempted'
+        $previousId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'ReadyLongLived' -MarkerPath $pidPath) -FailLifecycleRelease $true -LifecycleReleaseMarkerPath $releaseAttemptPath
         Set-CcodTestActivePointer -Root $root -ActiveRuntime $activeId -PreviousRuntime $previousId -SchemaVersion 2 -Generation 9
 
-        $run = Invoke-CcodBootstrapTimed -Root $root -ReadyToken (New-CcodBootstrapToken)
+        $run = Invoke-CcodBootstrapTimed -Root $root -ReadyToken (New-CcodBootstrapToken) -ReleaseAttemptMarkerPath $releaseAttemptPath
         if ([IO.File]::Exists($pidPath)) { $supervisorPid = [int][IO.File]::ReadAllText($pidPath) }
+        Assert-CcodExactEqual $true $run.ReleaseAttemptObserved 'release failure timing starts only after the injected release attempt'
         Assert-CcodExactEqual $false $run.TimedOut 'release failure exits instead of waiting for the ready long-lived Supervisor'
         Assert-CcodExactEqual 1 $run.ExitCode 'release failure is a stable nonzero bootstrap outcome'
-        Assert-CcodTrue ($run.ElapsedMilliseconds -lt 4000) 'release failure returns within the bounded prompt-exit window'
+        Assert-CcodTrue ($run.ElapsedAfterReleaseAttemptMilliseconds -le 2000) 'release failure exits within two seconds of the injected release attempt'
         $log = [IO.File]::ReadAllText((Join-Path $root 'logs\bootstrap.log'))
         Assert-CcodTrue ($log.Contains('CCOD_BOOTSTRAP_FENCE_RELEASE_FAILED')) 'release failure is normalized to the stable bootstrap code'
         Assert-CcodTrue (-not $log.Contains('signaled ready; active pointer switched')) 'release failure never logs successful fallback readiness'
+        Assert-CcodTrue ($null-ne$supervisorPid) 'fallback Supervisor published its process identity before release failed'
+        $fallbackProcess = Get-Process -Id $supervisorPid -ErrorAction SilentlyContinue
+        try { Assert-CcodExactEqual $null $fallbackProcess 'bootstrap failure exits the fallback Supervisor before returning' } finally { if ($null-ne$fallbackProcess) { $fallbackProcess.Dispose() } }
 
         $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         $lease = Enter-CcodMutex -Kind AccountTransition -UserSid $sid -TimeoutMilliseconds 1000

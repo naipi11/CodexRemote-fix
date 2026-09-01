@@ -438,3 +438,76 @@ Important findings. This round keeps `2101485` and remediates all seven.
 - The documented current-user ordinary-race boundary remains unchanged.
 - Failed and superseded immutable generations remain retained until the
   separately proven reclamation path runs.
+
+## Fix round 5 — permit proven legacy selector fallback
+
+### RED and root-cause evidence
+
+- UninstallBootstrap exited `1` at
+  `uninstall-legacy-fallback-accepts-a-valid-pointer-when-the-entire-state-plane-is-absent`.
+  The regression expected a valid legacy pointer to reach the later missing
+  lifecycle-epoch boundary, but production rejected the selector path first.
+  `UninstallBootstrap` resolved `state\active-generation` before it performed
+  the separate ItemNotFound lookup for `state`, so a genuinely absent selector
+  plane could never take the permitted compatibility path.
+- The first focused matrix also reproduced the independent Bootstrap harness
+  failure at
+  `fails-promptly-when-fallback-lifecycle-ownership-cannot-be-released`:
+  `ASSERT_EXACT` reported `TimedOut` expected `False`, actual `True`. The old
+  test timed the whole cold launch with a 4-second watchdog even though the
+  injected release attempt occurred at about 3.1 seconds, fallback promotion
+  at about 5.0 seconds, the stable failure log at about 5.03 seconds, and
+  process exit at about 5.08 seconds. The harness killed the bootstrap before
+  its `finally`; this was not a production bootstrap deadlock.
+
+### GREEN and final verification evidence
+
+- Uninstall now resolves and probes `state` first. Exact ItemNotFound selects
+  legacy fallback without resolving its child; only a proven plain nonreparse
+  state directory permits resolving and probing `state\active-generation`.
+  The no-state regression first proves that an invalid legacy pointer is still
+  rejected, then restores the valid pointer and proves authorization reaches
+  the later missing lifecycle-epoch boundary rather than skipping validation.
+- The Bootstrap release-failure test is deterministic and test-only. Its
+  injected release function writes a marker immediately before throwing, the
+  whole-process watchdog is 15 seconds, and the assertion requires exit `1`
+  within 2 seconds after the marker. It retains the stable failure-log,
+  fallback-child-exited, and AccountTransition-mutex-reacquired proofs. No
+  production bootstrap control flow or timeout changed.
+- InstallFileTransaction exited `0`; all 26 named cases passed.
+- Bootstrap exited `0` with `Bootstrap self-test passed: 26`.
+- RuntimeManifest exited `0`; all 21 named cases reported `True`.
+- StaticProbeWorker exited `0`; all 41 named cases reported `True`.
+- UninstallBootstrap exited `0` with
+  `Uninstall bootstrap self-tests passed: 17`.
+- InstallLifecycle exited `0` with
+  `Install lifecycle self-tests passed: 116`.
+- PersistenceIO exited `0`; all 24 named cases reported `True`.
+- UiPreferences exited `0`; all 9 named cases reported `PASS`.
+- Explicit PowerShell parser checks passed all 3 changed `.ps1` files
+  (`TASK2_FIX5_PARSER_COUNT=3`).
+- `git diff --check` exited `0` (`TASK2_FIX5_DIFF_CHECK_EXIT=0`); it emitted
+  only checkout LF-to-CRLF warnings.
+- Aggregate command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\PersistenceSelfTest.ps1`
+  exited `0` (`TASK2_FIX5_AGGREGATE_EXIT=0`) with no suite failure output.
+
+### Behavior and boundaries
+
+- A wholly absent `state` plane is now the exact permitted Uninstall legacy
+  compatibility case. Existing state files, reparse points, inaccessible
+  objects, null or malformed lookup results, and non-ItemNotFound failures
+  still return `CCOD_UNINSTALL_RUNTIME_INVALID` at the selector boundary.
+- When `state` is valid, child absence alone permits legacy fallback; every
+  hostile selector-root/leaf, JSON, schema, generation, ADS, and multilink
+  negative case remains covered and green.
+- Legacy selection does not bypass runtime-manifest, cleanup-payload, bootstrap
+  fingerprint, or lifecycle-epoch validation. No production Bootstrap change,
+  release, install, product-process action, WindowsApps access, DPAPI access,
+  push, tag, signing, or external write was performed.
+
+### Remaining concerns
+
+- The documented current-user ordinary-race boundary remains unchanged.
+- Failed and superseded immutable generations remain retained until the
+  separately proven reclamation path runs.
