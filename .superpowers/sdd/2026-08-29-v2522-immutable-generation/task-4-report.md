@@ -395,3 +395,95 @@ signing, tag, push, or publication action occurred.
 
 - `3cd891221acfd569fd29e2244b5200fa28e43106`
   (`fix: prove durable Ready product authority`).
+
+## Fix round 5: canonical lifecycle authority, proof-to-use lease, and first-install handoff
+
+Independent review of `a83840b..a60759b` found three Important production
+gaps: product authority maintained a weaker parallel transaction-chain reader;
+selector proof and retained-file use were not serialized against an N+1
+commit; and normal first install passed its still-writable generation
+transaction to the default product-registration path.
+
+This was the fifth and final permitted Task 4 repair round. The implementation
+below is submitted for a new independent review; Task 4 is not claimed complete.
+
+### RED evidence
+
+- InstallFileTransaction exited `1` because a selected terminal Ready chain
+  plus an unrelated strict Prepared head was accepted instead of throwing
+  `CCOD_INSTALL_PRODUCT_SCOPE`. The companion Ready-to-Failed continuation
+  regression was added to the same canonical-head boundary.
+- The real two-process coordination regression reached
+  `Enter-CcodLifecycleOwnership` and `Set-CcodActiveRuntime` for N+1 while an N
+  product transaction was active. Before the lease fix, N+1 committed and the
+  subsequent N retained-file use failed with `CCOD_INSTALL_PRODUCT_SCOPE`;
+  proof and use were not one stable authority operation.
+- Clearing only the product transaction's stored authority-lease state while
+  retaining the real mutex still allowed a retained-file open; the test exited
+  `1` with `ASSERT_THROWS: expected CCOD_INSTALL_PRODUCT_SCOPE`.
+- The safe default first-install integration initially failed adapter
+  resolution because no lower product-side-effect seam existed. Once only the
+  registry/shortcut side effects were isolated, the old path failed with
+  `CCOD_PRODUCT_REGISTRATION_FAILED`; a targeted diagnostic recorded
+  `CCOD_INSTALL_RETAINED_GENERATION_INVALID` and a sharing violation because
+  the writable generation transaction was still pinned after Ready.
+- The new post-Ready close-failure case first exited `1` with
+  `CCOD_INSTALL_ADAPTER_INVALID`, target `CloseReadyGeneration`, before the
+  narrow close handoff existed.
+
+### GREEN and final verification evidence
+
+- InstallFileTransaction: all 32 named cases passed, exit `0`. Coverage includes
+  the unrelated Prepared head, Ready-to-Failed continuation, missing live
+  authority lease, and a real N/N+1 coordination process pair.
+- ProductRegistration: `13/13`, exit `0`.
+- UninstallBootstrap: `23/23`, exit `0`.
+- InstallLifecycle: `119/119`, exit `0`. The real default registration path
+  opens both retained shortcut candidates through product-only authority;
+  normal first install succeeds, product-write failure remains durable Ready
+  and retries through AlreadyInstalled, and post-Ready writable-close failure
+  performs zero product writes, appends no Failed snapshot, and retries.
+- Explicit PowerShell parser checks passed all four changed source/test files:
+  `PARSER_COUNT=4`, `PARSER_FAILURES=0`.
+- Static gates passed: `WEAK_SUBSTITUTE_COUNT=0`,
+  `AUTHORITY_PATH_READ_COUNT=0`, `CANONICAL_RESOLVER_CALL_COUNT=1`,
+  `WRITABLE_REGISTRATION_SOURCE_COUNT=0`, `STRICT_PRODUCT_OPEN_COUNT=1`, and
+  `READY_CLOSE_ADAPTER_CALL_COUNT=2`.
+- `git diff --check` exited `0`; only checkout LF-to-CRLF warnings were emitted.
+- Full `tests\PersistenceSelfTest.ps1` aggregate exited `0` with no failure
+  output. Its long-running child at the observed midpoint was the existing
+  TrayHost production-trace suite, not the new authority/lifecycle tests.
+
+### Remediated boundaries
+
+- InstallLifecycle owns the one canonical pure
+  `Resolve-CcodInstallTransactionRecordHead` implementation. Its normal reader
+  and InstallFileTransaction's native-handle authority reader both call that
+  implementation; product authority no longer carries a reduced parallel
+  chain checker. The native-handle selector, manifest, and transaction-file
+  reads remain intact, and the canonical record validator now also requires
+  `ownedObjectNames` to be an array.
+- Product transaction open acquires the same current-user global
+  `AccountTransition` mutex used by lifecycle ownership before reading the
+  selector. The opaque transaction retains that lease through canonical
+  selector/manifest/transaction proof and retained-file opens. Close attempts
+  both native cleanup and lease release on failure paths; retained-file open
+  explicitly requires the live product-only lease on its owning thread.
+- The deterministic N/N+1 test uses the real lifecycle-ownership and active
+  pointer commit paths. N+1 blocks while N opens its retained shortcut, commits
+  generation 2 only after N closes, and the closed stale N capability cannot
+  be reused.
+- Normal and recovered Ready paths close their writable generation/state
+  transaction before product registration. The default RegisterProduct adapter
+  always opens and owns a separate strict selected product transaction; the
+  writable input is never used as shortcut authority. A close or registration
+  failure is post-Ready, performs no lifecycle rollback, and is reconciled by
+  a later same-package invocation.
+
+No real registry, shortcut, installer, uninstaller, product process, network,
+release, signing, tag, push, or publication action occurred.
+
+### Fix implementation commit
+
+- `a9900a4b00508f9ed694375ea94a2bfb97437e96`
+  (`fix: serialize strict product authority`).
