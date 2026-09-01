@@ -208,6 +208,20 @@ try {
         }
     }
 
+    Invoke-CcodTest 'default immutable fence rejects selector root files and non-not-found lookup failures before pointer commit' {
+        foreach($kind in @('root-file','lookup-error')){
+            $installRoot=Join-Path $root ("pointer-root-$kind");[IO.Directory]::CreateDirectory($installRoot)|Out-Null;$identity=[Security.Principal.WindowsIdentity]::GetCurrent();$process=[Diagnostics.Process]::GetCurrentProcess();$transaction=$null;$ownership=$null
+            try{
+                $source=Join-Path $installRoot 'source.txt';[IO.File]::WriteAllText($source,'selector-root-proof',[Text.UTF8Encoding]::new($false));$sha=(Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant();$records=@([pscustomobject]@{path='payload.txt';length=[int64](Get-Item $source).Length;sha256=$sha});$runtimeId=Get-CcodRuntimeId -ProjectVersion '2.5.22' -Files $records -Nonce ('3'*32);$transaction=Open-CcodInstallGeneration -InstallRoot $installRoot -RuntimeId $runtimeId;Copy-CcodInstallSealedSource -Generation $transaction -SourcePath $source -Leaf 'payload.txt' -ExpectedLength $records[0].length -ExpectedSha256 $sha|Out-Null;$runtime=Join-Path $installRoot "runtime\$runtimeId";$manifest=New-CcodRuntimeManifest -RuntimeDirectory $runtime -ProjectVersion '2.5.22' -RuntimeId $runtimeId;Write-CcodInstallGenerationManifest -Generation $transaction -Manifest $manifest|Out-Null
+                $pointerRoot=Join-Path $installRoot 'state\active-generation';if($kind-ceq'root-file'){[IO.Directory]::CreateDirectory((Split-Path $pointerRoot -Parent))|Out-Null;[IO.File]::WriteAllText($pointerRoot,'not-a-directory',[Text.UTF8Encoding]::new($false))}
+                $owner=[pscustomobject][ordered]@{pid=[int]$process.Id;creationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o')};$ownership=Enter-CcodLifecycleOwnership -InstallRoot $installRoot -RuntimeId $runtimeId -RuntimeGeneration 1 -OwnerIdentity $owner -UserSid $identity.User.Value -SessionId ([int]$process.SessionId)
+                $adapters=if($kind-ceq'lookup-error'){@{GetSelectorRootItem={param($Path)throw [UnauthorizedAccessException]::new('selector lookup denied')}}}else{$null}
+                Assert-CcodThrows {Set-CcodActiveRuntime -InstallRoot $installRoot -NewRuntimeId $runtimeId -TargetGeneration $transaction -FileTransaction $transaction -Ownership $ownership -Adapters $adapters|Out-Null} 'CCOD_RUNTIME_POINTER_INVALID'
+                Assert-CcodEqual $false ([IO.File]::Exists((Join-Path $pointerRoot '00000000000000000001.json'))) "$kind failure publishes no active generation"
+            }finally{if($null-ne$ownership-and-not$ownership.released){Exit-CcodLifecycleOwnership $ownership|Out-Null};if($null-ne$transaction){Close-CcodInstallFileTransaction $transaction Failed};$process.Dispose();$identity.Dispose()}
+        }
+    }
+
     Invoke-CcodTest 'includes the lifecycle worker and coordinator in the staged runtime closure' {
         $sourceFiles=@(& $installLifecycleModule {param($sourceRoot)Get-CcodLifecycleSourceFiles -SourceRoot $sourceRoot} $repositoryRoot)
         foreach($relative in @('src\persistence\LifecycleWorker.ps1','src\persistence\SessionController.ps1','src\persistence\modules\LifecycleCoordinator.psm1','src\persistence\modules\LifecycleEpoch.psm1','src\persistence\modules\ProcessControl.psm1','src\persistence\modules\SessionEngine.psm1','src\persistence\modules\WorkerRuntime.psm1')){

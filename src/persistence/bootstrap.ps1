@@ -165,12 +165,13 @@ function Assert-CcodBootstrapPlainSelectorFile {
 }
 
 function Read-CcodBootstrapActivePointer {
-    param([Parameter(Mandatory)][string]$InstallRoot)
+    param([Parameter(Mandatory)][string]$InstallRoot,[hashtable]$SelectorAdapters)
 
     try{$pointerRoot=Assert-CcodBootstrapContained -Root $InstallRoot -Path (Join-Path $InstallRoot 'state\active-generation') -AllowMissingLeaf}catch{Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector root is unsafe' (Join-Path $InstallRoot 'state\active-generation')}
-    $pointerRootItem=$null;try{$pointerRootItem=Get-Item -LiteralPath $pointerRoot -Force -ErrorAction Stop}catch{}
-    if($null-ne$pointerRootItem-and-not$pointerRootItem.PSIsContainer){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector root is not a directory' $pointerRoot}
-    if($null-ne$pointerRootItem){
+    $pointerRootItem=$null;$pointerRootAbsent=$false;$getSelectorRootItem=if($null-ne$SelectorAdapters-and$SelectorAdapters.ContainsKey('GetSelectorRootItem')){$SelectorAdapters.GetSelectorRootItem}else{{param($Path)Get-Item -LiteralPath $Path -Force -ErrorAction Stop}}
+    try{$pointerRootItem=&$getSelectorRootItem $pointerRoot;if($null-eq$pointerRootItem){throw [IO.InvalidDataException]::new('selector lookup returned no proof')}}catch [Management.Automation.ItemNotFoundException]{$pointerRootAbsent=$true}catch{Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector root lookup failed' $pointerRoot}
+    if(-not$pointerRootAbsent-and-not$pointerRootItem.PSIsContainer){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector root is not a directory' $pointerRoot}
+    if(-not$pointerRootAbsent){
         if(Test-CcodBootstrapReparse $pointerRoot){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector root is a reparse point' $pointerRoot}
         $entries=@(Get-ChildItem -LiteralPath $pointerRoot -Force -ErrorAction Stop)
         if($entries.Count-eq0){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector is empty' $pointerRoot}

@@ -289,3 +289,80 @@ Important findings. This round keeps `2101485` and remediates all seven.
   a sandbox against unrestricted same-user or in-process code.
 - Failed and superseded immutable generations remain retained until the
   separately proven reclamation path runs.
+
+## Fix round 3 — fail closed selector fallback
+
+### RED and root-cause evidence
+
+- RuntimeManifest command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\RuntimeManifest.SelfTest.ps1`
+  exited `1` at
+  `default-immutable-fence-rejects-selector-root-files-and-non-not-found-lookup-failures-before-pointer-commit`
+  with `CCOD_INSTALL_POINTER_COMMIT_FAILED` and `The directory name is
+  invalid`. A selector-root file passed the authorization read and failed only
+  later inside pointer commit.
+- Bootstrap command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\Bootstrap.SelfTest.ps1`
+  exited `1` at
+  `bootstrap-selector-fallback-requires-proven-ItemNotFound-instead-of-a-lookup-error`;
+  the wished-for selector lookup seam did not yet exist
+  (`NamedParameterNotFound,Read-CcodBootstrapActivePointer`).
+- StaticProbeWorker command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\StaticProbeWorker.SelfTest.ps1`
+  exited `1` in the hostile selector matrix with
+  `ASSERT_THROWS: expected CCOD_STATIC_RUNTIME_UNAUTHORIZED`. The exact
+  identified case was `schema`: selector `schemaVersion:2` was authorized.
+- UninstallBootstrap command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\UninstallBootstrap.SelfTest.ps1`
+  exited `1` at
+  `uninstall-selector-fallback-requires-proven-ItemNotFound-instead-of-a-lookup-error`;
+  the wished-for selector lookup seam did not yet exist
+  (`NamedParameterNotFound,Get-CcodUninstallBootstrapVerifiedRuntimeContext`).
+
+### GREEN and final verification evidence
+
+- InstallFileTransaction exited `0`; all 26 named cases passed. The V3/V4
+  evidence now uses a fresh child `powershell.exe`: V3 is defined first, V4 is
+  proven absent before import, the current module then exposes ABI V4, one
+  state record is appended, and generation leaf, copy, manifest, retained,
+  pointer, and retirement operations are rejected through exports only.
+- Bootstrap exited `0` with `Bootstrap self-test passed: 25`.
+- RuntimeManifest exited `0`; all 20 named cases reported `True`.
+- StaticProbeWorker exited `0`; all 39 named cases reported `True`.
+- UninstallBootstrap exited `0` with
+  `Uninstall bootstrap self-tests passed: 15`.
+- InstallLifecycle exited `0` with
+  `Install lifecycle self-tests passed: 116`.
+- PersistenceIO exited `0`; all 24 named cases reported `True`.
+- UiPreferences exited `0`; all 9 named cases reported `PASS`.
+- Explicit parser checks passed all 9 changed `.ps1`/`.psm1` files
+  (`PARSER_COUNT=9`).
+- `git diff --check` exited `0`; it emitted only checkout LF-to-CRLF warnings.
+- Aggregate command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\PersistenceSelfTest.ps1`
+  exited `0` and emitted no stdout/stderr result text.
+
+### Behavior and boundaries
+
+- RuntimeManifest/default fence, Bootstrap, StaticProbeWorker, and
+  UninstallBootstrap permit legacy `active.json` fallback only after a proven
+  ItemNotFound result for `state\active-generation`. Root files, reparse
+  points, access/I/O lookup errors, null/non-proof adapter returns, malformed
+  stores, and unsupported records fail with the component's bounded pointer or
+  runtime authorization error.
+- StaticProbeWorker now requires append-only selector `schemaVersion` to be
+  exactly integer `1`. Static and Uninstall matrices cover malformed JSON,
+  unsupported schema, duplicate key, ADS, multi-link, root/leaf reparse,
+  fractional generation, and noncanonical names before runtime authorization.
+  Bootstrap retains equivalent hostile-selector coverage.
+- Every fix2 invariant remains covered, including the real default pointer
+  fence, state-only Ready finalization, recorded-manifest compensation, and no
+  root-shell overwrite.
+- No push, tag, release, build, installation, product-process action,
+  WindowsApps access, DPAPI access, or external write was performed.
+
+### Remaining concerns
+
+- The documented current-user ordinary-race boundary remains unchanged.
+- Failed and superseded immutable generations remain retained until the
+  separately proven reclamation path runs.

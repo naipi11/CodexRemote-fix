@@ -353,7 +353,7 @@ function New-CcodUninstallBootstrapResumeContext {
 }
 
 function Get-CcodUninstallBootstrapVerifiedRuntimeContext {
-    param([Parameter(Mandatory)][string]$InstallerRoot,[Parameter(Mandatory)][string]$InstallRoot)
+    param([Parameter(Mandatory)][string]$InstallerRoot,[Parameter(Mandatory)][string]$InstallRoot,[hashtable]$SelectorAdapters)
     try {
         $installer = Get-CcodUninstallBootstrapComparablePath -Path $InstallerRoot -Kind 'Installer root'
         $install = Get-CcodUninstallBootstrapComparablePath -Path $InstallRoot -Kind 'Install root'
@@ -369,9 +369,10 @@ function Get-CcodUninstallBootstrapVerifiedRuntimeContext {
             Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'The uninstall bootstrap was not launched from the installed application root' $PSCommandPath
         }
         try{$pointerRoot=Resolve-CcodUninstallBootstrapChildPath -Root $install -RelativePath 'state\active-generation' -AllowMissingLeaf}catch{Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active generation selector root is unsafe' $install}
-        $pointerRootItem=$null;try{$pointerRootItem=Get-Item -LiteralPath $pointerRoot -Force -ErrorAction Stop}catch{}
-        if($null-ne$pointerRootItem-and-not$pointerRootItem.PSIsContainer){throw 'selector root type'}
-        if($null-ne$pointerRootItem){
+        $pointerRootItem=$null;$pointerRootAbsent=$false;$getSelectorRootItem=if($null-ne$SelectorAdapters-and$SelectorAdapters.ContainsKey('GetSelectorRootItem')){$SelectorAdapters.GetSelectorRootItem}else{{param($Path)Get-Item -LiteralPath $Path -Force -ErrorAction Stop}}
+        try{$pointerRootItem=&$getSelectorRootItem $pointerRoot;if($null-eq$pointerRootItem){throw [IO.InvalidDataException]::new('selector lookup returned no proof')}}catch [Management.Automation.ItemNotFoundException]{$pointerRootAbsent=$true}catch{Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active generation selector root lookup failed' $pointerRoot}
+        if(-not$pointerRootAbsent-and-not$pointerRootItem.PSIsContainer){throw 'selector root type'}
+        if(-not$pointerRootAbsent){
             $entries=@(Get-ChildItem -LiteralPath $pointerRoot -Force -ErrorAction Stop);if($entries.Count-eq0){throw 'empty selector'};$records=[Collections.Generic.List[object]]::new()
             foreach($entry in $entries){if($entry.PSIsContainer-or$entry.Name-cnotmatch'^\d{20}\.json$'){throw 'selector entry'};try{$path=Resolve-CcodUninstallBootstrapChildPath -Root $install -RelativePath ('state\active-generation\'+$entry.Name) -RequireLeafFile;$record=Read-CcodUninstallBootstrapJson -Path $path -Kind 'Active generation'}catch{Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active generation selector leaf is unsafe' $entry.FullName};$integerTypes=@([byte],[uint16],[uint32],[uint64],[int16],[int32],[int64]);$gType=$false;$pType=$false;foreach($t in $integerTypes){if($record.generation-is$t){$gType=$true};if($record.previousGeneration-is$t){$pType=$true}};if(-not(Test-CcodUninstallBootstrapExactProperties $record @('schemaVersion','generation','activeRuntime','previousGeneration'))-or$record.schemaVersion-isnot[int]-or$record.schemaVersion-ne1-or-not$gType-or-not$pType-or$record.activeRuntime-isnot[string]-or$record.activeRuntime-cnotmatch'^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$'){throw 'selector record'};[uint64]$g=ConvertTo-CcodUninstallBootstrapUInt64 $record.generation 'active generation';[uint64]$p=[uint64]$record.previousGeneration;if($p-eq[uint64]::MaxValue-or$g-ne($p+1)-or$entry.Name-cne('{0:D20}.json'-f$g)){throw 'selector canonical'};$records.Add([pscustomobject]@{generation=$g;previousGeneration=$p;activeRuntime=[string]$record.activeRuntime})}
             $ordered=@($records|Sort-Object generation);for($i=0;$i-lt$ordered.Count;$i++){if([uint64]$ordered[$i].generation-ne[uint64]($i+1)-or[uint64]$ordered[$i].previousGeneration-ne[uint64]$i){throw 'selector chain'}};$latest=$ordered[-1];$active=[pscustomobject]@{activeRuntime=$latest.activeRuntime};$generation=[uint64]$latest.generation

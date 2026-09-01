@@ -512,18 +512,29 @@ try {
     }
 
     Invoke-CcodTest 'append-only authorization rejects unsafe roots leaves JSON and generations' {
-        foreach($kind in @('root-file','root-reparse','leaf-reparse','ads','multilink','duplicate','fractional','noncanonical')){
+        foreach($kind in @('root-file','root-reparse','leaf-reparse','ads','multilink','malformed','schema','duplicate','fractional','noncanonical')){
             $fixture=New-CcodAuthorizedRuntimeFixture -Root (Join-Path $root ("append-hostile-$kind")) -AppendOnly;$pointerRoot=Join-Path $fixture.InstallRoot 'state\active-generation';$leaf=Join-Path $pointerRoot '00000000000000000001.json';$target=Join-Path $fixture.InstallRoot ("target-$kind")
             if($kind-ceq'root-file'){Remove-Item $pointerRoot -Recurse -Force;[IO.File]::WriteAllText($pointerRoot,'x',[Text.UTF8Encoding]::new($false))}
             elseif($kind-ceq'root-reparse'){Remove-Item $pointerRoot -Recurse -Force;[IO.Directory]::CreateDirectory($target)|Out-Null;New-Item -ItemType Junction -Path $pointerRoot -Target $target|Out-Null}
             elseif($kind-ceq'leaf-reparse'){[IO.File]::Delete($leaf);[IO.Directory]::CreateDirectory($target)|Out-Null;New-Item -ItemType Junction -Path $leaf -Target $target|Out-Null}
             elseif($kind-ceq'ads'){Set-Content -LiteralPath $leaf -Stream evidence -Value x -NoNewline}
             elseif($kind-ceq'multilink'){$text=[IO.File]::ReadAllText($leaf);[IO.File]::Delete($leaf);$outside=Join-Path $fixture.InstallRoot 'outside-pointer.json';[IO.File]::WriteAllText($outside,$text,[Text.UTF8Encoding]::new($false));New-Item -ItemType HardLink -Path $leaf -Target $outside|Out-Null}
+            elseif($kind-ceq'malformed'){[IO.File]::WriteAllText($leaf,'{',[Text.UTF8Encoding]::new($false))}
+            elseif($kind-ceq'schema'){$id=$fixture.RuntimeId;[IO.File]::WriteAllText($leaf,('{"schemaVersion":2,"generation":1,"activeRuntime":"'+$id+'","previousGeneration":0}'),[Text.UTF8Encoding]::new($false))}
             elseif($kind-ceq'duplicate'){$id=$fixture.RuntimeId;[IO.File]::WriteAllText($leaf,('{"schemaVersion":1,"schemaVersion":1,"generation":1,"activeRuntime":"'+$id+'","previousGeneration":0}'),[Text.UTF8Encoding]::new($false))}
             elseif($kind-ceq'fractional'){$id=$fixture.RuntimeId;[IO.File]::WriteAllText($leaf,('{"schemaVersion":1,"generation":1.5,"activeRuntime":"'+$id+'","previousGeneration":0}'),[Text.UTF8Encoding]::new($false))}
             else{Move-Item -LiteralPath $leaf -Destination (Join-Path $pointerRoot '00000000000000000002.json')}
-            Assert-CcodThrows {Get-CcodStaticProbeRuntimeAuthorization -ScriptPath $fixture.WorkerPath|Out-Null} 'CCOD_STATIC_RUNTIME_UNAUTHORIZED'
+            $failure=$null;try{Get-CcodStaticProbeRuntimeAuthorization -ScriptPath $fixture.WorkerPath|Out-Null}catch{$failure=$_}
+            $actualId=if($null-eq$failure){'<none>'}else{[string]$failure.FullyQualifiedErrorId}
+            Assert-CcodTrue ($null-ne$failure-and$actualId-like'CCOD_STATIC_RUNTIME_UNAUTHORIZED*') "$kind selector mutation is rejected before runtime authorization (actual=$actualId)"
         }
+    }
+
+    Invoke-CcodTest 'append-only selector lookup errors cannot fall back to a valid legacy pointer' {
+        $fixture=New-CcodAuthorizedRuntimeFixture -Root (Join-Path $root 'append-lookup-error')
+        $pointerRoot=Join-Path $fixture.InstallRoot 'state\active-generation'
+        $getItem={param($Path,$AllowMissing)if([IO.Path]::GetFullPath($Path)-ceq[IO.Path]::GetFullPath($pointerRoot)){throw [UnauthorizedAccessException]::new('selector lookup denied')};try{return Get-Item -LiteralPath $Path -Force -ErrorAction Stop}catch [Management.Automation.ItemNotFoundException]{if($AllowMissing){return $null};throw}}.GetNewClosure()
+        Assert-CcodThrows {Get-CcodStaticProbeRuntimeAuthorization -ScriptPath $fixture.WorkerPath -Adapters @{GetItem=$getItem}|Out-Null} 'CCOD_STATIC_RUNTIME_UNAUTHORIZED'
     }
 
     Invoke-CcodTest 'imports only exact private bound runtime APIs and unloads every module command surface' {

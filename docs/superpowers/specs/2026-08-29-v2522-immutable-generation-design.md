@@ -87,6 +87,11 @@ new chain is absent. Lifecycle readiness likewise accepts the exact
 generation bootstrap selected by the scheduled task, with the fixed root
 bootstrap retained only for a proven legacy task.
 
+Absence of the append-only selector is a positive lookup result: only an exact
+ItemNotFound outcome permits legacy fallback. A selector-root file, reparse
+point, access or I/O failure, malformed store, or unsupported record fails the
+component's bounded authorization contract instead of consulting `active.json`.
+
 ### 1a. Immutable initialization evidence and operational state
 
 The install transaction writes create-only, generation-bound initialization
@@ -132,7 +137,8 @@ only the install-root `state` directories and create-only records; it cannot
 create a runtime generation, copy a payload, write a manifest, open a retained
 generation, or commit a pointer. A recovery uses it only after revalidating the
 already committed pointer, generation manifest, Ready receipt, and transaction
-identity.
+identity. Its V4 ABI compatibility proof runs in a fresh child process that
+loads the V3 marker first and exercises only the exported capability surface.
 
 `Retire-CcodInstallGeneration` removes a generation from the active selection by
 one create-only retired-generation record; it does not rename or recursively
