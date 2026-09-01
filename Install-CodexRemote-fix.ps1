@@ -126,20 +126,23 @@ function Invoke-CcodPortableLifecycleInstaller {
     param(
         [Parameter(Mandatory)][string]$InstallerPath,
         [Parameter(Mandatory)][string]$InstallRoot,
-        [Parameter(Mandatory)][string]$VerifiedSealedPackageSha256,
-        [Parameter(Mandatory)][string]$ExpectedSealedPackageSha256,
+        [Parameter(Mandatory)][string]$CopiedSealedPackageSha256,
+        [Parameter(Mandatory)][string]$InitialSealedPackageSha256,
+        [Parameter(Mandatory)][string]$RevalidatedSourceSealedPackageSha256,
         [switch]$EnableCandidateCompatibleUpdates,
         [switch]$DoNotStart
     )
-    if ($VerifiedSealedPackageSha256 -cnotmatch '^[0-9a-f]{64}$' -or
-        $ExpectedSealedPackageSha256 -cnotmatch '^[0-9a-f]{64}$' -or
-        $VerifiedSealedPackageSha256 -cne $ExpectedSealedPackageSha256) {
-        Throw-CcodPortableInstallerError 'CCOD_PORTABLE_PACKAGE_IDENTITY_INVALID' 'The revalidated portable payload identity changed before lifecycle activation.' $VerifiedSealedPackageSha256
+    if ($CopiedSealedPackageSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $InitialSealedPackageSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $RevalidatedSourceSealedPackageSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $CopiedSealedPackageSha256 -cne $InitialSealedPackageSha256 -or
+        $CopiedSealedPackageSha256 -cne $RevalidatedSourceSealedPackageSha256) {
+        Throw-CcodPortableInstallerError 'CCOD_PORTABLE_PACKAGE_IDENTITY_INVALID' 'The initial, revalidated source, and copied portable payload identities differ before lifecycle activation.' $CopiedSealedPackageSha256
     }
     return & $InstallerPath -InstallRoot $InstallRoot `
         -EnableCandidateCompatibleUpdates:([bool]$EnableCandidateCompatibleUpdates) `
         -DoNotStart:([bool]$DoNotStart) `
-        -SealedPackageSha256 $VerifiedSealedPackageSha256
+        -SealedPackageSha256 $CopiedSealedPackageSha256
 }
 
 $bundleRoot = Assert-CcodPortableInstallerPlainDirectory -Path $PSScriptRoot -Kind 'Portable bundle root'
@@ -172,8 +175,9 @@ $copied = Copy-CcodPortablePayload -PayloadRoot $payloadRoot -ManifestPath $payl
 $installerPath = Assert-CcodPortableInstallerRegularFile -Path (Join-Path $copied.InstallerRoot 'Install-CodexControlOtherDevices.ps1') -Kind 'Installed lifecycle installer'
 try {
     $installReceipt = Invoke-CcodPortableLifecycleInstaller -InstallerPath $installerPath -InstallRoot $installRoot `
-        -VerifiedSealedPackageSha256 ([string]$revalidatedPayload.PayloadManifestSha256) `
-        -ExpectedSealedPackageSha256 ([string]$payload.PayloadManifestSha256) `
+        -CopiedSealedPackageSha256 ([string]$copied.Manifest.PayloadManifestSha256) `
+        -InitialSealedPackageSha256 ([string]$payload.PayloadManifestSha256) `
+        -RevalidatedSourceSealedPackageSha256 ([string]$revalidatedPayload.PayloadManifestSha256) `
         -EnableCandidateCompatibleUpdates:$EnableCandidateCompatibleUpdates -DoNotStart:$DoNotStart
 } catch {
     Throw-CcodPortableInstallerError 'CCOD_PORTABLE_INSTALL_FAILED' 'The verified portable payload could not activate the protected runtime.' $_

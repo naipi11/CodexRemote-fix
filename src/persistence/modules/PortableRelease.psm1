@@ -356,7 +356,9 @@ function Copy-CcodPortablePayload {
         Clear-CcodPortableReleaseZoneIdentifier -Path $installedManifestPath
         Test-CcodPortablePayloadManifest -PayloadRoot $staging -ManifestPath $installedManifestPath -ExpectedVersion $manifest.Version -ExpectedGitCommit $manifest.GitCommit -AllowInstalledMetadata | Out-Null
         [IO.Directory]::Move($staging,$target)
-        return [pscustomobject][ordered]@{ InstallerRoot=$target; Manifest=$manifest }
+        $publishedManifestPath = Join-Path $target 'portable-payload-manifest.json'
+        $publishedManifest = Test-CcodPortablePayloadManifest -PayloadRoot $target -ManifestPath $publishedManifestPath -ExpectedVersion $manifest.Version -ExpectedGitCommit $manifest.GitCommit -AllowInstalledMetadata
+        return [pscustomobject][ordered]@{ InstallerRoot=$target; Manifest=$publishedManifest }
     } catch {
         if ([IO.Directory]::Exists($staging)) {
             try { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction Stop } catch { }

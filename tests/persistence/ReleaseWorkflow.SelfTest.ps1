@@ -264,6 +264,46 @@ function New-CcodPortableReleaseFixture {
     return [pscustomobject]@{Root=$root;Bundle=$bundle;Checksum=$checksum;PayloadManifest=$payloadAsset;Manifest=$manifest}
 }
 
+function Get-CcodReadOnlyProductTreeSnapshot {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [int]$MaximumEntries=8192,
+        [long]$MaximumFileBytes=268435456,
+        [long]$MaximumTotalBytes=1073741824
+    )
+    $full=[IO.Path]::GetFullPath($Root).TrimEnd('\')
+    if([IO.File]::Exists($full)){throw 'CCOD_TEST_PRODUCT_SNAPSHOT_UNSAFE'}
+    if(-not[IO.Directory]::Exists($full)){
+        return [pscustomobject][ordered]@{root=$full;exists=$false;rootAttributes=$null;rootCreationTimeUtc=$null;rootLastWriteTimeUtc=$null;entryCount=0;totalBytes=[long]0;records=@()}
+    }
+    $rootItem=Get-Item -LiteralPath $full -Force -ErrorAction Stop
+    if(-not$rootItem.PSIsContainer-or($rootItem.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){throw 'CCOD_TEST_PRODUCT_SNAPSHOT_UNSAFE'}
+    $prefix=$full+'\';$pending=[Collections.Generic.Stack[string]]::new();$pending.Push($full);$records=[Collections.Generic.List[object]]::new();$seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase);$total=[long]0
+    while($pending.Count-gt0){
+        $directory=$pending.Pop()
+        foreach($item in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)){
+            if($records.Count-ge$MaximumEntries){throw 'CCOD_TEST_PRODUCT_SNAPSHOT_UNSAFE'}
+            $path=[IO.Path]::GetFullPath($item.FullName)
+            if(-not$path.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){throw 'CCOD_TEST_PRODUCT_SNAPSHOT_UNSAFE'}
+            $relative=$path.Substring($prefix.Length).Replace('\','/')
+            if([string]::IsNullOrWhiteSpace($relative)-or-not$seen.Add($relative)){throw 'CCOD_TEST_PRODUCT_SNAPSHOT_UNSAFE'}
+            if($item.PSIsContainer){
+                $records.Add([pscustomobject][ordered]@{path=$relative;kind='directory';attributes=[int]$item.Attributes;creationTimeUtc=$item.CreationTimeUtc.ToString('o',[Globalization.CultureInfo]::InvariantCulture);lastWriteTimeUtc=$item.LastWriteTimeUtc.ToString('o',[Globalization.CultureInfo]::InvariantCulture);length=$null;sha256=$null})
+                $pending.Push($path)
+            }else{
+                $length=[long]$item.Length
+                if($length-lt0-or$length-gt$MaximumFileBytes-or$total-gt($MaximumTotalBytes-$length)){throw 'CCOD_TEST_PRODUCT_SNAPSHOT_UNSAFE'}
+                $total+=$length
+                try{$streams=@(Get-Item -LiteralPath $path -Stream * -ErrorAction Stop|Where-Object{[string]$_.Stream-cnotin@(':$DATA','::$DATA','$DATA')})}catch{throw 'CCOD_TEST_PRODUCT_SNAPSHOT_UNSAFE'}
+                if($streams.Count-ne0){throw 'CCOD_TEST_PRODUCT_SNAPSHOT_UNSAFE'}
+                $records.Add([pscustomobject][ordered]@{path=$relative;kind='file';attributes=[int]$item.Attributes;creationTimeUtc=$item.CreationTimeUtc.ToString('o',[Globalization.CultureInfo]::InvariantCulture);lastWriteTimeUtc=$item.LastWriteTimeUtc.ToString('o',[Globalization.CultureInfo]::InvariantCulture);length=$length;sha256=Get-CcodTestFileSha256 -Path $path})
+            }
+        }
+    }
+    $comparison=[System.Comparison[object]]{param($left,$right)[StringComparer]::Ordinal.Compare([string]$left.path,[string]$right.path)};$records.Sort($comparison)
+    return [pscustomobject][ordered]@{root=$full;exists=$true;rootAttributes=[int]$rootItem.Attributes;rootCreationTimeUtc=$rootItem.CreationTimeUtc.ToString('o',[Globalization.CultureInfo]::InvariantCulture);rootLastWriteTimeUtc=$rootItem.LastWriteTimeUtc.ToString('o',[Globalization.CultureInfo]::InvariantCulture);entryCount=$records.Count;totalBytes=$total;records=@($records)}
+}
+
 Invoke-CcodTest 'release defender tool exposes manifest and scan functions without a live scan' {
     Assert-CcodTrue (Test-Path -LiteralPath $defenderPath -PathType Leaf) 'Defender release gate exists'
     . $defenderPath -Library
@@ -1676,6 +1716,8 @@ Invoke-CcodTest 'compiled production Setup rejects a wrong package hash before a
         Assert-CcodTrue (Test-Path -LiteralPath $fixture.SetupPath -PathType Leaf) 'wrong-hash compiled Setup exists'
         Assert-CcodEqual ('0'*64) ([string]$fixture.BoundPackageSha256) 'fixture binds the deliberate wrong package hash'
         Assert-CcodEqual ('0'*64) ([string][Diagnostics.FileVersionInfo]::GetVersionInfo($fixture.SetupPath).LegalCopyright).Trim() 'compiled PE independently retains the wrong expected package hash'
+        $realProductRoot=Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'CodexControlOtherDevices'
+        $productStateBefore=Get-CcodReadOnlyProductTreeSnapshot -Root $realProductRoot
         $appRoot=Join-Path $fixture.Root 'forbidden-app-output'
         $logPath=Join-Path $fixture.Root 'executed-setup.log'
         $arguments=@('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',("/DIR=$appRoot"),("/LOG=$logPath"))
@@ -1683,14 +1725,15 @@ Invoke-CcodTest 'compiled production Setup rejects a wrong package hash before a
         $process=[Diagnostics.Process]::new();$process.StartInfo=$startInfo
         Assert-CcodTrue $process.Start() 'wrong-hash compiled Setup starts'
         Assert-CcodTrue $process.WaitForExit(20000) 'wrong-hash compiled Setup exits within the pre-activation bound'
+        $productStateAfter=Get-CcodReadOnlyProductTreeSnapshot -Root $realProductRoot
         Assert-CcodTrue (Test-Path -LiteralPath $logPath -PathType Leaf) 'executed Setup emits its isolated runtime log'
         $log=[IO.File]::ReadAllText($logPath,[Text.UTF8Encoding]::new($false))
         Assert-CcodTrue ([int]$process.ExitCode-ne0) "wrong-hash compiled Setup fails closed: exit=$([int]$process.ExitCode) log=$($log.Substring([Math]::Max(0,$log.Length-1000)))"
         Assert-CcodTrue ($log-cmatch 'CCOD_SETUP_INPUT_BINDING_INVALID') 'runtime CurStepChanged reports the package hash/lock barrier failure'
         Assert-CcodTrue (-not(Test-Path -LiteralPath $fixture.ActivationMarker)) 'temporary activation bootstrap never executes'
         Assert-CcodTrue (-not(Test-Path -LiteralPath $appRoot)) 'CreateAppDir=no leaves no app product output'
-        $realProductRoot=Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'CodexControlOtherDevices'
         Assert-CcodTrue ($log.IndexOf($realProductRoot,[StringComparison]::OrdinalIgnoreCase)-lt0) 'failure log never reaches the real LocalAppData product root'
+        Assert-CcodEqual ($productStateBefore|ConvertTo-Json -Depth 8 -Compress) ($productStateAfter|ConvertTo-Json -Depth 8 -Compress) 'actual LocalAppData product tree is byte-and-metadata unchanged'
     } finally {
         if($null-ne$process){try{if(-not$process.HasExited){$process.Kill();[void]$process.WaitForExit(5000)}}catch{};$process.Dispose()}
         if(Test-Path -LiteralPath $fixture.Root){Remove-Item -LiteralPath $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue}
@@ -1784,6 +1827,27 @@ Invoke-CcodTest 'sealed Setup provenance rejects every field type name length co
             try{Test-CcodSealedSetupBuildProvenance -ProvenancePath $mutated @arguments|Out-Null}catch{$failure=$_}
             Assert-CcodTrue ($null-ne$failure) "provenance mutation is rejected: $($mutation.Name)"
             Assert-CcodTrue ($failure.FullyQualifiedErrorId-like'CCOD_SETUP_PROVENANCE_INVALID*') "provenance mutation has the bounded code: $($mutation.Name)"
+        }
+        $rawProvenance=[IO.File]::ReadAllText($provenance,[Text.UTF8Encoding]::new($false))
+        $duplicatePatterns=@(
+            [pscustomobject]@{Name='top';Pattern='(?s)^\s*\{\s*(?<member>"schemaVersion"\s*:\s*2)'},
+            [pscustomobject]@{Name='installerPackage';Pattern='(?s)"installerPackage"\s*:\s*\{\s*(?<member>"name"\s*:\s*"[^"]+")'},
+            [pscustomobject]@{Name='installerPackageManifest';Pattern='(?s)"installerPackageManifest"\s*:\s*\{\s*(?<member>"name"\s*:\s*"[^"]+")'},
+            [pscustomobject]@{Name='activationBootstrap';Pattern='(?s)"activationBootstrap"\s*:\s*\{\s*(?<member>"name"\s*:\s*"[^"]+")'},
+            [pscustomobject]@{Name='buildInputs';Pattern='(?s)"buildInputs"\s*:\s*\{\s*(?<member>"innoTemplateSha256"\s*:\s*"[^"]+")'},
+            [pscustomobject]@{Name='peContract';Pattern='(?s)"peContract"\s*:\s*\{\s*(?<member>"fileVersion"\s*:\s*"[^"]+")'}
+        )
+        foreach($duplicate in $duplicatePatterns){
+            $match=[regex]::Match($rawProvenance,$duplicate.Pattern)
+            Assert-CcodTrue ($match.Success-and$match.Groups['member'].Success) "duplicate mutation locates object: $($duplicate.Name)"
+            $member=$match.Groups['member'].Value
+            $duplicateRaw=$rawProvenance.Insert($match.Groups['member'].Index+$match.Groups['member'].Length,(','+$member))
+            $mutated=Join-Path $fixture.Root ("provenance-duplicate-$($duplicate.Name).json")
+            [IO.File]::WriteAllText($mutated,$duplicateRaw,[Text.UTF8Encoding]::new($false))
+            $failure=$null
+            try{Test-CcodSealedSetupBuildProvenance -ProvenancePath $mutated @arguments|Out-Null}catch{$failure=$_}
+            Assert-CcodTrue ($null-ne$failure) "raw duplicate provenance member is rejected: $($duplicate.Name)"
+            Assert-CcodTrue ($failure.FullyQualifiedErrorId-like'CCOD_SETUP_PROVENANCE_INVALID*') "raw duplicate provenance member has bounded code: $($duplicate.Name)"
         }
     } finally {
         if(Test-Path -LiteralPath $fixture.Root){Remove-Item -LiteralPath $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue}
@@ -2625,15 +2689,50 @@ param([string]`$InstallRoot,[switch]`$EnableCandidateCompatibleUpdates,[switch]`
 "@
         [IO.File]::WriteAllText($child,$childSource,[Text.UTF8Encoding]::new($false))
         $verified='a'*64
-        $receipt=&$module {param($Path,$Root,$Identity)Invoke-CcodPortableLifecycleInstaller -InstallerPath $Path -InstallRoot $Root -VerifiedSealedPackageSha256 $Identity -ExpectedSealedPackageSha256 $Identity} $child $root $verified
+        $receipt=&$module {param($Path,$Root,$Identity)Invoke-CcodPortableLifecycleInstaller -InstallerPath $Path -InstallRoot $Root -CopiedSealedPackageSha256 $Identity -InitialSealedPackageSha256 $Identity -RevalidatedSourceSealedPackageSha256 $Identity} $child $root $verified
         Assert-CcodEqual 'runtime-fixture' ([string]$receipt.RuntimeId) 'portable helper returns the exact child receipt'
         Assert-CcodEqual $verified ([IO.File]::ReadAllText($marker,[Text.UTF8Encoding]::new($false))) 'exact verified identity reaches the lifecycle child'
         Remove-Item -LiteralPath $marker -Force
         Assert-CcodThrows {
-            &$module {param($Path,$Root,$Verified,$Expected)Invoke-CcodPortableLifecycleInstaller -InstallerPath $Path -InstallRoot $Root -VerifiedSealedPackageSha256 $Verified -ExpectedSealedPackageSha256 $Expected} $child $root ('b'*64) $verified | Out-Null
+            &$module {param($Path,$Root,$Copied,$Expected)Invoke-CcodPortableLifecycleInstaller -InstallerPath $Path -InstallRoot $Root -CopiedSealedPackageSha256 $Copied -InitialSealedPackageSha256 $Expected -RevalidatedSourceSealedPackageSha256 $Expected} $child $root ('b'*64) $verified | Out-Null
         } 'CCOD_PORTABLE_PACKAGE_IDENTITY_INVALID'
         Assert-CcodTrue (-not(Test-Path -LiteralPath $marker)) 'changed identity fails before lifecycle child mutation'
     } finally {
+        if($null-ne$module){Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue}
+        if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue}
+    }
+}
+
+# Production mutation caught: source bytes change after manifest validation but before the full portable copy path executes.
+Invoke-CcodTest 'portable full copy path rejects a validation-to-copy source race before child or lifecycle state' {
+    $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-portable-copy-race-'+[guid]::NewGuid().ToString('N'))
+    $module=$null;$breakpoint=$null
+    try {
+        $payload=Join-Path $root 'payload';[IO.Directory]::CreateDirectory($payload)|Out-Null
+        $sourceFile=Join-Path $payload 'Install-CodexControlOtherDevices.ps1'
+        [IO.File]::WriteAllText($sourceFile,'original-child-bytes',[Text.UTF8Encoding]::new($false))
+        $sha=Get-CcodTestFileSha256 -Path $sourceFile
+        $manifestPath=Join-Path $root 'payload-manifest.json'
+        $manifest=[ordered]@{schemaVersion=1;product='CodexRemote-fix';version='2.5.22';gitCommit=('a'*40);buildTimestampUtc='2030-02-03T04:05:06.0000000Z';files=@([ordered]@{path='Install-CodexControlOtherDevices.ps1';length=[int64](Get-Item $sourceFile).Length;sha256=$sha})}
+        [IO.File]::WriteAllText($manifestPath,(($manifest|ConvertTo-Json -Depth 8)+[Environment]::NewLine),[Text.UTF8Encoding]::new($false))
+        $modulePath=Join-Path $repositoryRoot 'src\persistence\modules\PortableRelease.psm1'
+        $module=Import-Module $modulePath -Force -PassThru
+        $target=Join-Path $root 'copied-installer'
+        &$module {param($ExpectedRoot)Set-Item -Path Function:Get-CcodPortableReleaseExpectedInstallerRoot -Value { $ExpectedRoot }.GetNewClosure()} $target
+        $line=@(Select-String -Path $modulePath -Pattern '^\s*\[IO\.File\]::Copy\(\$sourceFile,\$destination,\$false\)'|ForEach-Object{$_.LineNumber})
+        Assert-CcodEqual 1 $line.Count 'portable production copy barrier is unique'
+        $attack=[pscustomobject]@{Ran=$false}
+        $action={if(-not$attack.Ran){$attack.Ran=$true;[IO.File]::WriteAllText($sourceFile,'raced-child-bytes',[Text.UTF8Encoding]::new($false))}}.GetNewClosure()
+        $breakpoint=Set-PSBreakpoint -Script $modulePath -Line $line[0] -Action $action
+        $failure=$null
+        try{Copy-CcodPortablePayload -PayloadRoot $payload -ManifestPath $manifestPath -InstallerRoot $target|Out-Null}catch{$failure=$_}
+        Assert-CcodTrue $attack.Ran 'source race runs after validation at the production copy barrier'
+        Assert-CcodTrue ($null-ne$failure-and$failure.FullyQualifiedErrorId-like'CCOD_PORTABLE_COPY_HASH_MISMATCH*') 'raced source fails with the bounded copied-byte hash code'
+        Assert-CcodTrue (-not(Test-Path -LiteralPath $target)) 'raced copy publishes no installer root'
+        Assert-CcodTrue (-not(Test-Path -LiteralPath (Join-Path $root 'child-executed.txt'))) 'raced copy executes no lifecycle child'
+        Assert-CcodTrue (-not(Test-Path -LiteralPath (Join-Path $root 'lifecycle-state'))) 'raced copy creates no lifecycle state'
+    } finally {
+        if($null-ne$breakpoint){Remove-PSBreakpoint -Breakpoint $breakpoint -ErrorAction SilentlyContinue}
         if($null-ne$module){Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue}
         if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue}
     }

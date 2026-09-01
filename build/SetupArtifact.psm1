@@ -33,6 +33,132 @@ function Test-CcodSetupCanonicalUtc {
         $parsed.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture) -ceq $Value
 }
 
+function Initialize-CcodSetupJsonMemberScanner {
+    if ($null -ne ('CcodSetupJsonMemberScannerV1' -as [type])) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
+
+public static class CcodSetupJsonMemberScannerV1
+{
+    public static void AssertUnique(string json)
+    {
+        if (json == null || json.Length == 0 || json.Length > 1048576) throw new InvalidDataException("json bounds");
+        int index = 0;
+        ParseValue(json, ref index, 0);
+        Skip(json, ref index);
+        if (index != json.Length) throw new InvalidDataException("trailing json");
+    }
+
+    private static void ParseValue(string json, ref int index, int depth)
+    {
+        if (depth > 32) throw new InvalidDataException("json depth");
+        Skip(json, ref index);
+        if (index >= json.Length) throw new InvalidDataException("missing value");
+        char c = json[index];
+        if (c == '{') { ParseObject(json, ref index, depth + 1); return; }
+        if (c == '[') { ParseArray(json, ref index, depth + 1); return; }
+        if (c == '"') { ParseString(json, ref index); return; }
+        int start = index;
+        while (index < json.Length && json[index] != ',' && json[index] != '}' && json[index] != ']' && !Char.IsWhiteSpace(json[index])) index++;
+        if (index == start) throw new InvalidDataException("invalid scalar");
+    }
+
+    private static void ParseObject(string json, ref int index, int depth)
+    {
+        index++;
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        Skip(json, ref index);
+        if (index < json.Length && json[index] == '}') { index++; return; }
+        while (true)
+        {
+            Skip(json, ref index);
+            if (index >= json.Length || json[index] != '"') throw new InvalidDataException("object key");
+            string name = ParseString(json, ref index);
+            if (!names.Add(name)) throw new InvalidDataException("duplicate object member: " + name);
+            Skip(json, ref index);
+            if (index >= json.Length || json[index] != ':') throw new InvalidDataException("object colon");
+            index++;
+            ParseValue(json, ref index, depth);
+            Skip(json, ref index);
+            if (index >= json.Length) throw new InvalidDataException("object end");
+            if (json[index] == '}') { index++; return; }
+            if (json[index] != ',') throw new InvalidDataException("object comma");
+            index++;
+        }
+    }
+
+    private static void ParseArray(string json, ref int index, int depth)
+    {
+        index++;
+        Skip(json, ref index);
+        if (index < json.Length && json[index] == ']') { index++; return; }
+        while (true)
+        {
+            ParseValue(json, ref index, depth);
+            Skip(json, ref index);
+            if (index >= json.Length) throw new InvalidDataException("array end");
+            if (json[index] == ']') { index++; return; }
+            if (json[index] != ',') throw new InvalidDataException("array comma");
+            index++;
+        }
+    }
+
+    private static string ParseString(string json, ref int index)
+    {
+        if (json[index] != '"') throw new InvalidDataException("string start");
+        index++;
+        var value = new StringBuilder();
+        while (index < json.Length)
+        {
+            char c = json[index++];
+            if (c == '"') return value.ToString();
+            if (c < 0x20) throw new InvalidDataException("string control");
+            if (c != '\\') { value.Append(c); continue; }
+            if (index >= json.Length) throw new InvalidDataException("string escape");
+            char escaped = json[index++];
+            switch (escaped)
+            {
+                case '"': value.Append('"'); break;
+                case '\\': value.Append('\\'); break;
+                case '/': value.Append('/'); break;
+                case 'b': value.Append('\b'); break;
+                case 'f': value.Append('\f'); break;
+                case 'n': value.Append('\n'); break;
+                case 'r': value.Append('\r'); break;
+                case 't': value.Append('\t'); break;
+                case 'u':
+                    if (index + 4 > json.Length) throw new InvalidDataException("unicode escape");
+                    int code;
+                    if (!Int32.TryParse(json.Substring(index, 4), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out code)) throw new InvalidDataException("unicode escape");
+                    value.Append((char)code); index += 4; break;
+                default: throw new InvalidDataException("unknown escape");
+            }
+        }
+        throw new InvalidDataException("unterminated string");
+    }
+
+    private static void Skip(string json, ref int index)
+    {
+        while (index < json.Length && Char.IsWhiteSpace(json[index])) index++;
+    }
+}
+'@
+}
+
+function Assert-CcodSetupUniqueJsonMembers {
+    param([Parameter(Mandatory)][string]$Json,[Parameter(Mandatory)]$Target)
+    try {
+        Initialize-CcodSetupJsonMemberScanner
+        [CcodSetupJsonMemberScannerV1]::AssertUnique($Json)
+    } catch {
+        Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'JSON contains duplicate members or is outside the bounded raw schema' $Target
+    }
+}
+
 function Get-CcodSetupDescription {
     param([Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version)
     return "CCODSETUP $Version"
@@ -261,8 +387,10 @@ function Test-CcodSealedSetupBuildProvenance {
     $compiler=Assert-CcodSetupRegularFile $CompilerPath 'Inno compiler'
     try {
         $raw=[IO.File]::ReadAllText($path,[Text.UTF8Encoding]::new($false))
+        Assert-CcodSetupUniqueJsonMembers -Json $raw -Target $path
         $record=$raw|ConvertFrom-Json -ErrorAction Stop
         $manifestRaw=[IO.File]::ReadAllText($manifest,[Text.UTF8Encoding]::new($false))
+        Assert-CcodSetupUniqueJsonMembers -Json $manifestRaw -Target $manifest
         $packageManifest=$manifestRaw|ConvertFrom-Json -ErrorAction Stop
     } catch { Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Sealed Setup provenance or package manifest JSON is invalid' $path }
 
