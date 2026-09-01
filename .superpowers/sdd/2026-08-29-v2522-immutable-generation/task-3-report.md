@@ -226,3 +226,52 @@ remained FAIL with three Important findings.
 
 - `1cb91621f2565318143dffe08844a91a350a36d9`
   (`fix: bind portable sealed execution`).
+
+## Fix round 3: actual portable entrypoint race evidence
+
+### Review finding and RED evidence
+
+Scoped review of
+`728b62710c0729b40908e92887d3fe70903edbba..a5d595892f134a5ef957feab4ec4e68228cec97b`
+remained FAIL with one Important test-compliance finding. The race test invoked
+`Copy-CcodPortablePayload` directly inside the module and therefore did not
+prove that the real `Install-CodexRemote-fix.ps1` control flow stopped before
+its child and lifecycle boundaries. This review failure is the RED evidence;
+the production post-Defender revalidation behavior itself did not require a
+code change.
+
+### Remediated evidence
+
+- The replacement fixture copies the production
+  `Install-CodexRemote-fix.ps1` byte-for-byte and asserts the copy hash before
+  invoking that actual script path.
+- It uses the production `PortableRelease.psm1`, a valid manifest, and an
+  isolated child installer that would create both a marker and fixture
+  lifecycle directory if execution reached it.
+- Test-local Defender commands remain entirely inside the fixture process.
+  `Start-MpScan` changes the child source after the entrypoint's initial
+  manifest validation and before its copy boundary.
+- The actual entrypoint returns `CCOD_PORTABLE_MANIFEST_INVALID` from its
+  post-Defender `Test-CcodPortablePayloadManifest` call. Only after it returns,
+  the test proves the marker and fixture lifecycle root are both absent.
+- The helper identity test remains as unit coverage, but no helper-only race
+  test is claimed as end-to-end evidence.
+
+### GREEN and verification evidence
+
+- Final `ReleaseWorkflow.SelfTest.ps1`: exit `0`; the named actual-entrypoint
+  validation-to-copy race case passed.
+- Final `InstallLifecycle.SelfTest.ps1`: exit `0`;
+  `Install lifecycle self-tests passed: 113`.
+- The changed PowerShell test file parsed with zero errors (`1/1`).
+- `git diff --check` exited `0`; only the checkout LF-to-CRLF warning was
+  emitted.
+- No aggregate run was performed in this fix round; no aggregate-pass claim is
+  made.
+- No external release, push, tag, signing, install, product-process,
+  WindowsApps, or DPAPI action occurred.
+
+### Exact implementation commit
+
+- `58bd7603fa83133d78d2f62ac045ec00d25134c9`
+  (`test: exercise portable sealed race end to end`).
