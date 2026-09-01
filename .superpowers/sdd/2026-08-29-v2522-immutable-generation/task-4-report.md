@@ -232,3 +232,15 @@ network, release, push, tag, signing, or publication action was performed.
 
 - `283ecbe3eb012f1e78377e9336aacc7b3acc9336`
   (`fix: bind matched product finalization`).
+
+### Supplemental pre-cleanup target gate
+
+Final pre-commit audit added a noncanonical Ready target negative. Its RED
+returned the expected validation error but observed `Cleanup=1`: validation
+failure was captured without clearing the fresh context. The fix clears every
+failed fresh context, validates the same canonical Ready invariant on stored
+resume transactions, and rejects before cleanup. Fresh UninstallBootstrap is
+`20/20`, exit `0`; focused parser `4/4` and diff check exit `0`.
+
+- Supplemental commit: `67c79d82e18c805f27aec8e05553938f1f706380`
+  (`fix: reject invalid Ready evidence before cleanup`).
