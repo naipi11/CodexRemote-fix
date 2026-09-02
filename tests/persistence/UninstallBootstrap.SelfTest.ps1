@@ -15,6 +15,10 @@ if (-not (Test-Path -LiteralPath $installedFinalizerScript -PathType Leaf)) { th
 Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\RuntimeManifest.psm1') -Force
 $canonicalTaskTarget=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'schtasks.exe'))
 
+function New-CcodUninstallBootstrapTestPayloadRecords {
+    $records=@(New-CcodUninstallBootstrapPayloadRecords -ResumeOnly);foreach($record in $records){$record.length=[int64]1;$record.sha256=('d'*64)};$resume=@($records|Where-Object{$_.path-ceq'src/persistence/InstalledUninstallFinalizer.ps1'})[0];$resume.length=[int64]123;$resume.sha256=('e'*64);return $records
+}
+
 function New-CcodUninstallBootstrapContext {
     return [pscustomobject][ordered]@{
         runtimeId = '2.5.0-uninstall-test'
@@ -23,7 +27,7 @@ function New-CcodUninstallBootstrapContext {
         userSid = 'S-1-5-21-111-222-333-1001'
         sessionId = 1
         readyEvidence = [pscustomobject][ordered]@{phase='Ready';installRoot='C:\install';runtimeId='2.5.0-uninstall-test';runtimeGeneration=[uint64]7;packageSha256=('0'*64);manifestSha256=('a'*64);startMenuSha256=('0'*64);desktopSha256=('0'*64);targetPath=$canonicalTaskTarget;arguments='/Run /TN "Codex Control Other Devices Supervisor"'}
-        payloadRecords = New-CcodUninstallBootstrapPayloadRecords -ResumeOnly
+        payloadRecords = New-CcodUninstallBootstrapTestPayloadRecords
     }
 }
 
@@ -69,7 +73,7 @@ function New-CcodUninstallBootstrapAdapters {
                 userSid = 'S-1-5-21-111-222-333-1001'
                 sessionId = 1
                 readyEvidence = [pscustomobject][ordered]@{phase='Ready';installRoot='C:\install';runtimeId='2.5.0-uninstall-test';runtimeGeneration=[uint64]7;packageSha256=('0'*64);manifestSha256=('a'*64);startMenuSha256=('0'*64);desktopSha256=('0'*64);targetPath=$canonicalTaskTarget;arguments='/Run /TN "Codex Control Other Devices Supervisor"'}
-                payloadRecords = New-CcodUninstallBootstrapPayloadRecords -ResumeOnly
+                payloadRecords = New-CcodUninstallBootstrapTestPayloadRecords
             }
         }.GetNewClosure()
         GetTransactionRoot = {
@@ -121,6 +125,12 @@ function New-CcodUninstallBootstrapAdapters {
             param($TransactionRoot,$Transaction)
             [void]$World.Calls.Add("Receipt:$($Transaction.phase)")
             [void]($World.Receipt = $Transaction)
+        }.GetNewClosure()
+        ReadReceipt = {
+            param($TransactionRoot)
+            [void]$World.Calls.Add('ReadReceipt')
+            if($null-eq$World.Receipt){return $null}
+            [pscustomobject][ordered]@{schemaVersion=1;transactionId=[string]$World.Receipt.transactionId;runtimeId=[string]$World.Receipt.runtimeId;runtimeGeneration=[uint64]$World.Receipt.runtimeGeneration;leaseEpoch=[uint64]$World.Receipt.leaseEpoch;phase=[string]$World.Receipt.phase;updatedAtUtc=[string]$World.Receipt.updatedAtUtc;errorCode=$World.Receipt.errorCode}
         }.GetNewClosure()
         RunCleanup = {
             param($InstallerRoot,$InstallRoot,$TransactionRoot,$Transaction,$WriteTransaction)
@@ -268,7 +278,7 @@ function New-CcodUninstallBootstrapTestInstalledBinding {
         [string]$RuntimeManifestSha256=('a'*64)
     )
     $local=Get-CcodInstalledFinalizerLocalAppData;if([string]::IsNullOrWhiteSpace($TransactionDirectory)){$TransactionDirectory=Join-Path (Join-Path $local 'CodexRemote-fix-uninstall') $TransactionId};$resumeScript=[IO.Path]::GetFullPath((Join-Path $TransactionDirectory 'payload\src\persistence\InstalledUninstallFinalizer.ps1'))
-    $records=if($null-ne$PayloadRecords){@($PayloadRecords)}else{@(New-CcodUninstallBootstrapPayloadRecords -ResumeOnly)};if($null-eq$PayloadRecords){foreach($record in $records){$record.length=[int64]1;$record.sha256=('d'*64)};$fakeResume=@($records|Where-Object{$_.path-ceq'src/persistence/InstalledUninstallFinalizer.ps1'})[0];$fakeResume.length=[int64]123;$fakeResume.sha256=('e'*64)};$resumeRecord=@($records|Where-Object{$_.path-ceq'src/persistence/InstalledUninstallFinalizer.ps1'})[0]
+    $records=if($null-ne$PayloadRecords){@($PayloadRecords)}else{@(New-CcodUninstallBootstrapTestPayloadRecords)};$resumeRecord=@($records|Where-Object{$_.path-ceq'src/persistence/InstalledUninstallFinalizer.ps1'})[0]
     [pscustomobject][ordered]@{selectedRuntimeRoot=[IO.Path]::GetFullPath($RuntimeRoot);runtimeManifestSha256=$RuntimeManifestSha256;wrapperPid=$WrapperPid;wrapperCreationTimeUtc=$WrapperCreationTimeUtc;wrapperSessionId=$SessionId;wrapperUserSid=$UserSid;resumeWrapperPid=$null;resumeWrapperCreationTimeUtc=$null;resumeWrapperSessionId=$null;resumeWrapperUserSid=$null;resumeScriptPath=$resumeScript;resumeScriptLength=[int64]$resumeRecord.length;resumeScriptSha256=[string]$resumeRecord.sha256;resumeCommand=(Get-CcodUninstallBootstrapInstalledResumeCommand -ResumeScriptPath $resumeScript -TransactionId $TransactionId -RuntimeRoot $RuntimeRoot -InstallRoot $InstallRoot);payloadRecords=$records}
 }
 
@@ -280,7 +290,7 @@ function New-CcodInstalledFinalizerMemoryAdapters {
         ExitAccountTransition={param($Lease)$World.Calls.Add('AccountUnlock');$Lease.Held=$false}.GetNewClosure()
         EnterTransactionLock={param($Sid)$World.Calls.Add('Lock');[pscustomobject]@{Held=$true}}.GetNewClosure()
         ExitTransactionLock={param($Lock)$World.Calls.Add('Unlock');$Lock.Held=$false}.GetNewClosure()
-        WaitWrapperExit={param($Identity,$Timeout)$World.Calls.Add('WaitWrapper');[pscustomobject]@{verifiedAtStart=$true;exited=$true}}.GetNewClosure()
+        WaitWrapperExit={param($Identity,$Timeout)$World.Calls.Add('WaitWrapper');if($null-eq$World.PSObject.Properties['LastWaitIdentity']){$World|Add-Member -NotePropertyName LastWaitIdentity -NotePropertyValue $null};$World.LastWaitIdentity=$Identity;[pscustomobject]@{verifiedAtStart=$true;exited=$true}}.GetNewClosure()
         ReadPreparedTransaction={param($Id,$Root)$World.Calls.Add("Read:$($World.Transaction.phase)");$World.Transaction}.GetNewClosure()
         ValidateStagedPayload={param($Transaction,$Root)$World.Calls.Add('ValidatePayload');$true}.GetNewClosure()
         ValidateSelectedGeneration={param($Runtime,$Install,$Transaction)$World.Calls.Add('ValidateGeneration');[bool]$World.RootPresent}.GetNewClosure()
@@ -624,20 +634,81 @@ $results += Invoke-CcodTest 'FinalizeReceipt repairs a missing receipt after the
     Assert-CcodEqual 'GetRoot,Read,FinalizeInvocation,RootAbsent,Receipt:Completed' ($world.Calls-join',') 'receipt repair performs no second transaction write before the public registry anchor is removed'
 }
 
-# Production mutation caught: deleting the selected generation while its public wrapper is still executing from it.
-$results += Invoke-CcodTest 'installed Prepare stops at TaskRemoved and external finalizer completes only after wrapper exit' {
+# Production mutation caught: the generic context matcher rejects a same-SID TaskRemoved
+# replacement wrapper merely because its fresh Windows session differs from the historical one.
+$results += Invoke-CcodTest 'same-SID new-session TaskRemoved replacement persists a fresh wrapper without rerunning cleanup' {
+    $world=[pscustomobject]@{Calls=[Collections.Generic.List[string]]::new();Transaction=(New-CcodUninstallBootstrapTestTransaction -Phase 'TaskRemoved');Receipt=$null;ValidationError=$false;StageError=$false;CleanupError=$false;CleanupFailurePhase=$null;InstallRootAbsent=$false;StagedEntries=@();ProductRegistrationRemovals=0}
+    $world.Transaction.installedBinding=New-CcodUninstallBootstrapTestInstalledBinding -SessionId 1 -WrapperPid 42 -WrapperCreationTimeUtc '2030-02-03T03:04:05.0000000Z'
+    $adapters=New-CcodUninstallBootstrapAdapters $world;$fresh=New-CcodUninstallBootstrapContext;$fresh.sessionId=99;$fresh.payloadRecords=@($world.Transaction.installedBinding.payloadRecords);$freshCalls=[pscustomobject]@{Count=0};$cleanupCalls=[pscustomobject]@{Count=0}
+    $adapters.ValidateInvocation={param($InstallerRoot,$InstallRoot)$freshCalls.Count++;$world.Calls.Add("FreshValidate:$($freshCalls.Count)");$fresh}.GetNewClosure()
+    $adapters.GetInstalledBinding={param($InstallerRoot,$InstallRoot,$Context,$WrapperIdentity,$TransactionDirectory,$TransactionId)New-CcodUninstallBootstrapTestInstalledBinding -TransactionId $TransactionId -RuntimeRoot 'C:\install\runtime\2.5.0-uninstall-test' -InstallRoot 'C:\install' -UserSid $WrapperIdentity.userSid -SessionId $WrapperIdentity.sessionId -WrapperPid $WrapperIdentity.pid -WrapperCreationTimeUtc $WrapperIdentity.creationTimeUtc -PayloadRecords $Context.payloadRecords}.GetNewClosure()
+    $adapters.RunCleanup={param($InstallerRoot,$InstallRoot,$TransactionRoot,$Transaction,$WriteTransaction,$Mode)$cleanupCalls.Count++;throw 'TASK1_EXISTING_TASKREMOVED_REENTERED_CLEANUP'}.GetNewClosure()
+    $replacement=[pscustomobject]@{pid=43;creationTimeUtc='2030-02-03T03:04:06.0000000Z';sessionId=99;userSid='S-1-5-21-111-222-333-1001'}
+
+    $resumed=Invoke-CcodUninstallBootstrap -InstallerRoot 'C:\install\runtime\2.5.0-uninstall-test' -InstallRoot 'C:\install' -Mode PrepareInstalled -WrapperIdentity $replacement -Adapters $adapters
+
+    Assert-CcodEqual 'TaskRemoved' $resumed.phase 'same-SID new-session replacement returns the existing TaskRemoved transaction'
+    Assert-CcodEqual 2 $freshCalls.Count 'replacement recovery revalidates runtime selector Ready manifest payload and epoch after both locks are held'
+    Assert-CcodTrue ([Array]::IndexOf(@($world.Calls),'AccountLock')-lt[Array]::IndexOf(@($world.Calls),'FreshValidate:2')) 'fresh replacement proof runs only after Local uninstall and Global AccountTransition acquisition'
+    Assert-CcodEqual 0 $cleanupCalls.Count 'existing TaskRemoved never re-enters RunCleanup'
+    Assert-CcodEqual 1 $resumed.sessionId 'historical transaction session remains immutable evidence'
+    Assert-CcodEqual 42 $resumed.installedBinding.wrapperPid 'historical wrapper identity remains immutable evidence'
+    Assert-CcodEqual 43 $resumed.installedBinding.resumeWrapperPid 'only the exact replacement wrapper PID is persisted'
+    Assert-CcodEqual 99 $resumed.installedBinding.resumeWrapperSessionId 'replacement wrapper records its fresh Windows session'
+    Assert-CcodEqual 'TaskRemoved' $world.Receipt.phase 'TaskRemoved replacement receipt is persisted after transaction read-back'
+}
+
+$results += Invoke-CcodTest 'new-session relaxation rejects every nonexact TaskRemoved identity without mutation' {
+    foreach($kind in @('DifferentSid','Runtime','Generation','Epoch','Ready','Payload','PreTaskRemoved')){
+        $world=[pscustomobject]@{Calls=[Collections.Generic.List[string]]::new();Transaction=(New-CcodUninstallBootstrapTestTransaction -Phase 'TaskRemoved');Receipt=$null;ValidationError=$false;StageError=$false;CleanupError=$false;CleanupFailurePhase=$null;InstallRootAbsent=$false;StagedEntries=@();ProductRegistrationRemovals=0}
+        $world.Transaction.installedBinding=New-CcodUninstallBootstrapTestInstalledBinding
+        if($kind-ceq'PreTaskRemoved'){$world.Transaction.phase='ProtectionStopped';$world.Transaction.resumePhase='ProtectionStopped'}
+        $fresh=New-CcodUninstallBootstrapContext;$fresh.sessionId=99;$fresh.payloadRecords=@($world.Transaction.installedBinding.payloadRecords|ForEach-Object{[pscustomobject][ordered]@{path=[string]$_.path;length=[int64]$_.length;sha256=[string]$_.sha256}})
+        switch($kind){
+            'DifferentSid' {$fresh.userSid='S-1-5-21-999-888-777-1001'}
+            'Runtime' {$fresh.runtimeId='2.5.0-uninstall-foreign';$fresh.readyEvidence.runtimeId=$fresh.runtimeId}
+            'Generation' {$fresh.runtimeGeneration=[uint64]8;$fresh.readyEvidence.runtimeGeneration=[uint64]8}
+            'Epoch' {$fresh.leaseEpoch=[uint64]12}
+            'Ready' {$fresh.readyEvidence.packageSha256=('f'*64)}
+            'Payload' {$fresh.payloadRecords[0].sha256=('f'*64)}
+        }
+        $adapters=New-CcodUninstallBootstrapAdapters $world;$adapters.ValidateInvocation={param($InstallerRoot,$InstallRoot)$fresh}.GetNewClosure();$cleanup=[pscustomobject]@{Count=0};$adapters.RunCleanup={param($InstallerRoot,$InstallRoot,$TransactionRoot,$Transaction,$WriteTransaction,$Mode)$cleanup.Count++;throw 'TASK1_NEGATIVE_REENTERED_CLEANUP'}.GetNewClosure()
+        $replacement=[pscustomobject]@{pid=43;creationTimeUtc='2030-02-03T03:04:06.0000000Z';sessionId=99;userSid='S-1-5-21-111-222-333-1001'}
+        Assert-CcodThrows {Invoke-CcodUninstallBootstrap -InstallerRoot 'C:\install\runtime\2.5.0-uninstall-test' -InstallRoot 'C:\install' -Mode PrepareInstalled -WrapperIdentity $replacement -Adapters $adapters|Out-Null} 'CCOD_UNINSTALL_TRANSACTION_MISMATCH'
+        Assert-CcodEqual 0 @($world.Calls|Where-Object{$_-like'Write:*'-or$_-like'Receipt:*'}).Count "$kind writes no transaction or receipt"
+        Assert-CcodEqual 0 $cleanup.Count "$kind never enters RunCleanup"
+        Assert-CcodEqual $null $world.Transaction.installedBinding.resumeWrapperPid "$kind persists no replacement wrapper"
+    }
+}
+
+$results += Invoke-CcodTest 'WrapperResume rejects PID creation session and SID mutations before waiting or reclaiming' {
+    foreach($kind in @('Pid','Creation','Session','Sid')){
+        $transaction=New-CcodUninstallBootstrapTestTransaction -Phase 'TaskRemoved';$transaction.installedBinding=New-CcodUninstallBootstrapTestInstalledBinding;$transaction.installedBinding.resumeWrapperPid=43;$transaction.installedBinding.resumeWrapperCreationTimeUtc='2030-02-03T03:04:06.0000000Z';$transaction.installedBinding.resumeWrapperSessionId=99;$transaction.installedBinding.resumeWrapperUserSid=$transaction.userSid
+        $world=[pscustomobject]@{Calls=[Collections.Generic.List[string]]::new();Transaction=$transaction;RootPresent=$true;PublicEntry=$false;PublicCommand=$null;ShortcutsPresent=$true;CompletedReceipt=$false;Failure=$null;FailureInjected=$false;EntryPresentAtReclaim=$false};$adapters=New-CcodInstalledFinalizerMemoryAdapters $world
+        $identity=[pscustomobject]@{pid=43;creationTimeUtc='2030-02-03T03:04:06.0000000Z';sessionId=99;userSid=$transaction.userSid};switch($kind){'Pid'{$identity.pid=44}'Creation'{$identity.creationTimeUtc='2030-02-03T03:04:07.0000000Z'}'Session'{$identity.sessionId=100}'Sid'{$identity.userSid='S-1-5-21-999-888-777-1001'}}
+        Assert-CcodThrows {Invoke-CcodInstalledUninstallFinalizer -TransactionId $transaction.transactionId -RuntimeRoot $transaction.installedBinding.selectedRuntimeRoot -InstallRoot 'C:\install' -WrapperIdentity $identity -WrapperResume -Adapters $adapters|Out-Null} 'CCOD_INSTALLED_FINALIZER_INVALID'
+        Assert-CcodEqual 0 @($world.Calls|Where-Object{$_-in@('WaitWrapper','Reclaim','Write:ReadyForInno')}).Count "$kind mismatch is rejected before wrapper wait or reclamation"
+    }
+}
+
+# Production mutation caught: a finalizer-start failure leaves no anchor, and a replacement
+# wrapper from a new session must bind itself and still be waited before reclamation.
+$results += Invoke-CcodTest 'finalizer-start failure recovers through same-SID new-session WrapperResume exact wait' {
     $world=[pscustomobject]@{Calls=[Collections.Generic.List[string]]::new();Transaction=$null;Receipt=$null;ValidationError=$false;StageError=$false;CleanupError=$false;CleanupFailurePhase=$null;InstallRootAbsent=$false;StagedEntries=@();ProductRegistrationRemovals=0}
     $adapters=New-CcodUninstallBootstrapAdapters $world
     $originalCleanup=$adapters.RunCleanup
     $adapters.RunCleanup={param($InstallerRoot,$InstallRoot,$TransactionRoot,$Transaction,$WriteTransaction,$Mode);$world.Calls.Add("Cleanup:$Mode");$Transaction.phase='TaskRemoved';$Transaction.resumePhase='TaskRemoved';&$WriteTransaction $TransactionRoot $Transaction;$Transaction}.GetNewClosure()
-    $adapters.GetInstalledBinding={param($InstallerRoot,$InstallRoot,$Context,$WrapperIdentity,$TransactionDirectory,$TransactionId)New-CcodUninstallBootstrapTestInstalledBinding -TransactionId $TransactionId -RuntimeRoot 'C:\install\runtime\2.5.0-uninstall-test' -InstallRoot 'C:\install' -UserSid $WrapperIdentity.userSid -SessionId $WrapperIdentity.sessionId -WrapperPid $WrapperIdentity.pid -WrapperCreationTimeUtc $WrapperIdentity.creationTimeUtc}.GetNewClosure()
+    $adapters.GetInstalledBinding={param($InstallerRoot,$InstallRoot,$Context,$WrapperIdentity,$TransactionDirectory,$TransactionId)New-CcodUninstallBootstrapTestInstalledBinding -TransactionId $TransactionId -RuntimeRoot 'C:\install\runtime\2.5.0-uninstall-test' -InstallRoot 'C:\install' -UserSid $WrapperIdentity.userSid -SessionId $WrapperIdentity.sessionId -WrapperPid $WrapperIdentity.pid -WrapperCreationTimeUtc $WrapperIdentity.creationTimeUtc -PayloadRecords $Context.payloadRecords}.GetNewClosure()
     $wrapperIdentity=[pscustomobject]@{pid=42;creationTimeUtc='2030-02-03T03:04:05.0000000Z';sessionId=1;userSid='S-1-5-21-111-222-333-1001'}
-    $prepared=Invoke-CcodUninstallBootstrap -InstallerRoot 'C:\runtime' -InstallRoot 'C:\install' -Mode PrepareInstalled -WrapperIdentity $wrapperIdentity -Adapters $adapters
+    $prepared=Invoke-CcodUninstallBootstrap -InstallerRoot 'C:\install\runtime\2.5.0-uninstall-test' -InstallRoot 'C:\install' -Mode PrepareInstalled -WrapperIdentity $wrapperIdentity -Adapters $adapters
     Assert-CcodEqual 'TaskRemoved' $prepared.phase 'installed wrapper retains application state until it exits'
     Assert-CcodEqual 0 $world.ProductRegistrationRemovals 'installed Prepare removes no product state before the external finalizer'
+    $startFailure=$null;try{throw [Management.Automation.ErrorRecord]::new([IO.IOException]::new('injected finalizer start failure'),'CCOD_UNINSTALL_INSTALLED_FINALIZER_START_FAILED',[Management.Automation.ErrorCategory]::OpenError,$prepared.transactionId)}catch{$startFailure=$_}
+    Assert-CcodEqual 'CCOD_UNINSTALL_INSTALLED_FINALIZER_START_FAILED' (([string]$startFailure.FullyQualifiedErrorId-split',')[0]) 'first public invocation fails only after durable TaskRemoved and before any Apps anchor'
 
     $replacementWrapper=[pscustomobject]@{pid=43;creationTimeUtc='2030-02-03T03:04:06.0000000Z';sessionId=99;userSid='S-1-5-21-111-222-333-1001'}
-    $resumedPrepare=Invoke-CcodUninstallBootstrap -InstallerRoot 'C:\runtime' -InstallRoot 'C:\install' -Mode PrepareInstalled -WrapperIdentity $replacementWrapper -Adapters $adapters
+    $replacementContext=New-CcodUninstallBootstrapContext;$replacementContext.sessionId=99;$adapters.ValidateInvocation={param($InstallerRoot,$InstallRoot)$replacementContext}.GetNewClosure()
+    $resumedPrepare=Invoke-CcodUninstallBootstrap -InstallerRoot 'C:\install\runtime\2.5.0-uninstall-test' -InstallRoot 'C:\install' -Mode PrepareInstalled -WrapperIdentity $replacementWrapper -Adapters $adapters
     Assert-CcodEqual 'TaskRemoved' $resumedPrepare.phase 'a later runtime wrapper reuses the staged transaction instead of replacing historical wrapper proof'
     Assert-CcodEqual 42 $resumedPrepare.installedBinding.wrapperPid 'historical wrapper identity remains immutable during public retry'
     Assert-CcodEqual 43 $resumedPrepare.installedBinding.resumeWrapperPid 'replacement wrapper launch identity is persisted separately before returning'
@@ -651,6 +722,9 @@ $results += Invoke-CcodTest 'installed Prepare stops at TaskRemoved and external
     Assert-CcodTrue (-not$final.PublicEntry) 'public recovery entry is removed only after the Completed receipt'
     Assert-CcodTrue $final.EntryPresentAtReclaim 'durable public recovery entry exists before generation reclamation'
     Assert-CcodTrue (@($final.Calls)-ccontains'WaitWrapper') 'replacement wrapper finalizer waits for the exact replacement instance before reclamation'
+    Assert-CcodEqual 43 $final.LastWaitIdentity.pid 'WrapperResume waits the newly persisted replacement PID'
+    Assert-CcodEqual '2030-02-03T03:04:06.0000000Z' $final.LastWaitIdentity.creationTimeUtc 'WrapperResume waits the newly persisted replacement creation time'
+    Assert-CcodEqual 99 $final.LastWaitIdentity.sessionId 'WrapperResume waits the newly persisted replacement session'
     $localLock=[Array]::IndexOf(@($final.Calls),'Lock');$accountLock=[Array]::IndexOf(@($final.Calls),'AccountLock');$reclaim=[Array]::IndexOf(@($final.Calls),'Reclaim');$registry=[Array]::IndexOf(@($final.Calls),'RemoveRegistry');$accountUnlock=[Array]::IndexOf(@($final.Calls),'AccountUnlock');$localUnlock=[Array]::IndexOf(@($final.Calls),'Unlock')
     Assert-CcodTrue ($localLock-ge0-and$accountLock-gt$localLock-and$reclaim-gt$accountLock-and$registry-gt$reclaim-and$accountUnlock-gt$registry-and$localUnlock-gt$accountUnlock) 'Local uninstall then Global AccountTransition acquisition order spans the complete tail without ABBA'
 }

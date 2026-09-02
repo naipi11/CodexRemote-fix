@@ -327,8 +327,8 @@ function New-CcodUninstallBootstrapResumeContext {
         [Parameter(Mandatory)]$Identity
     )
     Assert-CcodUninstallBootstrapTransaction $Transaction -ExpectedInstallRoot $InstallRoot
-    if ($Transaction.userSid -cne $Identity.userSid) {
-        Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'The interrupted uninstall transaction does not match the current user' $Transaction
+    if ($Transaction.userSid -cne $Identity.userSid -or $Transaction.sessionId -ne $Identity.sessionId) {
+        Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'The interrupted uninstall transaction does not match the current user and session' $Transaction
     }
     $resumePhase = if ($Transaction.phase -ceq 'Failed') { $Transaction.resumePhase } else { $Transaction.phase }
     if (@('TaskRemoved','ApplicationStateRemoved','ReadyForInno') -cnotcontains $resumePhase) {
@@ -824,6 +824,19 @@ function Assert-CcodUninstallBootstrapReadyEvidence {
     return $ReadyEvidence
 }
 
+function Read-CcodUninstallBootstrapStoredReceipt {
+    param([Parameter(Mandatory)][string]$TransactionDirectory)
+    $directory=Get-CcodUninstallBootstrapComparablePath -Path $TransactionDirectory -Kind 'Uninstall transaction directory';$path=Resolve-CcodUninstallBootstrapChildPath -Root $directory -RelativePath 'receipt.json' -RequireLeafFile;Read-CcodUninstallBootstrapJson -Path $path -Kind 'Uninstall receipt'
+}
+
+function Test-CcodUninstallBootstrapReceiptMatchesTransaction {
+    param($Receipt,[Parameter(Mandatory)]$Transaction)
+    return (Test-CcodUninstallBootstrapExactProperties $Receipt @('schemaVersion','transactionId','runtimeId','runtimeGeneration','leaseEpoch','phase','updatedAtUtc','errorCode'))-and$Receipt.schemaVersion-is[int]-and$Receipt.schemaVersion-eq1-and
+        $Receipt.transactionId-is[string]-and$Receipt.transactionId-ceq$Transaction.transactionId-and$Receipt.runtimeId-is[string]-and$Receipt.runtimeId-ceq$Transaction.runtimeId-and
+        [uint64]$Receipt.runtimeGeneration-eq[uint64]$Transaction.runtimeGeneration-and[uint64]$Receipt.leaseEpoch-eq[uint64]$Transaction.leaseEpoch-and$Receipt.phase-is[string]-and$Receipt.phase-ceq$Transaction.phase-and
+        $Receipt.updatedAtUtc-is[string]-and$Receipt.updatedAtUtc-ceq$Transaction.updatedAtUtc-and[string]$Receipt.errorCode-ceq[string]$Transaction.errorCode
+}
+
 function Test-CcodUninstallBootstrapStoredCompletedReceipt {
     param([Parameter(Mandatory)][string]$TransactionRoot,[Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)][string]$ExpectedUserSid)
     try{
@@ -1009,6 +1022,10 @@ function Get-CcodUninstallBootstrapAdapters {
             param($TransactionRoot,$Transaction)
             Write-CcodUninstallBootstrapStoredReceipt -TransactionDirectory $TransactionRoot -Transaction $Transaction
         }
+        ReadReceipt = {
+            param($TransactionRoot)
+            Read-CcodUninstallBootstrapStoredReceipt -TransactionDirectory $TransactionRoot
+        }
         RunCleanup = {
             param($InstallerRoot,$InstallRoot,$TransactionRoot,$Transaction,$WriteTransaction,$Mode)
             $payloadRoot = Resolve-CcodUninstallBootstrapChildPath -Root $TransactionRoot -RelativePath 'payload'
@@ -1050,6 +1067,26 @@ function Get-CcodUninstallBootstrapAdapters {
         $resolved[$key] = $Adapters[$key]
     }
     return $resolved
+}
+
+function Assert-CcodUninstallBootstrapInstalledTaskRemovedContext {
+    param(
+        [Parameter(Mandatory)]$Transaction,
+        [Parameter(Mandatory)]$FreshContext,
+        [Parameter(Mandatory)][string]$InstallerRoot,
+        [Parameter(Mandatory)][string]$InstallRoot
+    )
+    Assert-CcodUninstallBootstrapTransaction $Transaction -ExpectedInstallRoot $InstallRoot
+    Assert-CcodUninstallBootstrapContext $FreshContext -ExpectedInstallRoot $InstallRoot
+    if($Transaction.phase-cne'TaskRemoved'-or$Transaction.resumePhase-cne'TaskRemoved'-or$null-eq$Transaction.installedBinding){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'Only an exact installed TaskRemoved transaction may relax its historical session.' $Transaction}
+    $installer=Get-CcodUninstallBootstrapComparablePath -Path $InstallerRoot -Kind 'Installed runtime root';$install=Get-CcodUninstallBootstrapComparablePath -Path $InstallRoot -Kind 'Install root';$expectedRuntime=Get-CcodUninstallBootstrapComparablePath -Path (Join-Path (Join-Path $install 'runtime') ([string]$Transaction.runtimeId)) -Kind 'Selected runtime root'
+    if($installer-cne$expectedRuntime-or(Get-CcodUninstallBootstrapComparablePath -Path ([string]$Transaction.installedBinding.selectedRuntimeRoot) -Kind 'Bound selected runtime root')-cne$expectedRuntime-or
+       $Transaction.userSid-cne$FreshContext.userSid-or$Transaction.runtimeId-cne$FreshContext.runtimeId-or[uint64]$Transaction.runtimeGeneration-ne[uint64]$FreshContext.runtimeGeneration-or
+       [uint64]$Transaction.leaseEpoch-ne[uint64]$FreshContext.leaseEpoch-or($Transaction.readyEvidence|ConvertTo-Json -Depth 8 -Compress)-cne($FreshContext.readyEvidence|ConvertTo-Json -Depth 8 -Compress)-or
+       ($Transaction.installedBinding.payloadRecords|ConvertTo-Json -Depth 8 -Compress)-cne($FreshContext.payloadRecords|ConvertTo-Json -Depth 8 -Compress)){
+        Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'Installed TaskRemoved replacement does not match the locked fresh runtime proof.' $Transaction
+    }
+    return $true
 }
 
 function Test-CcodUninstallBootstrapInstalledBindingResume {
@@ -1126,6 +1163,7 @@ function Invoke-CcodUninstallBootstrap {
     $stageRoot = $null
     $stagePayload = $false
     $returnExistingInstalledTaskRemoved = $false
+    $installedTaskRemovedRecovery = $false
     $transactionLock = $null
     $accountTransition = $null
     try {
@@ -1166,21 +1204,31 @@ function Invoke-CcodUninstallBootstrap {
             & $adapter.PublishTransaction $transactionRoot $transactionId $context.userSid ([bool]$replaceCompletedLocator)
             $stagePayload = $true
         } else {
-            Assert-CcodUninstallBootstrapTransactionMatchesContext $transaction $context $InstallRoot
+            $installedTaskRemovedCandidate=$Mode-ceq'PrepareInstalled'-and$transaction.phase-ceq'TaskRemoved'-and$transaction.resumePhase-ceq'TaskRemoved'-and$null-ne$transaction.installedBinding
+            if($installedTaskRemovedCandidate){
+                $installedTaskRemovedRecovery=$true
+                $freshContext=&$adapter.ValidateInvocation $InstallerRoot $InstallRoot
+                Assert-CcodUninstallBootstrapContext $freshContext -ExpectedInstallRoot $InstallRoot
+                [void](Assert-CcodUninstallBootstrapInstalledTaskRemovedContext -Transaction $transaction -FreshContext $freshContext -InstallerRoot $InstallerRoot -InstallRoot $InstallRoot)
+                $context=$freshContext
+            }else{Assert-CcodUninstallBootstrapTransactionMatchesContext $transaction $context $InstallRoot}
             $stageRoot = & $adapter.GetTransactionDirectory $transactionRoot $transaction.transactionId
             if ($stageRoot -isnot [string] -or [string]::IsNullOrWhiteSpace($stageRoot)) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_ROOT_INVALID' 'The external uninstall transaction root is invalid' $stageRoot }
             if($Mode-ceq'PrepareInstalled'){
                 $binding=&$adapter.GetInstalledBinding $InstallerRoot $InstallRoot $context $WrapperIdentity $stageRoot $transaction.transactionId
                 if(-not(Test-CcodUninstallBootstrapInstalledBindingResume -Existing $transaction.installedBinding -Observed $binding)){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'Installed wrapper binding changed during resume' $binding}
-                if(($transaction.phase-ceq'TaskRemoved'-and$transaction.resumePhase-ceq'TaskRemoved')-or($transaction.phase-ceq'Failed'-and$transaction.resumePhase-ceq'TaskRemoved')){
+                if($installedTaskRemovedCandidate){
                     $transaction.installedBinding.resumeWrapperPid=[int]$WrapperIdentity.pid;$transaction.installedBinding.resumeWrapperCreationTimeUtc=[string]$WrapperIdentity.creationTimeUtc;$transaction.installedBinding.resumeWrapperSessionId=[int]$WrapperIdentity.sessionId;$transaction.installedBinding.resumeWrapperUserSid=[string]$WrapperIdentity.userSid
-                    $transaction.phase='TaskRemoved';$transaction.resumePhase='TaskRemoved';$transaction.errorCode=$null;$transaction.updatedAtUtc=(& $adapter.GetUtcNow).ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture);Assert-CcodUninstallBootstrapTransaction $transaction -ExpectedInstallRoot $InstallRoot;&$adapter.WriteTransaction $stageRoot $transaction;$returnExistingInstalledTaskRemoved=$true
+                    Assert-CcodUninstallBootstrapTransaction $transaction -ExpectedInstallRoot $InstallRoot;&$adapter.WriteTransaction $stageRoot $transaction
+                    $readBack=&$adapter.ReadTransaction $transactionRoot $identity.userSid $true $InstallRoot
+                    if($null-eq$readBack-or($readBack|ConvertTo-Json -Depth 16 -Compress)-cne($transaction|ConvertTo-Json -Depth 16 -Compress)){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_WRITE_FAILED' 'Replacement wrapper transaction read-back did not match.' $transaction.transactionId}
+                    $transaction=$readBack;$returnExistingInstalledTaskRemoved=$true
                 }
             }
             $stagePayload = $transaction.phase -ceq 'Requested' -or ($transaction.phase -ceq 'Failed' -and $transaction.resumePhase -ceq 'Requested')
         }
         if ($stagePayload) { & $adapter.StagePayload $InstallerRoot $InstallRoot $context $stageRoot }
-        if($returnExistingInstalledTaskRemoved){&$adapter.WriteReceipt $stageRoot $transaction;return $transaction}
+        if($returnExistingInstalledTaskRemoved){&$adapter.WriteReceipt $stageRoot $transaction;$receipt=&$adapter.ReadReceipt $stageRoot;if(-not(Test-CcodUninstallBootstrapReceiptMatchesTransaction -Receipt $receipt -Transaction $transaction)){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_WRITE_FAILED' 'Replacement wrapper receipt read-back did not match.' $transaction.transactionId};return $transaction}
         $result = & $adapter.RunCleanup $InstallerRoot $InstallRoot $stageRoot $transaction $adapter.WriteTransaction $Mode
         if ($null -eq $result) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PREPARE_FAILED' 'The staged cleanup returned no transaction receipt' $stageRoot }
         Assert-CcodUninstallBootstrapTransactionMatchesContext $result $context $InstallRoot
@@ -1192,7 +1240,7 @@ function Invoke-CcodUninstallBootstrap {
     } catch {
         $code = Get-CcodUninstallBootstrapErrorId $_
         if ($code -notmatch '^CCOD_[A-Z0-9_]+$') { $code = 'CCOD_UNINSTALL_PREPARE_FAILED' }
-        if ($null -ne $transaction -and -not [string]::IsNullOrWhiteSpace([string]$stageRoot)) { Set-CcodUninstallBootstrapFailedTransaction -Transaction $transaction -Code $code -Adapters $adapter -TransactionRoot $stageRoot }
+        if (-not$installedTaskRemovedRecovery-and$null -ne $transaction -and -not [string]::IsNullOrWhiteSpace([string]$stageRoot)) { Set-CcodUninstallBootstrapFailedTransaction -Transaction $transaction -Code $code -Adapters $adapter -TransactionRoot $stageRoot }
         if ((Get-CcodUninstallBootstrapErrorId $_) -ceq $code) { throw }
         Throw-CcodUninstallBootstrapError $code 'The uninstall bootstrap failed before Inno deletion' $stageRoot
     } finally {
