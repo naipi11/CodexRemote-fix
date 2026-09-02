@@ -487,3 +487,66 @@ release, signing, tag, push, or publication action occurred.
 
 - `a9900a4b00508f9ed694375ea94a2bfb97437e96`
   (`fix: serialize strict product authority`).
+
+## Fix round 6: durable product-close outcome and atomic lock-wait proof
+
+This architecture-level repair addresses the two remaining product-close and
+concurrency-proof gaps. It does not claim Task 4 complete. No real registry,
+shortcut, installer, uninstaller, product, network, release, signing, tag,
+push, or publication action was performed.
+
+### RED evidence
+
+- The default-registration close regression initially failed with
+  `CCOD_INSTALL_ADAPTER_INVALID`: there was no narrow
+  `CloseProductTransaction` seam at the owned strict-product-transaction
+  boundary. The prior default `RegisterProduct` `finally` also discarded an
+  owned transaction close exception and could return a verified receipt.
+- The previous N/N+1 test announced a marker before it had reached the real
+  `AccountTransition` wait, so it could not prove that the child was actually
+  blocked on the same mutex.
+
+### GREEN evidence
+
+- `tests\persistence\InstallFileTransaction.SelfTest.ps1`: exit `0`; all 32
+  named cases passed. The N/N+1 case runs the child with `-Mta`, atomically
+  signals its real mutex attempt through `SignalAndWait`, proves N can open its
+  retained shortcut while the child waits, then proves N+1 commits only after
+  N closes and stale N is unusable.
+- `tests\persistence\InstallLifecycle.SelfTest.ps1`: exit `0`; `120/120`.
+  The new default-path integration forces both the initial owned close and its
+  bounded same-thread retry to fail, observes no successful receipt and a
+  durable `Ready` record with no `Failed` snapshot, then proves an exact
+  same-package reconciliation drains the pending cleanup before opening fresh
+  strict product authority and returns verified success.
+- `tests\persistence\ProductRegistration.SelfTest.ps1`: exit `0`;
+  `13/13`.
+- `tests\persistence\UninstallBootstrap.SelfTest.ps1`: exit `0`; `23/23`.
+- Explicit PowerShell parser checks on the three changed PowerShell files
+  passed with `PARSER_FAILURES=0`. `git diff --check` exited `0`; only
+  checkout LF-to-CRLF warnings were emitted.
+- A fresh full `tests\PersistenceSelfTest.ps1` aggregate remains pending at
+  this evidence point. No aggregate-pass or Task 4 completion claim is made.
+
+### Remediated boundaries
+
+- `CloseProductTransaction` is a narrow lifecycle adapter. The default
+  delegates to the normal `Ready` file-transaction close. A first close
+  failure always makes the current registration call fail as
+  `CCOD_PRODUCT_REGISTRATION_FAILED`, even if its one bounded same-thread
+  cleanup retry succeeds; no verified receipt is returned from that call.
+- If both close attempts fail, the exact opaque transaction and its bound
+  same-module close delegate remain in a synchronized, process-local pending
+  table keyed by the canonical install root and owner managed-thread ID. The
+  next registration on that same thread drains it before opening fresh product
+  authority. A different thread or another cleanup failure fails closed; no
+  lease or capability is transferred across threads or processes.
+- The normal install, Ready-finalization recovery, and exact
+  `AlreadyInstalled` reconciliation all pass the same close adapter to the
+  default registration path. The writable generation/state handoff remains
+  closed before product registration begins.
+
+### Fix implementation commit
+
+- `2e86de17a7c454cc56edd123b6c6487c5194f32d`
+  (`fix: retain failed product transaction cleanup`).
