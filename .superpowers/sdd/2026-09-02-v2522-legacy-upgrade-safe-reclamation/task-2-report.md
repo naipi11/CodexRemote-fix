@@ -5,7 +5,8 @@
 Task 2 已在隔离 worktree `codex/v2522-install-runtime-reliability` 中实现并完成要求的 focused verification。
 
 - 基线：`4504c1afa665bccd3cc9f9e1ffd748c795bf936d`
-- implementation commit：`6be1025`（`fix: migrate exact legacy registration profiles`）
+- initial implementation commit：`6be1025`（`fix: migrate exact legacy registration profiles`）
+- fix round 1 implementation commit：`69c762d`（`fix: make legacy registry compensation create-only`）
 - 未运行真实安装器，未读写真实 registry、Start menu、Desktop shortcut、scheduled task 或产品进程。
 - 未执行 push、tag、release、安装、重启或 reboot。
 - 本报告只声明 Task 2 focused scope；全计划 aggregate、installed acceptance 与 Task 3 不在本次完成声明内。
@@ -123,8 +124,73 @@ Lifecycle 的真实 v2.5.21 fixture 现在经过实际 ProductRegistration modul
 - `tests\persistence\InstallLifecycle.SelfTest.ps1` parser：`0` errors。
 - `git diff --check`：exit `0`。
 
+## Fix round 1：registry replacement 不可被补偿覆盖
+
+### Review finding
+
+独立 review 指出原 registry 删除/补偿存在 pathname race：
+
+- `Remove-CcodLegacySnapshotEntry` 在部分 value 删除失败后关闭原 key handle；
+- catch 随后通过 `Test-Path`、`New-Item -Force`、`Get-ItemProperty` 与 `New-ItemProperty -Force` 按路径补值；
+- 若原 key 已被重命名/删除且同路径出现 replacement，captured legacy values 会被写入 replacement。
+
+同样，完整删除后的 `Restore-CcodLegacySnapshotEntry` 使用 `Test-Path` 后再 `New-Item -Force`，不能区分本次新建 key 与在竞争窗口内已存在的 replacement。
+
+### Production-shaped RED
+
+测试导入 production module 的隔离副本，调用真实 `Remove-CcodLegacyProductRegistration`、`Remove-CcodLegacySnapshotEntry`、`Read-CcodLegacySnapshotEntry` 与 `Restore-CcodLegacySnapshotEntry`；只在 module 内替换 registry/native OS boundary，没有访问真实 HKCU。
+
+部分删除场景在第一次 `DeleteValue` 后让原 key 脱离路径、在同路径放入 replacement，并在第二次删除抛错。未修复代码的实际结果：
+
+```text
+ProductRegistration.SelfTest.ps1 -> exit 1
+case=partial-registry-compensation-never-writes-captured-values-into-a-replacement-key
+lower=TEST_PARTIAL_REGISTRY_DELETE_FAILURE
+replacement before={"DisplayName":"replacement-product","ReplacementSentinel":"unchanged"}
+replacement after ={"DisplayName":"replacement-product","ReplacementSentinel":"unchanged","NoModify":1}
+ReplacementWrites=1
+```
+
+捕获 RED 后，最终 regression fixture 把 sentinel 加强为 Binary `de ad be ef`；GREEN 同时校验 replacement 的所有 values、Binary bytes 与 value kinds 均不变。
+
+另分别观察两个 create-only RED：
+
+- replacement 在 absent-check 与 restore 之间赢得竞争：exit `1`，旧 `New-Item -Force` 把 `DisplayName` 改成 captured value 并加入 `NoModify`。
+- 路径保持完全 absent：exit `1`，断言 `native create-only open expected=[1] actual=[0]`，证明旧实现仍走 provider `New-Item`。
+
+Native wrapper 编译测试还捕获过一次真实类型错误：`RegistryKey.Handle` 在目标 Windows PowerShell/.NET 中是 `SafeRegistryHandle`，不能直接作为 `IntPtr` 传入。实现改用 `DangerousGetHandle()` 后才进入 GREEN。
+
+### Fix
+
+- 打开原 legacy key 时请求 `QueryValues | SetValue | EnumerateSubKeys | Delete`，删除通过原 open handle 调用 `NtDeleteKey`，不再按路径删除 registry key。
+- mid-delete 失败只通过仍打开的原 handle 写回全部 captured values；随后从同一 handle 重读 exact names/kinds/values，并以 `NtCompareObjects` 对比原 handle 与当前路径重新打开的 handle。
+- 若原 handle 已不再绑定该路径或不能精确验证，状态变为 `PartialUnresolved`；后续禁止降级到 path-level create，replacement 保持不变并记录 `Registry` unresolved。
+- 只有状态明确为 `Deleted` 的完整删除才允许 path-level restore。
+- path-level restore 使用窄 `RegCreateKeyExW(HKEY_CURRENT_USER, ...)` wrapper 并读取 disposition。只有 `REG_CREATED_NEW_KEY` 映射为 `CreatedNew` 后才能写值；`REG_OPENED_EXISTING_KEY` 立即关闭、零写入并标记 unresolved。
+- 新建后通过同一 handle 重读 exact names/kinds/values，并以 `NtCompareObjects` 证明仍绑定目标路径后才接受。写入/验证失败时尝试通过该新建 handle 删除部分 key，绝不删除同路径 replacement。
+- shortcut replacement、profile resolution、overlap retention、current proof revalidation 与 reverse compensation 行为未改变。
+
+### Fix round 1 GREEN
+
+- `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\ProductRegistration.SelfTest.ps1`
+  - `Product registration self-tests passed: 23`
+  - exit `0`
+- `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\InstallLifecycle.SelfTest.ps1`
+  - `Install lifecycle self-tests passed: 148`
+  - exit `0`
+- 三个相关 PowerShell 文件 parser：各 `0` errors。
+- `git diff --check`：exit `0`。
+- 本机只读 symbol check：`NtCompareObjects=True`、`NtDeleteKey=True`、`RegCreateKeyExW=True`。
+- Windows PowerShell registry rights 表达式结果：`0x1000b`，包含 exact-handle delete 所需 `DELETE`。
+
+Fix-round 测试同时证明：
+
+- partial failure 把 captured values 恢复到原 open handle，但路径 identity 已变时仍 fail unresolved；`NativeCreateCalls=0`、provider `New-Item` calls=`0`。
+- `OpenedExisting` disposition 对 replacement values、Binary bytes 与 kinds 均执行零修改，并只记录 `Registry` unresolved。
+- `CreatedNew` disposition 写回完整 captured values/kinds，same-handle 重读通过后才被视为成功补偿。
+
 ## 审查边界与后续
 
-- Focused self-review 未发现新的 Task 2 blocker。
-- 独立 review 仍由 controller 执行；本报告不把自审当成独立 review。
+- Fix round 1 focused self-review 未发现新的 Task 2 blocker。
+- Fix round 1 scoped re-review 仍由 controller 执行；本报告不把自审当成独立 review。
 - 全 persistence aggregate、installed scenario、Setup/Defender、真实升级与发布仍在后续总体验收 gate 之后。
