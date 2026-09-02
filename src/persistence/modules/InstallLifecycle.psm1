@@ -3240,6 +3240,13 @@ function Invoke-CcodInstall {
                     }
                     $installLease = $null
                 }
+                if ($null -ne $upgradeProductCleanupLease) {
+                    $cleanupReleased = Exit-CcodLifecycleProductCleanupLease -Context $upgradeProductCleanupLease
+                    if ($cleanupReleased -isnot [bool] -or -not $cleanupReleased -or -not $upgradeProductCleanupLease.Lease.Released) {
+                        throw 'Previous runtime product cleanup lease release was not proven'
+                    }
+                    $upgradeProductCleanupLease = $null
+                }
                 $rollbackStartedAt = & $adapters.UtcNow
                 if ($rollbackStartedAt -isnot [DateTime]) { throw 'Previous runtime restart clock is invalid' }
                 & $adapters.StartSupervisorTask
@@ -3275,7 +3282,7 @@ function Invoke-CcodInstall {
         if ($null -ne $installLease -and $installLease.Outcome -ceq 'Acquired') {
             try { [void](& $adapters.ExitInstallLease $installLease) } catch { }
         }
-        if($null-ne$upgradeProductCleanupLease){
+        if($null-ne$upgradeProductCleanupLease-and$null-ne$upgradeProductCleanupLease.Lease-and-not$upgradeProductCleanupLease.Lease.Released){
             try{[void](Exit-CcodLifecycleProductCleanupLease -Context $upgradeProductCleanupLease)}catch{}
         }
         if($null-ne$fileTransaction){try{Close-CcodInstallFileTransaction -Transaction $fileTransaction -Disposition $(if($null-ne$installRecord-and$installRecord.phase-ceq'Ready'){'Ready'}else{'Failed'})}catch{}}

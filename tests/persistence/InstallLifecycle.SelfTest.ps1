@@ -557,6 +557,66 @@ exit $exitCode
     }
 }
 
+function Invoke-CcodLifecycleRollbackBootstrapMutexProbe {
+    param(
+        [Parameter(Mandatory)][string]$MarkerRoot,
+        [int]$MutexTimeoutMilliseconds = 1500,
+        [int]$ProcessTimeoutMilliseconds = 10000
+    )
+
+    [IO.Directory]::CreateDirectory($MarkerRoot) | Out-Null
+    $payload = [ordered]@{
+        kernelModule = (Join-Path $repositoryRoot 'src\persistence\modules\KernelObjects.psm1')
+        markerRoot = $MarkerRoot
+        mutexTimeoutMilliseconds = $MutexTimeoutMilliseconds
+    }
+    $payloadBase64 = [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes(($payload | ConvertTo-Json -Compress)))
+    $childScript = @'
+$ErrorActionPreference='Stop'
+$payloadJson=[Text.UTF8Encoding]::new($false,$true).GetString([Convert]::FromBase64String('__PAYLOAD__'))
+$payload=$payloadJson|ConvertFrom-Json -ErrorAction Stop
+$kernelModule=Import-Module $payload.kernelModule -PassThru -DisableNameChecking -ErrorAction Stop
+$lease=$null;$exitCode=42
+try{
+    [IO.File]::WriteAllText((Join-Path $payload.markerRoot 'attempted.txt'),'attempted',[Text.UTF8Encoding]::new($false))
+    $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+    try{$sid=[string]$identity.User.Value}finally{$identity.Dispose()}
+    $lease=&$kernelModule {param($UserSid,$Timeout)Enter-CcodMutex -Kind AccountTransition -UserSid $UserSid -TimeoutMilliseconds $Timeout} $sid ([int]$payload.mutexTimeoutMilliseconds)
+    [IO.File]::WriteAllText((Join-Path $payload.markerRoot 'outcome.txt'),[string]$lease.Outcome,[Text.UTF8Encoding]::new($false))
+    if($null-eq$lease-or$lease.Outcome-cne'Acquired'){exit $exitCode}
+    [IO.File]::WriteAllText((Join-Path $payload.markerRoot 'acquired.txt'),'acquired',[Text.UTF8Encoding]::new($false))
+    $exitCode=0
+}catch{
+    [IO.File]::WriteAllText((Join-Path $payload.markerRoot 'child-failure.txt'),[string]$_,[Text.UTF8Encoding]::new($false))
+    $exitCode=43
+}finally{
+    if($null-ne$lease-and$lease.Outcome-ceq'Acquired'-and-not$lease.Released){try{&$kernelModule {param($Value)Exit-CcodMutex -Lease $Value} $lease|Out-Null}catch{$exitCode=44}}
+}
+exit $exitCode
+'@.Replace('__PAYLOAD__',$payloadBase64)
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
+    $process = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$encoded) -PassThru -WindowStyle Hidden
+    try {
+        if (-not $process.WaitForExit($ProcessTimeoutMilliseconds)) {
+            try { $process.Kill() } catch { }
+            $process.WaitForExit()
+            throw 'rollback bootstrap mutex probe exceeded its bounded process timeout'
+        }
+        $exitCode = $process.ExitCode
+    } finally {
+        $process.Dispose()
+    }
+    $outcomePath = Join-Path $MarkerRoot 'outcome.txt'
+    $failurePath = Join-Path $MarkerRoot 'child-failure.txt'
+    return [pscustomobject][ordered]@{
+        ExitCode = [int]$exitCode
+        Attempted = [IO.File]::Exists((Join-Path $MarkerRoot 'attempted.txt'))
+        MutexAcquired = [IO.File]::Exists((Join-Path $MarkerRoot 'acquired.txt'))
+        Outcome = $(if ([IO.File]::Exists($outcomePath)) { [IO.File]::ReadAllText($outcomePath) } else { $null })
+        ChildFailure = $(if ([IO.File]::Exists($failurePath)) { [IO.File]::ReadAllText($failurePath) } else { $null })
+    }
+}
+
 function Invoke-CcodLifecycleDeadOwnerCleanupTest {
     $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
     $fileModule=$null;$fake=$null
@@ -1807,6 +1867,61 @@ $results += Invoke-CcodTest 'upgrade boundaries fail closed with phase receipts 
         } finally {
             foreach ($path in @($source, $install, $nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
         }
+    }
+}
+
+# Production mutation caught: retaining the outer AccountTransition cleanup lease while starting the old Supervisor makes its bootstrap deadlock before readiness.
+$results += Invoke-CcodTest 'pre-pointer rollback releases the outer cleanup lease before old Supervisor bootstrap' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot;$markerRoot=New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.0-rollback-cleanup-lease-a' | Out-Null
+        $nodePath=New-CcodLifecycleFakeNode -Root $nodeRoot
+        $first=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
+        Set-CcodLifecycleTestStatus -InstallRoot $install -RuntimeId $first.RuntimeId
+        [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'),"module.exports='rollback-cleanup-lease-b';`n",[Text.UTF8Encoding]::new($false))
+
+        $fake=New-CcodLifecycleFake -NodePath $nodePath
+        $world=[pscustomobject][ordered]@{
+            PointerCommitted=$false
+            PreviousProtectionStopped=$false
+            BootstrapAttempted=$false
+            BootstrapMutexAcquired=$false
+            OldRuntimeOutcome='NotReady'
+            ChildExitCode=$null
+            ChildMutexOutcome=$null
+            ChildFailure=$null
+        }
+        $fake.World.SetActiveFailure={throw 'INJECTED_PRE_POINTER_COMMIT_FAILURE'}
+        $fake.Adapters.StartSupervisorTask={
+            $probe=Invoke-CcodLifecycleRollbackBootstrapMutexProbe -MarkerRoot $markerRoot
+            $world.BootstrapAttempted=[bool]$probe.Attempted
+            $world.BootstrapMutexAcquired=[bool]$probe.MutexAcquired
+            $world.ChildExitCode=[int]$probe.ExitCode
+            $world.ChildMutexOutcome=$probe.Outcome
+            $world.ChildFailure=$probe.ChildFailure
+        }.GetNewClosure()
+        $fake.Adapters.WaitNewRuntimeReady={
+            param($Root,$Runtime,$Generation,$Identity,$Started,$Timeout)
+            $ready=[string]$Runtime-ceq[string]$first.RuntimeId-and[UInt64]$Generation-eq[UInt64]1-and$world.BootstrapMutexAcquired
+            if($ready){$world.OldRuntimeOutcome='Ready'}
+            [pscustomobject][ordered]@{SupervisorReady=[bool]$ready;TrayReady=[bool]$ready}
+        }.GetNewClosure()
+
+        $failure=$null
+        try { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters | Out-Null } catch { $failure=$_ }
+        $pointer=Read-CcodLifecycleActivePointer -Root $install
+        $world.PointerCommitted=([string]$pointer.activeRuntime-cne[string]$first.RuntimeId-or[UInt64]$pointer.generation-ne[UInt64]1)
+        $world.PreviousProtectionStopped=[bool]$fake.World.OldSupervisorExitProven
+
+        Assert-CcodTrue ($null-ne$failure) 'injected SetActiveRuntime failure remains fail closed after rollback'
+        Assert-CcodEqual $false $world.PointerCommitted 'failure occurs before selector commit'
+        Assert-CcodTrue $world.PreviousProtectionStopped 'old protection was stopped'
+        Assert-CcodTrue $world.BootstrapAttempted 'rollback attempted old Supervisor bootstrap'
+        Assert-CcodTrue $world.BootstrapMutexAcquired "old bootstrap acquires AccountTransition before readiness (childExit=$($world.ChildExitCode); outcome=$($world.ChildMutexOutcome); childFailure=$($world.ChildFailure))"
+        Assert-CcodEqual 'Ready' $world.OldRuntimeOutcome 'old runtime is restored and proven ready'
+        Assert-CcodTrue ($failure.FullyQualifiedErrorId-like'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN*') 'successful rollback preserves the original pre-pointer failure code'
+    } finally {
+        foreach($path in @($source,$install,$nodeRoot,$markerRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
     }
 }
 
