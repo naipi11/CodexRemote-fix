@@ -226,46 +226,59 @@ Invoke-CcodTest 'product authority rejects the canonical Ready to Failed post-te
 
 # Production mutation caught: selector proof without the committing install's AccountTransition lease permits N+1 to commit across N proof/use.
 Invoke-CcodTest 'product authority holds the real commit coordination lease across proof and retained-file use' {
-    $authority=New-CcodProductAuthorityFixture;$fixture=$authority.Fixture;$product=$null;$commitProcess=$null
-    $readyMarker=Join-Path $fixture.Base 'commit-ready.marker';$resultPath=Join-Path $fixture.Base 'commit-result.json';$stdout=Join-Path $fixture.Base 'commit.stdout.txt';$stderr=Join-Path $fixture.Base 'commit.stderr.txt';$childScript=Join-Path $fixture.Base 'commit-next-generation.ps1'
+    $authority=New-CcodProductAuthorityFixture;$fixture=$authority.Fixture;$product=$null;$commitProcess=$null;$attemptEvent=$null
+    $attemptEventName='Local\CcodInstallProductAuthorityAttempt.'+[guid]::NewGuid().ToString('N');$eventCreated=$false;$attemptEvent=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,$attemptEventName,[ref]$eventCreated)
+    Assert-CcodTrue $eventCreated 'atomic attempt event is create-only for this test'
+    $resultPath=Join-Path $fixture.Base 'commit-result.json';$stdout=Join-Path $fixture.Base 'commit.stdout.txt';$stderr=Join-Path $fixture.Base 'commit.stderr.txt';$childScript=Join-Path $fixture.Base 'commit-next-generation.ps1'
     $moduleRoot=Join-Path $projectRoot 'src\persistence\modules';$nextRuntime='runtime-product-canonical-authority-next'
     $child=@'
-param([string]$ModuleRoot,[string]$InstallRoot,[string]$CurrentRuntime,[string]$NextRuntime,[string]$ReadyMarker,[string]$ResultPath)
-$ErrorActionPreference='Stop';$transaction=$null;$ownership=$null;$identity=$null;$process=$null
+param([string]$ModuleRoot,[string]$InstallRoot,[string]$CurrentRuntime,[string]$NextRuntime,[string]$AttemptEventName,[string]$ResultPath)
+$ErrorActionPreference='Stop';$transaction=$null;$ownership=$null;$identity=$null;$process=$null;$attemptEvent=$null
 try{
     $fileModule=Import-Module (Join-Path $ModuleRoot 'InstallFileTransaction.psm1') -Force -PassThru -ErrorAction Stop
     $runtimeModule=Import-Module (Join-Path $ModuleRoot 'RuntimeManifest.psm1') -Force -PassThru -ErrorAction Stop
     $epochModule=Import-Module (Join-Path $ModuleRoot 'LifecycleEpoch.psm1') -Force -PassThru -ErrorAction Stop
+    $kernelModule=Import-Module (Join-Path $ModuleRoot 'KernelObjects.psm1') -Force -PassThru -ErrorAction Stop
     $transaction=&$fileModule {param($Root,$Id)Open-CcodInstallGeneration -InstallRoot $Root -RuntimeId $Id} $InstallRoot $NextRuntime
     &$fileModule {param($Generation,$Id)Write-CcodInstallGenerationManifest -Generation $Generation -Manifest ([ordered]@{schemaVersion=1;projectVersion='2.5.22';runtimeId=$Id;commit='0123456789abcdef0123456789abcdef01234567';files=@()})|Out-Null} $transaction $NextRuntime
-    [IO.File]::WriteAllText($ReadyMarker,'ready',[Text.UTF8Encoding]::new($false))
+    $attemptEvent=[Threading.EventWaitHandle]::OpenExisting($AttemptEventName)
+    $enterRealMutex={
+        param($UserSid,$SessionId,$TimeoutMilliseconds)
+        try{
+            &$kernelModule {
+                param($Sid,$Timeout,$EnteredEvent)
+                $wait={param($MutexHandle,$WaitTimeout)try{[Threading.WaitHandle]::SignalAndWait($EnteredEvent,$MutexHandle,$WaitTimeout,$false)}catch{[Console]::Error.WriteLine('SIGNAL_AND_WAIT_FAILURE: '+($_|Out-String));throw}}.GetNewClosure()
+                Enter-CcodMutex -Kind AccountTransition -UserSid $Sid -TimeoutMilliseconds $Timeout -Adapters @{WaitMutex=$wait}
+            } $UserSid $TimeoutMilliseconds $attemptEvent
+        }catch{[Console]::Error.WriteLine('ATOMIC_WAIT_FAILURE: '+($_|Out-String));throw}
+    }.GetNewClosure()
     $process=[Diagnostics.Process]::GetCurrentProcess();$owner=[pscustomobject][ordered]@{pid=[int]$process.Id;creationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o')}
     $identity=[Security.Principal.WindowsIdentity]::GetCurrent();$sid=$identity.User.Value
-    $ownership=&$epochModule {param($Root,$Runtime,$Owner,$Sid,$Session)Enter-CcodLifecycleOwnership -InstallRoot $Root -RuntimeId $Runtime -RuntimeGeneration 1 -OwnerIdentity $Owner -UserSid $Sid -SessionId $Session -TimeoutMilliseconds 15000} $InstallRoot $CurrentRuntime $owner $sid $process.SessionId
+    $ownership=&$epochModule {param($Root,$Runtime,$Owner,$Sid,$Session,$EnterMutex)Enter-CcodLifecycleOwnership -InstallRoot $Root -RuntimeId $Runtime -RuntimeGeneration 1 -OwnerIdentity $Owner -UserSid $Sid -SessionId $Session -TimeoutMilliseconds 15000 -Adapters @{EnterMutex=$EnterMutex}} $InstallRoot $CurrentRuntime $owner $sid $process.SessionId $enterRealMutex
     $pointer=&$runtimeModule {param($Root,$Runtime,$Generation,$Transaction,$Owner)Set-CcodActiveRuntime -InstallRoot $Root -NewRuntimeId $Runtime -TargetGeneration $Generation -FileTransaction $Transaction -Ownership $Owner} $InstallRoot $NextRuntime $transaction $transaction $ownership
     [IO.File]::WriteAllText($ResultPath,($pointer|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
     exit 0
 }catch{$message=$_|Out-String;[Console]::Error.WriteLine($message);exit 3}
-finally{if($null-ne$ownership){try{&$epochModule {param($Owner)Exit-CcodLifecycleOwnership -Ownership $Owner|Out-Null} $ownership}catch{}};if($null-ne$transaction){try{&$fileModule {param($Transaction)Close-CcodInstallFileTransaction -Transaction $Transaction -Disposition Ready} $transaction}catch{}};if($null-ne$identity){$identity.Dispose()};if($null-ne$process){$process.Dispose()}}
+finally{if($null-ne$ownership){try{&$epochModule {param($Owner)Exit-CcodLifecycleOwnership -Ownership $Owner|Out-Null} $ownership}catch{}};if($null-ne$transaction){try{&$fileModule {param($Transaction)Close-CcodInstallFileTransaction -Transaction $Transaction -Disposition Ready} $transaction}catch{}};if($null-ne$attemptEvent){$attemptEvent.Dispose()};if($null-ne$identity){$identity.Dispose()};if($null-ne$process){$process.Dispose()}}
 '@
     [IO.File]::WriteAllText($childScript,$child,[Text.UTF8Encoding]::new($false))
     try{
         $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready;$fixture.Transactions.Add($product)
         $retained=Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $authority.RuntimeId -ExpectedManifestSha256 $authority.Manifest.Sha256 -FileTransaction $product
         $powershell=(Get-Process -Id $PID).Path
-        $commitProcess=Start-Process -FilePath $powershell -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$childScript,'-ModuleRoot',$moduleRoot,'-InstallRoot',$fixture.Install,'-CurrentRuntime',$authority.RuntimeId,'-NextRuntime',$nextRuntime,'-ReadyMarker',$readyMarker,'-ResultPath',$resultPath) -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
-        $deadline=[DateTime]::UtcNow.AddSeconds(20);while(-not[IO.File]::Exists($readyMarker)-and[DateTime]::UtcNow-lt$deadline){$commitProcess.Refresh();if($commitProcess.HasExited){break};Start-Sleep -Milliseconds 25}
-        if(-not[IO.File]::Exists($readyMarker)){if(-not$commitProcess.HasExited){Stop-Process -Id $commitProcess.Id -Force};$commitProcess.WaitForExit();throw "real N+1 commit child did not reach lifecycle ownership: $($(if([IO.File]::Exists($stderr)){[IO.File]::ReadAllText($stderr)}else{'no stderr'}))"}
-        $commitBlocked=$true;$watch=[Diagnostics.Stopwatch]::StartNew();while($watch.ElapsedMilliseconds-lt1200){if([IO.File]::Exists($resultPath)-or$commitProcess.HasExited){$commitBlocked=$false;break};Start-Sleep -Milliseconds 20};$watch.Stop()
+        $commitProcess=Start-Process -FilePath $powershell -ArgumentList @('-Mta','-NoProfile','-ExecutionPolicy','Bypass','-File',$childScript,'-ModuleRoot',$moduleRoot,'-InstallRoot',$fixture.Install,'-CurrentRuntime',$authority.RuntimeId,'-NextRuntime',$nextRuntime,'-AttemptEventName',$attemptEventName,'-ResultPath',$resultPath) -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+        if(-not$attemptEvent.WaitOne(20000)){if(-not$commitProcess.HasExited){Stop-Process -Id $commitProcess.Id -Force};$commitProcess.WaitForExit();throw "real N+1 commit child did not atomically enter the AccountTransition wait: $($(if([IO.File]::Exists($stderr)){[IO.File]::ReadAllText($stderr)}else{'no stderr'}))"}
+        $commitBlocked=$true;$watch=[Diagnostics.Stopwatch]::StartNew();while($watch.ElapsedMilliseconds-lt5000){if([IO.File]::Exists($resultPath)-or$commitProcess.HasExited){$commitBlocked=$false;break};Start-Sleep -Milliseconds 20};$watch.Stop()
+        Assert-CcodTrue $commitBlocked 'N+1 commit is blocked after its atomic real AccountTransition wait signal'
         if($commitBlocked){$opened=Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk' -ReadyTransaction $authority.Ready;Assert-CcodTrue ($null-ne$opened) 'N retained shortcut opens while its authority lease excludes N+1'}
         Close-CcodInstallFileTransaction -Transaction $product -Disposition Ready
         if(-not$commitProcess.WaitForExit(20000)){Stop-Process -Id $commitProcess.Id -Force;throw 'real N+1 commit child timed out'}
         $commitProcess.Refresh();if(-not[IO.File]::Exists($resultPath)){throw "real N+1 commit child produced no committed pointer exit=$($commitProcess.ExitCode) stdout=$([IO.File]::ReadAllText($stdout)) stderr=$([IO.File]::ReadAllText($stderr))"}
         $pointer=[IO.File]::ReadAllText($resultPath)|ConvertFrom-Json;Assert-CcodEqual 2 ([uint64]$pointer.generation) 'real commit advances to N+1 only after N authority closes'
         Assert-CcodThrows {Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk' -ReadyTransaction $authority.Ready|Out-Null} 'CCOD_INSTALL_TRANSACTION_CLOSED'
-        Assert-CcodTrue $commitBlocked 'N+1 commit is blocked for the complete N proof-to-use boundary'
     }finally{
         if($null-ne$commitProcess-and-not$commitProcess.HasExited){try{Stop-Process -Id $commitProcess.Id -Force}catch{}};if($null-ne$commitProcess){$commitProcess.Dispose()}
+        if($null-ne$attemptEvent){$attemptEvent.Dispose()}
         Remove-CcodInstallFileFixture $fixture
     }
 }

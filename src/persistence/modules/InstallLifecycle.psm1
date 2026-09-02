@@ -18,6 +18,7 @@ $script:CcodActivationPhases = @('StoppingPreviousRuntime','InstallingRuntime','
 $script:CcodInstallTransactionPhases = @('Prepared','PackageVerified','RuntimeStaged','PreviousProtectionStopped','RuntimePromoted','PointerCommitted','StableShellCommitted','ProtectionReady','Ready')
 $script:CcodInstallTransactionFields = @('schemaVersion','transactionId','oldRuntimeId','oldGeneration','oldManifestSha256','newRuntimeId','newGeneration','newManifestSha256','sealedPackageSha256','ownedObjectNames','phase','errorCode')
 $script:CcodInstallTransactionRoots = [Runtime.CompilerServices.ConditionalWeakTable[object,object]]::new()
+$script:CcodPendingProductTransactionCleanups = [Collections.Hashtable]::Synchronized(@{})
 
 function Throw-CcodLifecycleError {
     param(
@@ -37,6 +38,26 @@ function Throw-CcodLifecycleError {
 function Get-CcodLifecycleErrorId {
     param($ErrorRecord)
     return ([string]$ErrorRecord.FullyQualifiedErrorId -split ',')[0]
+}
+
+function Get-CcodLifecycleProductCleanupKey {
+    param([Parameter(Mandatory)][string]$InstallRoot)
+    return Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
+}
+
+function Invoke-CcodLifecycleProductTransactionClose {
+    param([Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)][scriptblock]$CloseProductTransaction,[Parameter(Mandatory)][scriptblock]$DefaultClose)
+    & $CloseProductTransaction $Transaction $defaultClose
+}
+
+function Resolve-CcodLifecyclePendingProductTransactionCleanup {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][scriptblock]$CloseProductTransaction)
+    $key=Get-CcodLifecycleProductCleanupKey -InstallRoot $InstallRoot
+    if(-not$script:CcodPendingProductTransactionCleanups.ContainsKey($key)){return}
+    $pending=$script:CcodPendingProductTransactionCleanups[$key]
+    if($pending.OwnerManagedThreadId-ne[Threading.Thread]::CurrentThread.ManagedThreadId){Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Pending product transaction cleanup belongs to a different thread' $InstallRoot}
+    try{Invoke-CcodLifecycleProductTransactionClose -Transaction $pending.Transaction -CloseProductTransaction $CloseProductTransaction -DefaultClose $pending.DefaultClose}catch{Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Pending product transaction cleanup remains retryable' $InstallRoot}
+    [void]$script:CcodPendingProductTransactionCleanups.Remove($key)
 }
 
 function Test-CcodActivationExactProperties {
@@ -457,7 +478,7 @@ function Complete-CcodReadyFinalizationRecovery {
         $observed=Read-CcodInstallTransactionRecord -InstallRoot $InstallRoot -TransactionId $TransactionRecord.transactionId
         if($null-eq$observed-or$observed.phase-cne'Ready'){Throw-CcodLifecycleError 'CCOD_INSTALL_READY_FINALIZATION_PENDING' 'Ready finalization snapshot is not visible' $TransactionRecord.transactionId}
         if([string]$proof.Validation.Manifest.projectVersion-ceq$script:CcodProductVersion){
-            try{&$Adapters.CloseReadyGeneration $fileTransaction;$fileTransaction=$null;$productAdapters=&$Adapters.GetProductRegistrationAdapters;$registration=&$Adapters.RegisterProduct $InstallRoot ([string]$observed.newRuntimeId) ([string]$proof.Validation.Manifest.projectVersion) ([string]$observed.sealedPackageSha256) $null $observed $productAdapters;if($null-eq$registration-or$registration.verified-isnot[bool]-or-not$registration.verified){throw 'registration receipt invalid'};$productRegistrationVerified=$true}catch{$productRegistrationFailure=$_}
+            try{&$Adapters.CloseReadyGeneration $fileTransaction;$fileTransaction=$null;$productAdapters=&$Adapters.GetProductRegistrationAdapters;$registration=&$Adapters.RegisterProduct $InstallRoot ([string]$observed.newRuntimeId) ([string]$proof.Validation.Manifest.projectVersion) ([string]$observed.sealedPackageSha256) $null $observed $productAdapters $Adapters.CloseProductTransaction;if($null-eq$registration-or$registration.verified-isnot[bool]-or-not$registration.verified){throw 'registration receipt invalid'};$productRegistrationVerified=$true}catch{$productRegistrationFailure=$_}
         }
     }catch{
         try{$observed=Read-CcodInstallTransactionRecord -InstallRoot $InstallRoot -TransactionId $TransactionRecord.transactionId}catch{}
@@ -1955,6 +1976,10 @@ function Get-CcodLifecycleAdapters {
             param($FileTransaction)
             Close-CcodInstallFileTransaction -Transaction $FileTransaction -Disposition Ready
         }
+        CloseProductTransaction = {
+            param($FileTransaction,$DefaultClose)
+            & $DefaultClose $FileTransaction
+        }
         AddProductShortcutCandidates = {
             param($Files)
             $temporaryRoot=Join-Path ([IO.Path]::GetTempPath()) ('ccod-product-shortcuts-'+[guid]::NewGuid().ToString('N'))
@@ -1964,18 +1989,35 @@ function Get-CcodLifecycleAdapters {
         }
         GetProductRegistrationAdapters = { $null }
         RegisterProduct = {
-            param($InstallRoot,$RuntimeId,$Version,$PackageSha256,$FileTransaction,$TransactionRecord,$ProductAdapters)
+            param($InstallRoot,$RuntimeId,$Version,$PackageSha256,$FileTransaction,$TransactionRecord,$ProductAdapters,$CloseProductTransaction)
+            if($CloseProductTransaction-isnot[scriptblock]){Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product transaction close adapter is invalid' $InstallRoot}
+            Resolve-CcodLifecyclePendingProductTransactionCleanup -InstallRoot $InstallRoot -CloseProductTransaction $CloseProductTransaction
             $module=Import-Module (Join-Path $PSScriptRoot 'ProductRegistration.psm1') -Force -PassThru -ErrorAction Stop
-            $ownedTransaction=$null;$sourceCapability=$null
+            $fileModule=$null;$ownedTransaction=$null;$sourceCapability=$null;$receiptResult=$null;$firstCloseFailure=$null;$defaultClose=$null
             try{
-                Import-Module (Join-Path $PSScriptRoot 'InstallFileTransaction.psm1') -ErrorAction Stop;$ownedTransaction=Open-CcodInstallProductRegistrationTransaction -InstallRoot $InstallRoot -ReadyTransaction $TransactionRecord;$sourceCapability=Open-CcodInstallRetainedGeneration -InstallRoot $InstallRoot -RuntimeId $RuntimeId -ExpectedManifestSha256 ([string]$TransactionRecord.newManifestSha256) -FileTransaction $ownedTransaction
+                $fileModule=Import-Module (Join-Path $PSScriptRoot 'InstallFileTransaction.psm1') -PassThru -ErrorAction Stop
+                $defaultClose={param($Value)&$fileModule {param($Transaction)Close-CcodInstallFileTransaction -Transaction $Transaction -Disposition Ready} $Value}.GetNewClosure()
+                $ownedTransaction=&$fileModule {param($Root,$Record)Open-CcodInstallProductRegistrationTransaction -InstallRoot $Root -ReadyTransaction $Record} $InstallRoot $TransactionRecord
+                $sourceCapability=&$fileModule {param($Root,$Id,$Manifest,$Transaction)Open-CcodInstallRetainedGeneration -InstallRoot $Root -RuntimeId $Id -ExpectedManifestSha256 $Manifest -FileTransaction $Transaction} $InstallRoot $RuntimeId ([string]$TransactionRecord.newManifestSha256) $ownedTransaction
                 $registration=New-CcodProductRegistration -InstallRoot $InstallRoot -RuntimeId $RuntimeId -Version $Version -PackageSha256 $PackageSha256 -FileTransaction $sourceCapability
                 $system=[Environment]::GetFolderPath([Environment+SpecialFolder]::System);$proof=[pscustomobject][ordered]@{phase=[string]$TransactionRecord.phase;runtimeId=$RuntimeId;version=$Version;packageSha256=$PackageSha256;runtimeGeneration=[uint64]$TransactionRecord.newGeneration;manifestSha256=[string]$TransactionRecord.newManifestSha256;startMenuSha256=(Get-CcodLifecycleFileSha256 $registration.startMenuShortcut.candidatePath);desktopSha256=(Get-CcodLifecycleFileSha256 $registration.desktopShortcut.candidatePath);targetPath=[IO.Path]::GetFullPath((Join-Path $system 'schtasks.exe'));arguments='/Run /TN "Codex Control Other Devices Supervisor"';transactionRecord=$TransactionRecord;bootstrapPath=$registration.bootstrapPath;uninstallerPath=$registration.uninstallerPath}
                 $commitAdapters=@{};if($null-ne$ProductAdapters){if($ProductAdapters-isnot[hashtable]){throw 'product side-effect adapters invalid'};foreach($key in $ProductAdapters.Keys){$commitAdapters[$key]=$ProductAdapters[$key]}};$commitAdapters.GetReadyProof={param($Ignored)$proof}.GetNewClosure()
                 $receipt=Commit-CcodProductRegistration -Registration $registration -FileTransaction $sourceCapability -Adapters $commitAdapters
                 Remove-CcodLegacyProductRegistration -ExpectedAppId '{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}' -Adapters $ProductAdapters
-                [pscustomobject]@{verified=[bool]$receipt.verified;legacyRemoved=$true}
-            }finally{if($null-ne$ownedTransaction){try{Close-CcodInstallFileTransaction -Transaction $ownedTransaction -Disposition Ready}catch{}}}
+                $receiptResult=[pscustomobject]@{verified=[bool]$receipt.verified;legacyRemoved=$true}
+            }finally{
+                if($null-ne$ownedTransaction){
+                    try{Invoke-CcodLifecycleProductTransactionClose -Transaction $ownedTransaction -CloseProductTransaction $CloseProductTransaction -DefaultClose $defaultClose}catch{
+                        $firstCloseFailure=$_
+                        try{Invoke-CcodLifecycleProductTransactionClose -Transaction $ownedTransaction -CloseProductTransaction $CloseProductTransaction -DefaultClose $defaultClose}catch{
+                            $key=Get-CcodLifecycleProductCleanupKey -InstallRoot $InstallRoot
+                            $script:CcodPendingProductTransactionCleanups[$key]=[pscustomobject]@{Transaction=$ownedTransaction;DefaultClose=$defaultClose;OwnerManagedThreadId=[Threading.Thread]::CurrentThread.ManagedThreadId}
+                        }
+                    }
+                }
+            }
+            if($null-ne$firstCloseFailure){Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product transaction cleanup failed after registration and requires reconciliation' $InstallRoot}
+            return $receiptResult
         }
         NewRuntimeManifest = {
             param($RuntimeDirectory, $ProjectVersion)
@@ -2390,7 +2432,7 @@ function Invoke-CcodInstall {
         if($activeValidation.Valid){
             $sameIdentity=Test-CcodInstallPackageIdentity -TransactionRecord $globalTransaction -ProjectVersion ([string]$projectVersion) -ActiveProjectVersion ([string]$activeValidation.Manifest.projectVersion) -SealedPackageSha256 $SealedPackageSha256 -ActiveRuntimeId ([string]$existingPointer.activeRuntime) -ActiveGeneration ([uint64]$existingPointer.generation)
             if($sameIdentity){
-                $productAdapters=&$adapters.GetProductRegistrationAdapters;$registration=&$adapters.RegisterProduct $root ([string]$existingPointer.activeRuntime) ([string]$projectVersion) $SealedPackageSha256 $null $globalTransaction $productAdapters
+                $productAdapters=&$adapters.GetProductRegistrationAdapters;$registration=&$adapters.RegisterProduct $root ([string]$existingPointer.activeRuntime) ([string]$projectVersion) $SealedPackageSha256 $null $globalTransaction $productAdapters $adapters.CloseProductTransaction
                 if($null-eq$registration-or$registration.verified-isnot[bool]-or-not$registration.verified){Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'AlreadyInstalled product registration reconciliation did not verify' $existingPointer.activeRuntime}
                 return [pscustomobject][ordered]@{Outcome='AlreadyInstalled';Installed=$true;RuntimeId=[string]$existingPointer.activeRuntime;PreviousRuntimeId=$existingPointer.previousRuntime;RepairCompleted=$false;ProductRegistrationVerified=$true}
             }
@@ -2522,7 +2564,7 @@ function Invoke-CcodInstall {
         if([string]$projectVersion-ceq$script:CcodProductVersion){
             try{
                 &$adapters.CloseReadyGeneration $fileTransaction;$fileTransaction=$null
-                $productAdapters=&$adapters.GetProductRegistrationAdapters;$registrationReceipt=&$adapters.RegisterProduct $root $runtimeId ([string]$projectVersion) $SealedPackageSha256 $fileTransaction $installRecord $productAdapters
+                $productAdapters=&$adapters.GetProductRegistrationAdapters;$registrationReceipt=&$adapters.RegisterProduct $root $runtimeId ([string]$projectVersion) $SealedPackageSha256 $fileTransaction $installRecord $productAdapters $adapters.CloseProductTransaction
                 if($null-eq$registrationReceipt-or$registrationReceipt.verified-isnot[bool]-or-not$registrationReceipt.verified){throw 'registration receipt invalid'}
                 $productRegistrationVerified=$true
             }catch{$productRegistrationFailure=$_}

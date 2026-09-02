@@ -354,6 +354,18 @@ function Set-CcodLifecycleDefaultProductRegistrationFixture {
     }
 }
 
+function Set-CcodLifecycleProductCloseFailureFixture {
+    param([Parameter(Mandatory)]$Fake,[Parameter(Mandatory)][hashtable]$State)
+    $State.CloseAttempts=0
+    if(-not$State.ContainsKey('CloseFailuresRemaining')){$State.CloseFailuresRemaining=1}
+    $Fake.Adapters.CloseProductTransaction={
+        param($Transaction,$DefaultClose)
+        $State.CloseAttempts++
+        if($State.CloseAttempts-le[int]$State.CloseFailuresRemaining){throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('fixture owned product close failed'),'CCOD_INSTALL_CLOSE_FAILED',[Management.Automation.ErrorCategory]::CloseError,$Transaction)}
+        &$DefaultClose $Transaction
+    }.GetNewClosure()
+}
+
 function New-CcodReadyFinalizationGapFixture {
     $source=New-CcodLifecycleTempRoot
     $install=New-CcodLifecycleTempRoot
@@ -3336,6 +3348,28 @@ $results += Invoke-CcodTest 'post-Ready writable close failure preserves Ready a
         Assert-CcodEqual 'AlreadyInstalled' $result.Outcome 'same-package retry reconciles after post-Ready writable close failure'
         Assert-CcodTrue $retryState.ProductOnlyObserved 'retry uses strict product authority after cleanup succeeds'
         Assert-CcodEqual 2 $retryState.ShortcutWrites 'retry completes both lower shortcut side effects'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
+}
+
+# Production mutation caught: a strict owned product transaction close failure must not be discarded after a verified registration body.
+$results += Invoke-CcodTest 'default product close failure is retryable and never returns a successful post-Ready receipt' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$first=New-CcodLifecycleFake -NodePath $node
+        $failedState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{};CloseFailuresRemaining=2};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $first -ProductState $failedState;Set-CcodLifecycleProductCloseFailureFixture -Fake $first -State $failedState
+        $unexpectedReceipt=$null;$failure=$null
+        try{$unexpectedReceipt=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('9'*64) -Adapters $first.Adapters}catch{$failure=$_}
+        Assert-CcodEqual $null $unexpectedReceipt 'owned product close failure emits no successful install or registration receipt'
+        Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' (([string]$failure.FullyQualifiedErrorId-split',')[0]) 'owned product close failure surfaces as stable product registration failure'
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Ready' $head.phase 'owned product close failure retains the durable lifecycle Ready record'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'owned product close failure appends no lifecycle Failed snapshot'
+        Assert-CcodEqual 2 $failedState.CloseAttempts 'real default registration performs one bounded same-thread close retry before deferring cleanup'
+        $retry=New-CcodLifecycleFake -NodePath $node;$retryState=@{FailWrites=$false;Registration=$failedState.Registration;ReadyEvidence=$failedState.ReadyEvidence;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=$failedState.Shortcuts};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $retry -ProductState $retryState
+        $result=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('9'*64) -Adapters $retry.Adapters
+        Assert-CcodEqual 'AlreadyInstalled' $result.Outcome 'later exact same-package invocation retries after owned product cleanup recovers'
+        Assert-CcodTrue $result.ProductRegistrationVerified 'later reconciliation reports success only after its owned transaction closes'
+        Assert-CcodTrue $retryState.ProductOnlyObserved 'cleanup recovery retry reacquires real strict product authority'
     }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
 }
 
