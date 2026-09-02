@@ -463,6 +463,15 @@ function New-CcodLifecycleProductSideEffectAdapters {
             try{$fileModule=Get-Module -All|Where-Object{$null-ne$_.Path-and[IO.Path]::GetFileName($_.Path)-ceq'InstallFileTransaction.psm1'}|Select-Object -First 1;if($null-eq$fileModule){throw 'install file transaction module unavailable'};$source=&$fileModule {param($Generation,$Path,$Record)Open-CcodInstallRetainedFile -Generation $Generation -RelativePath $Path -ReadyTransaction $Record} $FileTransaction $relative $ReadyEvidence.transactionRecord}catch{$State.RetainedError=([string]$_.FullyQualifiedErrorId-split',')[0];throw}
             if($null-eq$source){throw 'retained shortcut capability missing'}
             $State.ProductOnlyObserved=$true;$State.Shortcuts[$Kind]=$Shortcut;$State.ShortcutWrites++
+            if($State.ContainsKey('LegacyEntries')){
+                $legacyName=if($Kind-ceq'StartMenu'){$v2521LifecycleShortcutNames[0]}else{$v2521LifecycleShortcutNames[3]}
+                if(-not$State.LegacyEntries.Contains($legacyName)){$State.LegacyEntries.Add($legacyName)}
+                if($State.ContainsKey('LegacyShortcutProofs')){
+                    $State.LegacyShortcutProofs[$legacyName]=[pscustomobject][ordered]@{
+                        targetPath=[string]$ReadyEvidence.targetPath;arguments=[string]$ReadyEvidence.arguments;workingDirectory='';sha256=$(if($Kind-ceq'StartMenu'){[string]$ReadyEvidence.startMenuSha256}else{[string]$ReadyEvidence.desktopSha256})
+                    }
+                }
+            }
         }.GetNewClosure()
         ReadShortcut={param($Kind,$Shortcut)$State.Shortcuts[$Kind]}.GetNewClosure()
         ReadVerifiedRegistration={
@@ -471,22 +480,29 @@ function New-CcodLifecycleProductSideEffectAdapters {
                 shortcutNames=@($v2521LifecycleShortcutNames[0],$v2521LifecycleShortcutNames[3]);startMenuSha256=[string]$State.ReadyEvidence.startMenuSha256;desktopSha256=[string]$State.ReadyEvidence.desktopSha256
             }
         }.GetNewClosure()
-        ReadLegacyRegistration={param($ExpectedAppId);if($State.ContainsKey('LegacyEntries')-and$State.LegacyEntries.Contains('Registry')){$State.LegacyRegistration}else{$null}}.GetNewClosure()
+        ReadLegacyRegistration={
+            param($ExpectedAppId)
+            if(-not$State.ContainsKey('LegacyEntries')-or-not$State.LegacyEntries.Contains('Registry')){return $null}
+            [pscustomobject][ordered]@{
+                appId=[string]$State.LegacyRegistration.appId;displayVersion=[string]$State.LegacyRegistration.displayVersion;installLocation=[string]$State.LegacyRegistration.installLocation
+                uninstallString=[string]$State.LegacyRegistration.uninstallString;shortcutNames=@($State.LegacyEntries|Where-Object{[string]$_-cne'Registry'});unsafeShortcutNames=@($(if($State.ContainsKey('LegacyUnsafeShortcutNames')){@($State.LegacyUnsafeShortcutNames)}else{@()}))
+            }
+        }.GetNewClosure()
         ReadLegacySnapshot={
             param($ExpectedAppId,$ExpectedProfile)
             $entries=[Collections.Generic.List[object]]::new()
             foreach($entry in @($State.LegacyEntries)){
-                if(@($v2521LifecycleShortcutNames[0],$v2521LifecycleShortcutNames[3])-ccontains[string]$entry){
+                if([string]$entry-cne'Registry'){
                     $base=if(([string]$entry).StartsWith('Programs\',[StringComparison]::Ordinal)){[Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)}else{[Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)}
-                    $relative=([string]$entry).Substring(([string]$entry).IndexOf('\')+1);$sha=if([string]$entry-ceq$v2521LifecycleShortcutNames[0]){[string]$State.ReadyEvidence.startMenuSha256}else{[string]$State.ReadyEvidence.desktopSha256}
-                    $entries.Add([pscustomobject]@{kind='Shortcut';name=[string]$entry;path=[IO.Path]::GetFullPath((Join-Path $base $relative));sha256=$sha;bytesBase64=''})
+                    $relative=([string]$entry).Substring(([string]$entry).IndexOf('\')+1);$proof=if($State.ContainsKey('LegacyShortcutProofs')){$State.LegacyShortcutProofs[[string]$entry]}else{$null}
+                    $entries.Add([pscustomobject][ordered]@{kind='Shortcut';name=[string]$entry;path=[IO.Path]::GetFullPath((Join-Path $base $relative));sha256=[string]$proof.sha256;bytesBase64=[string]$proof.bytesBase64;targetPath=[string]$proof.targetPath;arguments=[string]$proof.arguments;workingDirectory=[string]$proof.workingDirectory})
                 }else{$entries.Add([string]$entry)}
             }
             [pscustomobject][ordered]@{appId=$State.LegacyRegistration.appId;entries=@($entries)}
         }.GetNewClosure()
-        RemoveLegacyEntry={param($Entry);$State.LegacyRemovalAttempts++;[void]$State.LegacyEntries.Remove([string]$Entry)}.GetNewClosure()
-        ReadLegacyEntry={param($Entry);if($State.LegacyEntries.Contains([string]$Entry)){'Exact'}else{$null}}.GetNewClosure()
-        RestoreLegacyEntry={param($Entry);if(-not$State.LegacyEntries.Contains([string]$Entry)){$State.LegacyEntries.Add([string]$Entry)}}.GetNewClosure()
+        RemoveLegacyEntry={param($Entry);$name=if($Entry-is[string]){[string]$Entry}elseif($Entry.kind-ceq'Registry'){'Registry'}else{[string]$Entry.name};$State.LegacyRemovalAttempts++;[void]$State.LegacyEntries.Remove($name)}.GetNewClosure()
+        ReadLegacyEntry={param($Entry);$name=if($Entry-is[string]){[string]$Entry}elseif($Entry.kind-ceq'Registry'){'Registry'}else{[string]$Entry.name};if($State.LegacyEntries.Contains($name)){'Exact'}else{$null}}.GetNewClosure()
+        RestoreLegacyEntry={param($Entry);$name=if($Entry-is[string]){[string]$Entry}elseif($Entry.kind-ceq'Registry'){'Registry'}else{[string]$Entry.name};if(-not$State.LegacyEntries.Contains($name)){$State.LegacyEntries.Add($name)}}.GetNewClosure()
         WriteLegacyCompensationFailure={param($Record);$State.LegacyCompensationFailures.Add($Record)}.GetNewClosure()
     }
 }
@@ -503,6 +519,28 @@ function Set-CcodLifecycleDefaultProductRegistrationFixture {
         foreach($leaf in @('StartMenu.CodexRemote-fix.lnk','Desktop.CodexRemote-fix.lnk')){$path=Join-Path $temporaryRoot $leaf;[IO.File]::WriteAllText($path,"sealed $leaf",[Text.UTF8Encoding]::new($false));$item=Get-Item -LiteralPath $path;$sha=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant();$records.Add([pscustomobject]@{Relative=('registration/'+$leaf);Source=$path;ExpectedLength=[int64]$item.Length;ExpectedSha256=$sha})}
         [pscustomobject]@{Files=@($Files)+@($records);TemporaryRoot=$temporaryRoot}
     }
+}
+
+function New-CcodLifecycleV2521ShortcutProofs {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][string]$InstallerRoot)
+    $powershell=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'WindowsPowerShell\v1.0\powershell.exe'))
+    $bootstrap=[IO.Path]::GetFullPath((Join-Path $InstallRoot 'bootstrap.ps1'))
+    $testScript=[IO.Path]::GetFullPath((Join-Path $InstallerRoot 'Test-CodexControlOtherDevices.ps1'))
+    $uninstaller=[IO.Path]::GetFullPath((Join-Path $InstallerRoot 'unins000.exe'))
+    $mainArguments='-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -InstallRoot "{1}" -EntryMode Explicit' -f $bootstrap,[IO.Path]::GetFullPath($InstallRoot)
+    $specifications=@(
+        [pscustomobject]@{name=$v2521LifecycleShortcutNames[0];targetPath=$powershell;arguments=$mainArguments;workingDirectory=[IO.Path]::GetFullPath($InstallRoot)},
+        [pscustomobject]@{name=$v2521LifecycleShortcutNames[1];targetPath=$powershell;arguments=('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $testScript);workingDirectory=[IO.Path]::GetFullPath($InstallerRoot)},
+        [pscustomobject]@{name=$v2521LifecycleShortcutNames[2];targetPath=$uninstaller;arguments='';workingDirectory=''},
+        [pscustomobject]@{name=$v2521LifecycleShortcutNames[3];targetPath=$powershell;arguments=$mainArguments;workingDirectory=[IO.Path]::GetFullPath($InstallRoot)}
+    )
+    $proofs=@{}
+    foreach($specification in $specifications){
+        $bytes=[Text.UTF8Encoding]::new($false).GetBytes(('legacy-shortcut:'+([string]$specification.name)))
+        $sha=[Security.Cryptography.SHA256]::Create();try{$hash=[BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+        $proofs[[string]$specification.name]=[pscustomobject][ordered]@{targetPath=[string]$specification.targetPath;arguments=[string]$specification.arguments;workingDirectory=[string]$specification.workingDirectory;sha256=$hash;bytesBase64=[Convert]::ToBase64String($bytes)}
+    }
+    return $proofs
 }
 
 function Set-CcodLifecycleProductCloseFailureFixture {
@@ -994,7 +1032,8 @@ $results += Invoke-CcodTest 'real v2.5.21 legacy lifecycle state upgrades throug
                 appId='{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}';displayVersion='2.5.21';installLocation='C:\legacy\CodexControlOtherDevices-installer'
                 uninstallString='"C:\legacy\CodexControlOtherDevices-installer\unins000.exe"';shortcutNames=@($v2521LifecycleShortcutNames);unsafeShortcutNames=@()
             }
-            LegacyEntries=$legacyEntries;LegacyRemovalAttempts=0;LegacyCompensationFailures=[Collections.Generic.List[object]]::new()
+            LegacyEntries=$legacyEntries;LegacyShortcutProofs=(New-CcodLifecycleV2521ShortcutProofs -InstallRoot $install -InstallerRoot 'C:\legacy\CodexControlOtherDevices-installer');LegacyUnsafeShortcutNames=@()
+            LegacyRemovalAttempts=0;LegacyCompensationFailures=[Collections.Generic.List[object]]::new()
         }
         Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $fake -ProductState $productState
         $beforeRuntimeCount=@(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count
@@ -1043,6 +1082,41 @@ $results += Invoke-CcodTest 'real v2.5.21 legacy lifecycle state upgrades throug
         Assert-CcodEqual 0 $sameFake.World.TaskStarted 'idempotent true-legacy retry starts no process'
     } finally {
         foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+    }
+}
+
+# Production mutation caught: current registration writes the two overlapping names before it
+# proves that one complete historical profile existed, washing missing or foreign legacy leaves.
+$results += Invoke-CcodTest 'legacy profile is captured before any current product or shortcut write' {
+    foreach($kind in @('MissingMain','MissingDesktop','ForeignMain')){
+        $legacySource=New-CcodLifecycleTempRoot;$source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+        try {
+            New-CcodLifecycleSourceFixture -Root $legacySource -Version '2.5.21'|Out-Null
+            $legacy=New-CcodLifecycleV2521LegacyInstallFixture -InstallRoot $install -SourceRoot $legacySource
+            New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null
+            $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+            $entries=[Collections.Generic.List[string]]::new();foreach($entry in @('Registry')+$v2521LifecycleShortcutNames){$entries.Add($entry)}
+            $installerRoot='C:\legacy\CodexControlOtherDevices-installer'
+            $productState=@{
+                FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}
+                LegacyRegistration=[pscustomobject][ordered]@{appId='{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}';displayVersion='2.5.21';installLocation=$installerRoot;uninstallString=('"{0}\unins000.exe"'-f$installerRoot);shortcutNames=@($v2521LifecycleShortcutNames);unsafeShortcutNames=@()}
+                LegacyEntries=$entries;LegacyShortcutProofs=(New-CcodLifecycleV2521ShortcutProofs -InstallRoot $install -InstallerRoot $installerRoot);LegacyUnsafeShortcutNames=@()
+                LegacyRemovalAttempts=0;LegacyCompensationFailures=[Collections.Generic.List[object]]::new()
+            }
+            switch($kind){
+                'MissingMain' {[void]$productState.LegacyEntries.Remove($v2521LifecycleShortcutNames[0]);[void]$productState.LegacyShortcutProofs.Remove($v2521LifecycleShortcutNames[0])}
+                'MissingDesktop' {[void]$productState.LegacyEntries.Remove($v2521LifecycleShortcutNames[3]);[void]$productState.LegacyShortcutProofs.Remove($v2521LifecycleShortcutNames[3])}
+                'ForeignMain' {$foreign=$productState.LegacyShortcutProofs[$v2521LifecycleShortcutNames[0]];$foreign.targetPath='C:\foreign\owned.exe';$foreign.arguments='--foreign';$foreign.workingDirectory='C:\foreign'}
+            }
+            $before=@($productState.LegacyEntries|Sort-Object)-join'|'
+            Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $fake -ProductState $productState
+            $failure=$null;try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('9'*64) -Adapters $fake.Adapters|Out-Null}catch{$failure=$_}
+            Assert-CcodEqual 0 $productState.Writes "$kind is rejected before the current registry write"
+            Assert-CcodEqual 0 $productState.ShortcutWrites "$kind is rejected before either current overlap write"
+            Assert-CcodEqual 0 $productState.LegacyRemovalAttempts "$kind removes no legacy-only entry"
+            Assert-CcodEqual $before ((@($productState.LegacyEntries|Sort-Object))-join'|') "$kind preserves the exact observed legacy set"
+            Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' (([string]$failure.FullyQualifiedErrorId-split',')[0]) "$kind reports the post-Ready product boundary without washing legacy evidence"
+        } finally {foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}}
     }
 }
 
@@ -1159,6 +1233,56 @@ $results += Invoke-CcodTest 'real v2.5.21 upgrade failure before new Ready resta
         $ready=[IO.File]::ReadAllText($readyHeads[0].FullName)|ConvertFrom-Json
         Assert-CcodEqual ([uint64]4) ([uint64]$ready.newGeneration) 'compensated retry Ready is bound to selector generation four'
         Assert-CcodEqual $failedRuntimeId $ready.newRuntimeId 'compensated retry Ready remains bound to the original failed runtime'
+    } finally {
+        foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+    }
+}
+
+# Production mutation caught: requiring a PointerCommitted journal snapshot even when the
+# exact generation-two selector commit and generation-three compensation are both durable.
+$results += Invoke-CcodTest 'real v2.5.21 selector commit with a missing PointerCommitted journal resumes the exact retained runtime' {
+    $legacySource=New-CcodLifecycleTempRoot;$source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $legacySource -Version '2.5.21' | Out-Null
+        $legacy=New-CcodLifecycleV2521LegacyInstallFixture -InstallRoot $install -SourceRoot $legacySource
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $gate=[pscustomobject]@{Remaining=1}
+        $fake.World.SetActiveFailure={
+            param($Root,$RuntimeId,$Ownership,$TargetGeneration,$FileTransaction)
+            if($gate.Remaining-gt0){
+                $gate.Remaining--
+                $fence={param($InstallRoot,$Receipt,$ExpectActivePointer)$true}
+                Set-CcodActiveRuntime -InstallRoot $Root -TargetGeneration $TargetGeneration -FileTransaction $FileTransaction -Ownership $Ownership -Adapters @{AssertLifecycleFence=$fence}|Out-Null
+                throw 'PRIVATE_AFTER_SELECTOR_COMMIT_BEFORE_JOURNAL'
+            }
+        }.GetNewClosure()
+
+        $failure=$null
+        try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('f'*64) -Adapters $fake.Adapters|Out-Null}catch{$failure=$_}
+        Assert-CcodEqual 'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN' (([string]$failure.FullyQualifiedErrorId-split',')[0]) 'post-selector journal failure preserves the stable activation boundary'
+        $selectorFiles=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\active-generation') -File -Force|Sort-Object Name)
+        Assert-CcodEqual 3 $selectorFiles.Count 'selector commit and compensation leave the canonical three-record chain'
+        $selectors=@($selectorFiles|ForEach-Object{[IO.File]::ReadAllText($_.FullName)|ConvertFrom-Json})
+        Assert-CcodEqual ($legacy.RuntimeId+','+$selectors[1].activeRuntime+','+$legacy.RuntimeId) (($selectors|ForEach-Object activeRuntime)-join',') 'selector evidence is exactly old new old'
+        $failedRuntimeId=[string]$selectors[1].activeRuntime
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Failed' $head.phase 'journal-gap transaction has a terminal Failed head'
+        Assert-CcodEqual $failedRuntimeId $head.newRuntimeId 'journal-gap transaction remains bound to the committed generation-two runtime'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.PointerCommitted.*.json' -File -Force).Count 'failure happened before the PointerCommitted journal became durable'
+        Assert-CcodEqual 1 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.RuntimePromoted.*.json' -File -Force).Count 'immutable RuntimePromoted identity is durable before the selector commit'
+        $runtimeCount=@(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count
+
+        $retry=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('f'*64) -Adapters $fake.Adapters
+
+        Assert-CcodEqual 'Upgraded' $retry.Outcome 'second exact attempt resumes the selector-journal gap'
+        Assert-CcodEqual $failedRuntimeId $retry.RuntimeId 'selector-journal retry reuses the exact sealed generation-two runtime'
+        Assert-CcodEqual $runtimeCount @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count 'selector-journal retry creates no additional runtime'
+        $retryPointer=Read-CcodActiveRuntime -InstallRoot $install
+        Assert-CcodEqual $failedRuntimeId $retryPointer.activeRuntime 'selector-journal retry selects the retained failed runtime'
+        Assert-CcodEqual ([uint64]4) ([uint64]$retryPointer.generation) 'selector-journal retry appends generation four after compensation'
+        $readyHeads=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Ready.*.json' -File -Force)
+        Assert-CcodEqual 1 $readyHeads.Count 'selector-journal retry writes one terminal Ready transaction'
     } finally {
         foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
     }

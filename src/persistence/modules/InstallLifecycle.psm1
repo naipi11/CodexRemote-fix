@@ -1264,7 +1264,7 @@ function Get-CcodLegacyMigrationRetryContext {
         Throw-CcodLifecycleError 'CCOD_INSTALL_UPGRADE_SOURCE_INVALID' 'Failed legacy migration runtime is not an exact current sealed generation' $retryRuntimeRoot
     }
     $selector=Get-CcodLegacyMigrationRetrySelectorProfile -InstallRoot $InstallRoot -ExistingPointer $ExistingPointer -LegacyRuntimeId ([string]$FailedTransaction.oldRuntimeId) -RetryRuntimeId ([string]$FailedTransaction.newRuntimeId)
-    if(($selector.Profile-ceq'PrePointer'-and$observedPhases.Contains('PointerCommitted'))-or($selector.Profile-ceq'PostPointerCompensated'-and-not$observedPhases.Contains('PointerCommitted'))){
+    if($selector.Profile-ceq'PrePointer'-and$observedPhases.Contains('PointerCommitted')){
         Throw-CcodLifecycleError 'CCOD_INSTALL_UPGRADE_SOURCE_INVALID' 'Failed migration phases do not match the exact selector profile' $FailedTransaction.transactionId
     }
     return [pscustomobject][ordered]@{
@@ -2895,8 +2895,10 @@ function Get-CcodLifecycleAdapters {
                     $registration=New-CcodProductRegistration -InstallRoot $InstallRoot -RuntimeId $RuntimeId -Version $Version -PackageSha256 $PackageSha256 -FileTransaction $sourceCapability
                     $system=[Environment]::GetFolderPath([Environment+SpecialFolder]::System);$proof=[pscustomobject][ordered]@{phase=[string]$TransactionRecord.phase;runtimeId=$RuntimeId;version=$Version;packageSha256=$PackageSha256;runtimeGeneration=[uint64]$TransactionRecord.newGeneration;manifestSha256=[string]$TransactionRecord.newManifestSha256;startMenuSha256=(Get-CcodLifecycleFileSha256 $registration.startMenuShortcut.candidatePath);desktopSha256=(Get-CcodLifecycleFileSha256 $registration.desktopShortcut.candidatePath);targetPath=[IO.Path]::GetFullPath((Join-Path $system 'schtasks.exe'));arguments='/Run /TN "Codex Control Other Devices Supervisor"';transactionRecord=$TransactionRecord;bootstrapPath=$registration.bootstrapPath;uninstallerPath=$registration.uninstallerPath}
                     $commitAdapters=@{};if($null-ne$ProductAdapters){if($ProductAdapters-isnot[hashtable]){throw 'product side-effect adapters invalid'};foreach($key in $ProductAdapters.Keys){$commitAdapters[$key]=$ProductAdapters[$key]}};$commitAdapters.GetReadyProof={param($Ignored)$proof}.GetNewClosure()
+                    $legacyMigrationPlan=Get-CcodLegacyProductRegistrationMigrationPlan -ExpectedAppId '{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}' -ExpectedInstallRoot $InstallRoot -Adapters $ProductAdapters
                     $receipt=Commit-CcodProductRegistration -Registration $registration -FileTransaction $sourceCapability -Adapters $commitAdapters
-                    Remove-CcodLegacyProductRegistration -ExpectedAppId '{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}' -Adapters $ProductAdapters
+                    $expectedCurrentProof=[pscustomobject][ordered]@{verified=$true;runtimeId=$RuntimeId;version=$Version;packageSha256=$PackageSha256;shortcutNames=@('Programs\CodexRemote-fix\CodexRemote-fix.lnk','Desktop\CodexRemote-fix.lnk');startMenuSha256=[string]$proof.startMenuSha256;desktopSha256=[string]$proof.desktopSha256}
+                    Remove-CcodLegacyProductRegistration -ExpectedAppId '{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}' -MigrationPlan $legacyMigrationPlan -ExpectedCurrentProof $expectedCurrentProof -Adapters $ProductAdapters
                     $receiptResult=[pscustomobject]@{verified=[bool]$receipt.verified;legacyRemoved=$true}
                 }catch{$operationFailure=$_}
                 finally{
