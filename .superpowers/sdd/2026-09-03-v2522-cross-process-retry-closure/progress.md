@@ -17,7 +17,7 @@ Plan: `docs/superpowers/plans/2026-09-03-v2522-cross-process-retry-closure.md`
 
 ## Status
 
-Task 1: complete. RED hit the real generic session matcher; exact locked same-SID/new-session TaskRemoved recovery is implemented in `9973bfd`. Focused verification: UninstallBootstrap 40/40, ManualWrappers pass, two changed parsers 0 errors, `git diff --check` exit 0. No real system action.
+Task 1: initial implementation `9973bfd`, evidence `bf4d215`; scoped review FAIL (1 Critical, 3 Important). Fix round 1 is in progress. Required closure: include `Failed(resumePhase=TaskRemoved)` in the exact early-return state; make replacement persistence and receipt fresh; require historical wrapper SID/session consistency; replace aliasing test doubles with serialized/disk-backed read-back and failure negatives.
 
 Task 2: pending.
 
