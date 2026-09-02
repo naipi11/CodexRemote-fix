@@ -171,6 +171,111 @@ function Set-CcodRegistrationLegacyFixture {
     foreach ($entry in @('Registry') + $ShortcutNames) { $World.LegacyEntries.Add($entry) }
 }
 
+function New-CcodFix1RegistryKey {
+    param([Parameter(Mandatory)][string]$Id,[Parameter(Mandatory)]$Values,[Parameter(Mandatory)]$Kinds,[Parameter(Mandatory)]$World)
+    $key=[pscustomobject]@{Id=$Id;Values=$Values;Kinds=$Kinds;World=$World;DeleteCalls=0;DisposeCalls=0;Deleted=$false}
+    $key|Add-Member ScriptMethod GetValueNames { @($this.Values.Keys) }
+    $key|Add-Member ScriptMethod GetSubKeyNames { ,([string[]]@()) }
+    $key|Add-Member ScriptMethod GetValue {param($Name,$DefaultValue,$Options)if($this.Values.Contains([string]$Name)){$this.Values[[string]$Name]}else{$DefaultValue}}
+    $key|Add-Member ScriptMethod GetValueKind {param($Name)[Enum]::Parse([Microsoft.Win32.RegistryValueKind],[string]$this.Kinds[[string]$Name])}
+    $key|Add-Member ScriptMethod DeleteValue {
+        param($Name,$ThrowOnMissing)
+        $this.DeleteCalls++
+        if($this.World.Mode-ceq'PartialReplacement'-and$this.Id-ceq'Original'-and$this.DeleteCalls-eq2){$this.World.CurrentKey=$this.World.Replacement;throw 'TEST_PARTIAL_REGISTRY_DELETE_FAILURE'}
+        if(-not$this.Values.Contains([string]$Name)){if($ThrowOnMissing){throw 'TEST_REGISTRY_VALUE_MISSING'};return}
+        $this.Values.Remove([string]$Name)
+    }
+    $key|Add-Member ScriptMethod Dispose {$this.DisposeCalls++}
+    return $key
+}
+
+function New-CcodFix1RegistryWorld {
+    param([Parameter(Mandatory)][ValidateSet('PartialReplacement','CreateOpened','CreateNew')][string]$Mode)
+    $world=[pscustomobject]@{
+        Mode=$Mode;CurrentKey=$null;Original=$null;Replacement=$null;Created=$null;NativeCreateCalls=0;ProviderNewItemCalls=0
+        ReplacementWrites=0;CompensationRecords=[Collections.Generic.List[object]]::new();RegistryAdapters=$null;LowerFailure=$null
+    }
+    $world.Original=New-CcodFix1RegistryKey -Id Original -Values ([ordered]@{DisplayName='captured-product';NoModify=1}) -Kinds ([ordered]@{DisplayName='String';NoModify='DWord'}) -World $world
+    $world.Replacement=New-CcodFix1RegistryKey -Id Replacement -Values ([ordered]@{DisplayName='replacement-product';ReplacementSentinel=[byte[]]@(0xde,0xad,0xbe,0xef)}) -Kinds ([ordered]@{DisplayName='String';ReplacementSentinel='Binary'}) -World $world
+    $world.CurrentKey=$world.Original
+    $world.RegistryAdapters=@{
+        OpenExisting={param($Path)if($null-eq$world.CurrentKey){return $null};[pscustomobject][ordered]@{key=$world.CurrentKey;resource=$world.CurrentKey;disposition='OpenedExisting'}}.GetNewClosure()
+        CloseKey={param($Handle)$Handle.key.Dispose()}.GetNewClosure()
+        GetValueNames={param($Handle)@($Handle.key.Values.Keys)}.GetNewClosure()
+        GetSubKeyNames={param($Handle)@()}.GetNewClosure()
+        GetValue={param($Handle,$Name)if($Handle.key.Values.Contains([string]$Name)){$Handle.key.Values[[string]$Name]}else{$null}}.GetNewClosure()
+        GetValueKind={param($Handle,$Name)[string]$Handle.key.Kinds[[string]$Name]}.GetNewClosure()
+        DeleteValue={param($Handle,$Name)$Handle.key.DeleteValue([string]$Name,$true)}.GetNewClosure()
+        SetValue={param($Handle,$Name,$Value,$Kind)if($Handle.key.Id-ceq'Replacement'){$world.ReplacementWrites++};$Handle.key.Values[[string]$Name]=$Value;$Handle.key.Kinds[[string]$Name]=[string]$Kind}.GetNewClosure()
+        DeleteKey={param($Handle)$Handle.key.Deleted=$true;if([object]::ReferenceEquals($world.CurrentKey,$Handle.key)){$world.CurrentKey=$null}}.GetNewClosure()
+        TestKeyAtPath={param($Path,$Handle)[object]::ReferenceEquals($world.CurrentKey,$Handle.key)}.GetNewClosure()
+        CreateKey={
+            param($Path)
+            $world.NativeCreateCalls++
+            if($world.Mode-ceq'CreateOpened'){$world.CurrentKey=$world.Replacement;return [pscustomobject][ordered]@{key=$world.Replacement;resource=$world.Replacement;disposition='OpenedExisting'}}
+            if($null-ne$world.CurrentKey){return [pscustomobject][ordered]@{key=$world.CurrentKey;resource=$world.CurrentKey;disposition='OpenedExisting'}}
+            $world.Created=New-CcodFix1RegistryKey -Id Created -Values ([ordered]@{}) -Kinds ([ordered]@{}) -World $world;$world.CurrentKey=$world.Created
+            [pscustomobject][ordered]@{key=$world.Created;resource=$world.Created;disposition='CreatedNew'}
+        }.GetNewClosure()
+    }
+    return $world
+}
+
+function New-CcodFix1RegistrySnapshotEntry {
+    [pscustomobject][ordered]@{
+        kind='Registry';path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}_is1'
+        values=[ordered]@{DisplayName=[pscustomobject]@{value='captured-product';kind='String'};NoModify=[pscustomobject]@{value=1;kind='DWord'}}
+    }
+}
+
+function Invoke-CcodFix1RegistryCompensationScenario {
+    param([Parameter(Mandatory)][ValidateSet('PartialReplacement','CreateOpened','CreateNew')][string]$Mode)
+    $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-product-fix1-'+[guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($root)|Out-Null
+    $copy=Join-Path $root 'ProductRegistrationFix1.psm1';Copy-Item -LiteralPath $modulePath -Destination $copy
+    $isolated=Import-Module $copy -Force -PassThru -DisableNameChecking -Prefix Fix1
+    $world=New-CcodFix1RegistryWorld -Mode $Mode;$replacementBefore=($world.Replacement.Values|ConvertTo-Json -Compress);$replacementKindsBefore=($world.Replacement.Kinds|ConvertTo-Json -Compress)
+    try{
+        &$isolated {
+            param($State)
+            $script:CcodFix1RegistryWorld=$State
+            function script:Get-CcodLegacyRegistryMutationAdapters {param($Adapters)$script:CcodFix1RegistryWorld.RegistryAdapters}
+            function script:Get-Item {param($LiteralPath,$ErrorAction)$script:CcodFix1RegistryWorld.CurrentKey}
+            function script:Test-Path {param($LiteralPath,$PathType)[bool]($null-ne$script:CcodFix1RegistryWorld.CurrentKey)}
+            function script:Get-ItemProperty {param($LiteralPath,$Name,$ErrorAction)$key=$script:CcodFix1RegistryWorld.CurrentKey;if($null-ne$key-and$key.Values.Contains([string]$Name)){[pscustomobject]@{value=$key.Values[[string]$Name]}}else{$null}}
+            function script:New-ItemProperty {param($LiteralPath,$Name,$Value,$PropertyType,[switch]$Force)$key=$script:CcodFix1RegistryWorld.CurrentKey;if($key.Id-ceq'Replacement'){$script:CcodFix1RegistryWorld.ReplacementWrites++};$key.Values[[string]$Name]=$Value;$key.Kinds[[string]$Name]=[string]$PropertyType;[pscustomobject]@{value=$Value}}
+            function script:Remove-Item {param($LiteralPath,[switch]$Force,$ErrorAction)$key=$script:CcodFix1RegistryWorld.CurrentKey;if($null-ne$key){$key.Deleted=$true};$script:CcodFix1RegistryWorld.CurrentKey=$null}
+            function script:New-Item {
+                param($Path,[switch]$Force)
+                $script:CcodFix1RegistryWorld.ProviderNewItemCalls++
+                if($script:CcodFix1RegistryWorld.Mode-in@('PartialReplacement','CreateOpened')){$script:CcodFix1RegistryWorld.CurrentKey=$script:CcodFix1RegistryWorld.Replacement;return $script:CcodFix1RegistryWorld.Replacement}
+                $created=New-CcodFix1RegistryKey -Id Created -Values ([ordered]@{}) -Kinds ([ordered]@{}) -World $script:CcodFix1RegistryWorld;$script:CcodFix1RegistryWorld.Created=$created;$script:CcodFix1RegistryWorld.CurrentKey=$created;$created
+            }
+        } $world
+        $registryEntry=New-CcodFix1RegistrySnapshotEntry
+        $programs=[Environment]::GetFolderPath([Environment+SpecialFolder]::Programs);$desktop=[Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)
+        $snapshot=[pscustomobject][ordered]@{appId=$appId;entries=@(
+            $registryEntry,
+            [pscustomobject]@{kind='Shortcut';name=$v2521ShortcutNames[0];path=[IO.Path]::GetFullPath((Join-Path $programs 'CodexRemote-fix\CodexRemote-fix.lnk'));sha256=('b'*64);bytesBase64=''},
+            $v2521ShortcutNames[1],$v2521ShortcutNames[2],
+            [pscustomobject]@{kind='Shortcut';name=$v2521ShortcutNames[3];path=[IO.Path]::GetFullPath((Join-Path $desktop 'CodexRemote-fix.lnk'));sha256=('c'*64);bytesBase64=''}
+        )}
+        $proof=[pscustomobject][ordered]@{verified=$true;runtimeId=$runtimeId;version='2.5.22';packageSha256=$packageSha256;shortcutNames=@($currentShortcutNames);startMenuSha256=('b'*64);desktopSha256=('c'*64)}
+        $legacy=New-CcodLegacyRegistrationFixture -Version '2.5.21' -ShortcutNames $v2521ShortcutNames
+        $removeRegistry={param($Entry)&$isolated {param($Value)Remove-CcodLegacySnapshotEntry -Entry $Value} $Entry}.GetNewClosure()
+        $readRegistry={param($Entry)&$isolated {param($Value)Read-CcodLegacySnapshotEntry -Entry $Value} $Entry}.GetNewClosure()
+        $restoreRegistry={param($Entry)&$isolated {param($Value)Restore-CcodLegacySnapshotEntry -Entry $Value} $Entry}.GetNewClosure()
+        $adapters=@{
+            ReadVerifiedRegistration={$proof}.GetNewClosure();ReadLegacyRegistration={param($ExpectedAppId)$legacy}.GetNewClosure();ReadLegacySnapshot={param($ExpectedAppId,$ExpectedProfile)$snapshot}.GetNewClosure()
+            RemoveLegacyEntry={param($Entry)if($Entry-isnot[string]){try{&$removeRegistry $Entry}catch{$world.LowerFailure=$_;throw};return};if($Mode-cne'PartialReplacement'-and[string]$Entry-ceq$v2521ShortcutNames[1]){throw 'TEST_LATER_SHORTCUT_DELETE_FAILURE'}}.GetNewClosure()
+            ReadLegacyEntry={param($Entry)if($Entry-isnot[string]){&$readRegistry $Entry}else{'Exact'}}.GetNewClosure()
+            RestoreLegacyEntry={param($Entry)if($Entry-isnot[string]){&$restoreRegistry $Entry}}.GetNewClosure()
+            WriteLegacyCompensationFailure={param($Record)$world.CompensationRecords.Add($Record)}.GetNewClosure()
+        }
+        $failure=$null;try{&$isolated {param($ExpectedAppId,$ProductAdapters)Remove-CcodLegacyProductRegistration -ExpectedAppId $ExpectedAppId -Adapters $ProductAdapters} $appId $adapters}catch{$failure=$_}
+        return [pscustomobject]@{World=$world;Failure=$failure;ReplacementBefore=$replacementBefore;ReplacementKindsBefore=$replacementKindsBefore;RegistryEntry=$registryEntry}
+    }finally{Remove-Module $isolated -Force -ErrorAction SilentlyContinue;if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}}
+}
+
 $results = @()
 
 # Production mutation caught: accepting a caller-crafted path/runtime tuple as a registration contract.
@@ -418,6 +523,50 @@ $results += Invoke-CcodTest 'legacy migration restores earlier exact deletions a
     Assert-CcodEqual ($before-join'|') ((@($world.LegacyEntries)|Sort-Object)-join'|') 'failed migration restores the complete exact legacy set'
     Assert-CcodEqual 2 $world.LegacyRestores 'only successfully removed legacy-only entries are restored'
     Assert-CcodEqual (($v2521ShortcutNames[1],'Registry')-join'|') (@($world.LegacyRestoreOrder)-join'|') 'successful legacy-only deletions are compensated in exact reverse order'
+}
+
+$results += Invoke-CcodTest 'native registry create-only boundary loads without opening or changing a key' {
+    $native=&$module {Initialize-CcodLegacyRegistryNative;[pscustomobject]@{Create=$null-ne[CcodLegacyRegistryNativeV1].GetMethod('CreateCurrentUserKey');Compare=$null-ne[CcodLegacyRegistryNativeV1].GetMethod('IsSameKey');Delete=$null-ne[CcodLegacyRegistryNativeV1].GetMethod('DeleteKey')}}
+    Assert-CcodTrue ($native.Create-and$native.Compare-and$native.Delete) 'native boundary exposes only create-with-disposition compare-handle and delete-by-handle operations used by compensation'
+}
+
+$results += Invoke-CcodTest 'create-only registry compensation accepts only a newly created exact key' {
+    $result=Invoke-CcodFix1RegistryCompensationScenario -Mode CreateNew
+    Assert-CcodEqual 1 $result.World.NativeCreateCalls 'fully absent registry compensation performs exactly one native create-only open'
+    Assert-CcodEqual 0 $result.World.ProviderNewItemCalls 'new registry restoration never uses provider New-Item -Force'
+    Assert-CcodEqual '{"DisplayName":"captured-product","NoModify":1}' ($result.World.Created.Values|ConvertTo-Json -Compress) 'newly created key is restored to the exact captured values'
+    Assert-CcodEqual '{"DisplayName":"String","NoModify":"DWord"}' ($result.World.Created.Kinds|ConvertTo-Json -Compress) 'newly created key is restored to the exact captured value kinds'
+    Assert-CcodEqual 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' (([string]$result.Failure.FullyQualifiedErrorId-split',')[0]) 'later failure reports ordinary restored rollback only after exact create-only compensation'
+    Assert-CcodEqual 0 $result.World.CompensationRecords.Count 'exact newly created restoration needs no unresolved record'
+}
+
+$results += Invoke-CcodTest 'create-only registry compensation preserves a replacement that wins the restore race' {
+    $result=Invoke-CcodFix1RegistryCompensationScenario -Mode CreateOpened
+    Assert-CcodEqual $result.ReplacementBefore ($result.World.Replacement.Values|ConvertTo-Json -Compress) 'opened-existing restore disposition leaves replacement values unchanged'
+    Assert-CcodEqual $result.ReplacementKindsBefore ($result.World.Replacement.Kinds|ConvertTo-Json -Compress) 'opened-existing restore disposition leaves replacement kinds unchanged'
+    Assert-CcodEqual 0 $result.World.ReplacementWrites 'opened-existing restore disposition performs zero value writes'
+    Assert-CcodEqual 1 $result.World.NativeCreateCalls 'fully deleted registry compensation attempts exactly one native create-only open'
+    Assert-CcodEqual 0 $result.World.ProviderNewItemCalls 'registry compensation never falls back to provider New-Item -Force'
+    Assert-CcodEqual 'CCOD_LEGACY_PRODUCT_COMPENSATION_FAILED' (([string]$result.Failure.FullyQualifiedErrorId-split',')[0]) 'opened-existing restore disposition remains explicitly unresolved'
+    Assert-CcodEqual 'Registry' (@($result.World.CompensationRecords[0].entries)-join'|') 'replacement race records only Registry as unresolved'
+}
+
+# Production mutation caught: disposing the partially deleted original registry handle and then
+# filling missing values by path writes captured data into a replacement key at the same name.
+$results += Invoke-CcodTest 'partial registry compensation never writes captured values into a replacement key' {
+    $result=Invoke-CcodFix1RegistryCompensationScenario -Mode PartialReplacement
+    Assert-CcodEqual 2 $result.World.Original.DeleteCalls "production registry remover reaches the injected mid-delete failure after one value deletion; lower=$($result.World.LowerFailure.Exception.Message)"
+    Assert-CcodEqual $result.ReplacementBefore ($result.World.Replacement.Values|ConvertTo-Json -Compress) 'replacement registry values remain byte-for-byte unchanged'
+    Assert-CcodEqual $result.ReplacementKindsBefore ($result.World.Replacement.Kinds|ConvertTo-Json -Compress) 'replacement registry value kinds remain unchanged'
+    Assert-CcodEqual 0 $result.World.ReplacementWrites 'captured values are written only through the original open registry handle'
+    Assert-CcodEqual 2 $result.World.Original.Values.Count 'partial deletion restores the complete captured value set through the still-open original handle'
+    Assert-CcodEqual 'captured-product' $result.World.Original.Values.DisplayName 'same-handle restoration restores the captured string value'
+    Assert-CcodEqual 1 $result.World.Original.Values.NoModify 'same-handle restoration restores the captured DWORD value'
+    Assert-CcodEqual 0 $result.World.NativeCreateCalls 'unproven partial deletion never falls back to path-level create'
+    Assert-CcodEqual 0 $result.World.ProviderNewItemCalls 'unproven partial deletion never uses provider New-Item -Force'
+    Assert-CcodEqual 'CCOD_LEGACY_PRODUCT_COMPENSATION_FAILED' (([string]$result.Failure.FullyQualifiedErrorId-split',')[0]) 'replacement during partial registry compensation remains explicitly unresolved'
+    Assert-CcodEqual 1 $result.World.CompensationRecords.Count 'one create-only unresolved compensation record is persisted'
+    Assert-CcodEqual 'Registry' (@($result.World.CompensationRecords[0].entries)-join'|') 'the unresolved record names only the displaced Registry entry'
 }
 
 $results += Invoke-CcodTest 'legacy compensation never overwrites a replacement that appeared after deletion' {

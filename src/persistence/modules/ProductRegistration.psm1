@@ -445,7 +445,166 @@ function Read-CcodLegacySnapshot {
     }
     return [pscustomobject][ordered]@{appId=$ExpectedAppId;entries=@($entries)}
 }
-function Remove-CcodLegacySnapshotEntry {param($Entry);if($Entry-is[string]){return};if($Entry.kind-ceq'Registry'){$key=$null;try{$key=Get-Item -LiteralPath $Entry.path -ErrorAction Stop;if((@($key.GetValueNames()|Sort-Object)-join'|')-cne((@($Entry.values.Keys)|Sort-Object)-join'|')-or$key.GetSubKeyNames().Count-ne0){throw 'legacy registry changed'};foreach($name in @($Entry.values.Keys)){$current=$key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);if([string]$current-cne[string]$Entry.values[$name].value-or[string]$key.GetValueKind($name)-cne[string]$Entry.values[$name].kind){throw 'legacy registry value changed'}};foreach($name in @($Entry.values.Keys)){$key.DeleteValue($name,$true)};$key.Dispose();$key=$null;Remove-Item -LiteralPath $Entry.path -Force -ErrorAction Stop;return}catch{if($null-ne$key){$key.Dispose()};if(-not(Test-Path -LiteralPath $Entry.path)){New-Item -Path $Entry.path -Force|Out-Null};foreach($name in $Entry.values.Keys){if($null-eq(Get-ItemProperty -LiteralPath $Entry.path -Name $name -ErrorAction SilentlyContinue)){$kind=[Enum]::Parse([Microsoft.Win32.RegistryValueKind],[string]$Entry.values[$name].kind);New-ItemProperty -LiteralPath $Entry.path -Name $name -Value $Entry.values[$name].value -PropertyType $kind -Force|Out-Null}};throw}};if(-not[IO.File]::Exists($Entry.path)-or(Get-CcodProductFileSha256 $Entry.path)-cne$Entry.sha256){throw 'legacy shortcut changed'};Remove-Item -LiteralPath $Entry.path -Force -ErrorAction Stop}
+function Initialize-CcodLegacyRegistryNative {
+    if($null-ne('CcodLegacyRegistryNativeV1'-as[type])){return}
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32;
+using Microsoft.Win32.SafeHandles;
+
+public sealed class CcodLegacyRegistryCreateResultV1 : IDisposable
+{
+    private SafeRegistryHandle nativeHandle;
+    public RegistryKey Key { get; private set; }
+    public uint Disposition { get; private set; }
+    internal CcodLegacyRegistryCreateResultV1(IntPtr handle, uint disposition)
+    {
+        nativeHandle = new SafeRegistryHandle(handle, true);
+        Key = RegistryKey.FromHandle(nativeHandle);
+        Disposition = disposition;
+    }
+    public void Dispose()
+    {
+        if (Key != null) { Key.Dispose(); Key = null; }
+        if (nativeHandle != null) { nativeHandle.Dispose(); nativeHandle = null; }
+    }
+}
+
+public static class CcodLegacyRegistryNativeV1
+{
+    private const int KEY_QUERY_VALUE = 0x0001;
+    private const int KEY_SET_VALUE = 0x0002;
+    private const int KEY_ENUMERATE_SUB_KEYS = 0x0008;
+    private const int DELETE = 0x00010000;
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int RegCreateKeyExW(IntPtr hKey, string subKey, uint reserved, string keyClass, uint options, int desiredAccess, IntPtr securityAttributes, out IntPtr result, out uint disposition);
+    [DllImport("ntdll.dll", ExactSpelling = true)]
+    private static extern int NtCompareObjects(IntPtr first, IntPtr second);
+    [DllImport("ntdll.dll", ExactSpelling = true)]
+    private static extern int NtDeleteKey(IntPtr keyHandle);
+    [DllImport("ntdll.dll", ExactSpelling = true)]
+    private static extern uint RtlNtStatusToDosError(int status);
+
+    public static CcodLegacyRegistryCreateResultV1 CreateCurrentUserKey(string subKey)
+    {
+        IntPtr handle;
+        uint disposition;
+        int error = RegCreateKeyExW(new IntPtr(unchecked((int)0x80000001)), subKey, 0, null, 0, KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS | DELETE, IntPtr.Zero, out handle, out disposition);
+        if (error != 0) throw new Win32Exception(error);
+        return new CcodLegacyRegistryCreateResultV1(handle, disposition);
+    }
+    public static bool IsSameKey(RegistryKey first, RegistryKey second)
+    {
+        if (first == null || second == null) return false;
+        return NtCompareObjects(first.Handle.DangerousGetHandle(), second.Handle.DangerousGetHandle()) == 0;
+    }
+    public static void DeleteKey(RegistryKey key)
+    {
+        if (key == null) throw new ArgumentNullException("key");
+        int status = NtDeleteKey(key.Handle.DangerousGetHandle());
+        if (status < 0) throw new Win32Exception((int)RtlNtStatusToDosError(status));
+    }
+}
+'@ -ErrorAction Stop
+}
+
+function Get-CcodLegacyRegistryNativeSubKey {
+    param([Parameter(Mandatory)][string]$Path)
+    if(-not$Path.StartsWith('HKCU:\',[StringComparison]::Ordinal)-or$Path.Length-le6){throw 'legacy registry path is invalid'}
+    return $Path.Substring(6)
+}
+
+function Get-CcodLegacyRegistryMutationAdapters {
+    param([hashtable]$Adapters)
+    $defaults=@{
+        OpenExisting={
+            param($Path)
+            $rights=[Security.AccessControl.RegistryRights]::QueryValues-bor[Security.AccessControl.RegistryRights]::SetValue-bor[Security.AccessControl.RegistryRights]::EnumerateSubKeys-bor[Security.AccessControl.RegistryRights]::Delete
+            $key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey((Get-CcodLegacyRegistryNativeSubKey $Path),[Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,$rights)
+            if($null-eq$key){return $null}
+            [pscustomobject][ordered]@{key=$key;resource=$key;disposition='OpenedExisting'}
+        }
+        CloseKey={param($Handle)$Handle.resource.Dispose()}
+        GetValueNames={param($Handle)@($Handle.key.GetValueNames())}
+        GetSubKeyNames={param($Handle)@($Handle.key.GetSubKeyNames())}
+        GetValue={param($Handle,$Name)$Handle.key.GetValue([string]$Name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)}
+        GetValueKind={param($Handle,$Name)[string]$Handle.key.GetValueKind([string]$Name)}
+        DeleteValue={param($Handle,$Name)$Handle.key.DeleteValue([string]$Name,$true)}
+        SetValue={param($Handle,$Name,$Value,$Kind)$valueKind=[Enum]::Parse([Microsoft.Win32.RegistryValueKind],[string]$Kind);$Handle.key.SetValue([string]$Name,$Value,$valueKind)}
+        DeleteKey={param($Handle)Initialize-CcodLegacyRegistryNative;[CcodLegacyRegistryNativeV1]::DeleteKey($Handle.key)}
+        TestKeyAtPath={
+            param($Path,$Handle)
+            $current=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey((Get-CcodLegacyRegistryNativeSubKey $Path),$false)
+            if($null-eq$current){return $false}
+            try{Initialize-CcodLegacyRegistryNative;return [CcodLegacyRegistryNativeV1]::IsSameKey($Handle.key,$current)}finally{$current.Dispose()}
+        }
+        CreateKey={
+            param($Path)
+            Initialize-CcodLegacyRegistryNative;$result=[CcodLegacyRegistryNativeV1]::CreateCurrentUserKey((Get-CcodLegacyRegistryNativeSubKey $Path))
+            $disposition=if($result.Disposition-eq1){'CreatedNew'}elseif($result.Disposition-eq2){'OpenedExisting'}else{$result.Dispose();throw 'legacy registry create disposition is invalid'}
+            [pscustomobject][ordered]@{key=$result.Key;resource=$result;disposition=$disposition}
+        }
+    }
+    if($null-eq$Adapters){return $defaults}
+    if($Adapters-isnot[hashtable]){throw 'legacy registry adapters are invalid'}
+    $resolved=@{};foreach($name in $defaults.Keys){$resolved[$name]=$defaults[$name]}
+    foreach($name in $Adapters.Keys){if($name-isnot[string]-or-not$resolved.ContainsKey($name)-or$Adapters[$name]-isnot[scriptblock]){throw 'legacy registry adapters are invalid'};$resolved[$name]=$Adapters[$name]}
+    return $resolved
+}
+
+function Get-CcodLegacyRegistryMutationState {
+    param([Parameter(Mandatory)]$Entry)
+    if($null-eq$Entry.PSObject.Properties['mutationState']){$Entry|Add-Member -NotePropertyName mutationState -NotePropertyValue ([pscustomobject]@{status='Captured'})}
+    $state=$Entry.mutationState
+    if($null-eq$state-or$state.status-isnot[string]){throw 'legacy registry mutation state is invalid'}
+    return $state
+}
+
+function Test-CcodLegacyRegistryHandleExact {
+    param([Parameter(Mandatory)]$Entry,[Parameter(Mandatory)]$Handle,[Parameter(Mandatory)][hashtable]$Adapters)
+    $names=@(&$Adapters.GetValueNames $Handle);$subkeys=@(&$Adapters.GetSubKeyNames $Handle)
+    if($subkeys.Count-ne0-or-not(Test-CcodProductExactStringSet $names @($Entry.values.Keys))){return $false}
+    foreach($name in @($Entry.values.Keys)){
+        $actualKind=&$Adapters.GetValueKind $Handle $name;$actualValue=$Adapters.GetValue.InvokeReturnAsIs($Handle,$name)
+        if([string]$actualKind-cne[string]$Entry.values[$name].kind-or($actualValue|ConvertTo-Json -Compress)-cne($Entry.values[$name].value|ConvertTo-Json -Compress)){return $false}
+    }
+    return $true
+}
+
+function Remove-CcodLegacySnapshotEntry {
+    param($Entry,[hashtable]$RegistryAdapters)
+    if($Entry-is[string]){return}
+    if($Entry.kind-ceq'Registry'){
+        $state=Get-CcodLegacyRegistryMutationState $Entry;$adapter=Get-CcodLegacyRegistryMutationAdapters $RegistryAdapters;$handle=&$adapter.OpenExisting $Entry.path
+        if($null-eq$handle){throw 'legacy registry disappeared before deletion'}
+        $mutationStarted=$false;$operationFailure=$null;$closeFailure=$null
+        try{
+            if(-not(Test-CcodLegacyRegistryHandleExact -Entry $Entry -Handle $handle -Adapters $adapter)-or-not(&$adapter.TestKeyAtPath $Entry.path $handle)){throw 'legacy registry changed'}
+            foreach($name in @($Entry.values.Keys)){$mutationStarted=$true;&$adapter.DeleteValue $handle $name}
+            if(@(&$adapter.GetValueNames $handle).Count-ne0){throw 'legacy registry values remain after deletion'}
+            &$adapter.DeleteKey $handle
+            $state.status='Deleted'
+        }catch{
+            $operationFailure=$_
+            if($mutationStarted-and$state.status-cne'Deleted'){
+                $restored=$false
+                try{
+                    foreach($name in @($Entry.values.Keys)){&$adapter.SetValue $handle $name $Entry.values[$name].value $Entry.values[$name].kind}
+                    $restored=(Test-CcodLegacyRegistryHandleExact -Entry $Entry -Handle $handle -Adapters $adapter)-and[bool](&$adapter.TestKeyAtPath $Entry.path $handle)
+                }catch{$restored=$false}
+                $state.status=if($restored){'SameHandleRestoredExact'}else{'PartialUnresolved'}
+            }
+        }finally{try{&$adapter.CloseKey $handle}catch{$closeFailure=$_}}
+        if($null-ne$closeFailure){$state.status='PartialUnresolved';throw $closeFailure}
+        if($null-ne$operationFailure){throw $operationFailure}
+        return
+    }
+    if($Entry.kind-cne'Shortcut'){throw 'unknown legacy snapshot entry'}
+    if(-not[IO.File]::Exists($Entry.path)-or(Get-CcodProductFileSha256 $Entry.path)-cne$Entry.sha256){throw 'legacy shortcut changed'}
+    Remove-Item -LiteralPath $Entry.path -Force -ErrorAction Stop
+}
 function Compare-CcodLegacySnapshotEntry {
     param($Expected,$Current)
     if($null-eq$Current){return 'Absent'}
@@ -459,14 +618,50 @@ function Compare-CcodLegacySnapshotEntry {
     return 'Mismatch'
 }
 function Read-CcodLegacySnapshotEntry {
-    param($Entry)
+    param($Entry,[hashtable]$RegistryAdapters)
     if($Entry-is[string]){return $null}
     if($Entry.kind-ceq'Registry'){
-        if(-not(Test-Path -LiteralPath $Entry.path -PathType Container)){return $null};$key=Get-Item -LiteralPath $Entry.path -ErrorAction Stop;try{$values=[ordered]@{};foreach($name in @($key.GetValueNames())){$values[$name]=[pscustomobject]@{value=$key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);kind=[string]$key.GetValueKind($name)}};$current=[pscustomobject]@{kind='Registry';path=[string]$Entry.path;subKeyNames=@($key.GetSubKeyNames());values=$values};return Compare-CcodLegacySnapshotEntry -Expected $Entry -Current $current}finally{$key.Dispose()}
+        $state=Get-CcodLegacyRegistryMutationState $Entry
+        if($state.status-in@('SameHandleRestoredExact','CreatedExact')){return 'Exact'}
+        if($state.status-in@('PartialUnresolved','CreateBlocked','CreateUnresolved')){return 'Mismatch'}
+        $adapter=Get-CcodLegacyRegistryMutationAdapters $RegistryAdapters;$handle=&$adapter.OpenExisting $Entry.path
+        if($null-eq$handle){return $null}
+        try{
+            if($state.status-ceq'Deleted'){return 'Mismatch'}
+            if((Test-CcodLegacyRegistryHandleExact -Entry $Entry -Handle $handle -Adapters $adapter)-and[bool](&$adapter.TestKeyAtPath $Entry.path $handle)){return 'Exact'}
+            return 'Mismatch'
+        }finally{&$adapter.CloseKey $handle}
     }
     if([IO.File]::Exists($Entry.path)){$current=[pscustomobject]@{kind='Shortcut';path=[string]$Entry.path;sha256=Get-CcodProductFileSha256 $Entry.path};return Compare-CcodLegacySnapshotEntry -Expected $Entry -Current $current};$null
 }
-function Restore-CcodLegacySnapshotEntry {param($Entry);if($Entry-is[string]){return};if($Entry.kind-ceq'Registry'){if(Test-Path -LiteralPath $Entry.path){throw 'legacy registry replacement present'};New-Item -Path $Entry.path -Force|Out-Null;foreach($name in $Entry.values.Keys){$kind=[Enum]::Parse([Microsoft.Win32.RegistryValueKind],[string]$Entry.values[$name].kind);New-ItemProperty -LiteralPath $Entry.path -Name $name -Value $Entry.values[$name].value -PropertyType $kind -Force|Out-Null};return};if([IO.File]::Exists($Entry.path)-or[IO.Directory]::Exists($Entry.path)){throw 'legacy shortcut replacement present'};[IO.Directory]::CreateDirectory((Split-Path $Entry.path -Parent))|Out-Null;$bytes=[Convert]::FromBase64String([string]$Entry.bytesBase64);$stream=[IO.File]::Open($Entry.path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read);try{$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)}finally{$stream.Dispose()};if((Get-CcodProductFileSha256 $Entry.path)-cne$Entry.sha256){throw 'legacy shortcut restore mismatch'}}
+function Restore-CcodLegacySnapshotEntry {
+    param($Entry,[hashtable]$RegistryAdapters)
+    if($Entry-is[string]){return}
+    if($Entry.kind-ceq'Registry'){
+        $state=Get-CcodLegacyRegistryMutationState $Entry
+        if($state.status-cne'Deleted'){throw 'legacy registry is not eligible for path-level restoration'}
+        $adapter=Get-CcodLegacyRegistryMutationAdapters $RegistryAdapters;$created=$null;$createdNew=$false;$accepted=$false;$operationFailure=$null;$closeFailure=$null
+        try{
+            $created=&$adapter.CreateKey $Entry.path
+            if($null-eq$created-or$created.disposition-cne'CreatedNew'){$state.status='CreateBlocked';throw 'legacy registry replacement won the create-only race'}
+            $createdNew=$true
+            foreach($name in @($Entry.values.Keys)){&$adapter.SetValue $created $name $Entry.values[$name].value $Entry.values[$name].kind}
+            if(-not(Test-CcodLegacyRegistryHandleExact -Entry $Entry -Handle $created -Adapters $adapter)-or-not(&$adapter.TestKeyAtPath $Entry.path $created)){throw 'created legacy registry did not re-read exactly'}
+            $state.status='CreatedExact';$accepted=$true
+        }catch{
+            $operationFailure=$_
+            if($createdNew-and-not$accepted){try{&$adapter.DeleteKey $created}catch{};$state.status='CreateUnresolved'}
+        }finally{if($null-ne$created){try{&$adapter.CloseKey $created}catch{$closeFailure=$_}}}
+        if($null-ne$closeFailure){$state.status='CreateUnresolved';throw $closeFailure}
+        if($null-ne$operationFailure){throw $operationFailure}
+        return
+    }
+    if($Entry.kind-cne'Shortcut'){throw 'unknown legacy snapshot entry'}
+    if([IO.File]::Exists($Entry.path)-or[IO.Directory]::Exists($Entry.path)){throw 'legacy shortcut replacement present'}
+    [IO.Directory]::CreateDirectory((Split-Path $Entry.path -Parent))|Out-Null;$bytes=[Convert]::FromBase64String([string]$Entry.bytesBase64);$stream=[IO.File]::Open($Entry.path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read)
+    try{$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)}finally{$stream.Dispose()}
+    if((Get-CcodProductFileSha256 $Entry.path)-cne$Entry.sha256){throw 'legacy shortcut restore mismatch'}
+}
 function Write-CcodLegacyCompensationFailure {param($Record)$local=[Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData);$root=Join-Path $local 'CodexControlOtherDevices\state\legacy-registration-compensation';[IO.Directory]::CreateDirectory($root)|Out-Null;$path=Join-Path $root (([guid]::NewGuid().ToString('D'))+'.json');$bytes=[Text.UTF8Encoding]::new($false).GetBytes(($Record|ConvertTo-Json -Depth 8 -Compress)+"`n");$stream=[IO.File]::Open($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read);try{$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)}finally{$stream.Dispose()}}
 
 function Commit-CcodProductRegistration {
