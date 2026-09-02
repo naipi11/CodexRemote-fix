@@ -160,6 +160,30 @@ function New-CcodLifecycleV2521LegacyInstallFixture {
     return [pscustomobject][ordered]@{ RuntimeId=$runtimeId;RuntimeRoot=$runtimeRoot;Manifest=$manifest;Active=$active;Receipt=$receipt }
 }
 
+function New-CcodLifecycleLegacyMigrationRetryFixture {
+    $legacySource=New-CcodLifecycleTempRoot;$source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $legacySource -Version '2.5.21'|Out-Null
+        $legacy=New-CcodLifecycleV2521LegacyInstallFixture -InstallRoot $install -SourceRoot $legacySource
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $fake.World.SetActiveFailure={param($InstallRoot,$RuntimeId,$Ownership,$TargetGeneration,$FileTransaction)throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('adapted pointer failure'),'CCOD_RUNTIME_POINTER_COMMIT_FAILED',[Management.Automation.ErrorCategory]::InvalidData,$RuntimeId)}
+        $failure=$null;try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('d'*64) -Adapters $fake.Adapters|Out-Null}catch{$failure=$_}
+        if($null-eq$failure-or([string]$failure.FullyQualifiedErrorId-split',')[0]-cne'CCOD_RUNTIME_POINTER_COMMIT_FAILED'){throw 'legacy migration retry fixture did not reach the expected first failure'}
+        $fake.World.SetActiveFailure=$null
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        return [pscustomobject]@{LegacySource=$legacySource;Source=$source;Install=$install;NodeRoot=$nodeRoot;Node=$node;Legacy=$legacy;Fake=$fake;Head=$head}
+    } catch {
+        foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+        throw
+    }
+}
+
+function Remove-CcodLifecycleLegacyMigrationRetryFixture {
+    param([Parameter(Mandatory)]$Fixture)
+    foreach($path in @($Fixture.LegacySource,$Fixture.Source,$Fixture.Install,$Fixture.NodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+}
+
 function New-CcodLifecyclePayloadManifest {
     param(
         [Parameter(Mandatory)][string]$Root,
@@ -1058,6 +1082,24 @@ $results += Invoke-CcodTest 'real v2.5.21 upgrade failure before new Ready resta
         Assert-CcodEqual 'Failed' $head.phase 'failed new generation has a terminal diagnostic transaction'
         Assert-CcodEqual 'CCOD_INSTALL_NEW_RUNTIME_NOT_READY' $head.errorCode 'failed transaction retains the original pre-Ready error'
         Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install 'active.json') -PathType Leaf) 'legacy active pointer remains untouched as evidence after compensation'
+        $failedRuntimeId=[string]$head.newRuntimeId
+        $runtimeCount=@(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count
+        $fake.Adapters.WaitNewRuntimeReady={param($InstallRoot,$RuntimeId,$RuntimeGeneration,$Identity,$TaskStartedAtUtc,$TimeoutMilliseconds)[pscustomobject][ordered]@{SupervisorReady=$true;TrayReady=$true}}
+
+        $retry=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('c'*64) -Adapters $fake.Adapters
+
+        Assert-CcodEqual 'Upgraded' $retry.Outcome 'second exact attempt resumes the compensated legacy migration'
+        Assert-CcodEqual $failedRuntimeId $retry.RuntimeId 'compensated retry reuses the exact sealed generation-two runtime'
+        Assert-CcodEqual $runtimeCount @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count 'compensated retry invents no additional runtime generation'
+        $retryPointer=Read-CcodActiveRuntime -InstallRoot $install
+        Assert-CcodEqual $failedRuntimeId $retryPointer.activeRuntime 'compensated retry selects the previously failed sealed runtime'
+        Assert-CcodEqual ([uint64]4) $retryPointer.generation 'compensated retry appends after the canonical three-record rollback chain'
+        Assert-CcodEqual 4 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\active-generation') -File -Force).Count 'compensated retry preserves and extends the complete selector chain'
+        $readyHeads=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Ready.*.json' -File -Force)
+        Assert-CcodEqual 1 $readyHeads.Count 'compensated retry produces exactly one terminal Ready transaction'
+        $ready=[IO.File]::ReadAllText($readyHeads[0].FullName)|ConvertFrom-Json
+        Assert-CcodEqual ([uint64]4) ([uint64]$ready.newGeneration) 'compensated retry Ready is bound to selector generation four'
+        Assert-CcodEqual $failedRuntimeId $ready.newRuntimeId 'compensated retry Ready remains bound to the original failed runtime'
     } finally {
         foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
     }
@@ -1086,8 +1128,72 @@ $results += Invoke-CcodTest 'real v2.5.21 upgrade failure before new pointer com
         Assert-CcodEqual 'Failed' $head.phase 'pre-pointer failure has a terminal diagnostic transaction'
         Assert-CcodEqual 'CCOD_RUNTIME_POINTER_COMMIT_FAILED' $head.errorCode 'diagnostic transaction retains the adapted pointer failure'
         Assert-CcodTrue (Test-Path -LiteralPath $legacy.RuntimeRoot -PathType Container) 'pre-pointer failure retains the old runtime tree'
+        $failedRuntimeId=[string]$head.newRuntimeId
+        $runtimeCount=@(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count
+        $fake.World.SetActiveFailure=$null
+
+        $retry=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('d'*64) -Adapters $fake.Adapters
+
+        Assert-CcodEqual 'Upgraded' $retry.Outcome 'second exact attempt resumes the failed legacy migration'
+        Assert-CcodEqual $failedRuntimeId $retry.RuntimeId 'retry reuses the exact sealed generation-two runtime'
+        Assert-CcodEqual $runtimeCount @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count 'retry invents no additional runtime generation'
+        $retryPointer=Read-CcodActiveRuntime -InstallRoot $install
+        Assert-CcodEqual $failedRuntimeId $retryPointer.activeRuntime 'retry selects the previously failed sealed runtime'
+        Assert-CcodEqual ([uint64]2) $retryPointer.generation 'pre-pointer retry completes the missing generation-two selector'
+        $readyHeads=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Ready.*.json' -File -Force)
+        Assert-CcodEqual 1 $readyHeads.Count 'retry produces exactly one terminal Ready transaction'
     } finally {
         foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+    }
+}
+
+foreach($retryCase in @(
+    [pscustomobject]@{Name='legacy manifest identity drift in the Failed chain';Kind='old-manifest'},
+    [pscustomobject]@{Name='Failed transaction generation drift';Kind='generation'},
+    [pscustomobject]@{Name='foreign terminal transaction chain';Kind='foreign'},
+    [pscustomobject]@{Name='Failed chain without RuntimePromoted evidence';Kind='premature'},
+    [pscustomobject]@{Name='cleanup fence plane';Kind='fence'},
+    [pscustomobject]@{Name='unexpected selector generation';Kind='selector'},
+    [pscustomobject]@{Name='failed runtime manifest byte drift';Kind='new-manifest'},
+    [pscustomobject]@{Name='different sealed package identity';Kind='package'}
+)) {
+    $case=$retryCase
+    $results += Invoke-CcodTest ("legacy migration retry rejects {0} before any new mutation" -f $case.Name) {
+        $fixture=New-CcodLifecycleLegacyMigrationRetryFixture
+        try {
+            $module=Get-Module InstallLifecycle -ErrorAction Stop
+            $store=Join-Path $fixture.Install 'state\install-transactions'
+            switch($case.Kind){
+                'old-manifest' {
+                    foreach($file in @(Get-ChildItem -LiteralPath $store -File -Force)){$record=[IO.File]::ReadAllText($file.FullName)|ConvertFrom-Json;$record.oldManifestSha256=('0'*64);[IO.File]::SetAttributes($file.FullName,[IO.FileAttributes]::Normal);[IO.File]::WriteAllText($file.FullName,($record|ConvertTo-Json -Depth 8 -Compress),[Text.UTF8Encoding]::new($false))}
+                }
+                'generation' {
+                    foreach($file in @(Get-ChildItem -LiteralPath $store -File -Force)){$record=[IO.File]::ReadAllText($file.FullName)|ConvertFrom-Json;$record.newGeneration=[uint64]3;$newLeaf=&$module {param($Value)Get-CcodInstallTransactionRecordLeaf -Record $Value} $record;[IO.File]::SetAttributes($file.FullName,[IO.FileAttributes]::Normal);[IO.File]::WriteAllText($file.FullName,($record|ConvertTo-Json -Depth 8 -Compress),[Text.UTF8Encoding]::new($false));[IO.File]::Move($file.FullName,(Join-Path $store $newLeaf))}
+                }
+                'foreign' {
+                    $foreign=&$module {New-CcodInstallTransactionRecord -TransactionId 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' -OldRuntimeId $null -OldGeneration $null -OldManifestSha256 $null -NewRuntimeId 'foreign-runtime' -NewGeneration ([uint64]1) -NewManifestSha256 ('1'*64) -SealedPackageSha256 ('2'*64) -OwnedObjectNames @('foreign-runtime')}
+                    foreach($phase in @('Prepared','Failed')){$record=$foreign.PSObject.Copy();$record.phase=$phase;$record.errorCode=if($phase-ceq'Failed'){'CCOD_INSTALL_FAILED'}else{$null};$leaf=&$module {param($Value)Get-CcodInstallTransactionRecordLeaf -Record $Value} $record;[IO.File]::WriteAllText((Join-Path $store $leaf),($record|ConvertTo-Json -Depth 8 -Compress),[Text.UTF8Encoding]::new($false))}
+                }
+                'premature' {
+                    foreach($file in @(Get-ChildItem -LiteralPath $store -File -Force)){$record=[IO.File]::ReadAllText($file.FullName)|ConvertFrom-Json;if($record.phase-notin@('Prepared','PackageVerified','Failed')){[IO.File]::SetAttributes($file.FullName,[IO.FileAttributes]::Normal);[IO.File]::Delete($file.FullName)}}
+                }
+                'fence' {[IO.Directory]::CreateDirectory((Join-Path $fixture.Install 'state\product-cleanup-fences'))|Out-Null}
+                'selector' {[IO.File]::WriteAllText((Join-Path $fixture.Install 'state\active-generation\00000000000000000002.json'),([ordered]@{schemaVersion=1;generation=[uint64]2;activeRuntime=$fixture.Legacy.RuntimeId;previousGeneration=[uint64]1}|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))}
+                'new-manifest' {$manifestPath=Join-Path $fixture.Install "runtime\$($fixture.Head.newRuntimeId)\manifest.json";[IO.File]::SetAttributes($manifestPath,[IO.FileAttributes]::Normal);[IO.File]::AppendAllText($manifestPath,"`n",[Text.UTF8Encoding]::new($false))}
+            }
+            $runtimeCount=@(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'runtime') -Directory -Force).Count
+            $selectorCount=@(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\active-generation') -File -Force).Count
+            $transactionCount=@(Get-ChildItem -LiteralPath $store -File -Force).Count
+            $taskInstalled=$fixture.Fake.World.TaskInstalled;$taskStarted=$fixture.Fake.World.TaskStarted
+            $packageHash=if($case.Kind-ceq'package'){('e'*64)}else{('d'*64)}
+            $failure=$null;try{Invoke-CcodInstall -SourceRoot $fixture.Source -InstallRoot $fixture.Install -SealedPackageSha256 $packageHash -Adapters $fixture.Fake.Adapters|Out-Null}catch{$failure=$_}
+            Assert-CcodEqual 'CCOD_INSTALL_UPGRADE_SOURCE_INVALID' (([string]$failure.FullyQualifiedErrorId-split',')[0]) "$($case.Name) fails through the retry compatibility boundary"
+            Assert-CcodEqual $runtimeCount @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'runtime') -Directory -Force).Count "$($case.Name) creates no runtime"
+            Assert-CcodEqual $selectorCount @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\active-generation') -File -Force).Count "$($case.Name) appends no selector"
+            Assert-CcodEqual $transactionCount @(Get-ChildItem -LiteralPath $store -File -Force).Count "$($case.Name) appends no transaction snapshot"
+            Assert-CcodEqual $taskInstalled $fixture.Fake.World.TaskInstalled "$($case.Name) performs no task install"
+            Assert-CcodEqual $taskStarted $fixture.Fake.World.TaskStarted "$($case.Name) performs no process start"
+        } finally {Remove-CcodLifecycleLegacyMigrationRetryFixture $fixture}
     }
 }
 
