@@ -271,7 +271,7 @@ finally{if($null-ne$ownership){try{&$epochModule {param($Owner)Exit-CcodLifecycl
         $commitBlocked=$true;$watch=[Diagnostics.Stopwatch]::StartNew();while($watch.ElapsedMilliseconds-lt5000){if([IO.File]::Exists($resultPath)-or$commitProcess.HasExited){$commitBlocked=$false;break};Start-Sleep -Milliseconds 20};$watch.Stop()
         Assert-CcodTrue $commitBlocked 'N+1 commit is blocked after its atomic real AccountTransition wait signal'
         if($commitBlocked){$opened=Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk' -ReadyTransaction $authority.Ready;Assert-CcodTrue ($null-ne$opened) 'N retained shortcut opens while its authority lease excludes N+1'}
-        Close-CcodInstallFileTransaction -Transaction $product -Disposition Ready
+        Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed
         if(-not$commitProcess.WaitForExit(20000)){Stop-Process -Id $commitProcess.Id -Force;throw 'real N+1 commit child timed out'}
         $commitProcess.Refresh();if(-not[IO.File]::Exists($resultPath)){throw "real N+1 commit child produced no committed pointer exit=$($commitProcess.ExitCode) stdout=$([IO.File]::ReadAllText($stdout)) stderr=$([IO.File]::ReadAllText($stderr))"}
         $pointer=[IO.File]::ReadAllText($resultPath)|ConvertFrom-Json;Assert-CcodEqual 2 ([uint64]$pointer.generation) 'real commit advances to N+1 only after N authority closes'
@@ -536,6 +536,43 @@ Invoke-CcodTest 'close retries a failing disposal and releases every other regis
         Assert-CcodEqual 2 ([CcodThrowingFileStream]::Attempts) 'second close retries the retained failing resource instead of short-circuiting'
         Assert-CcodOutsideUnchanged $fixture 'exception-safe close'
     } finally {Remove-CcodInstallFileFixture $fixture}
+}
+
+# Production mutation caught: a Ready product close without a durably bound Pending fence can release its account lease into an unguarded cross-process window.
+Invoke-CcodTest 'Ready product close rejects release before a durable cleanup fence is bound' {
+    $authority=New-CcodProductAuthorityFixture;$fixture=$authority.Fixture
+    try {
+        $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready;$fixture.Transactions.Add($product)
+        Assert-CcodThrows {Close-CcodInstallFileTransaction -Transaction $product -Disposition Ready|Out-Null} 'CCOD_INSTALL_CLOSE_FAILED'
+        $currentModule=Get-Module InstallFileTransaction -ErrorAction Stop
+        $leaseLive=&$currentModule {param($Transaction)$state=$null;if(-not$script:CcodTransactions.TryGetValue($Transaction,[ref]$state)){return $false};return $null-ne$state.AuthorityLease-and-not$state.AuthorityLease.Released-and-not$state.Closed} $product
+        Assert-CcodTrue $leaseLive 'rejected unbound Ready close retains the same-thread product authority lease'
+        Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed|Out-Null
+    } finally {Remove-CcodInstallFileFixture $fixture}
+}
+
+# Production mutation caught: bypassing the private lower-close seam prevents lifecycle tests from exercising native-close failure while the real lease-release path still runs.
+Invoke-CcodTest 'private lower close seam preserves the real transaction cleanup retry path' {
+    $fixture=New-CcodInstallFileFixture
+    $currentModule=Get-Module InstallFileTransaction -ErrorAction Stop
+    $lowerState=@{Attempts=0;FailuresRemaining=1}
+    $lowerClose={
+        param($TransactionState,$DefaultClose)
+        $lowerState.Attempts++
+        if($lowerState.FailuresRemaining-gt0){$lowerState.FailuresRemaining--;throw [IO.IOException]::new('injected lower native close failure')}
+        &$DefaultClose $TransactionState
+    }.GetNewClosure()
+    & $currentModule {param($Close)$script:CcodInstallFileTransactionLowerCloseForTest=$Close} $lowerClose
+    try {
+        $generation=Open-CcodFixtureGeneration $fixture 'runtime-lower-close-seam'
+        Assert-CcodThrows {Close-CcodInstallFileTransaction -Transaction $generation -Disposition Failed|Out-Null} 'CCOD_INSTALL_CLOSE_FAILED'
+        Assert-CcodEqual 1 $lowerState.Attempts 'first close reaches the injected lower native failure'
+        Close-CcodInstallFileTransaction -Transaction $generation -Disposition Failed|Out-Null
+        Assert-CcodEqual 2 $lowerState.Attempts 'same-thread retry reaches the lower close again and succeeds'
+    } finally {
+        & $currentModule {$script:CcodInstallFileTransactionLowerCloseForTest=$null}
+        Remove-CcodInstallFileFixture $fixture
+    }
 }
 
 Invoke-CcodTest 'pointer generation records are monotonic create-only and collision safe' {

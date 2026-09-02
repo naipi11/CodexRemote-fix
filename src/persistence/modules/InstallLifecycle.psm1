@@ -18,7 +18,9 @@ $script:CcodActivationPhases = @('StoppingPreviousRuntime','InstallingRuntime','
 $script:CcodInstallTransactionPhases = @('Prepared','PackageVerified','RuntimeStaged','PreviousProtectionStopped','RuntimePromoted','PointerCommitted','StableShellCommitted','ProtectionReady','Ready')
 $script:CcodInstallTransactionFields = @('schemaVersion','transactionId','oldRuntimeId','oldGeneration','oldManifestSha256','newRuntimeId','newGeneration','newManifestSha256','sealedPackageSha256','ownedObjectNames','phase','errorCode')
 $script:CcodInstallTransactionRoots = [Runtime.CompilerServices.ConditionalWeakTable[object,object]]::new()
+$script:CcodProductCleanupFenceFields = @('schemaVersion','transactionId','runtimeId','runtimeGeneration','manifestSha256','packageSha256','ownerPid','ownerCreationTimeUtc','ownerSid','state')
 $script:CcodPendingProductTransactionCleanups = [Collections.Hashtable]::Synchronized(@{})
+$script:CcodProductCleanupLeaseContexts = [Collections.Hashtable]::Synchronized(@{})
 
 function Throw-CcodLifecycleError {
     param(
@@ -45,19 +47,391 @@ function Get-CcodLifecycleProductCleanupKey {
     return Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
 }
 
+function Get-CcodLifecycleInstallFileTransactionModule {
+    $path = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'InstallFileTransaction.psm1'))
+    $command = Get-Command Close-CcodInstallFileTransaction -ErrorAction SilentlyContinue
+    $module = if ($null -ne $command -and $null -ne $command.Module -and $null -ne $command.Module.Path -and [IO.Path]::GetFullPath($command.Module.Path) -ceq $path) { $command.Module } else { $null }
+    if ($null -eq $module) { $module = Import-Module $path -PassThru -DisableNameChecking -ErrorAction Stop }
+    if ($null -eq $module) { Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Install file transaction module is unavailable' $path }
+    return $module
+}
+
+function Test-CcodLifecycleProductCleanupInteger {
+    param($Value)
+    return $Value -is [byte] -or $Value -is [uint16] -or $Value -is [uint32] -or $Value -is [uint64] -or
+        $Value -is [int16] -or $Value -is [int32] -or $Value -is [int64]
+}
+
+function Test-CcodLifecycleOrderedProperties {
+    param($Value,[string[]]$Expected)
+    if ($null -eq $Value -or ($Value -isnot [pscustomobject] -and $Value -isnot [Collections.IDictionary])) { return $false }
+    $actual = if ($Value -is [Collections.IDictionary]) { @($Value.Keys) } else { @($Value.PSObject.Properties.Name) }
+    return ($actual -join "`0") -ceq ($Expected -join "`0")
+}
+
+function Assert-CcodLifecycleProductCleanupIdentity {
+    param([Parameter(Mandatory)]$Identity)
+    if (-not (Test-CcodLifecycleOrderedProperties $Identity @('pid','creationTimeUtc','userSid')) -or
+        $Identity.pid -isnot [int] -or $Identity.pid -le 0 -or
+        $Identity.creationTimeUtc -isnot [string] -or $Identity.creationTimeUtc -cnotmatch 'Z$' -or
+        $Identity.userSid -isnot [string] -or $Identity.userSid -cnotmatch '^S-\d-\d+(?:-\d+)+$') {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup owner identity is invalid' $Identity
+    }
+    $parsed = [DateTime]::MinValue
+    if (-not [DateTime]::TryParseExact($Identity.creationTimeUtc,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$parsed) -or
+        $parsed.Kind -cne [DateTimeKind]::Utc -or
+        $parsed.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture) -cne $Identity.creationTimeUtc) {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup owner creation time is invalid' $Identity
+    }
+    return $true
+}
+
+function Get-CcodLifecycleCurrentProductCleanupIdentity {
+    $process = $null
+    $identity = $null
+    try {
+        $process = [Diagnostics.Process]::GetCurrentProcess()
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($null -eq $identity -or $null -eq $identity.User) { throw 'current user SID unavailable' }
+        $result = [pscustomobject][ordered]@{
+            pid = [int]$process.Id
+            creationTimeUtc = $process.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)
+            userSid = [string]$identity.User.Value
+        }
+        [void](Assert-CcodLifecycleProductCleanupIdentity $result)
+        return $result
+    } catch {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Current product cleanup identity could not be proven' $null
+    } finally {
+        if ($null -ne $process) { $process.Dispose() }
+        if ($null -ne $identity) { $identity.Dispose() }
+    }
+}
+
+function Enter-CcodLifecycleProductCleanupLease {
+    $owner = Get-CcodLifecycleCurrentProductCleanupIdentity
+    $lease = $null
+    try {
+        $lease = Enter-CcodMutex -Kind AccountTransition -UserSid $owner.userSid -TimeoutMilliseconds 30000
+        if ($null -eq $lease -or $lease.Outcome -cne 'Acquired' -or $lease.Kind -cne 'AccountTransition' -or
+            $lease.Released -isnot [bool] -or $lease.Released -or
+            $lease.OwnerManagedThreadId -isnot [int] -or $lease.OwnerManagedThreadId -ne [Threading.Thread]::CurrentThread.ManagedThreadId) {
+            throw 'outer product cleanup lease was not acquired exactly'
+        }
+        $threadKey = [string][Threading.Thread]::CurrentThread.ManagedThreadId
+        if ($script:CcodProductCleanupLeaseContexts.ContainsKey($threadKey)) { throw 'outer product cleanup lease context is already active' }
+        $context = [pscustomobject]@{ Lease=$lease; OwnerIdentity=$owner; ThreadKey=$threadKey }
+        $script:CcodProductCleanupLeaseContexts[$threadKey] = $context
+        return $context
+    } catch {
+        if ($null -ne $lease -and $lease.Outcome -ceq 'Acquired' -and -not $lease.Released) { try { Exit-CcodMutex -Lease $lease | Out-Null } catch { } }
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Outer product cleanup lease could not be acquired' $owner.userSid
+    }
+}
+
+function Assert-CcodLifecycleProductCleanupLease {
+    $threadKey = [string][Threading.Thread]::CurrentThread.ManagedThreadId
+    if (-not $script:CcodProductCleanupLeaseContexts.ContainsKey($threadKey)) {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Durable product cleanup requires the outer account-transition lease' $null
+    }
+    $context = $script:CcodProductCleanupLeaseContexts[$threadKey]
+    if ($null -eq $context -or $null -eq $context.Lease -or $context.Lease.Kind -cne 'AccountTransition' -or
+        $context.Lease.Outcome -cne 'Acquired' -or $context.Lease.Released -or
+        $context.Lease.OwnerManagedThreadId -ne [Threading.Thread]::CurrentThread.ManagedThreadId) {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Outer product cleanup lease is not live on the current thread' $null
+    }
+    return $context
+}
+
+function Exit-CcodLifecycleProductCleanupLease {
+    param([Parameter(Mandatory)]$Context)
+    $current = Assert-CcodLifecycleProductCleanupLease
+    if (-not [object]::ReferenceEquals($current,$Context)) {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Outer product cleanup lease context changed' $null
+    }
+    try {
+        $released = Exit-CcodMutex -Lease $Context.Lease
+        if ($released -isnot [bool] -or -not $released -or -not $Context.Lease.Released) { throw 'outer lease release was not proven' }
+        [void]$script:CcodProductCleanupLeaseContexts.Remove($Context.ThreadKey)
+        return $true
+    } catch {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Outer product cleanup lease could not be released exactly' $null
+    }
+}
+
+function Assert-CcodLifecycleProductCleanupReadyAuthority {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$ReadyTransaction)
+    [void](Assert-CcodLifecycleProductCleanupLease)
+    try {
+        [void](Assert-CcodInstallTransactionRecord -Record $ReadyTransaction)
+        if ($ReadyTransaction.phase -cne 'Ready') { throw 'terminal Ready transaction required' }
+        $fileModule = Get-CcodLifecycleInstallFileTransactionModule
+        return &$fileModule {param($Root,$Record)Get-CcodInstallProductReadyAuthority -InstallRoot $Root -ReadyTransaction $Record} $InstallRoot $ReadyTransaction
+    } catch {
+        if ((Get-CcodLifecycleErrorId $_) -ceq 'CCOD_PRODUCT_REGISTRATION_FAILED') { throw }
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Exact selected Ready authority could not be proven for product cleanup' $ReadyTransaction
+    }
+}
+
+function Assert-CcodLifecycleProductCleanupRecord {
+    param([Parameter(Mandatory)]$Record,[Parameter(Mandatory)]$ReadyTransaction,[Parameter(Mandatory)][ValidateSet('Pending','Completed')][string]$ExpectedState)
+    $validInteger = Test-CcodLifecycleProductCleanupInteger $Record.runtimeGeneration
+    if (-not (Test-CcodLifecycleOrderedProperties $Record $script:CcodProductCleanupFenceFields) -or
+        $Record.schemaVersion -isnot [int] -or $Record.schemaVersion -ne 1 -or
+        -not (Test-CcodLifecycleCanonicalGuid $Record.transactionId) -or
+        $Record.runtimeId -isnot [string] -or $Record.runtimeId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$' -or
+        -not $validInteger -or [uint64]$Record.runtimeGeneration -eq 0 -or
+        $Record.manifestSha256 -isnot [string] -or $Record.manifestSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $Record.packageSha256 -isnot [string] -or $Record.packageSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $Record.ownerPid -isnot [int] -or $Record.ownerPid -le 0 -or
+        $Record.ownerCreationTimeUtc -isnot [string] -or
+        $Record.ownerSid -isnot [string] -or
+        $Record.state -isnot [string] -or $Record.state -cne $ExpectedState) {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Durable product cleanup record is invalid' $Record
+    }
+    [void](Assert-CcodLifecycleProductCleanupIdentity ([pscustomobject][ordered]@{pid=[int]$Record.ownerPid;creationTimeUtc=[string]$Record.ownerCreationTimeUtc;userSid=[string]$Record.ownerSid}))
+    [void](Assert-CcodInstallTransactionRecord -Record $ReadyTransaction)
+    if ($ReadyTransaction.phase -cne 'Ready' -or
+        $Record.transactionId -cne $ReadyTransaction.transactionId -or
+        $Record.runtimeId -cne $ReadyTransaction.newRuntimeId -or
+        [uint64]$Record.runtimeGeneration -ne [uint64]$ReadyTransaction.newGeneration -or
+        $Record.manifestSha256 -cne $ReadyTransaction.newManifestSha256 -or
+        $Record.packageSha256 -cne $ReadyTransaction.sealedPackageSha256) {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Durable product cleanup record does not match the exact Ready transaction' $Record
+    }
+    return $true
+}
+
+function Get-CcodLifecycleProductCleanupFenceLeaf {
+    param([Parameter(Mandatory)][uint64]$Attempt,[Parameter(Mandatory)][ValidateSet('Pending','Completed')][string]$State,[Parameter(Mandatory)][string]$TransactionId)
+    return ('{0:D20}.{1}.{2}.json' -f $Attempt,$State,$TransactionId)
+}
+
+function Read-CcodLifecycleProductCleanupFenceHistory {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$ReadyTransaction)
+    $root = Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
+    $directory = Join-Path $root 'state\product-cleanup-fences'
+    if (-not [IO.Directory]::Exists($directory)) {
+        if (Test-Path -LiteralPath $directory) { Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence plane is not a directory' $directory }
+        return @()
+    }
+    try { [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $root -Path $directory) }
+    catch { Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence plane is unsafe' $directory }
+    $entries = [Collections.Generic.List[object]]::new()
+    $files = @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)
+    if ($files.Count -gt 4096) { Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence plane exceeds its bounded history' $directory }
+    foreach ($file in $files) {
+        if ($file.PSIsContainer -or $file.Name -cnotmatch '^(?<attempt>\d{20})\.(?<state>Pending|Completed)\.(?<transaction>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.json$') {
+            Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence plane contains an unknown object' $file.FullName
+        }
+        $attemptText = [string]$Matches.attempt
+        $state = [string]$Matches.state
+        $transactionId = [string]$Matches.transaction
+        [uint64]$attempt = 0
+        if (-not [uint64]::TryParse($attemptText,[ref]$attempt) -or $attempt -eq 0 -or ('{0:D20}' -f $attempt) -cne $attemptText) {
+            Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence attempt is invalid' $file.FullName
+        }
+        try { $record = Read-CcodStrictJson -Path $file.FullName -ExpectedSchema 1 -Kind 'product cleanup fence' -MaxBytes 16384 }
+        catch { Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence is malformed' $file.FullName }
+        [void](Assert-CcodLifecycleProductCleanupRecord -Record $record -ReadyTransaction $ReadyTransaction -ExpectedState $state)
+        if ($transactionId -cne $record.transactionId -or $file.Name -cne (Get-CcodLifecycleProductCleanupFenceLeaf -Attempt $attempt -State $state -TransactionId $record.transactionId)) {
+            Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence name is noncanonical' $file.FullName
+        }
+        $entries.Add([pscustomobject]@{Attempt=$attempt;State=$state;Record=$record;Leaf=$file.Name})
+    }
+    $groups = @($entries | Group-Object Attempt | Sort-Object {[uint64]$_.Name})
+    [uint64]$expectedAttempt = 1
+    for ($index=0; $index -lt $groups.Count; $index++) {
+        $group = $groups[$index]
+        if ([uint64]$group.Name -ne $expectedAttempt) { Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence history has a sequence gap' $directory }
+        $pending = @($group.Group | Where-Object {$_.State -ceq 'Pending'})
+        $completed = @($group.Group | Where-Object {$_.State -ceq 'Completed'})
+        if ($pending.Count -ne 1 -or $completed.Count -gt 1 -or ($index -lt $groups.Count-1 -and $completed.Count -ne 1)) {
+            Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence history has an invalid state transition' $directory
+        }
+        if ($completed.Count -eq 1) {
+            foreach ($field in @('transactionId','runtimeId','runtimeGeneration','manifestSha256','packageSha256','ownerPid','ownerCreationTimeUtc','ownerSid')) {
+                if ([string]$pending[0].Record.$field -cne [string]$completed[0].Record.$field) {
+                    Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup completion changed immutable fence identity' $completed[0].Leaf
+                }
+            }
+        }
+        $expectedAttempt++
+    }
+    return @($entries | Sort-Object @{Expression={[uint64]$_.Attempt}},@{Expression={if($_.State-ceq'Pending'){0}else{1}}})
+}
+
+function Write-CcodLifecycleProductCleanupRecord {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][string]$Leaf,[Parameter(Mandatory)]$Record)
+    $fileModule = Get-CcodLifecycleInstallFileTransactionModule
+    try {
+        &$fileModule {
+            param($Root,$RecordLeaf,$Value)
+            $transaction = $null
+            try {
+                $transaction = Open-CcodInstallStateTransaction -InstallRoot $Root
+                $state = New-CcodInstallDirectory -Transaction $transaction -Parent $transaction -Leaf 'state' -CreateIfMissing
+                $fences = New-CcodInstallDirectory -Transaction $transaction -Parent $state -Leaf 'product-cleanup-fences' -CreateIfMissing
+                Write-CcodInstallRecord -Transaction $transaction -Parent $fences -Leaf $RecordLeaf -Record $Value | Out-Null
+            } finally {
+                if ($null -ne $transaction) { Close-CcodInstallFileTransaction -Transaction $transaction -Disposition Ready }
+            }
+        } $InstallRoot $Leaf $Record
+    } catch {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Durable product cleanup record could not be appended create-only' $Leaf
+    }
+}
+
+function Complete-CcodLifecycleProductCleanupFence {
+    param([Parameter(Mandatory)]$Fence,[Parameter(Mandatory)][ValidateSet('Completed','Pending')][string]$Outcome)
+    [void](Assert-CcodLifecycleProductCleanupLease)
+    if ($null -eq $Fence -or -not (Test-CcodLifecycleOrderedProperties $Fence @('InstallRoot','ReadyTransaction','OwnerIdentity','Attempt')) -or
+        $Fence.InstallRoot -isnot [string] -or -not (Test-CcodLifecycleProductCleanupInteger $Fence.Attempt) -or [uint64]$Fence.Attempt -eq 0) {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence capability is invalid' $Fence
+    }
+    $root = Get-CcodLifecycleCanonicalRoot -Path $Fence.InstallRoot -Kind 'Install root'
+    [void](Assert-CcodLifecycleProductCleanupIdentity $Fence.OwnerIdentity)
+    [void](Assert-CcodLifecycleProductCleanupReadyAuthority -InstallRoot $root -ReadyTransaction $Fence.ReadyTransaction)
+    $record = [pscustomobject][ordered]@{
+        schemaVersion = 1
+        transactionId = $Fence.ReadyTransaction.transactionId
+        runtimeId = $Fence.ReadyTransaction.newRuntimeId
+        runtimeGeneration = [uint64]$Fence.ReadyTransaction.newGeneration
+        manifestSha256 = $Fence.ReadyTransaction.newManifestSha256
+        packageSha256 = $Fence.ReadyTransaction.sealedPackageSha256
+        ownerPid = [int]$Fence.OwnerIdentity.pid
+        ownerCreationTimeUtc = [string]$Fence.OwnerIdentity.creationTimeUtc
+        ownerSid = [string]$Fence.OwnerIdentity.userSid
+        state = $Outcome
+    }
+    [void](Assert-CcodLifecycleProductCleanupRecord -Record $record -ReadyTransaction $Fence.ReadyTransaction -ExpectedState $Outcome)
+    $history = @(Read-CcodLifecycleProductCleanupFenceHistory -InstallRoot $root -ReadyTransaction $Fence.ReadyTransaction)
+    $existing = @($history | Where-Object {[uint64]$_.Attempt -eq [uint64]$Fence.Attempt -and $_.State -ceq $Outcome})
+    if ($existing.Count -eq 1) { return $existing[0].Record }
+    if ($existing.Count -ne 0) { Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence outcome is ambiguous' $Fence.Attempt }
+    if ($Outcome -ceq 'Pending') {
+        [uint64]$expected = if ($history.Count -eq 0) { 1 } else { [uint64]$history[-1].Attempt + 1 }
+        if ([uint64]$Fence.Attempt -ne $expected -or ($history.Count -gt 0 -and $history[-1].State -cne 'Completed')) {
+            Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup Pending append is out of sequence' $Fence.Attempt
+        }
+    } else {
+        $pending = @($history | Where-Object {[uint64]$_.Attempt -eq [uint64]$Fence.Attempt -and $_.State -ceq 'Pending'})
+        if ($pending.Count -ne 1 -or $history[-1].State -cne 'Pending' -or [uint64]$history[-1].Attempt -ne [uint64]$Fence.Attempt) {
+            Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup Completed append lacks the latest exact Pending record' $Fence.Attempt
+        }
+    }
+    $leaf = Get-CcodLifecycleProductCleanupFenceLeaf -Attempt ([uint64]$Fence.Attempt) -State $Outcome -TransactionId $record.transactionId
+    Write-CcodLifecycleProductCleanupRecord -InstallRoot $root -Leaf $leaf -Record $record
+    $observed = @(Read-CcodLifecycleProductCleanupFenceHistory -InstallRoot $root -ReadyTransaction $Fence.ReadyTransaction | Where-Object {[uint64]$_.Attempt -eq [uint64]$Fence.Attempt -and $_.State -ceq $Outcome})
+    if ($observed.Count -ne 1) { Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Durable product cleanup append is not exactly visible' $leaf }
+    return $observed[0].Record
+}
+
+function New-CcodLifecycleProductCleanupFence {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$ReadyTransaction,[Parameter(Mandatory)]$OwnerIdentity)
+    [void](Assert-CcodLifecycleProductCleanupLease)
+    $root = Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
+    [void](Assert-CcodLifecycleProductCleanupIdentity $OwnerIdentity)
+    [void](Assert-CcodLifecycleProductCleanupReadyAuthority -InstallRoot $root -ReadyTransaction $ReadyTransaction)
+    $history = @(Read-CcodLifecycleProductCleanupFenceHistory -InstallRoot $root -ReadyTransaction $ReadyTransaction)
+    if ($history.Count -gt 0 -and $history[-1].State -cne 'Completed') {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'A prior product cleanup fence remains Pending' $history[-1].Leaf
+    }
+    if ($history.Count -gt 0 -and [uint64]$history[-1].Attempt -eq [uint64]::MaxValue) {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence sequence is exhausted' $root
+    }
+    [uint64]$attempt = if ($history.Count -eq 0) { 1 } else { [uint64]$history[-1].Attempt + 1 }
+    $fence = [pscustomobject][ordered]@{
+        InstallRoot = $root
+        ReadyTransaction = $ReadyTransaction
+        OwnerIdentity = [pscustomobject][ordered]@{pid=[int]$OwnerIdentity.pid;creationTimeUtc=[string]$OwnerIdentity.creationTimeUtc;userSid=[string]$OwnerIdentity.userSid}
+        Attempt = $attempt
+    }
+    [void](Complete-CcodLifecycleProductCleanupFence -Fence $fence -Outcome Pending)
+    return $fence
+}
+
 function Invoke-CcodLifecycleProductTransactionClose {
     param([Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)][scriptblock]$CloseProductTransaction,[Parameter(Mandatory)][scriptblock]$DefaultClose)
     & $CloseProductTransaction $Transaction $defaultClose
 }
 
-function Resolve-CcodLifecyclePendingProductTransactionCleanup {
-    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][scriptblock]$CloseProductTransaction)
-    $key=Get-CcodLifecycleProductCleanupKey -InstallRoot $InstallRoot
-    if(-not$script:CcodPendingProductTransactionCleanups.ContainsKey($key)){return}
-    $pending=$script:CcodPendingProductTransactionCleanups[$key]
-    if($pending.OwnerManagedThreadId-ne[Threading.Thread]::CurrentThread.ManagedThreadId){Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Pending product transaction cleanup belongs to a different thread' $InstallRoot}
-    try{Invoke-CcodLifecycleProductTransactionClose -Transaction $pending.Transaction -CloseProductTransaction $CloseProductTransaction -DefaultClose $pending.DefaultClose}catch{Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Pending product transaction cleanup remains retryable' $InstallRoot}
-    [void]$script:CcodPendingProductTransactionCleanups.Remove($key)
+function Test-CcodLifecycleProductCleanupOwnerAlive {
+    param([Parameter(Mandatory)]$OwnerIdentity)
+    $process = $null
+    try {
+        $process = Get-Process -Id ([int]$OwnerIdentity.pid) -ErrorAction SilentlyContinue
+        if ($null -eq $process) { return $false }
+        return $process.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture) -ceq [string]$OwnerIdentity.creationTimeUtc
+    } catch {
+        return $true
+    } finally {
+        if ($null -ne $process) { $process.Dispose() }
+    }
+}
+
+function Resolve-CcodLifecycleProductCleanupFence {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$ReadyTransaction,[Parameter(Mandatory)]$CurrentIdentity,[Parameter(Mandatory)][scriptblock]$CloseProductTransaction)
+    [void](Assert-CcodLifecycleProductCleanupLease)
+    [void](Assert-CcodLifecycleProductCleanupIdentity $CurrentIdentity)
+    $root = Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
+    [void](Assert-CcodLifecycleProductCleanupReadyAuthority -InstallRoot $root -ReadyTransaction $ReadyTransaction)
+    $history = @(Read-CcodLifecycleProductCleanupFenceHistory -InstallRoot $root -ReadyTransaction $ReadyTransaction)
+    $key = Get-CcodLifecycleProductCleanupKey -InstallRoot $root
+    if ($history.Count -eq 0 -or $history[-1].State -ceq 'Completed') {
+        if ($script:CcodPendingProductTransactionCleanups.ContainsKey($key)) { [void]$script:CcodPendingProductTransactionCleanups.Remove($key) }
+        return [pscustomobject]@{Outcome='None'}
+    }
+    $pendingRecord = $history[-1].Record
+    if ($pendingRecord.ownerSid -cne $CurrentIdentity.userSid) {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Pending product cleanup belongs to a different account' $pendingRecord.ownerSid
+    }
+    $sameOwner = [int]$pendingRecord.ownerPid -eq [int]$CurrentIdentity.pid -and
+        $pendingRecord.ownerCreationTimeUtc -ceq $CurrentIdentity.creationTimeUtc -and
+        $pendingRecord.ownerSid -ceq $CurrentIdentity.userSid
+    $entry = if ($script:CcodPendingProductTransactionCleanups.ContainsKey($key)) { $script:CcodPendingProductTransactionCleanups[$key] } else { $null }
+    if ($sameOwner) {
+        if ($null -eq $entry -or $entry.OwnerManagedThreadId -ne [Threading.Thread]::CurrentThread.ManagedThreadId -or
+            $null -eq $entry.Fence -or [uint64]$entry.Fence.Attempt -ne [uint64]$history[-1].Attempt) {
+            Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Pending product cleanup is live but its thread-bound capability is unavailable here' $root
+        }
+        if (-not $entry.CloseCompleted) {
+            if ($null -eq $entry.Transaction -or $entry.CloseProductTransaction -isnot [scriptblock] -or $entry.DefaultClose -isnot [scriptblock]) {
+                Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Pending product cleanup capability is invalid' $root
+            }
+            try { Invoke-CcodLifecycleProductTransactionClose -Transaction $entry.Transaction -CloseProductTransaction $entry.CloseProductTransaction -DefaultClose $entry.DefaultClose }
+            catch { Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Pending product transaction cleanup remains retryable' $root }
+            $entry.CloseCompleted = $true
+        }
+        try { [void](Complete-CcodLifecycleProductCleanupFence -Fence $entry.Fence -Outcome Completed) }
+        catch { Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product transaction closed but durable completion remains pending' $root }
+        [void]$script:CcodPendingProductTransactionCleanups.Remove($key)
+        return [pscustomobject]@{Outcome='SameThreadCompleted'}
+    }
+    if (Test-CcodLifecycleProductCleanupOwnerAlive ([pscustomobject][ordered]@{pid=[int]$pendingRecord.ownerPid;creationTimeUtc=[string]$pendingRecord.ownerCreationTimeUtc;userSid=[string]$pendingRecord.ownerSid})) {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Pending product cleanup owner is still alive' $root
+    }
+    $fence = [pscustomobject][ordered]@{
+        InstallRoot = $root
+        ReadyTransaction = $ReadyTransaction
+        OwnerIdentity = [pscustomobject][ordered]@{pid=[int]$pendingRecord.ownerPid;creationTimeUtc=[string]$pendingRecord.ownerCreationTimeUtc;userSid=[string]$pendingRecord.ownerSid}
+        Attempt = [uint64]$history[-1].Attempt
+    }
+    $fileModule = Get-CcodLifecycleInstallFileTransactionModule
+    $recoveryTransaction = $null
+    try {
+        $recoveryTransaction = &$fileModule {param($Root,$Record)Open-CcodInstallProductRegistrationTransaction -InstallRoot $Root -ReadyTransaction $Record} $root $ReadyTransaction
+        [void](&$fileModule {param($Transaction,$Fence)Set-CcodInstallProductCleanupFence -Transaction $Transaction -Fence $Fence} $recoveryTransaction $fence)
+        $defaultClose = {param($Value)&$fileModule {param($Transaction)Close-CcodInstallFileTransaction -Transaction $Transaction -Disposition Ready} $Value}.GetNewClosure()
+        Invoke-CcodLifecycleProductTransactionClose -Transaction $recoveryTransaction -CloseProductTransaction $CloseProductTransaction -DefaultClose $defaultClose
+        $recoveryTransaction = $null
+    } catch {
+        if ($null -ne $recoveryTransaction) { try { &$fileModule {param($Transaction)Close-CcodInstallFileTransaction -Transaction $Transaction -Disposition Failed} $recoveryTransaction } catch { } }
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Dead-owner product cleanup could not be reconciled through fresh strict authority' $root
+    }
+    [void](Complete-CcodLifecycleProductCleanupFence -Fence $fence -Outcome Completed)
+    if ($script:CcodPendingProductTransactionCleanups.ContainsKey($key)) { [void]$script:CcodPendingProductTransactionCleanups.Remove($key) }
+    return [pscustomobject]@{Outcome='DeadOwnerCompleted'}
 }
 
 function Test-CcodActivationExactProperties {
@@ -1991,33 +2365,54 @@ function Get-CcodLifecycleAdapters {
         RegisterProduct = {
             param($InstallRoot,$RuntimeId,$Version,$PackageSha256,$FileTransaction,$TransactionRecord,$ProductAdapters,$CloseProductTransaction)
             if($CloseProductTransaction-isnot[scriptblock]){Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product transaction close adapter is invalid' $InstallRoot}
-            Resolve-CcodLifecyclePendingProductTransactionCleanup -InstallRoot $InstallRoot -CloseProductTransaction $CloseProductTransaction
-            $module=Import-Module (Join-Path $PSScriptRoot 'ProductRegistration.psm1') -Force -PassThru -ErrorAction Stop
-            $fileModule=$null;$ownedTransaction=$null;$sourceCapability=$null;$receiptResult=$null;$firstCloseFailure=$null;$defaultClose=$null
+            $outerLease=$null
             try{
-                $fileModule=Import-Module (Join-Path $PSScriptRoot 'InstallFileTransaction.psm1') -PassThru -ErrorAction Stop
+                $outerLease=Enter-CcodLifecycleProductCleanupLease
+                $currentIdentity=$outerLease.OwnerIdentity
+                [void](Resolve-CcodLifecycleProductCleanupFence -InstallRoot $InstallRoot -ReadyTransaction $TransactionRecord -CurrentIdentity $currentIdentity -CloseProductTransaction $CloseProductTransaction)
+                $module=Import-Module (Join-Path $PSScriptRoot 'ProductRegistration.psm1') -Force -PassThru -ErrorAction Stop
+                $fileModule=Get-CcodLifecycleInstallFileTransactionModule
                 $defaultClose={param($Value)&$fileModule {param($Transaction)Close-CcodInstallFileTransaction -Transaction $Transaction -Disposition Ready} $Value}.GetNewClosure()
-                $ownedTransaction=&$fileModule {param($Root,$Record)Open-CcodInstallProductRegistrationTransaction -InstallRoot $Root -ReadyTransaction $Record} $InstallRoot $TransactionRecord
-                $sourceCapability=&$fileModule {param($Root,$Id,$Manifest,$Transaction)Open-CcodInstallRetainedGeneration -InstallRoot $Root -RuntimeId $Id -ExpectedManifestSha256 $Manifest -FileTransaction $Transaction} $InstallRoot $RuntimeId ([string]$TransactionRecord.newManifestSha256) $ownedTransaction
-                $registration=New-CcodProductRegistration -InstallRoot $InstallRoot -RuntimeId $RuntimeId -Version $Version -PackageSha256 $PackageSha256 -FileTransaction $sourceCapability
-                $system=[Environment]::GetFolderPath([Environment+SpecialFolder]::System);$proof=[pscustomobject][ordered]@{phase=[string]$TransactionRecord.phase;runtimeId=$RuntimeId;version=$Version;packageSha256=$PackageSha256;runtimeGeneration=[uint64]$TransactionRecord.newGeneration;manifestSha256=[string]$TransactionRecord.newManifestSha256;startMenuSha256=(Get-CcodLifecycleFileSha256 $registration.startMenuShortcut.candidatePath);desktopSha256=(Get-CcodLifecycleFileSha256 $registration.desktopShortcut.candidatePath);targetPath=[IO.Path]::GetFullPath((Join-Path $system 'schtasks.exe'));arguments='/Run /TN "Codex Control Other Devices Supervisor"';transactionRecord=$TransactionRecord;bootstrapPath=$registration.bootstrapPath;uninstallerPath=$registration.uninstallerPath}
-                $commitAdapters=@{};if($null-ne$ProductAdapters){if($ProductAdapters-isnot[hashtable]){throw 'product side-effect adapters invalid'};foreach($key in $ProductAdapters.Keys){$commitAdapters[$key]=$ProductAdapters[$key]}};$commitAdapters.GetReadyProof={param($Ignored)$proof}.GetNewClosure()
-                $receipt=Commit-CcodProductRegistration -Registration $registration -FileTransaction $sourceCapability -Adapters $commitAdapters
-                Remove-CcodLegacyProductRegistration -ExpectedAppId '{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}' -Adapters $ProductAdapters
-                $receiptResult=[pscustomobject]@{verified=[bool]$receipt.verified;legacyRemoved=$true}
-            }finally{
-                if($null-ne$ownedTransaction){
-                    try{Invoke-CcodLifecycleProductTransactionClose -Transaction $ownedTransaction -CloseProductTransaction $CloseProductTransaction -DefaultClose $defaultClose}catch{
-                        $firstCloseFailure=$_
-                        try{Invoke-CcodLifecycleProductTransactionClose -Transaction $ownedTransaction -CloseProductTransaction $CloseProductTransaction -DefaultClose $defaultClose}catch{
-                            $key=Get-CcodLifecycleProductCleanupKey -InstallRoot $InstallRoot
-                            $script:CcodPendingProductTransactionCleanups[$key]=[pscustomobject]@{Transaction=$ownedTransaction;DefaultClose=$defaultClose;OwnerManagedThreadId=[Threading.Thread]::CurrentThread.ManagedThreadId}
-                        }
+                $fence=New-CcodLifecycleProductCleanupFence -InstallRoot $InstallRoot -ReadyTransaction $TransactionRecord -OwnerIdentity $currentIdentity
+                $cleanupKey=Get-CcodLifecycleProductCleanupKey -InstallRoot $InstallRoot
+                $cleanupEntry=[pscustomobject]@{
+                    Fence=$fence
+                    Transaction=$null
+                    DefaultClose=$defaultClose
+                    CloseProductTransaction=$CloseProductTransaction
+                    OwnerManagedThreadId=[Threading.Thread]::CurrentThread.ManagedThreadId
+                    CloseCompleted=$true
+                }
+                $script:CcodPendingProductTransactionCleanups[$cleanupKey]=$cleanupEntry
+                $operationFailure=$null;$closeFailure=$null;$completionFailure=$null;$receiptResult=$null
+                try{
+                    $ownedTransaction=&$fileModule {param($Root,$Record)Open-CcodInstallProductRegistrationTransaction -InstallRoot $Root -ReadyTransaction $Record} $InstallRoot $TransactionRecord
+                    $cleanupEntry.Transaction=$ownedTransaction;$cleanupEntry.CloseCompleted=$false
+                    [void](&$fileModule {param($Transaction,$Fence)Set-CcodInstallProductCleanupFence -Transaction $Transaction -Fence $Fence} $ownedTransaction $fence)
+                    $sourceCapability=&$fileModule {param($Root,$Id,$Manifest,$Transaction)Open-CcodInstallRetainedGeneration -InstallRoot $Root -RuntimeId $Id -ExpectedManifestSha256 $Manifest -FileTransaction $Transaction} $InstallRoot $RuntimeId ([string]$TransactionRecord.newManifestSha256) $ownedTransaction
+                    $registration=New-CcodProductRegistration -InstallRoot $InstallRoot -RuntimeId $RuntimeId -Version $Version -PackageSha256 $PackageSha256 -FileTransaction $sourceCapability
+                    $system=[Environment]::GetFolderPath([Environment+SpecialFolder]::System);$proof=[pscustomobject][ordered]@{phase=[string]$TransactionRecord.phase;runtimeId=$RuntimeId;version=$Version;packageSha256=$PackageSha256;runtimeGeneration=[uint64]$TransactionRecord.newGeneration;manifestSha256=[string]$TransactionRecord.newManifestSha256;startMenuSha256=(Get-CcodLifecycleFileSha256 $registration.startMenuShortcut.candidatePath);desktopSha256=(Get-CcodLifecycleFileSha256 $registration.desktopShortcut.candidatePath);targetPath=[IO.Path]::GetFullPath((Join-Path $system 'schtasks.exe'));arguments='/Run /TN "Codex Control Other Devices Supervisor"';transactionRecord=$TransactionRecord;bootstrapPath=$registration.bootstrapPath;uninstallerPath=$registration.uninstallerPath}
+                    $commitAdapters=@{};if($null-ne$ProductAdapters){if($ProductAdapters-isnot[hashtable]){throw 'product side-effect adapters invalid'};foreach($key in $ProductAdapters.Keys){$commitAdapters[$key]=$ProductAdapters[$key]}};$commitAdapters.GetReadyProof={param($Ignored)$proof}.GetNewClosure()
+                    $receipt=Commit-CcodProductRegistration -Registration $registration -FileTransaction $sourceCapability -Adapters $commitAdapters
+                    Remove-CcodLegacyProductRegistration -ExpectedAppId '{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}' -Adapters $ProductAdapters
+                    $receiptResult=[pscustomobject]@{verified=[bool]$receipt.verified;legacyRemoved=$true}
+                }catch{$operationFailure=$_}
+                finally{
+                    if(-not$cleanupEntry.CloseCompleted-and$null-ne$cleanupEntry.Transaction){
+                        try{Invoke-CcodLifecycleProductTransactionClose -Transaction $cleanupEntry.Transaction -CloseProductTransaction $cleanupEntry.CloseProductTransaction -DefaultClose $cleanupEntry.DefaultClose;$cleanupEntry.CloseCompleted=$true}catch{$closeFailure=$_}
+                    }
+                    if($cleanupEntry.CloseCompleted){
+                        try{[void](Complete-CcodLifecycleProductCleanupFence -Fence $cleanupEntry.Fence -Outcome Completed);[void]$script:CcodPendingProductTransactionCleanups.Remove($cleanupKey)}catch{$completionFailure=$_}
                     }
                 }
+                if($null-ne$closeFailure){Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product transaction cleanup failed after registration and requires same-thread reconciliation' $InstallRoot}
+                if($null-ne$completionFailure){Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product transaction closed but durable completion could not be appended' $InstallRoot}
+                if($null-ne$operationFailure){throw $operationFailure}
+                if($null-eq$receiptResult-or$receiptResult.verified-isnot[bool]-or-not$receiptResult.verified){Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product registration receipt is invalid after exact cleanup completion' $InstallRoot}
+                return $receiptResult
+            }finally{
+                if($null-ne$outerLease){[void](Exit-CcodLifecycleProductCleanupLease -Context $outerLease)}
             }
-            if($null-ne$firstCloseFailure){Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product transaction cleanup failed after registration and requires reconciliation' $InstallRoot}
-            return $receiptResult
         }
         NewRuntimeManifest = {
             param($RuntimeDirectory, $ProjectVersion)

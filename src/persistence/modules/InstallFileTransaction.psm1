@@ -2,6 +2,7 @@ Set-StrictMode -Version Latest
 
 $script:CcodTransactions = [Runtime.CompilerServices.ConditionalWeakTable[object,object]]::new()
 $script:CcodScopes = [Runtime.CompilerServices.ConditionalWeakTable[object,object]]::new()
+$script:CcodInstallFileTransactionLowerCloseForTest = $null
 
 function Throw-CcodInstallFileError {
     param([string]$Id,[string]$Message,$Target)
@@ -369,6 +370,7 @@ function Open-CcodInstallStateTransaction { param([Parameter(Mandatory)][string]
 function Open-CcodInstallRetainedGeneration { param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][string]$RuntimeId,[Parameter(Mandatory)][string]$ExpectedManifestSha256,[Parameter(Mandatory)]$FileTransaction) if(-not[IO.Path]::IsPathRooted($InstallRoot)-or$ExpectedManifestSha256-cnotmatch'^[0-9a-f]{64}$'){Throw-CcodInstallFileError 'CCOD_INSTALL_RETAINED_GENERATION_INVALID' 'Invalid retained generation contract' $RuntimeId};Assert-CcodInstallLeaf $RuntimeId 'CCOD_INSTALL_RUNTIME_ID_INVALID';$scope=Get-CcodInstallTransaction $FileTransaction 'CCOD_INSTALL_TRANSACTION_INVALID';if(-not[object]::ReferenceEquals($scope.Record.Transaction,$FileTransaction)){Throw-CcodInstallFileError 'CCOD_INSTALL_TRANSACTION_INVALID' 'FileTransaction must be the transaction root capability' $null};Assert-CcodInstallRootScope $scope.State $InstallRoot 'CCOD_INSTALL_TRANSACTION_SCOPE';$nativeResult=Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $scope.State.Runtime OpenRetained @($RuntimeId,$ExpectedManifestSha256)} 'CCOD_INSTALL_RETAINED_GENERATION_INVALID';if(@($nativeResult).Count-ne 2-or-not(Test-CcodRetainedManifestIdentity ([string]$nativeResult[1]) $RuntimeId)){Throw-CcodInstallFileError 'CCOD_INSTALL_RETAINED_RUNTIME_ID_MISMATCH' 'Retained manifest must contain exactly one matching top-level runtimeId string' $RuntimeId};Add-CcodInstallScope $scope.Record.Transaction $nativeResult[0] Generation $true $RuntimeId }
 
 $script:CcodProductReadyFields=@('schemaVersion','transactionId','oldRuntimeId','oldGeneration','oldManifestSha256','newRuntimeId','newGeneration','newManifestSha256','sealedPackageSha256','ownedObjectNames','phase','errorCode')
+$script:CcodInstallProductCleanupFields=@('schemaVersion','transactionId','runtimeId','runtimeGeneration','manifestSha256','packageSha256','ownerPid','ownerCreationTimeUtc','ownerSid','state')
 function Test-CcodInstallOrderedProperties($Value,[string[]]$Names){if($null-eq$Value){return $false};$actual=@($Value.PSObject.Properties.Name);return(($actual-join"`0")-ceq($Names-join"`0"))}
 function Test-CcodInstallUnsignedInteger($Value){return $Value-is[byte]-or$Value-is[uint16]-or$Value-is[uint32]-or$Value-is[uint64]-or$Value-is[int16]-or$Value-is[int32]-or$Value-is[int64]}
 function Read-CcodInstallAuthorityFile {
@@ -444,6 +446,39 @@ function Open-CcodInstallProductRegistrationTransaction {
         $arguments=[object[]]@($root,$null);$token=Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeStatic OpenProduct $arguments} 'CCOD_INSTALL_PRODUCT_SCOPE';$runtime=$arguments[1];$transaction=New-CcodInstallCapability;$script:CcodTransactions.Add($transaction,[pscustomobject]@{Runtime=$runtime;InstallRoot=$root.TrimEnd('\');RuntimeId=$authority.RuntimeId;RootToken=$token;StateOnly=$false;ProductOnly=$true;ReadyAuthority=$authority;AuthorityLease=$lease;Closed=$false;CleanupFailed=$false;Retired=$false;RetirementResult=$null;Disposition=$null});$script:CcodScopes.Add($transaction,[pscustomobject]@{Transaction=$transaction;Token=$token;Kind='ProductTransaction';ReadOnly=$true;RuntimeId=$authority.RuntimeId});$lease=$null;return $transaction
     }finally{if($null-ne$lease){try{Exit-CcodInstallProductAuthorityLease $lease}catch{}}}
 }
+function Get-CcodInstallProductCleanupFenceProof($State,$Fence){
+    if($null-eq$State-or-not$State.ProductOnly-or$null-eq$State.ReadyAuthority-or$null-eq$Fence-or-not(Test-CcodInstallOrderedProperties $Fence @('InstallRoot','ReadyTransaction','OwnerIdentity','Attempt'))){Throw-CcodInstallFileError 'CCOD_INSTALL_CLOSE_FAILED' 'Product cleanup fence binding is invalid' $null}
+    $root=[IO.Path]::GetFullPath([string]$Fence.InstallRoot).TrimEnd('\')
+    $readyCanonical=$Fence.ReadyTransaction|ConvertTo-Json -Depth 8 -Compress
+    $owner=$Fence.OwnerIdentity
+    if($root-cne$State.InstallRoot-or$readyCanonical-cne$State.ReadyAuthority.ReadyCanonical-or-not(Test-CcodInstallUnsignedInteger $Fence.Attempt)-or[uint64]$Fence.Attempt-eq0-or$null-eq$owner-or-not(Test-CcodInstallOrderedProperties $owner @('pid','creationTimeUtc','userSid'))-or$owner.pid-isnot[int]-or$owner.pid-le0-or$owner.creationTimeUtc-isnot[string]-or$owner.userSid-isnot[string]){Throw-CcodInstallFileError 'CCOD_INSTALL_CLOSE_FAILED' 'Product cleanup fence does not match strict Ready authority' $Fence}
+    $leaf='{0:D20}.Pending.{1}.json'-f[uint64]$Fence.Attempt,[string]$Fence.ReadyTransaction.transactionId
+    $path=Join-Path $root ('state\product-cleanup-fences\'+$leaf)
+    try{$record=Read-CcodInstallProductStrictJson -Path $path -Fields $script:CcodInstallProductCleanupFields}catch{Throw-CcodInstallFileError 'CCOD_INSTALL_CLOSE_FAILED' 'Durable Pending product cleanup fence is unavailable' $path}
+    if($record.schemaVersion-isnot[int]-or$record.schemaVersion-ne1-or$record.state-isnot[string]-or$record.state-cne'Pending'-or
+        $record.transactionId-cne$Fence.ReadyTransaction.transactionId-or$record.runtimeId-cne$State.ReadyAuthority.RuntimeId-or
+        -not(Test-CcodInstallUnsignedInteger $record.runtimeGeneration)-or[uint64]$record.runtimeGeneration-ne[uint64]$State.ReadyAuthority.Generation-or
+        $record.manifestSha256-cne$State.ReadyAuthority.ManifestSha256-or$record.packageSha256-cne$State.ReadyAuthority.PackageSha256-or
+        $record.ownerPid-isnot[int]-or[int]$record.ownerPid-ne[int]$owner.pid-or$record.ownerCreationTimeUtc-isnot[string]-or$record.ownerCreationTimeUtc-cne[string]$owner.creationTimeUtc-or
+        $record.ownerSid-isnot[string]-or$record.ownerSid-cne[string]$owner.userSid){Throw-CcodInstallFileError 'CCOD_INSTALL_CLOSE_FAILED' 'Durable Pending product cleanup fence changed before close' $path}
+    return [pscustomobject]@{Path=$path;Canonical=($record|ConvertTo-Json -Depth 8 -Compress)}
+}
+function Set-CcodInstallProductCleanupFence {
+    param([Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)]$Fence)
+    $scope=Get-CcodInstallTransaction $Transaction 'CCOD_INSTALL_TRANSACTION_INVALID'
+    if(-not[object]::ReferenceEquals($scope.Record.Transaction,$Transaction)-or$scope.Record.Kind-cne'ProductTransaction'){Throw-CcodInstallFileError 'CCOD_INSTALL_CLOSE_FAILED' 'Product cleanup fence requires the strict transaction root' $null}
+    [void](Assert-CcodInstallProductAuthorityLease $scope.State)
+    if($null-ne$scope.State.PSObject.Properties['ProductCleanupFence']-and$null-ne$scope.State.ProductCleanupFence){Throw-CcodInstallFileError 'CCOD_INSTALL_CLOSE_FAILED' 'Product cleanup fence is already bound' $null}
+    $scope.State|Add-Member -NotePropertyName ProductCleanupFence -NotePropertyValue (Get-CcodInstallProductCleanupFenceProof $scope.State $Fence)
+    return $true
+}
+function Assert-CcodInstallProductCleanupFenceBound($State){
+    $proof=if($null-ne$State.PSObject.Properties['ProductCleanupFence']){$State.ProductCleanupFence}else{$null}
+    if($null-eq$proof-or$proof.Path-isnot[string]-or$proof.Canonical-isnot[string]){Throw-CcodInstallFileError 'CCOD_INSTALL_CLOSE_FAILED' 'Ready product close requires a durable Pending cleanup fence' $null}
+    try{$record=Read-CcodInstallProductStrictJson -Path $proof.Path -Fields $script:CcodInstallProductCleanupFields}catch{Throw-CcodInstallFileError 'CCOD_INSTALL_CLOSE_FAILED' 'Durable Pending cleanup fence is unavailable at close' $proof.Path}
+    if(($record|ConvertTo-Json -Depth 8 -Compress)-cne$proof.Canonical-or$record.state-cne'Pending'){Throw-CcodInstallFileError 'CCOD_INSTALL_CLOSE_FAILED' 'Durable Pending cleanup fence changed before close' $proof.Path}
+    return $true
+}
 function Open-CcodInstallRetainedFile {
     param([Parameter(Mandatory)]$Generation,[Parameter(Mandatory)][string]$RelativePath,[Parameter(Mandatory)]$ReadyTransaction)
     if($RelativePath-cnotin@('registration/StartMenu.CodexRemote-fix.lnk','registration/Desktop.CodexRemote-fix.lnk')){Throw-CcodInstallFileError 'CCOD_INSTALL_PRODUCT_SHORTCUT_INVALID' 'Product shortcut source must be one fixed manifest-relative candidate' $RelativePath};$scope=Get-CcodInstallTransaction $Generation 'CCOD_INSTALL_PRODUCT_SHORTCUT_INVALID';[void](Assert-CcodInstallProductAuthorityLease $scope.State);$authority=Get-CcodInstallProductReadyAuthority $scope.State.InstallRoot $ReadyTransaction;$stored=$scope.State.ReadyAuthority;if($null-eq$stored-or$authority.ReadyCanonical-cne$stored.ReadyCanonical-or$authority.PersistedReadyCanonical-cne$stored.PersistedReadyCanonical-or$authority.RuntimeId-cne$stored.RuntimeId-or$authority.Generation-ne$stored.Generation-or$authority.ManifestSha256-cne$stored.ManifestSha256-or$authority.PackageSha256-cne$stored.PackageSha256-or$authority.RuntimeId-cne$scope.Record.RuntimeId){Throw-CcodInstallFileError 'CCOD_INSTALL_PRODUCT_SCOPE' 'Retained shortcut source authority changed after capability open' $ReadyTransaction};$result=Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $scope.State.Runtime OpenRetainedFile @($scope.Record.Token,$RelativePath)} 'CCOD_INSTALL_PRODUCT_SHORTCUT_INVALID';if(@($result).Count-ne3-or[int64]$result[1]-lt0-or[string]$result[2]-cnotmatch'^[0-9a-f]{64}$'){Throw-CcodInstallFileError 'CCOD_INSTALL_PRODUCT_SHORTCUT_INVALID' 'Retained product shortcut identity is invalid' $RelativePath};Add-CcodInstallScope $scope.Record.Transaction $result[0] RetainedFile $true $scope.Record.RuntimeId
@@ -472,11 +507,18 @@ function Copy-CcodInstallProductShortcut {
     Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $scope.State.Runtime CopyProductShortcut @($scope.Record.Token,$Kind,$sourceScope.Record.Token,$Leaf)} 'CCOD_INSTALL_PRODUCT_SHORTCUT_FAILED'|Out-Null
     [pscustomobject]@{Kind=$Kind;Leaf=$Leaf}
 }
+function Invoke-CcodInstallFileTransactionLowerClose {
+    param([Parameter(Mandatory)]$State)
+    $defaultClose={param($Value)Invoke-CcodRuntimeMethod $Value.Runtime Close @()|Out-Null}
+    if($script:CcodInstallFileTransactionLowerCloseForTest-is[scriptblock]){&$script:CcodInstallFileTransactionLowerCloseForTest $State $defaultClose;return}
+    &$defaultClose $State
+}
 function Close-CcodInstallFileTransaction {
     param([Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)][ValidateSet('Ready','Failed')][string]$Disposition)
     $state=$null;if($null-eq$Transaction-or-not$script:CcodTransactions.TryGetValue($Transaction,[ref]$state)){Throw-CcodInstallFileError 'CCOD_INSTALL_TRANSACTION_INVALID' 'Invalid install file transaction capability' $null};if($state.Closed-and-not$state.CleanupFailed){return}
+    if($state.ProductOnly-and$Disposition-ceq'Ready'){[void](Assert-CcodInstallProductCleanupFenceBound $state)}
     $cleanupFailed=$false
-    try{Invoke-CcodRuntimeMethod $state.Runtime Close @()|Out-Null}catch{$cleanupFailed=$true}
+    try{Invoke-CcodInstallFileTransactionLowerClose -State $state}catch{$cleanupFailed=$true}
     if($null-ne$state.PSObject.Properties['AuthorityLease']-and$null-ne$state.AuthorityLease){try{Exit-CcodInstallProductAuthorityLease $state.AuthorityLease;$state.AuthorityLease=$null}catch{$cleanupFailed=$true}}
     $state.CleanupFailed=$cleanupFailed;$state.Closed=$true;$state.Disposition=$Disposition
     if($cleanupFailed){Throw-CcodInstallFileError 'CCOD_INSTALL_CLOSE_FAILED' 'Install file transaction cleanup failed; registered failures are retained for retry' $null}
