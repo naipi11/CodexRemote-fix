@@ -61,6 +61,105 @@ function New-CcodLifecycleSourceFixture {
     return $Root
 }
 
+function New-CcodLifecycleV2521LegacyInstallFixture {
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$SourceRoot
+    )
+
+    # Source of truth: merge-base 19803a79af3302c49f129e6a6b3ff7ffaf1b930b.
+    # That release copied this pre-append-only inventory, derived a two-part
+    # version-digest runtime ID, wrote schema-2 active.json, and kept one
+    # mutable post-install activation receipt.
+    $relativeFiles = [Collections.Generic.List[string]]::new()
+    foreach ($relative in @(
+        'src\check-package.mjs',
+        'src\persistence\Supervisor.ps1',
+        'src\persistence\SessionController.ps1',
+        'src\persistence\StaticProbeWorker.ps1',
+        'src\persistence\LifecycleWorker.ps1',
+        'src\persistence\bootstrap.ps1',
+        'src\persistence\UninstallBootstrap.ps1',
+        'src\persistence\PortableUninstallFinalizer.ps1',
+        'Test-CodexControlOtherDevices.ps1',
+        'Start-CodexControlOtherDevices.ps1',
+        'Reset-CodexControlOtherDevices.ps1'
+    )) { $relativeFiles.Add($relative) }
+    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'bin') -File -Force)) {
+        $relativeFiles.Add('bin\' + $file.Name)
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src\runtime') -File -Force -Recurse)) {
+        $relativeFiles.Add('src\runtime\' + $file.FullName.Substring((Join-Path $SourceRoot 'src\runtime').TrimEnd('\').Length + 1))
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src\persistence\modules') -Filter '*.psm1' -File -Force)) {
+        $relativeFiles.Add('src\persistence\modules\' + $file.Name)
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src\persistence\resources') -File -Force)) {
+        $relativeFiles.Add('src\persistence\resources\' + $file.Name)
+    }
+
+    $runtimeParent = Join-Path $InstallRoot 'runtime'
+    $stagingRoot = Join-Path $runtimeParent '.v2521-fixture'
+    [IO.Directory]::CreateDirectory($stagingRoot) | Out-Null
+    foreach ($relative in $relativeFiles) {
+        $source = Join-Path $SourceRoot $relative
+        $destination = Join-Path $stagingRoot $relative
+        [IO.Directory]::CreateDirectory((Split-Path $destination -Parent)) | Out-Null
+        Copy-Item -LiteralPath $source -Destination $destination -Force
+    }
+
+    $records = [Collections.Generic.List[object]]::new()
+    foreach ($file in @(Get-ChildItem -LiteralPath $stagingRoot -File -Force -Recurse)) {
+        $records.Add([pscustomobject][ordered]@{
+            path = $file.FullName.Substring($stagingRoot.TrimEnd('\').Length + 1).Replace('\','/')
+            length = [int64]$file.Length
+            sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        })
+    }
+    $comparison = [Comparison[object]]{ param($left,$right) [StringComparer]::Ordinal.Compare([string]$left.path,[string]$right.path) }
+    $records.Sort($comparison)
+    $canonical = (@($records) | ForEach-Object { '{0}`t{1}`t{2}' -f $_.path,$_.length,$_.sha256 }) -join "`n"
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = [BitConverter]::ToString($sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))).Replace('-','').ToLowerInvariant()
+    } finally { $sha256.Dispose() }
+    $runtimeId = '2.5.21-' + $digest.Substring(0,16)
+    $runtimeRoot = Join-Path $runtimeParent $runtimeId
+    [IO.Directory]::Move($stagingRoot,$runtimeRoot)
+    $manifest = [pscustomobject][ordered]@{
+        schemaVersion = 1
+        projectVersion = '2.5.21'
+        runtimeId = $runtimeId
+        files = @($records)
+    }
+    [IO.File]::WriteAllText((Join-Path $runtimeRoot 'manifest.json'),($manifest | ConvertTo-Json -Depth 16),[Text.UTF8Encoding]::new($false))
+
+    $timestamp = '2030-02-03T03:04:05.0000000Z'
+    $active = [pscustomobject][ordered]@{
+        schemaVersion = 2
+        activeRuntime = $runtimeId
+        previousRuntime = $null
+        generation = [uint64]1
+        updatedAtUtc = $timestamp
+    }
+    [IO.File]::WriteAllText((Join-Path $InstallRoot 'active.json'),($active | ConvertTo-Json -Depth 4),[Text.UTF8Encoding]::new($false))
+    $stateRoot = Join-Path $InstallRoot 'state'
+    [IO.Directory]::CreateDirectory($stateRoot) | Out-Null
+    $receipt = [pscustomobject][ordered]@{
+        schemaVersion = 1
+        activationId = '11111111-2222-4333-8444-555555555555'
+        phase = 'Ready'
+        runtimeId = $runtimeId
+        previousRuntimeId = $null
+        startedAtUtc = $timestamp
+        updatedAtUtc = $timestamp
+        ready = $true
+        errorCode = $null
+    }
+    [IO.File]::WriteAllText((Join-Path $stateRoot 'post-install-activation.json'),($receipt | ConvertTo-Json -Depth 4),[Text.UTF8Encoding]::new($false))
+    return [pscustomobject][ordered]@{ RuntimeId=$runtimeId;RuntimeRoot=$runtimeRoot;Manifest=$manifest;Active=$active;Receipt=$receipt }
+}
+
 function New-CcodLifecyclePayloadManifest {
     param(
         [Parameter(Mandatory)][string]$Root,
@@ -805,6 +904,191 @@ $results += Invoke-CcodTest 'same-version immutable install identity is idempote
     Assert-CcodEqual $false $drift 'idempotence is bound to the active runtime and pointer generation'
     $legacy = & $module { Test-CcodInstallPackageIdentity -TransactionRecord $null -ProjectVersion '2.5.22' -ActiveProjectVersion '2.5.21' -SealedPackageSha256 ('d'*64) -ActiveRuntimeId 'legacy' -ActiveGeneration 1 }
     Assert-CcodEqual $false $legacy 'legacy install without transaction record is treated as non-idempotent Idle'
+}
+
+$results += Invoke-CcodTest 'real v2.5.21 legacy lifecycle state upgrades through the v2.5.22 install entrypoint' {
+    $legacySource=New-CcodLifecycleTempRoot;$source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $legacySource -Version '2.5.21' | Out-Null
+        $legacy=New-CcodLifecycleV2521LegacyInstallFixture -InstallRoot $install -SourceRoot $legacySource
+        Assert-CcodTrue ($legacy.RuntimeId -cmatch '^2\.5\.21-[0-9a-f]{16}$') 'fixture uses the merge-base two-part runtime identity'
+        Assert-CcodEqual 'schemaVersion,activeRuntime,previousRuntime,generation,updatedAtUtc' (@($legacy.Active.PSObject.Properties.Name)-join ',') 'fixture uses the merge-base schema-two active pointer'
+        Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $install 'state\active-generation')) 'legacy fixture has no append-only selector plane'
+        Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $install 'state\install-transactions')) 'legacy fixture has no append-only transaction plane'
+        Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $install 'state\product-cleanup-fences')) 'legacy fixture has no durable cleanup fence plane'
+        $legacyActiveHash=Get-CcodTestFileSha256 -Path (Join-Path $install 'active.json')
+        $legacyManifestHash=Get-CcodTestFileSha256 -Path (Join-Path $legacy.RuntimeRoot 'manifest.json')
+        $legacyPointer=Read-CcodActiveRuntime -InstallRoot $install
+        $legacyValidation=Test-CcodRuntimeManifest -RuntimeDirectory $legacy.RuntimeRoot -ExpectedRuntimeId $legacy.RuntimeId -ExpectedManifestSha256 $legacyManifestHash
+        $module=Get-Module InstallLifecycle -ErrorAction Stop
+        $compatibility=&$module {param($Root,$Pointer,$Validation)Get-CcodLegacyUpgradeCompatibilityContext -InstallRoot $Root -ExistingPointer $Pointer -ActiveValidation $Validation -GlobalTransaction $null} $install $legacyPointer $legacyValidation
+        Assert-CcodEqual 'ProvenLegacyWithoutReady' $compatibility.Kind 'compatibility function returns only the proven legacy classification'
+        Assert-CcodEqual $legacy.RuntimeId $compatibility.ActiveRuntimeId 'compatibility context retains the exact active runtime identity'
+        Assert-CcodEqual ([uint64]1) $compatibility.ActiveGeneration 'compatibility context retains the exact legacy generation'
+        Assert-CcodEqual '2.5.21' $compatibility.ProjectVersion 'compatibility context retains the exact supported project version'
+        Assert-CcodEqual $legacyManifestHash $compatibility.ManifestSha256 'compatibility context retains the exact manifest identity'
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot
+        $fake=New-CcodLifecycleFake -NodePath $node
+        $beforeRuntimeCount=@(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count
+
+        $upgrade=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters $fake.Adapters
+
+        Assert-CcodEqual 'Upgraded' $upgrade.Outcome 'proven legacy state converges through the real install entrypoint'
+        Assert-CcodEqual ($beforeRuntimeCount+1) @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count 'upgrade stages exactly one immutable generation'
+        Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install 'state\active-generation') -PathType Container) 'upgrade creates the append-only selector plane'
+        Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install 'state\install-transactions') -PathType Container) 'upgrade creates the append-only transaction plane'
+        Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install 'active.json') -PathType Leaf) 'legacy active pointer remains only as migration evidence'
+        Assert-CcodEqual $legacyActiveHash (Get-CcodTestFileSha256 -Path (Join-Path $install 'active.json')) 'upgrade never rewrites the legacy active pointer evidence'
+        $pointer=Read-CcodActiveRuntime -InstallRoot $install
+        Assert-CcodEqual $upgrade.RuntimeId $pointer.activeRuntime 'append-only selector chooses the new runtime instead of stale active.json'
+        Assert-CcodEqual ([uint64]2) $pointer.generation 'legacy genesis and new activation form a contiguous two-record selector chain'
+        Assert-CcodEqual 2 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\active-generation') -File -Force).Count 'upgrade publishes legacy genesis and the new active selector exactly once each'
+        $ready=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Ready' $ready.phase 'upgrade publishes a terminal append-only Ready transaction'
+        Assert-CcodEqual $legacy.RuntimeId $ready.oldRuntimeId 'Ready transaction is bound to the exact legacy source runtime'
+        Assert-CcodEqual ([uint64]1) $ready.oldGeneration 'Ready transaction is bound to the exact legacy source generation'
+        Assert-CcodEqual $upgrade.RuntimeId $ready.newRuntimeId 'Ready transaction is bound to the selected new runtime'
+        Assert-CcodEqual ([uint64]2) $ready.newGeneration 'Ready transaction is bound to the selected new generation'
+        $currentRuntimeRoot=Join-Path (Join-Path $install 'runtime') $upgrade.RuntimeId
+        $currentManifestHash=Get-CcodTestFileSha256 -Path (Join-Path $currentRuntimeRoot 'manifest.json')
+        $currentValidation=Test-CcodRuntimeManifest -RuntimeDirectory $currentRuntimeRoot -ExpectedRuntimeId $upgrade.RuntimeId -ExpectedManifestSha256 $currentManifestHash
+        $currentCompatibility=&$module {param($Root,$Pointer,$Validation,$Transaction)Get-CcodLegacyUpgradeCompatibilityContext -InstallRoot $Root -ExistingPointer $Pointer -ActiveValidation $Validation -GlobalTransaction $Transaction} $install $pointer $currentValidation $ready
+        Assert-CcodEqual 'CurrentReady' $currentCompatibility.Kind 'compatibility function returns only the current Ready classification after migration'
+        Assert-CcodEqual $upgrade.RuntimeId $currentCompatibility.ActiveRuntimeId 'current compatibility remains bound to the selected runtime'
+        Assert-CcodEqual ([uint64]2) $currentCompatibility.ActiveGeneration 'current compatibility remains bound to the selected generation'
+        Assert-CcodEqual $currentManifestHash $currentCompatibility.ManifestSha256 'current compatibility remains bound to the selected manifest'
+    } finally {
+        foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+    }
+}
+
+foreach($legacyCase in @(
+    [pscustomobject]@{Name='append-only selector without a transaction chain';Kind='selector';Expected='CCOD_INSTALL_UPGRADE_SOURCE_INVALID'},
+    [pscustomobject]@{Name='cleanup fence plane without Ready authority';Kind='fence';Expected='CCOD_INSTALL_UPGRADE_SOURCE_INVALID'},
+    [pscustomobject]@{Name='schema-one active pointer normalized by the general reader';Kind='active';Expected='CCOD_INSTALL_UPGRADE_SOURCE_INVALID'},
+    [pscustomobject]@{Name='generation-one active pointer with a previous runtime';Kind='previous';Expected='CCOD_INSTALL_UPGRADE_SOURCE_INVALID'},
+    [pscustomobject]@{Name='legacy generation without reconstructable append-only history';Kind='generation';Expected='CCOD_INSTALL_UPGRADE_SOURCE_INVALID'},
+    [pscustomobject]@{Name='current nonce runtime format disguised as v2.5.21';Kind='current-format';Expected='CCOD_INSTALL_UPGRADE_SOURCE_INVALID'},
+    [pscustomobject]@{Name='runtime manifest from an unsupported historical version';Kind='version';Expected='CCOD_INSTALL_UPGRADE_SOURCE_INVALID'},
+    [pscustomobject]@{Name='legacy runtime path reparse';Kind='reparse';Expected='CCOD_INSTALL_REPARSE_PATH'}
+)) {
+    $case=$legacyCase
+    $results += Invoke-CcodTest ("legacy upgrade classification rejects {0} before generation staging" -f $case.Name) {
+        $legacySource=New-CcodLifecycleTempRoot;$source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot;$outside=$null;$junction=$null
+        try {
+            New-CcodLifecycleSourceFixture -Root $legacySource -Version '2.5.21' | Out-Null
+            $legacy=New-CcodLifecycleV2521LegacyInstallFixture -InstallRoot $install -SourceRoot $legacySource
+            switch($case.Kind) {
+                'selector' {
+                    $selector=Join-Path $install 'state\active-generation';[IO.Directory]::CreateDirectory($selector)|Out-Null
+                    [IO.File]::WriteAllText((Join-Path $selector '00000000000000000001.json'),([ordered]@{schemaVersion=1;generation=[uint64]1;activeRuntime=$legacy.RuntimeId;previousGeneration=[uint64]0}|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                }
+                'fence' { [IO.Directory]::CreateDirectory((Join-Path $install 'state\product-cleanup-fences'))|Out-Null }
+                'active' {
+                    [IO.File]::WriteAllText((Join-Path $install 'active.json'),([ordered]@{schemaVersion=1;activeRuntime=$legacy.RuntimeId;previousRuntime=$null;updatedAtUtc=$legacy.Active.updatedAtUtc}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+                }
+                'previous' {
+                    [IO.File]::WriteAllText((Join-Path $install 'active.json'),([ordered]@{schemaVersion=2;activeRuntime=$legacy.RuntimeId;previousRuntime='2.5.20-0000000000000000';generation=[uint64]1;updatedAtUtc=$legacy.Active.updatedAtUtc}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+                }
+                'generation' {
+                    [IO.File]::WriteAllText((Join-Path $install 'active.json'),([ordered]@{schemaVersion=2;activeRuntime=$legacy.RuntimeId;previousRuntime='2.5.20-0000000000000000';generation=[uint64]2;updatedAtUtc=$legacy.Active.updatedAtUtc}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+                }
+                'current-format' {
+                    $currentId=Get-CcodRuntimeId -ProjectVersion '2.5.21' -Files @($legacy.Manifest.files) -Nonce ('f'*32)
+                    $currentRoot=Join-Path (Split-Path $legacy.RuntimeRoot -Parent) $currentId
+                    $legacy.Manifest.runtimeId=$currentId
+                    [IO.File]::WriteAllText((Join-Path $legacy.RuntimeRoot 'manifest.json'),($legacy.Manifest|ConvertTo-Json -Depth 16),[Text.UTF8Encoding]::new($false))
+                    [IO.Directory]::Move($legacy.RuntimeRoot,$currentRoot)
+                    [IO.File]::WriteAllText((Join-Path $install 'active.json'),([ordered]@{schemaVersion=2;activeRuntime=$currentId;previousRuntime=$null;generation=[uint64]1;updatedAtUtc=$legacy.Active.updatedAtUtc}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+                    $legacy.RuntimeId=$currentId;$legacy.RuntimeRoot=$currentRoot
+                }
+                'version' {
+                    $manifestPath=Join-Path $legacy.RuntimeRoot 'manifest.json';$manifest=[IO.File]::ReadAllText($manifestPath)|ConvertFrom-Json;$manifest.projectVersion='2.5.20'
+                    [IO.File]::WriteAllText($manifestPath,($manifest|ConvertTo-Json -Depth 16),[Text.UTF8Encoding]::new($false))
+                }
+                'reparse' {
+                    $outside=New-CcodLifecycleTempRoot
+                    Move-Item -LiteralPath $legacy.RuntimeRoot -Destination $outside
+                    $junction=New-Item -ItemType Junction -Path $legacy.RuntimeRoot -Target $outside
+                }
+            }
+            New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+            $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+            $runtimeBefore=@(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Force).Count
+            $selectorPath=Join-Path $install 'state\active-generation';$selectorBefore=if(Test-Path -LiteralPath $selectorPath -PathType Container){@(Get-ChildItem -LiteralPath $selectorPath -File -Force).Count}else{0}
+            $failure=$null
+            try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('b'*64) -Adapters $fake.Adapters|Out-Null}catch{$failure=$_}
+            $errorId=if($null-eq$failure){$null}else{([string]$failure.FullyQualifiedErrorId-split',')[0]}
+            Assert-CcodEqual $case.Expected $errorId "$($case.Name) uses the expected fail-closed boundary"
+            Assert-CcodEqual $runtimeBefore @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Force).Count "$($case.Name) creates no immutable generation"
+            $selectorAfter=if(Test-Path -LiteralPath $selectorPath -PathType Container){@(Get-ChildItem -LiteralPath $selectorPath -File -Force).Count}else{0}
+            Assert-CcodEqual $selectorBefore $selectorAfter "$($case.Name) appends no selector record"
+            Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $install 'state\install-transactions') -PathType Container) "$($case.Name) creates no transaction plane"
+            Assert-CcodEqual 0 $fake.World.TaskInstalled "$($case.Name) performs no scheduled-task mutation"
+        } finally {
+            if($null-ne$junction-and(Test-Path -LiteralPath $legacy.RuntimeRoot)){[IO.Directory]::Delete([IO.Path]::GetFullPath($legacy.RuntimeRoot))}
+            foreach($path in @($legacySource,$source,$install,$nodeRoot,$outside)){if($null-ne$path-and(Test-Path -LiteralPath $path)){Remove-Item -LiteralPath $path -Recurse -Force}}
+        }
+    }
+}
+
+$results += Invoke-CcodTest 'real v2.5.21 upgrade failure before new Ready restarts the retained legacy runtime' {
+    $legacySource=New-CcodLifecycleTempRoot;$source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $legacySource -Version '2.5.21' | Out-Null
+        $legacy=New-CcodLifecycleV2521LegacyInstallFixture -InstallRoot $install -SourceRoot $legacySource
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $fake.Adapters.WaitNewRuntimeReady={
+            param($InstallRoot,$RuntimeId,$RuntimeGeneration,$Identity,$TaskStartedAtUtc,$TimeoutMilliseconds)
+            $ready=$RuntimeId-ceq$legacy.RuntimeId
+            [pscustomobject][ordered]@{SupervisorReady=$ready;TrayReady=$ready}
+        }.GetNewClosure()
+        $failure=$null
+        try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('c'*64) -Adapters $fake.Adapters|Out-Null}catch{$failure=$_}
+        $errorId=if($null-eq$failure){$null}else{([string]$failure.FullyQualifiedErrorId-split',')[0]}
+        Assert-CcodEqual 'CCOD_INSTALL_NEW_RUNTIME_NOT_READY' $errorId 'new-runtime readiness failure remains the reported cause after successful compensation'
+        $pointer=Read-CcodActiveRuntime -InstallRoot $install
+        Assert-CcodEqual $legacy.RuntimeId $pointer.activeRuntime 'compensating append-only pointer reselects the retained legacy runtime'
+        Assert-CcodEqual ([uint64]3) $pointer.generation 'legacy genesis new activation and compensation form one monotonic selector chain'
+        Assert-CcodEqual 2 $fake.World.TaskStarted 'failed new runtime and retained legacy runtime are each started once'
+        Assert-CcodTrue (Test-Path -LiteralPath $legacy.RuntimeRoot -PathType Container) 'retained legacy runtime remains present after compensation'
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Failed' $head.phase 'failed new generation has a terminal diagnostic transaction'
+        Assert-CcodEqual 'CCOD_INSTALL_NEW_RUNTIME_NOT_READY' $head.errorCode 'failed transaction retains the original pre-Ready error'
+        Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install 'active.json') -PathType Leaf) 'legacy active pointer remains untouched as evidence after compensation'
+    } finally {
+        foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+    }
+}
+
+$results += Invoke-CcodTest 'real v2.5.21 upgrade failure before new pointer commit keeps the legacy selector active and restarts it' {
+    $legacySource=New-CcodLifecycleTempRoot;$source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $legacySource -Version '2.5.21' | Out-Null
+        $legacy=New-CcodLifecycleV2521LegacyInstallFixture -InstallRoot $install -SourceRoot $legacySource
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $fake.World.SetActiveFailure={
+            param($InstallRoot,$RuntimeId,$Ownership,$TargetGeneration,$FileTransaction)
+            throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('adapted pointer failure'),'CCOD_RUNTIME_POINTER_COMMIT_FAILED',[Management.Automation.ErrorCategory]::InvalidData,$RuntimeId)
+        }
+        $failure=$null
+        try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('d'*64) -Adapters $fake.Adapters|Out-Null}catch{$failure=$_}
+        $errorId=if($null-eq$failure){$null}else{([string]$failure.FullyQualifiedErrorId-split',')[0]}
+        Assert-CcodEqual 'CCOD_RUNTIME_POINTER_COMMIT_FAILED' $errorId 'adapted pre-pointer failure remains the reported cause after old-runtime restart'
+        $pointer=Read-CcodActiveRuntime -InstallRoot $install
+        Assert-CcodEqual $legacy.RuntimeId $pointer.activeRuntime 'selector genesis keeps the legacy runtime active when the new pointer never commits'
+        Assert-CcodEqual ([uint64]1) $pointer.generation 'pre-pointer failure appends no false new or compensating selector'
+        Assert-CcodEqual 1 $fake.World.TaskStarted 'pre-pointer failure restarts only the retained legacy runtime'
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Failed' $head.phase 'pre-pointer failure has a terminal diagnostic transaction'
+        Assert-CcodEqual 'CCOD_RUNTIME_POINTER_COMMIT_FAILED' $head.errorCode 'diagnostic transaction retains the adapted pointer failure'
+        Assert-CcodTrue (Test-Path -LiteralPath $legacy.RuntimeRoot -PathType Container) 'pre-pointer failure retains the old runtime tree'
+    } finally {
+        foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+    }
 }
 
 $results += Invoke-CcodTest 'Invoke-CcodInstall is idempotent only for the active Ready runtime and exact sealed package identity' {

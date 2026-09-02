@@ -21,9 +21,13 @@ function New-CcodHarnessFixture {
 }
 
 function New-CcodHarnessCandidate {
-    param([Parameter(Mandatory)]$Fixture, [Parameter(Mandatory)][string]$Version)
+    param(
+        [Parameter(Mandatory)]$Fixture,
+        [Parameter(Mandatory)][string]$Version,
+        [byte[]]$Bytes = [byte[]](8,7,6,5,4,3,2,1)
+    )
     $installer = Join-Path $Fixture.Root ("CodexRemote-fix-$Version-setup.exe")
-    [IO.File]::WriteAllBytes($installer, [byte[]](8,7,6,5,4,3,2,1))
+    [IO.File]::WriteAllBytes($installer, $Bytes)
     $hash = Get-CcodTestFileSha256 -Path $installer
     [IO.File]::WriteAllText("$installer.sha256.txt", ("{0} *{1}`r`n" -f $hash, [IO.Path]::GetFileName($installer)), [Text.UTF8Encoding]::new($false))
     return $installer
@@ -711,6 +715,25 @@ Invoke-CcodTest 'rolls back, records a redacted failure receipt, and raises a st
         Assert-CcodEqual 'Failed' ([string]$captured.outcome) 'failure receipt is explicit'
         $serialized = $captured | ConvertTo-Json -Depth 16 -Compress
         Assert-CcodTrue (-not $serialized.Contains('C:\\private')) 'failure evidence also redacts internal paths'
+    } finally {
+        if (Test-Path -LiteralPath $fixture.Root) { Remove-Item -LiteralPath $fixture.Root -Recurse -Force }
+    }
+}
+
+Invoke-CcodTest 'accepts an exact checksum-bound v2.5.21 installer as the source of a v2.5.22 upgrade run' {
+    . $harnessPath -Library
+    $fixture = New-CcodHarnessFixture
+    try {
+        $current = New-CcodHarnessCandidate -Fixture $fixture -Version '2.5.22' -Bytes ([byte[]](9,8,7,6,5,4,3,2))
+        $legacy = New-CcodHarnessCandidate -Fixture $fixture -Version '2.5.21' -Bytes ([byte[]](2,3,5,7,11,13,17,19))
+        $calls = [Collections.Generic.List[string]]::new()
+        $captured = $null
+        $adapters = New-CcodHarnessAdapters -Fixture $fixture -Calls $calls -CapturedReceipt ([ref]$captured)
+        $receipt = Invoke-CcodInstalledLifecycleIntegration -InstallerPath $current -PreviousInstallerPath $legacy -ExpectedVersion '2.5.22' -EvidenceRoot $fixture.EvidenceRoot -Scenario Upgrade -AllowMachineMutation -AllowCodexRestart -Adapters $adapters
+        Assert-CcodEqual 'Completed' ([string]$receipt.outcome) 'v2.5.21 to v2.5.22 reaches the fake installed verification boundary'
+        Assert-CcodEqual (Get-CcodTestFileSha256 -Path $legacy) ([string]$receipt.previousInstallerSha256) 'upgrade evidence binds the exact v2.5.21 installer bytes'
+        Assert-CcodTrue ($calls -contains 'CreateRollbackSnapshot') 'legacy upgrade captures rollback state before the adapted scenario'
+        Assert-CcodTrue ($calls -contains 'VerifyScenario') 'legacy upgrade still requires independent installed verification'
     } finally {
         if (Test-Path -LiteralPath $fixture.Root) { Remove-Item -LiteralPath $fixture.Root -Recurse -Force }
     }

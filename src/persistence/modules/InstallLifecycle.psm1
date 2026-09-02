@@ -21,6 +21,8 @@ $script:CcodInstallTransactionRoots = [Runtime.CompilerServices.ConditionalWeakT
 $script:CcodProductCleanupFenceFields = @('schemaVersion','transactionId','runtimeId','runtimeGeneration','manifestSha256','packageSha256','ownerPid','ownerCreationTimeUtc','ownerSid','state')
 $script:CcodPendingProductTransactionCleanups = [Collections.Hashtable]::Synchronized(@{})
 $script:CcodProductCleanupLeaseContexts = [Collections.Hashtable]::Synchronized(@{})
+# Exact pre-append-only profile from merge-base 19803a79af3302c49f129e6a6b3ff7ffaf1b930b.
+$script:CcodLegacyUpgradeProjectVersions = @('2.5.21')
 
 function Throw-CcodLifecycleError {
     param(
@@ -1094,6 +1096,161 @@ function Test-CcodInstallPackageIdentity {
     [void](Assert-CcodInstallTransactionRecord $TransactionRecord)
     if ([string]$TransactionRecord.sealedPackageSha256 -cne $SealedPackageSha256) { Throw-CcodLifecycleError 'CCOD_INSTALL_PACKAGE_CONFLICT' 'The installed version is bound to different sealed package bytes' $null }
     return ([string]$TransactionRecord.phase -ceq 'Ready' -and [string]$TransactionRecord.newRuntimeId -ceq $ActiveRuntimeId -and [uint64]$TransactionRecord.newGeneration -eq $ActiveGeneration)
+}
+
+function Test-CcodLegacyUpgradePlaneMissing {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][string]$RelativePath)
+    $path = [IO.Path]::GetFullPath((Join-Path $InstallRoot $RelativePath))
+    [void](Assert-CcodLifecycleInstallPathSafe -InstallRoot $InstallRoot -Path $path)
+    try {
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if ($null -eq $item) { throw [IO.InvalidDataException]::new('path lookup returned no object') }
+        return $false
+    } catch [Management.Automation.ItemNotFoundException] {
+        return $true
+    } catch {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_UPGRADE_SOURCE_INVALID' 'Upgrade compatibility plane presence could not be proven' $path
+    }
+}
+
+function Get-CcodLegacyRuntimeValidation {
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)]$ExistingPointer,
+        [Parameter(Mandatory)]$ActiveValidation
+    )
+
+    $runtimeRoot = [IO.Path]::GetFullPath((Join-Path (Join-Path $InstallRoot 'runtime') ([string]$ExistingPointer.activeRuntime)))
+    [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $InstallRoot -Path $runtimeRoot)
+    $manifestPath = Join-Path $runtimeRoot 'manifest.json'
+    [void](Assert-CcodLifecycleInstallLeafSafe -InstallRoot $InstallRoot -Path $manifestPath)
+    $manifest = Read-CcodStrictJson -Path $manifestPath -ExpectedSchema 1 -Kind 'legacy runtime manifest'
+    if (-not (Test-CcodLifecycleOrderedProperties $manifest @('schemaVersion','projectVersion','runtimeId','files')) -or
+        $manifest.schemaVersion -isnot [int] -or $manifest.schemaVersion -ne 1 -or
+        $manifest.projectVersion -isnot [string] -or $script:CcodLegacyUpgradeProjectVersions -cnotcontains [string]$manifest.projectVersion -or
+        $manifest.runtimeId -isnot [string] -or [string]$manifest.runtimeId -cne [string]$ExistingPointer.activeRuntime -or
+        $manifest.files -isnot [Array]) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_UPGRADE_SOURCE_INVALID' 'Legacy runtime manifest profile is not supported' $manifestPath
+    }
+    if ($null -eq $ActiveValidation -or $ActiveValidation.Valid -isnot [bool] -or $ActiveValidation.Valid -or
+        $ActiveValidation.Code -isnot [string] -or $ActiveValidation.Code -cne 'CCOD_RUNTIME_ID_MISMATCH' -or
+        $ActiveValidation.RuntimeId -isnot [string] -or $ActiveValidation.RuntimeId -cne [string]$manifest.runtimeId -or
+        $null -eq $ActiveValidation.Manifest -or
+        ($ActiveValidation.Manifest | ConvertTo-Json -Depth 16 -Compress) -cne ($manifest | ConvertTo-Json -Depth 16 -Compress)) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_UPGRADE_SOURCE_INVALID' 'Only the exact historical runtime-ID validation mismatch may enter legacy compatibility' $runtimeRoot
+    }
+
+    # v2.5.21 Get-CcodRuntimeId used version + the first 16 hex characters of
+    # the sorted manifest-record digest and did not yet include a nonce.
+    $canonicalLines = [Collections.Generic.List[string]]::new()
+    $previousPath = $null
+    foreach ($file in @($manifest.files)) {
+        if (-not (Test-CcodLifecycleOrderedProperties $file @('path','length','sha256')) -or
+            $file.path -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$file.path) -or
+            [IO.Path]::IsPathRooted([string]$file.path) -or [string]$file.path -match '\\' -or
+            [string]$file.path -match '(^|/)(\.|\.\.)(/|$)' -or [string]$file.path -match '//' -or
+            [string]$file.path -ceq 'manifest.json' -or
+            -not (Test-CcodLifecycleProductCleanupInteger $file.length) -or [int64]$file.length -lt 0 -or
+            $file.sha256 -isnot [string] -or [string]$file.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            ($null -ne $previousPath -and [StringComparer]::Ordinal.Compare($previousPath,[string]$file.path) -ge 0)) {
+            Throw-CcodLifecycleError 'CCOD_INSTALL_UPGRADE_SOURCE_INVALID' 'Legacy runtime manifest file records are not canonical' $manifestPath
+        }
+        $previousPath = [string]$file.path
+        $canonicalLines.Add(('{0}`t{1}`t{2}' -f [string]$file.path,[int64]$file.length,[string]$file.sha256))
+    }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($canonicalLines -join "`n")))).Replace('-','').ToLowerInvariant()
+    } finally { $sha.Dispose() }
+    $historicalRuntimeId = '{0}-{1}' -f [string]$manifest.projectVersion,$digest.Substring(0,16)
+    if ($historicalRuntimeId -cne [string]$manifest.runtimeId) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_UPGRADE_SOURCE_INVALID' 'Legacy runtime ID is not bound by the historical manifest algorithm' $manifestPath
+    }
+    return [pscustomobject]@{Valid=$true;Code='CCOD_RUNTIME_VALID';RuntimeId=[string]$manifest.runtimeId;Manifest=$manifest}
+}
+
+function Get-CcodLegacyUpgradeCompatibilityContext {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)]$ExistingPointer,
+        [Parameter(Mandatory)]$ActiveValidation,
+        [AllowNull()]$GlobalTransaction
+    )
+
+    $root = Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
+    try {
+        if (-not (Test-CcodLifecycleOrderedProperties $ExistingPointer @('schemaVersion','activeRuntime','previousRuntime','generation','updatedAtUtc')) -or
+            $ExistingPointer.schemaVersion -isnot [int] -or $ExistingPointer.schemaVersion -ne 2 -or
+            $ExistingPointer.activeRuntime -isnot [string] -or $ExistingPointer.activeRuntime -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$' -or
+            -not (Test-CcodLifecycleProductCleanupInteger $ExistingPointer.generation) -or [uint64]$ExistingPointer.generation -eq 0) {
+            throw 'active pointer contract'
+        }
+        $runtimeRoot = [IO.Path]::GetFullPath((Join-Path (Join-Path $root 'runtime') ([string]$ExistingPointer.activeRuntime)))
+        $manifestPath = Join-Path $runtimeRoot 'manifest.json'
+        [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $root -Path $runtimeRoot)
+        [void](Assert-CcodLifecycleInstallLeafSafe -InstallRoot $root -Path $manifestPath)
+        $manifestSha256 = Get-CcodLifecycleFileSha256 -Path $manifestPath
+        $selectorMissing = Test-CcodLegacyUpgradePlaneMissing -InstallRoot $root -RelativePath 'state\active-generation'
+        $transactionPlaneMissing = Test-CcodLegacyUpgradePlaneMissing -InstallRoot $root -RelativePath 'state\install-transactions'
+
+        if (-not $selectorMissing -and -not $transactionPlaneMissing) {
+            [void](Assert-CcodInstallTransactionRecord -Record $GlobalTransaction)
+            if ($GlobalTransaction.phase -cne 'Ready' -or
+                $ActiveValidation.Valid -isnot [bool] -or -not $ActiveValidation.Valid -or
+                $ActiveValidation.RuntimeId -cne [string]$ExistingPointer.activeRuntime -or
+                $GlobalTransaction.newRuntimeId -cne [string]$ExistingPointer.activeRuntime -or
+                [uint64]$GlobalTransaction.newGeneration -ne [uint64]$ExistingPointer.generation -or
+                $GlobalTransaction.newManifestSha256 -cne $manifestSha256 -or
+                $ActiveValidation.Manifest.runtimeId -cne [string]$ExistingPointer.activeRuntime) {
+                throw 'current Ready identity'
+            }
+            return [pscustomobject][ordered]@{
+                Kind='CurrentReady';ActiveRuntimeId=[string]$ExistingPointer.activeRuntime;ActiveGeneration=[uint64]$ExistingPointer.generation
+                ProjectVersion=[string]$ActiveValidation.Manifest.projectVersion;ManifestSha256=$manifestSha256;Manifest=$ActiveValidation.Manifest;ActiveValidation=$ActiveValidation
+            }
+        }
+        if ($selectorMissing -ne $transactionPlaneMissing -or $null -ne $GlobalTransaction -or
+            -not (Test-CcodLegacyUpgradePlaneMissing -InstallRoot $root -RelativePath 'state\product-cleanup-fences')) {
+            throw 'mixed legacy and append-only state'
+        }
+
+        $activePath = Join-Path $root 'active.json'
+        [void](Assert-CcodLifecycleInstallLeafSafe -InstallRoot $root -Path $activePath)
+        $legacyActive = Read-CcodStrictJson -Path $activePath -ExpectedSchema 2 -Kind 'legacy active runtime'
+        if (-not (Test-CcodLifecycleOrderedProperties $legacyActive @('schemaVersion','activeRuntime','previousRuntime','generation','updatedAtUtc')) -or
+            $legacyActive.schemaVersion -isnot [int] -or $legacyActive.schemaVersion -ne 2 -or
+            $legacyActive.activeRuntime -isnot [string] -or $legacyActive.activeRuntime -cne [string]$ExistingPointer.activeRuntime -or
+            $null -ne $legacyActive.previousRuntime -or $null -ne $ExistingPointer.previousRuntime -or
+            -not (Test-CcodLifecycleProductCleanupInteger $legacyActive.generation) -or [uint64]$legacyActive.generation -ne 1 -or [uint64]$legacyActive.generation -ne [uint64]$ExistingPointer.generation -or
+            -not (Test-CcodLifecycleCanonicalUtc $legacyActive.updatedAtUtc) -or $legacyActive.updatedAtUtc -cne [string]$ExistingPointer.updatedAtUtc) {
+            throw 'legacy active pointer identity'
+        }
+        $legacyValidation = Get-CcodLegacyRuntimeValidation -InstallRoot $root -ExistingPointer $ExistingPointer -ActiveValidation $ActiveValidation
+        return [pscustomobject][ordered]@{
+            Kind='ProvenLegacyWithoutReady';ActiveRuntimeId=[string]$ExistingPointer.activeRuntime;ActiveGeneration=[uint64]$ExistingPointer.generation
+            ProjectVersion=[string]$legacyValidation.Manifest.projectVersion;ManifestSha256=$manifestSha256;Manifest=$legacyValidation.Manifest;ActiveValidation=$legacyValidation
+        }
+    } catch {
+        if ((Get-CcodLifecycleErrorId $_) -ceq 'CCOD_INSTALL_UPGRADE_SOURCE_INVALID') { throw }
+        Throw-CcodLifecycleError 'CCOD_INSTALL_UPGRADE_SOURCE_INVALID' 'Existing installation is not an exact supported upgrade source' $root
+    }
+}
+
+function Initialize-CcodLegacyUpgradeSelector {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$CompatibilityContext,[Parameter(Mandatory)]$FileTransaction)
+    if ($CompatibilityContext.Kind -cne 'ProvenLegacyWithoutReady' -or [uint64]$CompatibilityContext.ActiveGeneration -ne 1) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_UPGRADE_SOURCE_INVALID' 'Supported legacy selector migration requires exact generation one' $CompatibilityContext
+    }
+    # Publish a generation-one selector for the retained legacy runtime before
+    # the ordinary generation-two pointer commit. active.json remains evidence.
+    $retained = Open-CcodInstallRetainedGeneration -InstallRoot $InstallRoot -RuntimeId $CompatibilityContext.ActiveRuntimeId -ExpectedManifestSha256 $CompatibilityContext.ManifestSha256 -FileTransaction $FileTransaction
+    [void](Commit-CcodInstallActivePointer -InstallRoot $InstallRoot -TargetGeneration $retained -ExpectedPreviousGeneration ([uint64]0) -FileTransaction $FileTransaction)
+    $pointer = Read-CcodActiveRuntime -InstallRoot $InstallRoot
+    if ($pointer.activeRuntime -cne $CompatibilityContext.ActiveRuntimeId -or [uint64]$pointer.generation -ne 1) {
+        Throw-CcodLifecycleError 'CCOD_INSTALL_UPGRADE_SOURCE_INVALID' 'Legacy selector migration could not be proven' $CompatibilityContext.ActiveRuntimeId
+    }
+    return $pointer
 }
 
 function Assert-CcodLifecycleInstallPathSafe {
@@ -3038,14 +3195,17 @@ function Invoke-CcodInstall {
         $files=@($preparedProductFiles.Files);$productShortcutTemporaryRoot=[string]$preparedProductFiles.TemporaryRoot
     }
 
-    $oldManifestSha256=$null;$activeValidation=$null
+    $oldManifestSha256=$null;$activeValidation=$null;$upgradeCompatibility=$null
     if($null-ne$existingPointer){
         $activeRuntimeRoot=[IO.Path]::GetFullPath((Join-Path (Join-Path $root 'runtime') ([string]$existingPointer.activeRuntime)))
         $activeManifestPath=Join-Path $activeRuntimeRoot 'manifest.json'
         if(-not[IO.File]::Exists($activeManifestPath)){Throw-CcodLifecycleError 'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN' 'The active runtime manifest is missing before upgrade' $activeManifestPath}
+        [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $root -Path $activeRuntimeRoot)
+        [void](Assert-CcodLifecycleInstallLeafSafe -InstallRoot $root -Path $activeManifestPath)
         $oldManifestSha256=Get-CcodLifecycleFileSha256 -Path $activeManifestPath
         $activeValidation=Test-CcodRuntimeManifest -RuntimeDirectory $activeRuntimeRoot -ExpectedRuntimeId ([string]$existingPointer.activeRuntime) -ExpectedManifestSha256 $oldManifestSha256
-        if(-not$activeValidation.Valid){Throw-CcodLifecycleError 'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN' 'The active runtime manifest is invalid before upgrade' $activeRuntimeRoot}
+        $upgradeCompatibility=Get-CcodLegacyUpgradeCompatibilityContext -InstallRoot $root -ExistingPointer $existingPointer -ActiveValidation $activeValidation -GlobalTransaction $globalTransaction
+        $activeValidation=$upgradeCompatibility.ActiveValidation
     }
     if($null-ne$existingPointer-and$sealedPackageIdentitySupplied){
         if($activeValidation.Valid){
@@ -3086,7 +3246,11 @@ function Invoke-CcodInstall {
         if($upgrade){
             if($adapters.CloseProductTransaction-isnot[scriptblock]){Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product transaction close adapter is invalid before upgrade' $root}
             $upgradeProductCleanupLease=Enter-CcodLifecycleProductCleanupLease
-            [void](Resolve-CcodLifecycleProductCleanupFence -InstallRoot $root -ReadyTransaction $globalTransaction -CurrentIdentity $upgradeProductCleanupLease.OwnerIdentity -CloseProductTransaction $adapters.CloseProductTransaction)
+            if($upgradeCompatibility.Kind-ceq'CurrentReady'){
+                [void](Resolve-CcodLifecycleProductCleanupFence -InstallRoot $root -ReadyTransaction $globalTransaction -CurrentIdentity $upgradeProductCleanupLease.OwnerIdentity -CloseProductTransaction $adapters.CloseProductTransaction)
+            }elseif($upgradeCompatibility.Kind-cne'ProvenLegacyWithoutReady'){
+                Throw-CcodLifecycleError 'CCOD_INSTALL_UPGRADE_SOURCE_INVALID' 'Upgrade compatibility classification changed before staging' $upgradeCompatibility
+            }
         }
         $runtimeId=New-CcodUniqueRuntimeId -ProjectVersion $projectVersion -Files $files;$generation=New-CcodLifecycleImmutableGeneration -InstallRoot $root -RuntimeId $runtimeId -ProjectVersion $projectVersion -Files $files;$fileTransaction=$generation.FileTransaction;$generationCapability=$generation.Generation;$runtimeRoot=$generation.RuntimeRoot;$runtimeCreated=$true
         $newGeneration=if($null-eq$existingPointer){[uint64]1}else{[uint64]$existingPointer.generation+1};$installRecord=New-CcodInstallTransactionRecord -TransactionId ([guid]::NewGuid().ToString('D')) -OldRuntimeId $(if($upgrade){$existingPointer.activeRuntime}else{$null}) -OldGeneration $(if($upgrade){$existingPointer.generation}else{$null}) -OldManifestSha256 $oldManifestSha256 -NewRuntimeId $runtimeId -NewGeneration $newGeneration -NewManifestSha256 $generation.ManifestSha256 -SealedPackageSha256 $SealedPackageSha256 -OwnedObjectNames @($runtimeId)
@@ -3127,6 +3291,7 @@ function Invoke-CcodInstall {
         $installRecord=Set-CcodInstallTransactionPhase -InstallRoot $root -TransactionId $installRecord.transactionId -ExpectedPhase 'PreviousProtectionStopped' -NewPhase 'RuntimePromoted' -FileTransaction $fileTransaction
         Initialize-CcodInstallStatePlanes -InstallRoot $root -RuntimeId $runtimeId -FileTransaction $fileTransaction -NodeCandidates $nodeCandidates -CandidateCompatibleOptIn ([bool]$EnableCandidateCompatibleUpdates)
         Write-CcodInstallActivationPhase -Activation $activation -Phase 'ActivatingRuntime' -RuntimeId $runtimeId -PreviousRuntimeId $(if ($upgrade) { [string]$existingPointer.activeRuntime } else { $null }) -ErrorCode $null -Adapters $adapters -InstallRoot $root -FileTransaction $fileTransaction | Out-Null
+        if($upgrade-and$upgradeCompatibility.Kind-ceq'ProvenLegacyWithoutReady'){$existingPointer=Initialize-CcodLegacyUpgradeSelector -InstallRoot $root -CompatibilityContext $upgradeCompatibility -FileTransaction $fileTransaction;$pointer=$existingPointer}
         $process = [Diagnostics.Process]::GetCurrentProcess()
         try {
             $ownerIdentity = [pscustomobject][ordered]@{ pid=[int]$process.Id; creationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o') }
