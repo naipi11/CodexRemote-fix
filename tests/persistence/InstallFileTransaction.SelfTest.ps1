@@ -913,4 +913,17 @@ Invoke-CcodTest 'retirement collision and record I/O failure leave generation el
     }
 }
 
+Invoke-CcodTest 'handle-pinned reclamation deletes an exact readonly immutable generation and nothing outside it' {
+    $reclamationPath=Join-Path $projectRoot 'src\persistence\modules\GenerationReclamation.psm1'
+    if(-not(Test-Path -LiteralPath $reclamationPath -PathType Leaf)){throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('generation reclamation module is missing'),'CCOD_RECLAMATION_RED_MODULE_MISSING',[Management.Automation.ErrorCategory]::ObjectNotFound,$reclamationPath)}
+    Import-Module (Join-Path $projectRoot 'src\persistence\modules\RuntimeManifest.psm1') -Force -DisableNameChecking
+    Import-Module $reclamationPath -Force -DisableNameChecking
+    $fixture=New-CcodInstallFileFixture
+    try{
+        $source=New-CcodSourceFile $fixture 'reclaim-source.bin' 'immutable-generation-reclamation';$record=[ordered]@{path='nested/payload.bin';length=$source.Length;sha256=$source.Sha256};$runtimeId=Get-CcodRuntimeId -ProjectVersion '2.5.22' -Files @($record) -Nonce '0123456789abcdef0123456789abcdef';$generation=Open-CcodFixtureGeneration $fixture $runtimeId;$nested=New-CcodInstallGenerationLeaf -Generation $generation -Leaf 'nested';Copy-CcodInstallSealedSource -Generation $nested -SourcePath $source.Path -Leaf 'payload.bin' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null;$manifest=Write-CcodInstallGenerationManifest -Generation $generation -Manifest ([ordered]@{schemaVersion=1;projectVersion='2.5.22';runtimeId=$runtimeId;files=@($record)});Close-CcodInstallFileTransaction -Transaction $generation -Disposition Ready|Out-Null
+        $runtimeRoot=Join-Path $fixture.Install "runtime\$runtimeId";Assert-CcodTrue (([IO.File]::GetAttributes((Join-Path $runtimeRoot 'nested\payload.bin'))-band[IO.FileAttributes]::ReadOnly)-ne0) 'fixture consumes the real immutable readonly leaf shape';$result=Remove-CcodVerifiedGenerationTree -InstallRoot $fixture.Install -RuntimeRoot $runtimeRoot -RuntimeId $runtimeId -ExpectedManifestSha256 $manifest.Sha256
+        Assert-CcodEqual 'Completed' $result.phase 'immutable reclamation reaches terminal phase';Assert-CcodEqual 'Reclaimed' $result.result 'immutable reclamation reports exact result';Assert-CcodEqual 2 $result.fileCount 'manifest plus one sealed file were reclaimed';Assert-CcodTrue (-not(Test-Path -LiteralPath $runtimeRoot)) 'exact immutable generation is absent';Assert-CcodTrue (Test-Path -LiteralPath $fixture.Install -PathType Container) 'install root remains';Assert-CcodOutsideUnchanged $fixture 'immutable reclamation'
+    }finally{Remove-CcodInstallFileFixture $fixture}
+}
+
 Write-Host 'Install file transaction self-test passed.' -ForegroundColor Green

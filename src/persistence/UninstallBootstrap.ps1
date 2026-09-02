@@ -22,6 +22,7 @@ $script:CcodUninstallPayloadEntries = @(
     'src/persistence/UninstallBootstrap.ps1',
     'src/persistence/PortableUninstallFinalizer.ps1',
     'src/persistence/InstalledUninstallFinalizer.ps1',
+    'src/persistence/modules/GenerationReclamation.psm1',
     'src/persistence/modules/InstallLifecycle.psm1',
     'src/persistence/modules/ProductRegistration.psm1',
     'src/persistence/modules/PortableRelease.psm1',
