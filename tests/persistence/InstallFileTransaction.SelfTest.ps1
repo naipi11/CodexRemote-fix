@@ -371,6 +371,56 @@ Invoke-CcodTest 'creates nested scoped directories and publishes sanitized recor
     } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
+Invoke-CcodTest 'abrupt writer exit cannot strand an exact internal create-only temporary leaf' {
+    $authority=New-CcodProductAuthorityFixture;$fixture=$authority.Fixture
+    $process=$null;$outer=$null;$lifecycleModule=$null
+    try {
+        $lifecycleModule=Import-Module (Join-Path $projectRoot 'src\persistence\modules\InstallLifecycle.psm1') -Force -PassThru -DisableNameChecking
+        $outer=&$lifecycleModule {Enter-CcodLifecycleProductCleanupLease}
+        $owner=$outer.OwnerIdentity
+        $fence=&$lifecycleModule {param($Root,$Ready,$Identity)New-CcodLifecycleProductCleanupFence -InstallRoot $Root -ReadyTransaction $Ready -OwnerIdentity $Identity} $fixture.Install $authority.Ready $owner
+        &$lifecycleModule {param($Context)Exit-CcodLifecycleProductCleanupLease -Context $Context|Out-Null} $outer;$outer=$null
+        $leaf=('00000000000000000001.Pending.'+$authority.Ready.transactionId+'.json')
+        $finalPath=Join-Path $fixture.Install ('state\product-cleanup-fences\'+$leaf);$finalSha=Get-CcodTestFileSha256 $finalPath
+        $marker=Join-Path $fixture.Base 'collision-reached.txt'
+        $payload=[ordered]@{module=$modulePath;install=$fixture.Install;leaf=$leaf;marker=$marker}
+        $payloadBase64=[Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes(($payload|ConvertTo-Json -Compress)))
+        $child=@'
+$ErrorActionPreference='Stop'
+$payload=[Text.UTF8Encoding]::new($false,$true).GetString([Convert]::FromBase64String('__PAYLOAD__'))|ConvertFrom-Json -ErrorAction Stop
+Import-Module $payload.module -Force -DisableNameChecking -ErrorAction Stop
+$transaction=$null
+try{
+    $transaction=Open-CcodInstallStateTransaction -InstallRoot ([string]$payload.install)
+    $state=New-CcodInstallDirectory -Transaction $transaction -Parent $transaction -Leaf 'state'
+    $fences=New-CcodInstallDirectory -Transaction $transaction -Parent $state -Leaf 'product-cleanup-fences'
+    try{Write-CcodInstallRecord -Transaction $transaction -Parent $fences -Leaf ([string]$payload.leaf) -Record ([ordered]@{schemaVersion=1;state='replacement'})|Out-Null;throw 'collision unexpectedly published'}
+    catch{if((([string]$_.FullyQualifiedErrorId-split',')[0])-cne'CCOD_INSTALL_RECORD_EXISTS'){throw}}
+    [IO.File]::WriteAllText([string]$payload.marker,'collision',[Text.UTF8Encoding]::new($false))
+    Start-Sleep -Seconds 30
+}finally{if($null-ne$transaction){try{Close-CcodInstallFileTransaction -Transaction $transaction -Disposition Failed|Out-Null}catch{}}}
+'@.Replace('__PAYLOAD__',$payloadBase64)
+        $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child))
+        $process=Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$encoded) -PassThru -WindowStyle Hidden
+        $deadline=[DateTime]::UtcNow.AddSeconds(15);while(-not[IO.File]::Exists($marker)-and-not$process.HasExited-and[DateTime]::UtcNow-lt$deadline){Start-Sleep -Milliseconds 10}
+        Assert-CcodTrue ([IO.File]::Exists($marker)) 'child reaches a real create-only collision while its transaction remains live'
+        $process.Kill();$process.WaitForExit()
+        $temporaries=@(Get-ChildItem -LiteralPath (Split-Path $finalPath -Parent) -File -Force|Where-Object{$_.Name-cmatch'^\.ccod\.[0-9a-f]{32}\.tmp$'})
+        Assert-CcodEqual 1 $temporaries.Count 'abrupt pre-fix writer exit leaves one exact internal crash artifact for recovery'
+        $outer=&$lifecycleModule {Enter-CcodLifecycleProductCleanupLease}
+        try{$history=@(&$lifecycleModule {param($Root,$Ready)Read-CcodLifecycleProductCleanupFenceHistory -InstallRoot $Root -ReadyTransaction $Ready} $fixture.Install $authority.Ready)}
+        finally{&$lifecycleModule {param($Context)Exit-CcodLifecycleProductCleanupLease -Context $Context|Out-Null} $outer;$outer=$null}
+        Assert-CcodEqual 1 $history.Count 'fence history remains readable after exact orphan recovery'
+        Assert-CcodEqual 'Pending' $history[0].State 'orphan recovery preserves the canonical Pending record'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Split-Path $finalPath -Parent) -File -Force|Where-Object{$_.Name-cmatch'^\.ccod\.[0-9a-f]{32}\.tmp$'}).Count 'outer-lease native recovery removes only the exact orphan temporary'
+        Assert-CcodEqual $finalSha (Get-CcodTestFileSha256 $finalPath) 'crash cleanup leaves the original create-only record byte-for-byte intact'
+    } finally {
+        if($null-ne$process){if(-not$process.HasExited){try{$process.Kill();$process.WaitForExit()}catch{}};$process.Dispose()}
+        if($null-ne$outer){try{&$lifecycleModule {param($Context)Exit-CcodLifecycleProductCleanupLease -Context $Context|Out-Null} $outer}catch{}}
+        Remove-CcodInstallFileFixture $fixture
+    }
+}
+
 Invoke-CcodTest 'generation and capabilities are unique create-only opaque references' {
     $fixture=New-CcodInstallFileFixture
     try {

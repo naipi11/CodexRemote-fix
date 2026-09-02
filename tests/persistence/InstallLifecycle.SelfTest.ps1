@@ -414,6 +414,29 @@ function Clear-CcodLifecycleProductOpenFailureFixture {
     if($null-ne$Fixture){&$Fixture.Module {param($Invoke)Set-Item -LiteralPath Function:\script:Invoke-CcodRuntimeStatic -Value $Invoke} $Fixture.Original}
 }
 
+function Set-CcodLifecycleProductFenceBindFailureFixture {
+    param([Parameter(Mandatory)][hashtable]$State)
+    $modulePath=Join-Path $repositoryRoot 'src\persistence\modules\InstallFileTransaction.psm1'
+    $fileModule=(Get-Command Close-CcodInstallFileTransaction -ErrorAction SilentlyContinue).Module
+    if($null-ne$fileModule-and($null-eq$fileModule.Path-or[IO.Path]::GetFullPath($fileModule.Path)-cne[IO.Path]::GetFullPath($modulePath))){$fileModule=$null}
+    if($null-eq$fileModule){$fileModule=Import-Module $modulePath -PassThru -DisableNameChecking -ErrorAction Stop}
+    $State.Attempts=0
+    $original=&$fileModule {(Get-Command Get-CcodInstallProductCleanupFenceProof -CommandType Function -ErrorAction Stop).ScriptBlock}
+    $replacement={
+        param($TransactionState,$Fence)
+        $State.Attempts++
+        if([int]$State.FailuresRemaining-gt0){$State.FailuresRemaining=[int]$State.FailuresRemaining-1;throw [IO.InvalidDataException]::new('injected durable fence bind failure')}
+        &$original $TransactionState $Fence
+    }.GetNewClosure()
+    &$fileModule {param($GetProof)Set-Item -LiteralPath Function:\script:Get-CcodInstallProductCleanupFenceProof -Value $GetProof} $replacement
+    return [pscustomobject]@{Module=$fileModule;Original=$original}
+}
+
+function Clear-CcodLifecycleProductFenceBindFailureFixture {
+    param($Fixture)
+    if($null-ne$Fixture){&$Fixture.Module {param($GetProof)Set-Item -LiteralPath Function:\script:Get-CcodInstallProductCleanupFenceProof -Value $GetProof} $Fixture.Original}
+}
+
 function Get-CcodLifecycleProductCleanupTestRecords {
     param([Parameter(Mandatory)][string]$InstallRoot)
     $directory=Join-Path $InstallRoot 'state\product-cleanup-fences'
@@ -3587,6 +3610,52 @@ $results += Invoke-CcodTest 'strict product open failure retains Pending and lat
     }
 }
 
+# Production mutation caught: a Ready-close fence assertion must not skip native abort cleanup after strict OpenProduct succeeds but binding fails.
+$results += Invoke-CcodTest 'fence bind failure aborts the real strict transaction before exact retry recovery' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot;$markerRoot=New-CcodLifecycleTempRoot
+    $bindFixture=$null;$fileModule=$null
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $productState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $fake -ProductState $productState
+        $fake.Adapters.RegisterProduct={param($InstallRoot,$RuntimeId,$Version,$PackageSha256,$FileTransaction,$TransactionRecord)[pscustomobject]@{verified=$true;legacyRemoved=$true}}
+        $null=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('d'*64) -Adapters $fake.Adapters
+        [void]$fake.Adapters.Remove('RegisterProduct')
+        $lowerState=@{FailuresRemaining=0};$fileModule=Set-CcodLifecycleLowerProductCloseFixture -State $lowerState
+        $bindState=@{FailuresRemaining=1};$bindFixture=Set-CcodLifecycleProductFenceBindFailureFixture -State $bindState
+
+        $unexpectedReceipt=$null;$failure=$null
+        try{$unexpectedReceipt=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('d'*64) -Adapters $fake.Adapters}catch{$failure=$_}
+        Assert-CcodEqual $null $unexpectedReceipt 'bind failure emits no verified registration receipt'
+        Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' (([string]$failure.FullyQualifiedErrorId-split',')[0]) 'bind failure is normalized to the stable product registration error'
+        $records=@(Get-CcodLifecycleProductCleanupTestRecords -InstallRoot $install)
+        Assert-CcodEqual '1:Pending' (($records|ForEach-Object{"$($_.Attempt):$($_.State)"})-join '|') 'bind failure retains Pending without false completion'
+        Assert-CcodEqual 0 $productState.Writes 'bind failure performs no product write'
+        Assert-CcodEqual 0 $productState.ShortcutWrites 'bind failure performs no shortcut write'
+
+        $child=Invoke-CcodLifecycleOtherProcessProductReconciliation -SourceRoot $source -InstallRoot $install -NodePath $node -PackageSha256 ('d'*64) -MarkerRoot $markerRoot
+        Assert-CcodTrue $child.MutexAcquired 'Failed abort releases the inner real AccountTransition mutex for another process'
+        Assert-CcodEqual 23 $child.ExitCode 'another process observes live Pending after acquiring the released mutex'
+        Assert-CcodEqual $false $child.AuthorityOpened 'live Pending blocks the other process before strict product authority'
+        Assert-CcodEqual 1 $lowerState.Attempts 'unbound strict transaction executes one real lower Failed close'
+
+        $bindState.FailuresRemaining=0
+        $retry=$null;$retryFailure=$null
+        try{$retry=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('d'*64) -Adapters $fake.Adapters}catch{$retryFailure=$_}
+        Assert-CcodEqual $null $retryFailure "same-package retry reaches fresh recovery bind=$($bindState.Attempts) close=$($lowerState.Attempts) writes=$($productState.Writes) shortcuts=$($productState.ShortcutWrites) retained=$($productState.RetainedError)"
+        Assert-CcodEqual 'AlreadyInstalled' $retry.Outcome 'same-package retry recovers the exact Pending only through fresh bound authority'
+        Assert-CcodTrue $retry.ProductRegistrationVerified 'retry verifies only after fresh bound Ready close succeeds'
+        Assert-CcodEqual 3 $bindState.Attempts 'retry binds one fresh recovery transaction and one new verification transaction'
+        Assert-CcodEqual 3 $lowerState.Attempts 'Failed abort and two bound Ready closes all reach real lower cleanup'
+        $records=@(Get-CcodLifecycleProductCleanupTestRecords -InstallRoot $install)
+        Assert-CcodEqual '1:Pending|1:Completed|2:Pending|2:Completed' (($records|ForEach-Object{"$($_.Attempt):$($_.State)"})-join '|') 'bind failure recovery preserves exact append-only cleanup history'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'post-Ready bind failure appends no lifecycle Failed snapshot'
+    }finally{
+        Clear-CcodLifecycleProductFenceBindFailureFixture -Fixture $bindFixture
+        Clear-CcodLifecycleLowerProductCloseFixture -FileModule $fileModule
+        foreach($path in @($source,$install,$nodeRoot,$markerRoot)){if(Test-Path $path){try{Remove-Item $path -Recurse -Force}catch{}}}
+    }
+}
+
 # Production mutation caught: validating every historical record against the latest Ready transaction makes any completed prior version poison an upgrade.
 $results += Invoke-CcodTest 'completed cleanup history from an older Ready transaction permits new upgrade registration' {
     $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
@@ -3618,32 +3687,34 @@ $results += Invoke-CcodTest 'completed cleanup history from an older Ready trans
     }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
 }
 
-# Production mutation caught: filtering history solely to the new Ready identity would silently ignore an unresolved cleanup from the prior transaction.
-$results += Invoke-CcodTest 'unresolved Pending from an older transaction blocks new Ready registration fail closed' {
+# Production mutation caught: resolving old cleanup only after the selector advances makes the old Ready authority permanently stale.
+$results += Invoke-CcodTest 'upgrade resolves a dead-owner old Pending while the old Ready is still selected' {
     $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
     try{
         New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$firstFake=New-CcodLifecycleFake -NodePath $node
         $first=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $firstFake.Adapters
-        $module=Get-Module InstallLifecycle -ErrorAction Stop;$oldReady=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install;$owner=Get-CcodLifecycleCurrentProductCleanupTestIdentity
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$oldReady=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install;$currentOwner=Get-CcodLifecycleCurrentProductCleanupTestIdentity
+        $owner=[pscustomobject][ordered]@{pid=[int]2147483647;creationTimeUtc='2000-01-01T00:00:00.0000000Z';userSid=$currentOwner.userSid}
         $outer=&$module {Enter-CcodLifecycleProductCleanupLease}
         try{&$module {param($Root,$Ready,$Identity)[void](New-CcodLifecycleProductCleanupFence -InstallRoot $Root -ReadyTransaction $Ready -OwnerIdentity $Identity)} $install $oldReady $owner}
         finally{&$module {param($Context)[void](Exit-CcodLifecycleProductCleanupLease -Context $Context)} $outer}
         Set-CcodLifecycleTestStatus -InstallRoot $install -RuntimeId $first.RuntimeId
         [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'),"module.exports = 'fixture-upgrade-prior-pending';`n",[Text.UTF8Encoding]::new($false))
         $upgradeFake=New-CcodLifecycleFake -NodePath $node;$upgradeProduct=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $upgradeFake -ProductState $upgradeProduct
-        $unexpectedReceipt=$null;$failure=$null
-        try{$unexpectedReceipt=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $upgradeFake.Adapters}catch{$failure=$_}
-        Assert-CcodEqual $null $unexpectedReceipt 'prior-transaction Pending emits no verified upgrade receipt'
-        Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' (([string]$failure.FullyQualifiedErrorId-split',')[0]) 'prior-transaction Pending blocks with the stable product registration error'
-        Assert-CcodEqual 0 $upgradeProduct.Writes 'prior-transaction Pending blocks before product writes'
-        Assert-CcodEqual 0 $upgradeProduct.ShortcutWrites 'prior-transaction Pending blocks before shortcut writes'
+        $upgrade=$null;$failure=$null
+        try{$upgrade=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $upgradeFake.Adapters}catch{$failure=$_}
+        Assert-CcodEqual $null $failure 'dead-owner old Pending is reconciled before selector advance'
+        Assert-CcodEqual 'Upgraded' $upgrade.Outcome 'upgrade proceeds only after old cleanup completion'
+        Assert-CcodTrue $upgrade.ProductRegistrationVerified 'upgrade verifies only after old and new strict cleanup complete'
         $newReady=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
-        Assert-CcodTrue ($newReady.transactionId-cne$oldReady.transactionId) 'upgrade lifecycle remains durably Ready under a distinct transaction'
+        Assert-CcodTrue ($newReady.transactionId-cne$oldReady.transactionId) 'upgrade commits a distinct Ready only after old cleanup completion'
         $records=@(Get-CcodLifecycleProductCleanupTestRecords -InstallRoot $install)
-        Assert-CcodEqual 1 $records.Count 'unresolved older Pending remains intact and no new fence is appended'
-        Assert-CcodEqual $oldReady.transactionId $records[0].Record.transactionId 'blocking Pending retains its original transaction identity'
-        Assert-CcodEqual 'Pending' $records[0].State 'blocking prior fence remains unresolved'
-        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'prior Pending does not fabricate a lifecycle Failed snapshot'
+        $oldRecords=@($records|Where-Object{$_.Record.transactionId-ceq$oldReady.transactionId});$newRecords=@($records|Where-Object{$_.Record.transactionId-ceq$newReady.transactionId})
+        Assert-CcodEqual '1:Pending|1:Completed' (($oldRecords|ForEach-Object{"$($_.Attempt):$($_.State)"})-join '|') 'old Pending completes against the still-selected old Ready'
+        Assert-CcodEqual '1:Pending|1:Completed' (($newRecords|ForEach-Object{"$($_.Attempt):$($_.State)"})-join '|') 'new Ready owns an independent completed cleanup attempt'
+        Assert-CcodEqual 1 $upgradeProduct.Writes 'upgrade reaches the product write boundary once after old cleanup'
+        Assert-CcodEqual 2 $upgradeProduct.ShortcutWrites 'upgrade reaches both shortcut writes after old cleanup'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'old cleanup recovery fabricates no lifecycle Failed snapshot'
     }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
 }
 
@@ -3669,6 +3740,37 @@ $results += Invoke-CcodTest 'cleanup history rejects an unknown record field bef
         Assert-CcodEqual 0 $productState.Writes 'unknown cleanup field blocks before product writes'
         Assert-CcodEqual 0 $productState.ShortcutWrites 'unknown cleanup field blocks before shortcut writes'
     }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
+}
+
+# Production mutation caught: broad temp-name deletion could remove attacker-controlled reparse, ADS, hardlink, or live objects from the authority plane.
+$results += Invoke-CcodTest 'cleanup fence orphan recovery rejects every hostile temporary lookalike' {
+    foreach($case in @('unexpected-name','reparse','ads','hardlink','open')){
+        $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot;$outside=New-CcodLifecycleTempRoot;$held=$null
+        try{
+            New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+            $null=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('e'*64) -Adapters $fake.Adapters
+            $plane=Join-Path $install 'state\product-cleanup-fences';[IO.Directory]::CreateDirectory($plane)|Out-Null
+            $exactName='.ccod.'+('a'*32)+'.tmp';$name=if($case-ceq'unexpected-name'){'.ccod.not-a-canonical-guid.tmp'}else{$exactName};$artifact=Join-Path $plane $name
+            switch($case){
+                'unexpected-name'{[IO.File]::WriteAllText($artifact,'hostile unexpected name',[Text.UTF8Encoding]::new($false))}
+                'reparse'{[IO.Directory]::CreateDirectory($outside)|Out-Null;New-Item -ItemType Junction -Path $artifact -Target $outside|Out-Null}
+                'ads'{[IO.File]::WriteAllText($artifact,'hostile alternate stream',[Text.UTF8Encoding]::new($false));$previous=$ErrorActionPreference;try{$ErrorActionPreference='Continue';$output=&cmd.exe /d /c "echo ads>`"$($artifact):metadata`"" 2>&1;$exitCode=$LASTEXITCODE}finally{$ErrorActionPreference=$previous};if($exitCode-ne0){throw "ADS fixture failed: $($output-join' ')"}}
+                'hardlink'{[IO.Directory]::CreateDirectory($outside)|Out-Null;$outsideFile=Join-Path $outside 'hostile.tmp';[IO.File]::WriteAllText($outsideFile,'hostile hardlink',[Text.UTF8Encoding]::new($false));New-Item -ItemType HardLink -Path $artifact -Target $outsideFile|Out-Null}
+                'open'{[IO.File]::WriteAllText($artifact,'hostile live handle',[Text.UTF8Encoding]::new($false));$held=[IO.File]::Open($artifact,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)}
+            }
+            [void]$fake.Adapters.Remove('RegisterProduct');$productState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $fake -ProductState $productState
+            $unexpectedReceipt=$null;$failure=$null
+            try{$unexpectedReceipt=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('e'*64) -Adapters $fake.Adapters}catch{$failure=$_}
+            Assert-CcodEqual $null $unexpectedReceipt "$case hostile temporary emits no verified receipt"
+            Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' (([string]$failure.FullyQualifiedErrorId-split',')[0]) "$case hostile temporary fails closed"
+            Assert-CcodTrue (Test-Path -LiteralPath $artifact) "$case hostile object is never deleted or ignored"
+            Assert-CcodEqual 0 $productState.Writes "$case blocks before product writes"
+            Assert-CcodEqual 0 $productState.ShortcutWrites "$case blocks before shortcut writes"
+        }finally{
+            if($null-ne$held){$held.Dispose()}
+            foreach($path in @($source,$install,$nodeRoot,$outside)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}
+        }
+    }
 }
 
 # Production mutation caught: releasing strict product authority after a lower close failure without a durable fence lets another process report verified registration.

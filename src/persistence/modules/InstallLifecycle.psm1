@@ -213,8 +213,151 @@ function Get-CcodLifecycleProductCleanupFenceLeaf {
     return ('{0:D20}.{1}.{2}.json' -f $Attempt,$State,$TransactionId)
 }
 
+function Initialize-CcodLifecycleProductCleanupOrphanRuntime {
+    $marker = 'CcodProductCleanupOrphanCapabilityMarkerV1' -as [type]
+    if ($null -eq $marker) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+public sealed class CcodProductCleanupOrphanCapabilityMarkerV1
+{
+    private CcodProductCleanupOrphanCapabilityMarkerV1() { }
+    public static int CapabilityAbi { get { return 1; } }
+}
+
+internal static class CcodProductCleanupOrphanRuntimeV1
+{
+    private const uint DELETE = 0x00010000, SYNCHRONIZE = 0x00100000;
+    private const uint READ_ATTRIBUTES = 0x80, WRITE_ATTRIBUTES = 0x100, LIST_DIRECTORY = 0x1;
+    private const uint SHARE_READ = 1, SHARE_WRITE = 2;
+    private const uint OPEN = 1, DIRECTORY = 1, SYNC_IO = 0x20, NON_DIRECTORY = 0x40, BACKUP_INTENT = 0x4000, OPEN_REPARSE = 0x200000;
+    private const uint OPEN_EXISTING = 3, FLAG_BACKUP = 0x02000000, FLAG_REPARSE = 0x00200000;
+    private const uint OBJ_CASE_INSENSITIVE = 0x40, ATTR_READONLY = 0x1, ATTR_DIRECTORY = 0x10, ATTR_REPARSE = 0x400, ATTR_NORMAL = 0x80;
+    private const int FileBasicInformation = 4, FileStreamInfo = 7, FileDirectoryInformation = 1, FileDispositionInformation = 13;
+    private const int STATUS_NO_MORE_FILES = unchecked((int)0x80000006);
+
+    [StructLayout(LayoutKind.Sequential)] private struct UNICODE_STRING { public ushort Length, MaximumLength; public IntPtr Buffer; }
+    [StructLayout(LayoutKind.Sequential)] private struct OBJECT_ATTRIBUTES { public int Length; public IntPtr RootDirectory, ObjectName; public uint Attributes; public IntPtr SecurityDescriptor, SecurityQualityOfService; }
+    [StructLayout(LayoutKind.Sequential)] private struct IO_STATUS_BLOCK { public IntPtr Status; public UIntPtr Information; }
+    [StructLayout(LayoutKind.Sequential)] private struct FILETIME_NATIVE { public uint Low, High; }
+    [StructLayout(LayoutKind.Sequential)] private struct FILE_INFO
+    {
+        public uint FileAttributes; public FILETIME_NATIVE CreationTime, LastAccessTime, LastWriteTime;
+        public uint VolumeSerialNumber, FileSizeHigh, FileSizeLow, NumberOfLinks, FileIndexHigh, FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] private static extern SafeFileHandle CreateFileW(string path,uint access,uint share,IntPtr security,uint creation,uint flags,IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern bool GetFileInformationByHandle(SafeFileHandle handle,out FILE_INFO info);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] private static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle,StringBuilder buffer,uint length,uint flags);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle,int infoClass,IntPtr info,uint size);
+    [DllImport("ntdll.dll")] private static extern int NtCreateFile(out IntPtr handle,uint access,ref OBJECT_ATTRIBUTES attributes,out IO_STATUS_BLOCK io,IntPtr allocationSize,uint fileAttributes,uint share,uint disposition,uint options,IntPtr ea,uint eaLength);
+    [DllImport("ntdll.dll")] private static extern int NtQueryDirectoryFile(SafeFileHandle handle,IntPtr evt,IntPtr apc,IntPtr context,out IO_STATUS_BLOCK io,IntPtr info,uint length,int infoClass,bool single,IntPtr name,bool restart);
+    [DllImport("ntdll.dll")] private static extern int NtSetInformationFile(SafeFileHandle handle,out IO_STATUS_BLOCK io,IntPtr info,uint length,int infoClass);
+    [DllImport("ntdll.dll")] private static extern uint RtlNtStatusToDosError(int status);
+
+    internal static bool Remove(string installRoot,string leaf)
+    {
+        if(!IsExactTemporaryLeaf(leaf))throw new InvalidDataException("temporary leaf name");
+        string rootPath=Path.GetFullPath(installRoot).TrimEnd('\\');
+        SafeFileHandle root=null,state=null,fences=null,file=null;
+        try
+        {
+            root=OpenAbsoluteDirectory(rootPath);ValidateDirectory(root,rootPath);
+            state=OpenRelative(root,"state",LIST_DIRECTORY|READ_ATTRIBUTES|SYNCHRONIZE,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);
+            string statePath=Path.Combine(rootPath,"state");ValidateDirectory(state,statePath);
+            fences=OpenRelative(state,"product-cleanup-fences",LIST_DIRECTORY|READ_ATTRIBUTES|SYNCHRONIZE,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);
+            string fencesPath=Path.Combine(statePath,"product-cleanup-fences");ValidateDirectory(fences,fencesPath);
+            file=OpenRelative(fences,leaf,DELETE|READ_ATTRIBUTES|WRITE_ATTRIBUTES|SYNCHRONIZE,0,OPEN,NON_DIRECTORY);
+            string filePath=Path.Combine(fencesPath,leaf);FILE_INFO before=Info(file);ValidatePlain(before,file);if(!SamePath(FinalPath(file),filePath))throw new InvalidDataException("temporary path changed");
+            if((before.FileAttributes&ATTR_READONLY)!=0)
+            {
+                uint attributes=before.FileAttributes&~ATTR_READONLY;if(attributes==0)attributes=ATTR_NORMAL;
+                SetAttributes(file,attributes);
+            }
+            FILE_INFO prepared=Info(file);ValidatePlain(prepared,file);if(!SameIdentity(before,prepared)||!SamePath(FinalPath(file),filePath))throw new InvalidDataException("temporary identity changed");
+            SetDelete(file);FILE_INFO armed=Info(file);ValidateDeleteArmed(armed,file);if(!SameIdentity(before,armed)||!SamePath(FinalPath(file),filePath))throw new InvalidDataException("temporary identity changed after delete disposition");
+            file.Dispose();file=null;
+            foreach(string entry in Enumerate(fences))if(String.Equals(entry,leaf,StringComparison.OrdinalIgnoreCase))throw new IOException("temporary leaf remained after native delete");
+            return true;
+        }
+        finally
+        {
+            if(file!=null)file.Dispose();if(fences!=null)fences.Dispose();if(state!=null)state.Dispose();if(root!=null)root.Dispose();
+        }
+    }
+
+    private static bool IsExactTemporaryLeaf(string leaf)
+    {
+        if(leaf==null||leaf.Length!=42||!leaf.StartsWith(".ccod.",StringComparison.Ordinal)||!leaf.EndsWith(".tmp",StringComparison.Ordinal))return false;
+        for(int index=6;index<38;index++){char value=leaf[index];if(!((value>='0'&&value<='9')||(value>='a'&&value<='f')))return false;}return true;
+    }
+    private static SafeFileHandle OpenAbsoluteDirectory(string path){SafeFileHandle handle=CreateFileW(path,LIST_DIRECTORY|READ_ATTRIBUTES|SYNCHRONIZE,SHARE_READ|SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,FLAG_BACKUP|FLAG_REPARSE,IntPtr.Zero);if(handle.IsInvalid){int error=Marshal.GetLastWin32Error();handle.Dispose();throw new Win32Exception(error);}return handle;}
+    private static SafeFileHandle OpenRelative(SafeFileHandle parent,string name,uint access,uint share,uint disposition,uint options)
+    {
+        IntPtr nameBuffer=IntPtr.Zero,unicodePointer=IntPtr.Zero;bool added=false;
+        try
+        {
+            parent.DangerousAddRef(ref added);nameBuffer=Marshal.StringToHGlobalUni(name);
+            UNICODE_STRING unicode=new UNICODE_STRING{Length=(ushort)(name.Length*2),MaximumLength=(ushort)((name.Length+1)*2),Buffer=nameBuffer};
+            unicodePointer=Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));Marshal.StructureToPtr(unicode,unicodePointer,false);
+            OBJECT_ATTRIBUTES attributes=new OBJECT_ATTRIBUTES{Length=Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES)),RootDirectory=parent.DangerousGetHandle(),ObjectName=unicodePointer,Attributes=OBJ_CASE_INSENSITIVE};
+            IO_STATUS_BLOCK io;IntPtr raw;int status=NtCreateFile(out raw,access,ref attributes,out io,IntPtr.Zero,0,share,disposition,options|SYNC_IO|OPEN_REPARSE,IntPtr.Zero,0);
+            if(status<0)throw new Win32Exception((int)RtlNtStatusToDosError(status));return new SafeFileHandle(raw,true);
+        }
+        finally{if(unicodePointer!=IntPtr.Zero)Marshal.FreeHGlobal(unicodePointer);if(nameBuffer!=IntPtr.Zero)Marshal.FreeHGlobal(nameBuffer);if(added)parent.DangerousRelease();}
+    }
+    private static void ValidateDirectory(SafeFileHandle handle,string path){FILE_INFO info=Info(handle);if(!IsDirectory(info)||(info.FileAttributes&ATTR_REPARSE)!=0||!OnlyDefaultStream(handle)||!SamePath(FinalPath(handle),path))throw new InvalidDataException("directory identity");}
+    private static void ValidatePlain(FILE_INFO info,SafeFileHandle handle){bool streams=OnlyDefaultStream(handle);if(IsDirectory(info)||(info.FileAttributes&ATTR_REPARSE)!=0||info.NumberOfLinks!=1||!streams)throw new InvalidDataException("temporary leaf identity attributes="+info.FileAttributes+" links="+info.NumberOfLinks+" streams="+streams);}
+    private static void ValidateDeleteArmed(FILE_INFO info,SafeFileHandle handle){if(IsDirectory(info)||(info.FileAttributes&ATTR_REPARSE)!=0||info.NumberOfLinks>1||!OnlyDefaultStream(handle))throw new InvalidDataException("delete-armed temporary leaf identity");}
+    private static bool SameIdentity(FILE_INFO first,FILE_INFO second){return first.VolumeSerialNumber==second.VolumeSerialNumber&&first.FileIndexHigh==second.FileIndexHigh&&first.FileIndexLow==second.FileIndexLow;}
+    private static bool IsDirectory(FILE_INFO info){return(info.FileAttributes&ATTR_DIRECTORY)!=0;}
+    private static FILE_INFO Info(SafeFileHandle handle){FILE_INFO info;if(handle==null||handle.IsClosed||!GetFileInformationByHandle(handle,out info))throw new Win32Exception(Marshal.GetLastWin32Error());return info;}
+    private static void SetAttributes(SafeFileHandle handle,uint attributes){IntPtr buffer=Marshal.AllocHGlobal(40);try{for(int index=0;index<40;index++)Marshal.WriteByte(buffer,index,0);Marshal.WriteInt32(buffer,32,unchecked((int)attributes));IO_STATUS_BLOCK io;int status=NtSetInformationFile(handle,out io,buffer,40,FileBasicInformation);if(status<0)throw new Win32Exception((int)RtlNtStatusToDosError(status));}finally{Marshal.FreeHGlobal(buffer);}}
+    private static void SetDelete(SafeFileHandle handle){IntPtr buffer=Marshal.AllocHGlobal(1);try{Marshal.WriteByte(buffer,0,1);IO_STATUS_BLOCK io;int status=NtSetInformationFile(handle,out io,buffer,1,FileDispositionInformation);if(status<0)throw new Win32Exception((int)RtlNtStatusToDosError(status));}finally{Marshal.FreeHGlobal(buffer);}}
+    private static string FinalPath(SafeFileHandle handle){StringBuilder buffer=new StringBuilder(512);uint length=GetFinalPathNameByHandleW(handle,buffer,(uint)buffer.Capacity,0);if(length==0)throw new Win32Exception(Marshal.GetLastWin32Error());if(length>=buffer.Capacity){buffer.Capacity=(int)length+1;length=GetFinalPathNameByHandleW(handle,buffer,(uint)buffer.Capacity,0);if(length==0||length>=buffer.Capacity)throw new Win32Exception(Marshal.GetLastWin32Error());}string path=buffer.ToString();if(path.StartsWith(@"\\?\UNC\",StringComparison.OrdinalIgnoreCase))return@"\\"+path.Substring(8);if(path.StartsWith(@"\\?\",StringComparison.OrdinalIgnoreCase))return path.Substring(4);return path;}
+    private static bool SamePath(string first,string second){return String.Equals(Path.GetFullPath(first).TrimEnd('\\'),Path.GetFullPath(second).TrimEnd('\\'),StringComparison.OrdinalIgnoreCase);}
+    private static bool OnlyDefaultStream(SafeFileHandle handle){IntPtr buffer=Marshal.AllocHGlobal(65536);try{if(!GetFileInformationByHandleEx(handle,FileStreamInfo,buffer,65536)){int error=Marshal.GetLastWin32Error();if(error==38)return true;throw new Win32Exception(error);}int offset=0;while(true){uint next=(uint)Marshal.ReadInt32(buffer,offset),nameLength=(uint)Marshal.ReadInt32(buffer,offset+4);string name=Marshal.PtrToStringUni(IntPtr.Add(buffer,offset+24),(int)nameLength/2);if(!String.Equals(name,"::$DATA",StringComparison.OrdinalIgnoreCase)&&!String.Equals(name,"::$INDEX_ALLOCATION",StringComparison.OrdinalIgnoreCase))return false;if(next==0)break;offset+=(int)next;}return true;}finally{Marshal.FreeHGlobal(buffer);}}
+    private static string[] Enumerate(SafeFileHandle handle){List<string> result=new List<string>();IntPtr buffer=Marshal.AllocHGlobal(65536);bool restart=true;try{while(true){IO_STATUS_BLOCK io;int status=NtQueryDirectoryFile(handle,IntPtr.Zero,IntPtr.Zero,IntPtr.Zero,out io,buffer,65536,FileDirectoryInformation,false,IntPtr.Zero,restart);restart=false;if(status==STATUS_NO_MORE_FILES)break;if(status<0)throw new Win32Exception((int)RtlNtStatusToDosError(status));int offset=0;while(true){uint next=(uint)Marshal.ReadInt32(buffer,offset),nameLength=(uint)Marshal.ReadInt32(buffer,offset+60);string name=Marshal.PtrToStringUni(IntPtr.Add(buffer,offset+64),(int)nameLength/2);if(name!="."&&name!="..")result.Add(name);if(next==0)break;offset+=(int)next;}}return result.ToArray();}finally{Marshal.FreeHGlobal(buffer);}}
+}
+'@
+        $marker = 'CcodProductCleanupOrphanCapabilityMarkerV1' -as [type]
+    }
+    if ($null -eq $marker -or [int]$marker.GetProperty('CapabilityAbi').GetValue($null,$null) -ne 1) {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup orphan runtime ABI is unavailable' $null
+    }
+    $script:CcodProductCleanupOrphanRuntimeType = $marker.Assembly.GetType('CcodProductCleanupOrphanRuntimeV1',$true)
+}
+
+function Remove-CcodLifecycleProductCleanupOrphanTemporary {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][string]$Leaf)
+    [void](Assert-CcodLifecycleProductCleanupLease)
+    $root = Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
+    if ($Leaf -cnotmatch '^\.ccod\.[0-9a-f]{32}\.tmp$') {
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup orphan temporary name is not exact' $Leaf
+    }
+    try {
+        Initialize-CcodLifecycleProductCleanupOrphanRuntime
+        $method = $script:CcodProductCleanupOrphanRuntimeType.GetMethod('Remove',[Reflection.BindingFlags]'NonPublic,Static')
+        $arguments = [object[]]@([string]$root,[string]$Leaf)
+        if ($null -eq $method -or -not [bool]$method.Invoke($null,$arguments)) { throw 'native orphan cleanup did not prove deletion' }
+        [void](Assert-CcodLifecycleProductCleanupLease)
+    } catch {
+        $exception = $_.Exception
+        while ($exception -is [Reflection.TargetInvocationException] -and $null -ne $exception.InnerException) { $exception = $exception.InnerException }
+        Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Exact product cleanup orphan temporary could not be removed safely' $Leaf
+    }
+    return $true
+}
+
 function Read-CcodLifecycleProductCleanupFenceHistory {
     param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$ReadyTransaction)
+    [void](Assert-CcodLifecycleProductCleanupLease)
     $root = Get-CcodLifecycleCanonicalRoot -Path $InstallRoot -Kind 'Install root'
     $directory = Join-Path $root 'state\product-cleanup-fences'
     if (-not [IO.Directory]::Exists($directory)) {
@@ -223,9 +366,21 @@ function Read-CcodLifecycleProductCleanupFenceHistory {
     }
     try { [void](Assert-CcodLifecycleInstallTreeSafe -InstallRoot $root -Path $directory) }
     catch { Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence plane is unsafe' $directory }
-    $entries = [Collections.Generic.List[object]]::new()
     $files = @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)
     if ($files.Count -gt 4096) { Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence plane exceeds its bounded history' $directory }
+    $orphanLeaves = [Collections.Generic.List[string]]::new()
+    foreach ($file in $files) {
+        if (-not $file.PSIsContainer -and $file.Name -cmatch '^\.ccod\.[0-9a-f]{32}\.tmp$') { $orphanLeaves.Add($file.Name); continue }
+        if ($file.PSIsContainer -or $file.Name -cnotmatch '^\d{20}\.(?:Pending|Completed)\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$') {
+            Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence plane contains an unknown object' $file.FullName
+        }
+    }
+    foreach ($leaf in $orphanLeaves) { [void](Remove-CcodLifecycleProductCleanupOrphanTemporary -InstallRoot $root -Leaf $leaf) }
+    if ($orphanLeaves.Count -gt 0) {
+        $files = @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)
+        if ($files.Count -gt 4096) { Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence plane exceeds its bounded history' $directory }
+    }
+    $entries = [Collections.Generic.List[object]]::new()
     foreach ($file in $files) {
         if ($file.PSIsContainer -or $file.Name -cnotmatch '^(?<attempt>\d{20})\.(?<state>Pending|Completed)\.(?<transaction>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.json$') {
             Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product cleanup fence plane contains an unknown object' $file.FullName
@@ -391,6 +546,12 @@ function Invoke-CcodLifecycleProductTransactionClose {
     & $CloseProductTransaction $Transaction $defaultClose
 }
 
+function Invoke-CcodLifecycleUnboundProductTransactionAbort {
+    param([Parameter(Mandatory)]$Transaction)
+    $fileModule = Get-CcodLifecycleInstallFileTransactionModule
+    &$fileModule {param($Value)Close-CcodInstallFileTransaction -Transaction $Value -Disposition Failed} $Transaction
+}
+
 function Test-CcodLifecycleProductCleanupOwnerAlive {
     param([Parameter(Mandatory)]$OwnerIdentity)
     $process = $null
@@ -436,15 +597,22 @@ function Resolve-CcodLifecycleProductCleanupFence {
             if ($entry.CloseProductTransaction -isnot [scriptblock] -or $entry.DefaultClose -isnot [scriptblock]) {
                 Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Pending product cleanup capability is invalid' $root
             }
+            $fenceBound = $null -ne $entry.PSObject.Properties['FenceBound'] -and $entry.FenceBound -is [bool] -and [bool]$entry.FenceBound
+            if ($null -ne $entry.Transaction -and -not $fenceBound) {
+                try { Invoke-CcodLifecycleUnboundProductTransactionAbort -Transaction $entry.Transaction; $entry.Transaction=$null }
+                catch { Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Unbound product transaction abort remains retryable' $root }
+            }
             if ($null -eq $entry.Transaction) {
                 $fileModule = Get-CcodLifecycleInstallFileTransactionModule
                 try {
                     $entry.Transaction = &$fileModule {param($Root,$Record)Open-CcodInstallProductRegistrationTransaction -InstallRoot $Root -ReadyTransaction $Record} $root $ReadyTransaction
+                    if ($null -eq $entry.PSObject.Properties['FenceBound']) { $entry | Add-Member -NotePropertyName FenceBound -NotePropertyValue $false }
+                    else { $entry.FenceBound = $false }
                     [void](&$fileModule {param($Transaction,$Fence)Set-CcodInstallProductCleanupFence -Transaction $Transaction -Fence $Fence} $entry.Transaction $entry.Fence)
+                    $entry.FenceBound = $true
                 } catch {
                     if ($null -ne $entry.Transaction) {
-                        try { &$fileModule {param($Transaction)Close-CcodInstallFileTransaction -Transaction $Transaction -Disposition Failed} $entry.Transaction } catch { }
-                        $entry.Transaction = $null
+                        try { Invoke-CcodLifecycleUnboundProductTransactionAbort -Transaction $entry.Transaction; $entry.Transaction = $null } catch { }
                     }
                     Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Pending product cleanup could not open fresh strict authority' $root
                 }
@@ -2431,14 +2599,16 @@ function Get-CcodLifecycleAdapters {
                     DefaultClose=$defaultClose
                     CloseProductTransaction=$CloseProductTransaction
                     OwnerManagedThreadId=[Threading.Thread]::CurrentThread.ManagedThreadId
+                    FenceBound=$false
                     CloseCompleted=$false
                 }
                 $script:CcodPendingProductTransactionCleanups[$cleanupKey]=$cleanupEntry
                 $operationFailure=$null;$closeFailure=$null;$completionFailure=$null;$receiptResult=$null
                 try{
                     $ownedTransaction=&$fileModule {param($Root,$Record)Open-CcodInstallProductRegistrationTransaction -InstallRoot $Root -ReadyTransaction $Record} $InstallRoot $TransactionRecord
-                    $cleanupEntry.Transaction=$ownedTransaction;$cleanupEntry.CloseCompleted=$false
+                    $cleanupEntry.Transaction=$ownedTransaction;$cleanupEntry.FenceBound=$false;$cleanupEntry.CloseCompleted=$false
                     [void](&$fileModule {param($Transaction,$Fence)Set-CcodInstallProductCleanupFence -Transaction $Transaction -Fence $Fence} $ownedTransaction $fence)
+                    $cleanupEntry.FenceBound=$true
                     $sourceCapability=&$fileModule {param($Root,$Id,$Manifest,$Transaction)Open-CcodInstallRetainedGeneration -InstallRoot $Root -RuntimeId $Id -ExpectedManifestSha256 $Manifest -FileTransaction $Transaction} $InstallRoot $RuntimeId ([string]$TransactionRecord.newManifestSha256) $ownedTransaction
                     $registration=New-CcodProductRegistration -InstallRoot $InstallRoot -RuntimeId $RuntimeId -Version $Version -PackageSha256 $PackageSha256 -FileTransaction $sourceCapability
                     $system=[Environment]::GetFolderPath([Environment+SpecialFolder]::System);$proof=[pscustomobject][ordered]@{phase=[string]$TransactionRecord.phase;runtimeId=$RuntimeId;version=$Version;packageSha256=$PackageSha256;runtimeGeneration=[uint64]$TransactionRecord.newGeneration;manifestSha256=[string]$TransactionRecord.newManifestSha256;startMenuSha256=(Get-CcodLifecycleFileSha256 $registration.startMenuShortcut.candidatePath);desktopSha256=(Get-CcodLifecycleFileSha256 $registration.desktopShortcut.candidatePath);targetPath=[IO.Path]::GetFullPath((Join-Path $system 'schtasks.exe'));arguments='/Run /TN "Codex Control Other Devices Supervisor"';transactionRecord=$TransactionRecord;bootstrapPath=$registration.bootstrapPath;uninstallerPath=$registration.uninstallerPath}
@@ -2449,7 +2619,11 @@ function Get-CcodLifecycleAdapters {
                 }catch{$operationFailure=$_}
                 finally{
                     if(-not$cleanupEntry.CloseCompleted-and$null-ne$cleanupEntry.Transaction){
-                        try{Invoke-CcodLifecycleProductTransactionClose -Transaction $cleanupEntry.Transaction -CloseProductTransaction $cleanupEntry.CloseProductTransaction -DefaultClose $cleanupEntry.DefaultClose;$cleanupEntry.CloseCompleted=$true}catch{$closeFailure=$_}
+                        if($cleanupEntry.FenceBound){
+                            try{Invoke-CcodLifecycleProductTransactionClose -Transaction $cleanupEntry.Transaction -CloseProductTransaction $cleanupEntry.CloseProductTransaction -DefaultClose $cleanupEntry.DefaultClose;$cleanupEntry.CloseCompleted=$true}catch{$closeFailure=$_}
+                        }else{
+                            try{Invoke-CcodLifecycleUnboundProductTransactionAbort -Transaction $cleanupEntry.Transaction;$cleanupEntry.Transaction=$null}catch{$closeFailure=$_}
+                        }
                     }
                     if($cleanupEntry.CloseCompleted){
                         try{[void](Complete-CcodLifecycleProductCleanupFence -Fence $cleanupEntry.Fence -Outcome Completed);[void]$script:CcodPendingProductTransactionCleanups.Remove($cleanupKey)}catch{$completionFailure=$_}
@@ -2905,9 +3079,15 @@ function Invoke-CcodInstall {
     $installLease = $null
     $shutdownGate = $null
     $lifecycleOwnership = $null
+    $upgradeProductCleanupLease = $null
     $previousProtectionStopped = $false
     $fileTransaction=$null;$generationCapability=$null;$installRecord=$null;$readyReceiptCommitted=$false;$productRegistrationVerified=$false;$productRegistrationFailure=$null
     try {
+        if($upgrade){
+            if($adapters.CloseProductTransaction-isnot[scriptblock]){Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product transaction close adapter is invalid before upgrade' $root}
+            $upgradeProductCleanupLease=Enter-CcodLifecycleProductCleanupLease
+            [void](Resolve-CcodLifecycleProductCleanupFence -InstallRoot $root -ReadyTransaction $globalTransaction -CurrentIdentity $upgradeProductCleanupLease.OwnerIdentity -CloseProductTransaction $adapters.CloseProductTransaction)
+        }
         $runtimeId=New-CcodUniqueRuntimeId -ProjectVersion $projectVersion -Files $files;$generation=New-CcodLifecycleImmutableGeneration -InstallRoot $root -RuntimeId $runtimeId -ProjectVersion $projectVersion -Files $files;$fileTransaction=$generation.FileTransaction;$generationCapability=$generation.Generation;$runtimeRoot=$generation.RuntimeRoot;$runtimeCreated=$true
         $newGeneration=if($null-eq$existingPointer){[uint64]1}else{[uint64]$existingPointer.generation+1};$installRecord=New-CcodInstallTransactionRecord -TransactionId ([guid]::NewGuid().ToString('D')) -OldRuntimeId $(if($upgrade){$existingPointer.activeRuntime}else{$null}) -OldGeneration $(if($upgrade){$existingPointer.generation}else{$null}) -OldManifestSha256 $oldManifestSha256 -NewRuntimeId $runtimeId -NewGeneration $newGeneration -NewManifestSha256 $generation.ManifestSha256 -SealedPackageSha256 $SealedPackageSha256 -OwnedObjectNames @($runtimeId)
         Write-CcodInstallTransactionRecord -InstallRoot $root -TransactionRecord $installRecord -FileTransaction $fileTransaction|Out-Null
@@ -2981,6 +3161,10 @@ function Invoke-CcodInstall {
                 Throw-CcodLifecycleError 'CCOD_INSTALL_LIFECYCLE_RELEASE_FAILED' 'Installation lease could not be released before scheduled-task bootstrap' $null
             }
             $installLease = $null
+        }
+        if($null-ne$upgradeProductCleanupLease){
+            [void](Exit-CcodLifecycleProductCleanupLease -Context $upgradeProductCleanupLease)
+            $upgradeProductCleanupLease=$null
         }
         $taskStartedAt = & $adapters.UtcNow
         try { & $adapters.StartSupervisorTask }
@@ -3085,11 +3269,14 @@ function Invoke-CcodInstall {
         if ($null -ne $shutdownGate) {
             try { & $adapters.CloseSupervisorShutdownGate $shutdownGate } catch { }
         }
+        if ($null -ne $lifecycleOwnership -and -not $lifecycleOwnership.released) {
+            try { & $adapters.ExitLifecycleOwnership $lifecycleOwnership | Out-Null } catch { }
+        }
         if ($null -ne $installLease -and $installLease.Outcome -ceq 'Acquired') {
             try { [void](& $adapters.ExitInstallLease $installLease) } catch { }
         }
-        if ($null -ne $lifecycleOwnership -and -not $lifecycleOwnership.released) {
-            try { & $adapters.ExitLifecycleOwnership $lifecycleOwnership | Out-Null } catch { }
+        if($null-ne$upgradeProductCleanupLease){
+            try{[void](Exit-CcodLifecycleProductCleanupLease -Context $upgradeProductCleanupLease)}catch{}
         }
         if($null-ne$fileTransaction){try{Close-CcodInstallFileTransaction -Transaction $fileTransaction -Disposition $(if($null-ne$installRecord-and$installRecord.phase-ceq'Ready'){'Ready'}else{'Failed'})}catch{}}
         if(-not[string]::IsNullOrWhiteSpace($productShortcutTemporaryRoot)-and(Test-Path -LiteralPath $productShortcutTemporaryRoot)){try{Remove-Item -LiteralPath $productShortcutTemporaryRoot -Recurse -Force -ErrorAction Stop}catch{}}
