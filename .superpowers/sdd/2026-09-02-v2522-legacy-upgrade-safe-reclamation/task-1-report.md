@@ -7,6 +7,8 @@ Task 1 已在隔离 worktree
 实现并通过要求的 focused tests。实现提交为
 `5114a09953e2566b1127788ffbad115c11ae072f`（`fix: bridge legacy lifecycle upgrade`），
 基线为 `2aef5ff2a74219a82e98fe26c2f8170a5232a280`。
+review fix round 1 实现提交为
+`52d3962b9bc91c91350317a148a145efdc9aa0c9`（`fix: resume failed legacy migration`）。
 
 本报告不声称 Task 2/Task 3、整分支验收或 release readiness 已完成。
 
@@ -40,7 +42,7 @@ Get-CcodLegacyUpgradeCompatibilityContext
   -GlobalTransaction
 ```
 
-它只返回两种 `Kind`：
+初始实现返回两种 `Kind`；fix round 1 增加第三种严格恢复分类：
 
 - `CurrentReady`：append-only selector 与 transaction plane 均存在；selected pointer、
   valid current manifest、manifest SHA-256 和 canonical terminal Ready transaction 的
@@ -50,6 +52,9 @@ Get-CcodLegacyUpgradeCompatibilityContext
   通过 contained path、non-reparse、no-ADS、single-link 和 hash/file-set 校验；current
   validator 的唯一失败是 `CCOD_RUNTIME_ID_MISMATCH`；随后使用历史算法复算并精确得到
   v2.5.21 两段式 runtime ID。只有此分支跳过不存在的旧 Ready cleanup resolver。
+- `LegacyMigrationRetry`：只接受一个已到 `RuntimePromoted` 的严格 v2.5.22 Failed
+  transaction、仍完整有效的 failed runtime/manifest/package、无 cleanup fence，以及下列一个
+  canonical selector profile。此分支复用 retained failed runtime，不创建另一个 runtime tree。
 
 在真实 legacy upgrade 中，同一个 opaque file transaction 先打开 manifest-bound retained
 legacy generation，并发布 generation-one selector genesis；普通新 runtime pointer 随后以
@@ -139,3 +144,74 @@ generation/history ambiguity、current-format lookalike、wrong manifest version
 - Task 2 的 exact historical product-registration profile 迁移尚未实现；Task 1 测试只用适配器
   证明 lifecycle/Ready/rollback 边界。
 - 尚待独立 reviewer 对本提交做 Task 1 scoped review；本报告不替代该门禁。
+
+## Fix round 1：Failed legacy migration 可精确重试
+
+### Review finding 与裁定
+
+第一次 true-legacy migration 在 Ready 前失败后，原分类器只接受 `CurrentReady` 或三个新 plane
+全缺失的 `ProvenLegacyWithoutReady`。因此第二次完全相同的升级会在 staging 前返回
+`CCOD_INSTALL_UPGRADE_SOURCE_INVALID`，即使失败 runtime 已经完整 sealed 且旧 runtime 已恢复。
+
+本轮接受两个、且仅两个 selector profile：
+
+- pre-pointer：latest selector 是 generation 1 legacy；重试复用原 Failed transaction 的
+  `newRuntimeId`，提交 selector/Ready generation 2；
+- post-pointer compensated：完整 selector chain 必须是
+  `1 legacy -> 2 failed-new -> 3 legacy`；重试追加 generation 4 指向同一 failed-new runtime，
+  Ready transaction 使用 generation 4。旧 selector records 不删除、不改写。
+
+### RED
+
+在现有 pre-pointer 与 post-pointer failure tests 中移除 transient failure 后立即执行第二次真实
+`Invoke-CcodInstall`。两者最初均 exit 1：
+
+```text
+CCOD_SELFTEST_FAILED case=real-v2.5.21-upgrade-failure-before-new-pointer-commit-keeps-the-legacy-selector-active-and-restarts-it error=CCOD_INSTALL_UPGRADE_SOURCE_INVALID
+CCOD_SELFTEST_FAILED case=real-v2.5.21-upgrade-failure-before-new-Ready-restarts-the-retained-legacy-runtime error=CCOD_INSTALL_UPGRADE_SOURCE_INVALID
+```
+
+自审另加入 premature-Failed RED：把 transaction chain 缩短为
+`Prepared -> PackageVerified -> Failed`，但保留 selector/runtime。旧实现错误接受并成功重试：
+
+```text
+ASSERT_EQUAL: Failed chain without RuntimePromoted evidence fails through the retry compatibility boundary expected=[CCOD_INSTALL_UPGRADE_SOURCE_INVALID] actual=[]
+```
+
+根因是原 retry 分类只绑定 Failed head、selector 和 manifest，没有证明第一次尝试已经完成
+runtime promotion 与 immutable initialization。修复要求 chain 包含 `RuntimePromoted`，并交叉要求
+pre-pointer profile 不得包含 `PointerCommitted`、post-pointer compensated profile 必须包含
+`PointerCommitted`。
+
+### 实现边界
+
+- `LegacyMigrationRetry` 重新验证 raw legacy `active.json`、v2.5.21 historical manifest/hash、
+  transaction store 中唯一 transaction ID、Failed immutable identity、current v2.5.22 failed
+  runtime manifest/hash、exact source file records、sealed package SHA-256 和 selector chain。
+- IFT ABI 从 V4 升为 V5，增加私有 migration-retry transaction capability。它只能在 `state`
+  子树写 create-only records、打开一个 manifest-bound retained generation、并通过该 retained
+  capability append pointer；不能创建 generation、copy payload、写 manifest、retire generation
+  或进入 product special-folder surface。公共 export surface 未扩大。
+- Failed 是 terminal，因此 retry 使用新的 transaction ID，但复用原 sealed runtime。新 Ready
+  transaction 的 generation 与新 append pointer 精确一致。
+- 负例覆盖：legacy manifest identity drift、Failed `newGeneration` drift、foreign terminal chain、
+  缺少 `RuntimePromoted`、cleanup fence plane、unexpected selector generation、failed runtime
+  manifest bytes drift、different sealed package identity。全部在 runtime/pointer/transaction/task
+  新 mutation 前失败。
+
+### 最终 GREEN（fix round 1）
+
+- `InstallLifecycle.SelfTest.ps1`：148/148，exit 0。
+- `InstalledLifecycleHarness.SelfTest.ps1`：21/21，exit 0。
+- `RuntimeManifest.SelfTest.ps1`：21/21，exit 0。
+- `InstallFileTransaction.SelfTest.ps1`：36/36，exit 0。
+- 四个修改 PowerShell 文件 parser：0 errors。
+- `git diff --check`：exit 0。
+
+一次候选 final run 曾返回 `CCOD_INSTALL_TRANSACTION_INVALID`：私有 opener 用强制 re-import
+创建了另一个 IFT module instance，而后续 exported commands 仍绑定旧 instance 的 capability
+table。最终实现从同一个 canonical module instance 调用私有 opener；修复后的 Lifecycle
+148/148 与 IFT 36/36 均重新运行通过。
+
+本轮仍只使用 GUID 临时目录、fake/adapters 和子进程测试；没有执行真实 installer、registry、
+shortcut、scheduled task、产品进程、网络、安装、重启、push、tag 或 release 操作。
