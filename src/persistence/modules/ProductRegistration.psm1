@@ -9,16 +9,10 @@ $script:CcodProductFields = @(
 )
 $script:CcodShortcutFields = @('kind','leaf','relativePath','candidatePath','bootstrapPath','installRoot')
 $script:CcodReadyFields = @('phase','runtimeId','version','packageSha256','runtimeGeneration','manifestSha256','startMenuSha256','desktopSha256','targetPath','arguments','transactionRecord','bootstrapPath','uninstallerPath')
-$script:CcodLegacyShortcutNames = @(
-    'Programs\Codex Control other devices\Codex Control other devices for Windows.lnk',
-    'Programs\Codex Control other devices\Open the tray supervisor.lnk',
-    'Programs\Codex Control other devices\Compatibility check.lnk',
-    'Programs\Codex Control other devices\Uninstall Codex Control other devices.lnk',
-    'Programs\Codex Control other devices\CodexRemote-fix.lnk',
-    'Programs\Codex Control other devices\CodexRemote-fix compatibility check.lnk',
-    'Programs\Codex Control other devices\Uninstall CodexRemote-fix.lnk',
-    ('Desktop\Codex ' + [char]0x8BBE + [char]0x5907 + [char]0x8FDE + [char]0x63A5 + ' (Device Connection).lnk')
-)
+$script:CcodLegacyRegistrationFields = @('appId','displayVersion','installLocation','uninstallString','shortcutNames','unsafeShortcutNames')
+$script:CcodLegacyProfileFields = @('profileId','appId','minimumVersion','maximumVersion','uninstallCommandShape','shortcutNames')
+$script:CcodVerifiedRegistrationFields = @('verified','runtimeId','version','packageSha256','shortcutNames','startMenuSha256','desktopSha256')
+$script:CcodCurrentShortcutNames = @('Programs\CodexRemote-fix\CodexRemote-fix.lnk','Desktop\CodexRemote-fix.lnk')
 $script:CcodLegacyRegistryValueNames=@('DisplayName','DisplayVersion','UninstallString','QuietUninstallString','DisplayIcon','InstallLocation','Publisher','URLInfoAbout','HelpLink','URLUpdateInfo','NoModify','NoRepair','InstallDate','MajorVersion','MinorVersion','VersionMajor','VersionMinor','EstimatedSize','Language','Inno Setup: App Path','Inno Setup: Icon Group','Inno Setup: Setup Version','Inno Setup: User')
 
 function Throw-CcodProductRegistrationError {
@@ -36,6 +30,90 @@ function Test-CcodProductExactProperties {
         if ($properties[$index].Name -cne $Names[$index]) { return $false }
     }
     return $true
+}
+
+function Test-CcodProductExactStringSet {
+    param($Values,$ExpectedValues)
+    $actual=@($Values);$expected=@($ExpectedValues)
+    if($actual.Count-ne$expected.Count){return $false}
+    $set=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach($value in $actual){if($value-isnot[string]-or[string]::IsNullOrWhiteSpace([string]$value)-or-not$set.Add([string]$value)){return $false}}
+    foreach($value in $expected){if($value-isnot[string]-or-not$set.Contains([string]$value)){return $false}}
+    return $true
+}
+
+function Get-CcodLegacyRegistrationProfiles {
+    [CmdletBinding()]
+    param()
+    $oldStartMenu=@(
+        'Programs\Codex Control other devices\Codex Control other devices for Windows.lnk',
+        'Programs\Codex Control other devices\Open the tray supervisor.lnk',
+        'Programs\Codex Control other devices\Compatibility check.lnk',
+        'Programs\Codex Control other devices\Uninstall Codex Control other devices.lnk'
+    )
+    $oldDesktop='Desktop\Codex '+[char]0x8BBE+[char]0x5907+[char]0x8FDE+[char]0x63A5+' (Device Connection).lnk'
+    $rebranded=@(
+        'Programs\CodexRemote-fix\CodexRemote-fix.lnk',
+        'Programs\CodexRemote-fix\CodexRemote-fix compatibility check.lnk',
+        'Programs\CodexRemote-fix\Uninstall CodexRemote-fix.lnk',
+        'Desktop\CodexRemote-fix.lnk'
+    )
+    return @(
+        [pscustomobject][ordered]@{profileId='CodexControlOtherDevicesInitial';appId=$script:CcodProductAppId;minimumVersion='2.1.0';maximumVersion='2.1.0';uninstallCommandShape='"{installLocation}\unins000.exe"';shortcutNames=@($oldStartMenu)},
+        [pscustomobject][ordered]@{profileId='CodexControlOtherDevicesDesktop';appId=$script:CcodProductAppId;minimumVersion='2.1.1';maximumVersion='2.1.6';uninstallCommandShape='"{installLocation}\unins000.exe"';shortcutNames=@($oldStartMenu)+@($oldDesktop)},
+        [pscustomobject][ordered]@{profileId='CodexRemoteFix';appId=$script:CcodProductAppId;minimumVersion='2.2.0';maximumVersion='2.5.21';uninstallCommandShape='"{installLocation}\unins000.exe"';shortcutNames=@($rebranded)}
+    )
+}
+
+function Resolve-CcodLegacyRegistrationProfile {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$LegacyRegistration)
+    if(-not(Test-CcodProductExactProperties $LegacyRegistration $script:CcodLegacyRegistrationFields)-or
+       $LegacyRegistration.appId-isnot[string]-or[string]$LegacyRegistration.appId-cne$script:CcodProductAppId-or
+       $LegacyRegistration.displayVersion-isnot[string]-or[string]$LegacyRegistration.displayVersion-cnotmatch'^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$'-or
+       $LegacyRegistration.installLocation-isnot[string]-or-not[IO.Path]::IsPathRooted([string]$LegacyRegistration.installLocation)-or
+       $LegacyRegistration.uninstallString-isnot[string]-or$null-eq$LegacyRegistration.shortcutNames-or$null-eq$LegacyRegistration.unsafeShortcutNames-or
+       @($LegacyRegistration.unsafeShortcutNames).Count-ne0){
+        Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy product registration evidence is incomplete or unsafe.' $LegacyRegistration
+    }
+    try{$installLocation=[IO.Path]::GetFullPath([string]$LegacyRegistration.installLocation).TrimEnd('\');$version=[version]::Parse([string]$LegacyRegistration.displayVersion)}catch{
+        Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy product registration paths or version are invalid.' $LegacyRegistration
+    }
+    if([string]::IsNullOrWhiteSpace($installLocation)-or[string]$LegacyRegistration.installLocation.TrimEnd('\')-cne$installLocation){
+        Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy installer location is not canonical.' $LegacyRegistration.installLocation
+    }
+    $matches=[Collections.Generic.List[object]]::new()
+    foreach($profile in @(Get-CcodLegacyRegistrationProfiles)){
+        if(-not(Test-CcodProductExactProperties $profile $script:CcodLegacyProfileFields)){continue}
+        $minimum=[version]::Parse([string]$profile.minimumVersion);$maximum=[version]::Parse([string]$profile.maximumVersion)
+        $expectedUninstall=[string]$profile.uninstallCommandShape.Replace('{installLocation}',$installLocation)
+        if([string]$profile.appId-ceq[string]$LegacyRegistration.appId-and$version-ge$minimum-and$version-le$maximum-and
+           [string]$LegacyRegistration.uninstallString-ceq$expectedUninstall-and
+           (Test-CcodProductExactStringSet $LegacyRegistration.shortcutNames $profile.shortcutNames)){$matches.Add($profile)}
+    }
+    if($matches.Count-ne1){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy product entry does not match one complete historical installer profile.' $LegacyRegistration}
+    return $matches[0]
+}
+
+function Test-CcodCurrentVerifiedRegistration {
+    param($Proof)
+    return (Test-CcodProductExactProperties $Proof $script:CcodVerifiedRegistrationFields) -and
+        $Proof.verified-is[bool] -and [bool]$Proof.verified -and
+        $Proof.runtimeId-is[string] -and [string]$Proof.runtimeId-cmatch'^2\.5\.22-[0-9a-f]{16}-[0-9a-f]{32}$' -and
+        $Proof.version-is[string] -and [string]$Proof.version-ceq$script:CcodProductVersion -and
+        $Proof.packageSha256-is[string] -and [string]$Proof.packageSha256-cmatch'^[0-9a-f]{64}$' -and
+        $Proof.startMenuSha256-is[string] -and [string]$Proof.startMenuSha256-cmatch'^[0-9a-f]{64}$' -and
+        $Proof.desktopSha256-is[string] -and [string]$Proof.desktopSha256-cmatch'^[0-9a-f]{64}$' -and
+        (Test-CcodProductExactStringSet $Proof.shortcutNames $script:CcodCurrentShortcutNames)
+}
+
+function Test-CcodCurrentVerifiedRegistrationUnchanged {
+    param($Before,$After)
+    return (Test-CcodCurrentVerifiedRegistration $Before) -and (Test-CcodCurrentVerifiedRegistration $After) -and
+        [string]$Before.runtimeId-ceq[string]$After.runtimeId -and [string]$Before.version-ceq[string]$After.version -and
+        [string]$Before.packageSha256-ceq[string]$After.packageSha256 -and
+        [string]$Before.startMenuSha256-ceq[string]$After.startMenuSha256 -and [string]$Before.desktopSha256-ceq[string]$After.desktopSha256 -and
+        (Test-CcodProductExactStringSet $Before.shortcutNames $After.shortcutNames)
 }
 
 function Get-CcodProductFullPath {
@@ -143,7 +221,7 @@ function Get-CcodProductRegistrationAdapters {
         RemoveLegacyRegistration = { param($ExpectedAppId,$ExpectedShortcutNames) Remove-CcodCurrentUserLegacyRegistration -ExpectedAppId $ExpectedAppId -ExpectedShortcutNames $ExpectedShortcutNames }
         ReadCurrentProductState = { param($ExpectedRuntimeId) Read-CcodCurrentProductState -ExpectedRuntimeId $ExpectedRuntimeId }
         RemoveCurrentProductEntry = { param($Entry) Remove-CcodCurrentProductEntry -Entry $Entry }
-        ReadLegacySnapshot = { param($ExpectedAppId) Read-CcodLegacySnapshot -ExpectedAppId $ExpectedAppId }
+        ReadLegacySnapshot = { param($ExpectedAppId,$ExpectedProfile) Read-CcodLegacySnapshot -ExpectedAppId $ExpectedAppId -ExpectedProfile $ExpectedProfile }
         RemoveLegacyEntry = { param($Entry) Remove-CcodLegacySnapshotEntry -Entry $Entry }
         ReadLegacyEntry = { param($Entry) Read-CcodLegacySnapshotEntry -Entry $Entry }
         RestoreLegacyEntry = { param($Entry) Restore-CcodLegacySnapshotEntry -Entry $Entry }
@@ -219,20 +297,67 @@ function Read-CcodCurrentUserProductShortcut {
     $item=Get-Item -LiteralPath $destination -Force -ErrorAction Stop;if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0-or(Get-CcodProductFileSha256 $destination)-cne(Get-CcodProductFileSha256 $source)){return $null}
     $Shortcut
 }
+function Get-CcodLegacyShortcutPath {
+    param([Parameter(Mandatory)][string]$RelativeName)
+    if($RelativeName.StartsWith('Programs\',[StringComparison]::Ordinal)){$base=[Environment]::GetFolderPath([Environment+SpecialFolder]::Programs);$relative=$RelativeName.Substring(9)}
+    elseif($RelativeName.StartsWith('Desktop\',[StringComparison]::Ordinal)){$base=[Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop);$relative=$RelativeName.Substring(8)}
+    else{Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy shortcut name is outside the supported special folders.' $RelativeName}
+    if([string]::IsNullOrWhiteSpace($base)-or-not[IO.Path]::IsPathRooted($base)-or[string]::IsNullOrWhiteSpace($relative)){
+        Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy shortcut special-folder path is invalid.' $RelativeName
+    }
+    return [IO.Path]::GetFullPath((Join-Path $base $relative))
+}
+
 function Read-CcodCurrentUserLegacyRegistration {
     param([string]$ExpectedAppId)
     $path=Get-CcodLegacyRegistryPath $ExpectedAppId;if(-not(Test-Path -LiteralPath $path -PathType Container)){return $null}
-    $value=Get-ItemProperty -LiteralPath $path -ErrorAction Stop;$present=[Collections.Generic.List[string]]::new()
+    $value=Get-ItemProperty -LiteralPath $path -ErrorAction Stop
     $programs=[Environment]::GetFolderPath([Environment+SpecialFolder]::Programs);$desktop=[Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)
-    foreach($name in $script:CcodLegacyShortcutNames){$relative=$name.Substring($name.IndexOf('\')+1);$candidate=if($name.StartsWith('Programs\',[StringComparison]::Ordinal)){Join-Path $programs $relative}else{Join-Path $desktop $relative};if(Test-Path -LiteralPath $candidate -PathType Leaf){$present.Add($name)}}
-    [pscustomobject]@{appId=$ExpectedAppId;uninstallString=[string]$value.UninstallString;shortcutNames=@($present)}
+    if([string]::IsNullOrWhiteSpace($programs)-or-not[IO.Path]::IsPathRooted($programs)-or[string]::IsNullOrWhiteSpace($desktop)-or-not[IO.Path]::IsPathRooted($desktop)){
+        Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy shortcut special folders are unavailable.' $ExpectedAppId
+    }
+    $groups=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal);$desktopNames=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach($profile in @(Get-CcodLegacyRegistrationProfiles)){
+        foreach($name in @($profile.shortcutNames)){
+            if($name.StartsWith('Programs\',[StringComparison]::Ordinal)){$tail=$name.Substring(9);$separator=$tail.IndexOf('\');if($separator-lt1){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Historical Start-menu profile is invalid.' $name};[void]$groups.Add($tail.Substring(0,$separator))}
+            elseif($name.StartsWith('Desktop\',[StringComparison]::Ordinal)){[void]$desktopNames.Add($name.Substring(8))}
+            else{Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Historical shortcut profile is invalid.' $name}
+        }
+    }
+    $present=[Collections.Generic.List[string]]::new();$unsafe=[Collections.Generic.List[string]]::new()
+    foreach($group in @($groups|Sort-Object)){
+        $groupPath=Join-Path $programs $group;$groupItem=Get-Item -LiteralPath $groupPath -Force -ErrorAction SilentlyContinue
+        if($null-eq$groupItem){continue}
+        $groupName='Programs\'+[string]$groupItem.Name
+        if(-not$groupItem.PSIsContainer-or($groupItem.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){$present.Add($groupName);$unsafe.Add($groupName);continue}
+        foreach($item in @(Get-ChildItem -LiteralPath $groupItem.FullName -Force -ErrorAction Stop)){
+            $name=$groupName+'\'+[string]$item.Name;$present.Add($name)
+            if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){$unsafe.Add($name)}
+        }
+    }
+    foreach($desktopName in @($desktopNames|Sort-Object)){
+        $item=Get-Item -LiteralPath (Join-Path $desktop $desktopName) -Force -ErrorAction SilentlyContinue
+        if($null-eq$item){continue};$name='Desktop\'+[string]$item.Name;$present.Add($name)
+        if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){$unsafe.Add($name)}
+    }
+    return [pscustomobject][ordered]@{
+        appId=$ExpectedAppId;displayVersion=[string]$value.DisplayVersion;installLocation=[string]$value.InstallLocation
+        uninstallString=[string]$value.UninstallString;shortcutNames=@($present);unsafeShortcutNames=@($unsafe)
+    }
 }
 function Read-CcodCurrentUserVerifiedRegistration {
-    $path=Get-CcodProductRegistryPath;if(-not(Test-Path -LiteralPath $path -PathType Container)){return $null}
-    $value=Get-ItemProperty -LiteralPath $path -ErrorAction Stop
-    if($value.CcodRuntimeId-isnot[string]-or$value.CcodRuntimeId-cnotmatch'^2\.5\.22-[0-9a-f]{16}-[0-9a-f]{32}$'-or$value.DisplayVersion-cne'2.5.22'-or$value.CcodPackageSha256-isnot[string]-or$value.CcodPackageSha256-cnotmatch'^[0-9a-f]{64}$'){return $null}
-    foreach($kind in @('StartMenu','Desktop')){if(-not[IO.File]::Exists((Get-CcodProductShortcutDestination $kind))){return $null}}
-    [pscustomobject]@{verified=$true;runtimeId=[string]$value.CcodRuntimeId;version=[string]$value.DisplayVersion;packageSha256=[string]$value.CcodPackageSha256}
+    try{
+        $path=Get-CcodProductRegistryPath;if(-not(Test-Path -LiteralPath $path -PathType Container)){return $null}
+        $value=Get-ItemProperty -LiteralPath $path -ErrorAction Stop;$runtimeId=[string]$value.CcodRuntimeId
+        $state=Read-CcodCurrentProductState -ExpectedRuntimeId $runtimeId
+        if($null-eq$state-or$state.valid-isnot[bool]-or-not$state.valid-or@($state.entries).Count-ne3-or$null-eq$state.readyEvidence){return $null}
+        $proof=[pscustomobject][ordered]@{
+            verified=$true;runtimeId=[string]$state.readyEvidence.runtimeId;version=$script:CcodProductVersion;packageSha256=[string]$state.readyEvidence.packageSha256
+            shortcutNames=@($script:CcodCurrentShortcutNames);startMenuSha256=[string]$state.readyEvidence.startMenuSha256;desktopSha256=[string]$state.readyEvidence.desktopSha256
+        }
+        if(Test-CcodCurrentVerifiedRegistration $proof){return $proof}
+        return $null
+    }catch{return $null}
 }
 function Remove-CcodCurrentUserLegacyRegistration {
     param([string]$ExpectedAppId,[string[]]$ExpectedShortcutNames)
@@ -267,9 +392,58 @@ function Remove-CcodProductRegistration {
     [CmdletBinding()]param([Parameter(Mandatory)]$ReadyEvidence,[hashtable]$Adapters)
     $fields=@('phase','installRoot','runtimeId','runtimeGeneration','packageSha256','manifestSha256','startMenuSha256','desktopSha256','targetPath','arguments');$canonicalTarget=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'schtasks.exe'));if(-not(Test-CcodProductExactProperties $ReadyEvidence $fields)-or$ReadyEvidence.phase-cne'Ready'-or$ReadyEvidence.installRoot-isnot[string]-or-not[IO.Path]::IsPathRooted($ReadyEvidence.installRoot)-or$ReadyEvidence.runtimeId-cnotmatch'^2\.5\.22-[0-9a-f]{16}-[0-9a-f]{32}$'-or[uint64]$ReadyEvidence.runtimeGeneration-lt1-or$ReadyEvidence.packageSha256-cnotmatch'^[0-9a-f]{64}$'-or$ReadyEvidence.manifestSha256-cnotmatch'^[0-9a-f]{64}$'-or$ReadyEvidence.startMenuSha256-cnotmatch'^[0-9a-f]{64}$'-or$ReadyEvidence.desktopSha256-cnotmatch'^[0-9a-f]{64}$'-or$ReadyEvidence.targetPath-isnot[string]-or[IO.Path]::GetFullPath([string]$ReadyEvidence.targetPath)-cne$canonicalTarget-or$ReadyEvidence.arguments-cne'/Run /TN "Codex Control Other Devices Supervisor"'){Throw-CcodProductRegistrationError 'CCOD_PRODUCT_CLEANUP_INVALID' 'Exact Ready cleanup evidence is invalid' $ReadyEvidence};$adapter=Get-CcodProductRegistrationAdapters $Adapters;$state=&$adapter.ReadCurrentProductState $ReadyEvidence.runtimeId;if($null-eq$state-or$state.valid-isnot[bool]-or-not$state.valid-or$null-eq$state.readyEvidence-or($state.readyEvidence|ConvertTo-Json -Compress)-cne($ReadyEvidence|ConvertTo-Json -Compress)-or$null-eq$state.entries){Throw-CcodProductRegistrationError 'CCOD_PRODUCT_CLEANUP_INVALID' 'Current product state is not bound to exact Ready evidence' $ReadyEvidence.runtimeId};$entries=@($state.entries);if($entries.Count-notin@(0,3)){Throw-CcodProductRegistrationError 'CCOD_PRODUCT_CLEANUP_INVALID' 'Current product state is ambiguous' $ReadyEvidence.runtimeId};foreach($entry in $entries){&$adapter.RemoveCurrentProductEntry $entry}
 }
+function Get-CcodLegacySnapshotEntryName {
+    param($Entry,[Parameter(Mandatory)][string]$ExpectedAppId)
+    if($Entry-is[string]){return [string]$Entry}
+    if($null-eq$Entry-or$null-eq$Entry.PSObject.Properties['kind']){return $null}
+    if($Entry.kind-ceq'Registry'){
+        if($Entry.path-isnot[string]-or[string]$Entry.path-cne(Get-CcodLegacyRegistryPath $ExpectedAppId)){return $null}
+        return 'Registry'
+    }
+    if($Entry.kind-ceq'Shortcut'-and$Entry.name-is[string]){
+        try{$expectedPath=Get-CcodLegacyShortcutPath -RelativeName ([string]$Entry.name);$actualPath=[IO.Path]::GetFullPath([string]$Entry.path)}catch{return $null}
+        if($actualPath-cne$expectedPath){return $null}
+        return [string]$Entry.name
+    }
+    return $null
+}
+
+function Test-CcodLegacySnapshotForProfile {
+    param($Snapshot,[Parameter(Mandatory)]$Profile,[Parameter(Mandatory)][string]$ExpectedAppId)
+    if($null-eq$Snapshot-or-not(Test-CcodProductExactProperties $Snapshot @('appId','entries'))-or
+       $Snapshot.appId-isnot[string]-or[string]$Snapshot.appId-cne$ExpectedAppId-or$null-eq$Snapshot.entries){return $false}
+    $actual=[Collections.Generic.List[string]]::new()
+    foreach($entry in @($Snapshot.entries)){$name=Get-CcodLegacySnapshotEntryName -Entry $entry -ExpectedAppId $ExpectedAppId;if($null-eq$name){return $false};$actual.Add($name)}
+    return Test-CcodProductExactStringSet $actual (@('Registry')+@($Profile.shortcutNames))
+}
+
+function Test-CcodLegacySnapshotCurrentReplacement {
+    param($Entry,[Parameter(Mandatory)][string]$Name,[Parameter(Mandatory)]$CurrentProof)
+    if($Entry-is[string]-or$null-eq$Entry-or$Entry.kind-cne'Shortcut'-or$Entry.name-isnot[string]-or[string]$Entry.name-cne$Name-or
+       $Entry.path-isnot[string]-or$Entry.sha256-isnot[string]){return $false}
+    try{$expectedPath=Get-CcodLegacyShortcutPath -RelativeName $Name;$actualPath=[IO.Path]::GetFullPath([string]$Entry.path)}catch{return $false}
+    if($actualPath-cne$expectedPath){return $false}
+    $expectedSha256=if($Name-ceq$script:CcodCurrentShortcutNames[0]){[string]$CurrentProof.startMenuSha256}elseif($Name-ceq$script:CcodCurrentShortcutNames[1]){[string]$CurrentProof.desktopSha256}else{return $false}
+    return [string]$Entry.sha256-ceq$expectedSha256
+}
+
 function Read-CcodLegacySnapshot {
-    param([string]$ExpectedAppId)
-    $legacy=Read-CcodCurrentUserLegacyRegistration $ExpectedAppId;if($null-eq$legacy){return $null};$entries=[Collections.Generic.List[object]]::new();$keyPath=Get-CcodLegacyRegistryPath $ExpectedAppId;$key=Get-Item -LiteralPath $keyPath -ErrorAction Stop;$names=@($key.GetValueNames());if($key.GetSubKeyNames().Count-ne0-or@($names|Where-Object{$script:CcodLegacyRegistryValueNames-cnotcontains$_}).Count-ne0){throw 'legacy registry contains unknown state'};$values=[ordered]@{};foreach($name in $names){$values[$name]=[pscustomobject]@{value=$key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);kind=[string]$key.GetValueKind($name)}};$entries.Add([pscustomobject]@{kind='Registry';path=$keyPath;values=$values});$programs=[Environment]::GetFolderPath([Environment+SpecialFolder]::Programs);$desktop=[Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop);foreach($name in $legacy.shortcutNames){$relative=$name.Substring($name.IndexOf('\')+1);$path=[IO.Path]::GetFullPath($(if($name.StartsWith('Programs\',[StringComparison]::Ordinal)){Join-Path $programs $relative}else{Join-Path $desktop $relative}));$item=Get-Item -LiteralPath $path -Force -ErrorAction Stop;if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){throw 'legacy shortcut unsafe'};$bytes=[IO.File]::ReadAllBytes($path);$entries.Add([pscustomobject]@{kind='Shortcut';name=$name;path=$path;sha256=Get-CcodProductFileSha256 $path;bytesBase64=[Convert]::ToBase64String($bytes)})};[pscustomobject]@{appId=$ExpectedAppId;entries=@($entries)}
+    param([string]$ExpectedAppId,[Parameter(Mandatory)]$ExpectedProfile)
+    $legacy=Read-CcodCurrentUserLegacyRegistration $ExpectedAppId;if($null-eq$legacy){return $null}
+    $observedProfile=Resolve-CcodLegacyRegistrationProfile -LegacyRegistration $legacy
+    if($observedProfile.profileId-cne$ExpectedProfile.profileId){throw 'legacy profile changed before snapshot'}
+    $entries=[Collections.Generic.List[object]]::new();$keyPath=Get-CcodLegacyRegistryPath $ExpectedAppId;$key=Get-Item -LiteralPath $keyPath -ErrorAction Stop
+    try{
+        $names=@($key.GetValueNames());if($key.GetSubKeyNames().Count-ne0-or@($names|Where-Object{$script:CcodLegacyRegistryValueNames-cnotcontains$_}).Count-ne0){throw 'legacy registry contains unknown state'}
+        $values=[ordered]@{};foreach($name in $names){$values[$name]=[pscustomobject]@{value=$key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);kind=[string]$key.GetValueKind($name)}}
+    }finally{$key.Dispose()}
+    $entries.Add([pscustomobject]@{kind='Registry';path=$keyPath;values=$values})
+    foreach($name in @($ExpectedProfile.shortcutNames)){
+        $path=Get-CcodLegacyShortcutPath -RelativeName $name;$item=Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0-or[string]$item.Name-cne[IO.Path]::GetFileName($name)){throw 'legacy shortcut unsafe'}
+        $bytes=[IO.File]::ReadAllBytes($path);$entries.Add([pscustomobject]@{kind='Shortcut';name=$name;path=$path;sha256=Get-CcodProductFileSha256 $path;bytesBase64=[Convert]::ToBase64String($bytes)})
+    }
+    return [pscustomobject][ordered]@{appId=$ExpectedAppId;entries=@($entries)}
 }
 function Remove-CcodLegacySnapshotEntry {param($Entry);if($Entry-is[string]){return};if($Entry.kind-ceq'Registry'){$key=$null;try{$key=Get-Item -LiteralPath $Entry.path -ErrorAction Stop;if((@($key.GetValueNames()|Sort-Object)-join'|')-cne((@($Entry.values.Keys)|Sort-Object)-join'|')-or$key.GetSubKeyNames().Count-ne0){throw 'legacy registry changed'};foreach($name in @($Entry.values.Keys)){$current=$key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);if([string]$current-cne[string]$Entry.values[$name].value-or[string]$key.GetValueKind($name)-cne[string]$Entry.values[$name].kind){throw 'legacy registry value changed'}};foreach($name in @($Entry.values.Keys)){$key.DeleteValue($name,$true)};$key.Dispose();$key=$null;Remove-Item -LiteralPath $Entry.path -Force -ErrorAction Stop;return}catch{if($null-ne$key){$key.Dispose()};if(-not(Test-Path -LiteralPath $Entry.path)){New-Item -Path $Entry.path -Force|Out-Null};foreach($name in $Entry.values.Keys){if($null-eq(Get-ItemProperty -LiteralPath $Entry.path -Name $name -ErrorAction SilentlyContinue)){$kind=[Enum]::Parse([Microsoft.Win32.RegistryValueKind],[string]$Entry.values[$name].kind);New-ItemProperty -LiteralPath $Entry.path -Name $name -Value $Entry.values[$name].value -PropertyType $kind -Force|Out-Null}};throw}};if(-not[IO.File]::Exists($Entry.path)-or(Get-CcodProductFileSha256 $Entry.path)-cne$Entry.sha256){throw 'legacy shortcut changed'};Remove-Item -LiteralPath $Entry.path -Force -ErrorAction Stop}
 function Compare-CcodLegacySnapshotEntry {
@@ -339,24 +513,40 @@ function Remove-CcodLegacyProductRegistration {
     }
     $adapter = Get-CcodProductRegistrationAdapters $Adapters
     $verified=&$adapter.ReadVerifiedRegistration
-    if($null-eq$verified-or$verified.verified-isnot[bool]-or-not$verified.verified){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy product migration requires a current three-record read-back proof.' $ExpectedAppId}
+    if(-not(Test-CcodCurrentVerifiedRegistration $verified)){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy product migration requires an exact current three-record read-back proof.' $ExpectedAppId}
     $legacy = & $adapter.ReadLegacyRegistration $ExpectedAppId
     if($null-eq$legacy){return}
-    if ($legacy.appId -isnot [string] -or [string]$legacy.appId -cne $ExpectedAppId -or
-        $legacy.uninstallString -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$legacy.uninstallString) -or
-        $null -eq $legacy.shortcutNames -or (@($legacy.shortcutNames) -join '|') -cne ($script:CcodLegacyShortcutNames -join '|')) {
-        Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy product entry or shortcut names do not match the exact migration allowlist.' $ExpectedAppId
+    $profile=Resolve-CcodLegacyRegistrationProfile -LegacyRegistration $legacy
+    $snapshot=&$adapter.ReadLegacySnapshot $ExpectedAppId $profile
+    if(-not(Test-CcodLegacySnapshotForProfile -Snapshot $snapshot -Profile $profile -ExpectedAppId $ExpectedAppId)){
+        Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy snapshot is incomplete or does not match the selected historical profile.' $ExpectedAppId
     }
-    $snapshot=&$adapter.ReadLegacySnapshot $ExpectedAppId
-    if($null-eq$snapshot-or$snapshot.appId-cne$ExpectedAppId-or@($snapshot.entries).Count-ne9){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy snapshot is incomplete or ambiguous' $ExpectedAppId}
-    $removed=[Collections.Generic.List[object]]::new()
-    try{foreach($entry in @($snapshot.entries)){&$adapter.RemoveLegacyEntry $entry;$removed.Add($entry)}}catch{
-        $unresolved=[Collections.Generic.List[string]]::new();$failedEntry=$entry;$failedName=if($failedEntry-is[string]){[string]$failedEntry}elseif($failedEntry.kind-ceq'Registry'){'Registry'}else{[string]$failedEntry.name}
-        try{$state=&$adapter.ReadLegacyEntry $failedEntry;if($null-eq$state){&$adapter.RestoreLegacyEntry $failedEntry;$state=&$adapter.ReadLegacyEntry $failedEntry};if($state-cne'Exact'){$unresolved.Add($failedName)}}catch{$unresolved.Add($failedName)}
-        for($index=$removed.Count-1;$index-ge0;$index--){$entry=$removed[$index];$name=if($entry-is[string]){[string]$entry}elseif($entry.kind-ceq'Registry'){'Registry'}else{[string]$entry.name};try{$state=&$adapter.ReadLegacyEntry $entry;if($null-eq$state){&$adapter.RestoreLegacyEntry $entry;$state=&$adapter.ReadLegacyEntry $entry};if($state-cne'Exact'){$unresolved.Add($name)}}catch{$unresolved.Add($name)}}
+    $removalEntries=[Collections.Generic.List[object]]::new()
+    foreach($entry in @($snapshot.entries)){
+        $name=Get-CcodLegacySnapshotEntryName -Entry $entry -ExpectedAppId $ExpectedAppId
+        if($script:CcodCurrentShortcutNames-ccontains$name){
+            if(-not(Test-CcodLegacySnapshotCurrentReplacement -Entry $entry -Name $name -CurrentProof $verified)){
+                Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'An overlapping legacy shortcut is not the exact verified current replacement.' $name
+            }
+            continue
+        }
+        $removalEntries.Add($entry)
+    }
+    $removed=[Collections.Generic.List[object]]::new();$failedEntry=$null
+    try{
+        foreach($entry in @($removalEntries)){$failedEntry=$entry;&$adapter.RemoveLegacyEntry $entry;$removed.Add($entry);$failedEntry=$null}
+        $verifiedAfter=&$adapter.ReadVerifiedRegistration
+        if(-not(Test-CcodCurrentVerifiedRegistrationUnchanged -Before $verified -After $verifiedAfter)){throw 'current product registration changed during legacy cleanup'}
+    }catch{
+        $unresolved=[Collections.Generic.List[string]]::new()
+        if($null-ne$failedEntry){
+            $failedName=Get-CcodLegacySnapshotEntryName -Entry $failedEntry -ExpectedAppId $ExpectedAppId
+            try{$state=&$adapter.ReadLegacyEntry $failedEntry;if($null-eq$state){&$adapter.RestoreLegacyEntry $failedEntry;$state=&$adapter.ReadLegacyEntry $failedEntry};if($state-cne'Exact'){$unresolved.Add($failedName)}}catch{$unresolved.Add($failedName)}
+        }
+        for($index=$removed.Count-1;$index-ge0;$index--){$entry=$removed[$index];$name=Get-CcodLegacySnapshotEntryName -Entry $entry -ExpectedAppId $ExpectedAppId;try{$state=&$adapter.ReadLegacyEntry $entry;if($null-eq$state){&$adapter.RestoreLegacyEntry $entry;$state=&$adapter.ReadLegacyEntry $entry};if($state-cne'Exact'){$unresolved.Add($name)}}catch{$unresolved.Add($name)}}
         if($unresolved.Count-gt0){$record=[pscustomobject][ordered]@{schemaVersion=1;appId=$ExpectedAppId;state='CompensationFailed';entries=@($unresolved);createdAtUtc=[DateTime]::UtcNow.ToString('o',[Globalization.CultureInfo]::InvariantCulture)};try{&$adapter.WriteLegacyCompensationFailure $record}catch{Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_COMPENSATION_FAILED' 'Legacy compensation failure record could not be persisted.' $record};Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_COMPENSATION_FAILED' 'Legacy migration compensation remains unresolved; exact entries were recorded.' $record}
         Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy product migration failed and the exact prior set was restored.' $ExpectedAppId
     }
 }
 
-Export-ModuleMember -Function New-CcodProductRegistration,Test-CcodProductRegistration,Commit-CcodProductRegistration,Remove-CcodProductRegistration,Remove-CcodLegacyProductRegistration
+Export-ModuleMember -Function New-CcodProductRegistration,Test-CcodProductRegistration,Commit-CcodProductRegistration,Remove-CcodProductRegistration,Remove-CcodLegacyProductRegistration,Get-CcodLegacyRegistrationProfiles,Resolve-CcodLegacyRegistrationProfile
