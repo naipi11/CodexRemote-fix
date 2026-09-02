@@ -27,6 +27,35 @@ blocked while N's outer lease is still live, releases that outer lease, and
 requires N+1 to commit generation 2.  The test also asserts that the closed N
 capability cannot be reused.
 
+## Fix round 1: fresh stale-N Ready authority
+
+After N+1 commits, the test now separately invokes a **fresh**
+`Open-CcodInstallProductRegistrationTransaction` with N's exact old Ready
+record and requires `CCOD_INSTALL_PRODUCT_SCOPE`.  If a transaction were
+returned, the test closes that temporary transaction with `Failed` before the
+assertion reports failure, so the negative probe cannot strand an authority
+lease.  This validates latest-pointer/canonical-head authority selection; the
+existing `CCOD_INSTALL_TRANSACTION_CLOSED` assertion remains separately tied
+to reusing the already-closed N capability.
+
+### Fix-round temporary-mutation RED
+
+The temporary IFT-only mutation omitted the selected-pointer stale rejection
+and, only when the latest pointer generation was newer than the supplied Ready
+generation, skipped the matching canonical-head rejection.  Same-generation
+Prepared/Failed rejection remained active.  It was restored fully before
+GREEN.
+
+- Command: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+  tests\persistence\InstallFileTransaction.SelfTest.ps1`
+- Exit: `1`
+- Exact failure: `ASSERT_THROWS: expected CCOD_INSTALL_PRODUCT_SCOPE` in
+  `product-authority-holds-the-real-commit-coordination-lease-across-proof-and-retained-file-use`.
+
+Thus the new assertion demonstrably detects a stale-N selector/head removal;
+the first failure was its own fresh-open boundary, not a pre-existing
+same-generation lifecycle-head test.
+
 ## Temporary-mutation RED
 
 The only temporary mutation replaced the real `Enter-CcodMutex` call in
@@ -50,6 +79,11 @@ not caused by STA, adapter loading, marker timing, or a mocked mutex.
 ## Final GREEN and verification
 
 All commands below were fresh direct runs after production restoration.
+
+Fix-round focused command:
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+tests\persistence\InstallFileTransaction.SelfTest.ps1` exited `0` and printed
+`Install file transaction self-test passed.`
 
 | Command | Exit | Result |
 |---|---:|---|

@@ -284,6 +284,7 @@ finally{if($null-ne$ownership){try{&$epochModule {param($Owner)Exit-CcodLifecycl
         if(-not$commitProcess.WaitForExit(20000)){Stop-Process -Id $commitProcess.Id -Force;throw 'real N+1 commit child timed out'}
         $commitProcess.Refresh();if(-not[IO.File]::Exists($resultPath)){throw "real N+1 commit child produced no committed pointer exit=$($commitProcess.ExitCode) stdout=$([IO.File]::ReadAllText($stdout)) stderr=$([IO.File]::ReadAllText($stderr))"}
         $pointer=[IO.File]::ReadAllText($resultPath)|ConvertFrom-Json;Assert-CcodEqual 2 ([uint64]$pointer.generation) 'real commit advances to N+1 only after N authority closes'
+        Assert-CcodThrows {$stale=$null;try{$stale=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready}finally{if($null-ne$stale){Close-CcodInstallFileTransaction -Transaction $stale -Disposition Failed|Out-Null}}} 'CCOD_INSTALL_PRODUCT_SCOPE'
         Assert-CcodThrows {Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk' -ReadyTransaction $authority.Ready|Out-Null} 'CCOD_INSTALL_TRANSACTION_CLOSED'
     }finally{
         if($null-ne$commitProcess-and-not$commitProcess.HasExited){try{Stop-Process -Id $commitProcess.Id -Force}catch{}};if($null-ne$commitProcess){$commitProcess.Dispose()}
