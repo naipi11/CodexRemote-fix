@@ -147,3 +147,116 @@ temporary fixture state were the only real OS primitives exercised.
   durable Pending bind.
 - Full aggregate/release validation and Task 4 completion are outside this
   Task 1 report and remain for the plan's later independent verification.
+
+## Fix round 1: fail-closed strict open and transaction-partitioned history
+
+### Scope and implementation commit
+
+- Review base: `ffb5dd0` (`docs: record durable product cleanup evidence`).
+- Fix implementation: `79b4825244fe53b9af8d10bf2b7e4efae347c909`
+  (`fix: partition durable cleanup history`).
+- The implementation commit contains only:
+  - `src/persistence/modules/InstallLifecycle.psm1`
+  - `tests/persistence/InstallLifecycle.SelfTest.ps1`
+- The fix keeps every record under the exact ten-field validator and canonical
+  filename validator, validates Pending/Completed sequencing independently per
+  `transactionId`, binds current records to the exact current Ready identity,
+  ignores only fully completed foreign history, and blocks every unresolved
+  foreign Pending record.
+- A new Pending entry starts with `CloseCompleted = false`. A strict open
+  failure therefore retains Pending and cannot append Completed. A later
+  same-owner/same-thread call first opens, binds, and closes fresh strict
+  authority for that Pending fence before starting a new verification attempt.
+
+### RED evidence
+
+#### Strict product open failure
+
+- Command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\InstallLifecycle.SelfTest.ps1`
+- Exit: `1`.
+- Exact first failure:
+  `CCOD_SELFTEST_FAILED case=strict-product-open-failure-retains-Pending-and-later-reconciles-before-verified-success error=ASSERT_EQUAL`
+- Exact assertion:
+  `ASSERT_EQUAL: strict product open failure leaves only its durable Pending record expected=[1] actual=[2]`.
+- The test first created a production-shaped temporary Ready generation with
+  both sealed registration shortcut candidates, then used the existing
+  module-private native dispatcher boundary to fail only `OpenProduct` after
+  Pending publication. It observed no returned receipt or real product action.
+
+#### Completed older transaction poisoning a new Ready upgrade
+
+- Targeted Windows PowerShell execution loaded lines 1-681 (imports and helper
+  definitions) from the checked-in lifecycle self-test, parsed the same file
+  with the PowerShell AST, selected the exact test named
+  `completed cleanup history from an older Ready transaction permits new upgrade registration`,
+  and invoked its checked-in scriptblock. The runner was passed through
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand` using
+  UTF-16LE solely to preserve shell quoting.
+- Exit: `1`.
+- Exact valid failure:
+  `ASSERT_EQUAL: older completed cleanup history is ignored for the new Ready attempt sequence expected=[] actual=[CCOD_PRODUCT_REGISTRATION_FAILED]`.
+- The valid fixture kept project version `2.5.22` and the same computed package
+  hash, changed a sealed payload byte to create a distinct runtime and Ready
+  transaction, and started with the prior Ready transaction's complete
+  Pending/Completed history. Thus failure occurred at fence-history validation,
+  not package identity or adapter setup.
+- An earlier same-version/different-explicit-hash attempt stopped at
+  `CCOD_INSTALL_PACKAGE_CONFLICT`, and an interim `2.5.23` attempt skipped the
+  version-gated product-registration path. Neither was counted as RED evidence.
+
+#### Prior Pending preservation
+
+- The same targeted runner selected
+  `unresolved Pending from an older transaction blocks new Ready registration fail closed`.
+- Before the production fix it exited `0` and printed
+  `TARGETED_PRIOR_PENDING_PASS`: the pre-existing behavior blocked, performed
+  zero product and shortcut writes, emitted no receipt, retained the foreign
+  Pending record, and appended no lifecycle Failed snapshot. This was retained
+  as a must-stay-green regression while completed history was partitioned.
+
+### GREEN evidence
+
+- Targeted strict-open runner: exit `0`,
+  `TARGETED_STRICT_OPEN_GREEN`.
+- Targeted completed-history upgrade runner: exit `0`,
+  `TARGETED_UPGRADE_HISTORY_GREEN`.
+- Targeted prior-Pending runner: exit `0`,
+  `TARGETED_PRIOR_PENDING_GREEN`.
+- The direct unknown-field negative is included in the full lifecycle suite. It
+  temporarily clears and restores the read-only bit only on its temporary test
+  fence, adds `unknownFenceField`, and proves default registration fails closed
+  before product writes. A first attempt to overwrite the still-read-only file
+  was rejected as fixture setup failure and was not counted as behavior evidence.
+
+#### Full focused suites
+
+- Command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\InstallLifecycle.SelfTest.ps1`
+- Exit: `0`.
+- Result: `Install lifecycle self-tests passed: 126`.
+- Exact cross-process observation remained:
+  `CCOD_CROSS_PROCESS_OBSERVED exit=23 mutex=True authority=False product=False verified=False error=CCOD_PRODUCT_REGISTRATION_FAILED`.
+- Command:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\InstallFileTransaction.SelfTest.ps1`
+- Exit: `0`.
+- Result: all `34/34` named cases printed `True`, followed by
+  `Install file transaction self-test passed.`
+
+#### Parser and diff
+
+- Parsed the two production modules and two focused self-tests with
+  `[System.Management.Automation.Language.Parser]::ParseFile`.
+- Exit: `0`; output: `PowerShell parser passed: 4/4`.
+- Command: `git diff --check`.
+- Exit: `0`; output: `git diff --check passed`, plus only Git checkout
+  LF-to-CRLF warnings.
+
+### No-real-action and remaining boundary
+
+No real registry, Start-menu/Desktop shortcut, installer, uninstaller,
+installed product, product process, network, release, push, tag, signing,
+installation, restart, or reboot action was performed. All product effects were
+temporary in-memory or marker-file adapters. This fix round is ready for scoped
+re-review; it does not claim Task 1, Task 4, aggregate validation, or release
+readiness complete.
