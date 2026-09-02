@@ -226,7 +226,7 @@ Invoke-CcodTest 'product authority rejects the canonical Ready to Failed post-te
 
 # Production mutation caught: selector proof without the committing install's AccountTransition lease permits N+1 to commit across N proof/use.
 Invoke-CcodTest 'product authority holds the real commit coordination lease across proof and retained-file use' {
-    $authority=New-CcodProductAuthorityFixture;$fixture=$authority.Fixture;$product=$null;$commitProcess=$null;$attemptEvent=$null
+    $authority=New-CcodProductAuthorityFixture;$fixture=$authority.Fixture;$product=$null;$outer=$null;$fence=$null;$lifecycleModule=$null;$commitProcess=$null;$attemptEvent=$null
     $attemptEventName='Local\CcodInstallProductAuthorityAttempt.'+[guid]::NewGuid().ToString('N');$eventCreated=$false;$attemptEvent=[Threading.EventWaitHandle]::new($false,[Threading.EventResetMode]::ManualReset,$attemptEventName,[ref]$eventCreated)
     Assert-CcodTrue $eventCreated 'atomic attempt event is create-only for this test'
     $resultPath=Join-Path $fixture.Base 'commit-result.json';$stdout=Join-Path $fixture.Base 'commit.stdout.txt';$stderr=Join-Path $fixture.Base 'commit.stderr.txt';$childScript=Join-Path $fixture.Base 'commit-next-generation.ps1'
@@ -263,21 +263,31 @@ finally{if($null-ne$ownership){try{&$epochModule {param($Owner)Exit-CcodLifecycl
 '@
     [IO.File]::WriteAllText($childScript,$child,[Text.UTF8Encoding]::new($false))
     try{
+        $lifecycleModule=Import-Module (Join-Path $projectRoot 'src\persistence\modules\InstallLifecycle.psm1') -Force -PassThru -DisableNameChecking
+        $outer=&$lifecycleModule {Enter-CcodLifecycleProductCleanupLease}
+        $owner=&$lifecycleModule {Get-CcodLifecycleCurrentProductCleanupIdentity}
+        $fence=&$lifecycleModule {param($Root,$Ready,$Owner)New-CcodLifecycleProductCleanupFence -InstallRoot $Root -ReadyTransaction $Ready -OwnerIdentity $Owner} $fixture.Install $authority.Ready $owner
         $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready;$fixture.Transactions.Add($product)
-        $retained=Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $authority.RuntimeId -ExpectedManifestSha256 $authority.Manifest.Sha256 -FileTransaction $product
+        &$module {param($Transaction,$Fence)Set-CcodInstallProductCleanupFence -Transaction $Transaction -Fence $Fence|Out-Null} $product $fence
         $powershell=(Get-Process -Id $PID).Path
         $commitProcess=Start-Process -FilePath $powershell -ArgumentList @('-Mta','-NoProfile','-ExecutionPolicy','Bypass','-File',$childScript,'-ModuleRoot',$moduleRoot,'-InstallRoot',$fixture.Install,'-CurrentRuntime',$authority.RuntimeId,'-NextRuntime',$nextRuntime,'-AttemptEventName',$attemptEventName,'-ResultPath',$resultPath) -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
         if(-not$attemptEvent.WaitOne(20000)){if(-not$commitProcess.HasExited){Stop-Process -Id $commitProcess.Id -Force};$commitProcess.WaitForExit();throw "real N+1 commit child did not atomically enter the AccountTransition wait: $($(if([IO.File]::Exists($stderr)){[IO.File]::ReadAllText($stderr)}else{'no stderr'}))"}
         $commitBlocked=$true;$watch=[Diagnostics.Stopwatch]::StartNew();while($watch.ElapsedMilliseconds-lt5000){if([IO.File]::Exists($resultPath)-or$commitProcess.HasExited){$commitBlocked=$false;break};Start-Sleep -Milliseconds 20};$watch.Stop()
         Assert-CcodTrue $commitBlocked 'N+1 commit is blocked after its atomic real AccountTransition wait signal'
+        $retained=Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId $authority.RuntimeId -ExpectedManifestSha256 $authority.Manifest.Sha256 -FileTransaction $product
         if($commitBlocked){$opened=Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk' -ReadyTransaction $authority.Ready;Assert-CcodTrue ($null-ne$opened) 'N retained shortcut opens while its authority lease excludes N+1'}
-        Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed
+        Close-CcodInstallFileTransaction -Transaction $product -Disposition Ready
+        &$lifecycleModule {param($Fence)Complete-CcodLifecycleProductCleanupFence -Fence $Fence -Outcome Completed|Out-Null} $fence
+        $commitBlockedAfterNClose=$true;$watch=[Diagnostics.Stopwatch]::StartNew();while($watch.ElapsedMilliseconds-lt5000){if([IO.File]::Exists($resultPath)-or$commitProcess.HasExited){$commitBlockedAfterNClose=$false;break};Start-Sleep -Milliseconds 20};$watch.Stop()
+        Assert-CcodTrue $commitBlockedAfterNClose 'N+1 commit remains blocked after N strict authority closes while its durable outer AccountTransition lease is live'
+        &$lifecycleModule {param($Context)Exit-CcodLifecycleProductCleanupLease -Context $Context|Out-Null} $outer;$outer=$null
         if(-not$commitProcess.WaitForExit(20000)){Stop-Process -Id $commitProcess.Id -Force;throw 'real N+1 commit child timed out'}
         $commitProcess.Refresh();if(-not[IO.File]::Exists($resultPath)){throw "real N+1 commit child produced no committed pointer exit=$($commitProcess.ExitCode) stdout=$([IO.File]::ReadAllText($stdout)) stderr=$([IO.File]::ReadAllText($stderr))"}
         $pointer=[IO.File]::ReadAllText($resultPath)|ConvertFrom-Json;Assert-CcodEqual 2 ([uint64]$pointer.generation) 'real commit advances to N+1 only after N authority closes'
         Assert-CcodThrows {Open-CcodInstallRetainedFile -Generation $retained -RelativePath 'registration/StartMenu.CodexRemote-fix.lnk' -ReadyTransaction $authority.Ready|Out-Null} 'CCOD_INSTALL_TRANSACTION_CLOSED'
     }finally{
         if($null-ne$commitProcess-and-not$commitProcess.HasExited){try{Stop-Process -Id $commitProcess.Id -Force}catch{}};if($null-ne$commitProcess){$commitProcess.Dispose()}
+        if($null-ne$outer){try{&$lifecycleModule {param($Context)Exit-CcodLifecycleProductCleanupLease -Context $Context|Out-Null} $outer}catch{}}
         if($null-ne$attemptEvent){$attemptEvent.Dispose()}
         Remove-CcodInstallFileFixture $fixture
     }
