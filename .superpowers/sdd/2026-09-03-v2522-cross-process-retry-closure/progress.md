@@ -17,7 +17,7 @@ Plan: `docs/superpowers/plans/2026-09-03-v2522-cross-process-retry-closure.md`
 
 ## Status
 
-Task 1: initial implementation `9973bfd`, evidence `bf4d215`; scoped review FAIL (1 Critical, 3 Important). Fix round 1 is in progress. Required closure: include `Failed(resumePhase=TaskRemoved)` in the exact early-return state; make replacement persistence and receipt fresh; require historical wrapper SID/session consistency; replace aliasing test doubles with serialized/disk-backed read-back and failure negatives.
+Task 1: initial implementation `9973bfd`, evidence `bf4d215`; scoped review FAIL (1 Critical, 3 Important). Fix round 1 implementation `bf939c6` addresses all four findings: exact Failed/TaskRemoved recovery, strictly fresh timestamp/receipt, historical wrapper SID/session consistency, and real disk-backed independent read-back plus failure negatives. Final focused evidence: UninstallBootstrap 45/45, ManualWrappers pass, two parsers 0 errors, `git diff --check` exit 0. Scoped fix-round re-review remains pending.
 
 Task 2: pending.
 

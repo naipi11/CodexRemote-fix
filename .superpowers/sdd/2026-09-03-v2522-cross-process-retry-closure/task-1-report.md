@@ -91,3 +91,77 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\Manual
 
 本报告不声明 Task 2、successor plan final gate、fresh scoped review 或 release readiness 完成。
 Tasks 5–8 继续 blocked。
+
+## Fix round 1 — Failed/TaskRemoved 与 durable freshness
+
+### Review findings 与 RED
+
+scoped review 对 `9973bfd` 判定 FAIL（1 Critical、3 Important）。本轮在 production 未修改时
+得到四组有效 RED：
+
+```text
+Disk-backed real runtime:
+  ASSERT_TRUE: replacement persistence advances updatedAtUtc strictly
+
+Failed(resumePhase=TaskRemoved):
+  same session actual=CCOD_UNINSTALL_PREPARE_FAILED cleanup=1
+  new session  actual=CCOD_UNINSTALL_TRANSACTION_MISMATCH cleanup=0
+
+Historical wrapper binding:
+  HistoricalSid / HistoricalSession did not throw CCOD_UNINSTALL_TRANSACTION_INVALID
+
+Freshness:
+  stale prior TaskRemoved receipt did not throw CCOD_UNINSTALL_TRANSACTION_WRITE_FAILED
+```
+
+其中 disk-backed RED 使用真实 v2.5.22 runtime manifest、七代 append-only selector、canonical
+`Prepared -> ... -> Ready` install transaction、真实 lifecycle epoch 与完整 payload records；external
+transaction/receipt 通过 production atomic writer 写入受保护临时目录，并由 production reader 形成
+独立反序列化对象。唯一替换的是 current-session seam 和禁止误入 cleanup 的 adapter。
+
+### Fix
+
+实现提交：`bf939c6`（`fix: harden TaskRemoved replacement recovery`）。
+
+- 专用 candidate 同时接受 exact `TaskRemoved` 与 exact
+  `Failed(resumePhase=TaskRemoved)`；后者在持久化前规范化回 TaskRemoved，清空 errorCode，
+  same/new session 均不进入 `RunCleanup`。
+- 每次 replacement persistence 必须从 adapter 获取 canonical UTC，且严格晚于 prior
+  `updatedAtUtc`；transaction 与 TaskRemoved receipt 精确绑定该新 timestamp。
+- receipt 比较显式区分 `null` 与空字符串；stale/null/malformed receipt、transaction no-op、
+  transaction/receipt write failure、stale/malformed transaction read-back 均返回
+  `CCOD_UNINSTALL_TRANSACTION_WRITE_FAILED`。
+- historical `wrapperUserSid` 必须等于 transaction SID，historical `wrapperSessionId` 必须等于
+  transaction session；不一致时在任何 replacement write 前拒绝。
+- transaction write 后及 receipt write 后都从 durable adapter 重新读取；专用恢复失败不把原
+  TaskRemoved 另写成 Failed。receipt write 中断后，下一次 exact wrapper 可写入更晚 timestamp、
+  替换仅 `resumeWrapper*` 并收敛。
+
+### Fix round 1 tests
+
+新增/强化覆盖：
+
+- real disk-backed verified-runtime / transaction / receipt independent deserialization；
+- Failed/TaskRemoved same session 与 session 99 两条 early-return；
+- historical SID/session zero-write negatives；
+- DifferentSid、runtime、generation、epoch、Ready、payload、pre-TaskRemoved negatives；
+- stale receipt、empty error、null receipt、transaction no-op/write failure/stale/malformed read-back、
+  receipt write failure/malformed receipt；
+- interrupted receipt write 后的新 wrapper retry；
+- WrapperResume PID/creation/session/SID exact-wait matrix。
+
+最终无过滤验证：
+
+```text
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\UninstallBootstrap.SelfTest.ps1
+  Uninstall bootstrap self-tests passed: 45
+  exit 0
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\persistence\ManualWrappers.SelfTest.ps1
+  Manual wrapper self-tests passed
+  exit 0
+```
+
+两个修改文件 parser 均为 `0 errors`；`git diff --check` exit 0，仅有 LF/CRLF checkout warning。
+未执行任何真实系统或外部操作。Task 2 未修改、仍 pending；本报告不作 final-gate 或 release
+readiness 声明。
