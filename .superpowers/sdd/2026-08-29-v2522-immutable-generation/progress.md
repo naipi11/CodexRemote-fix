@@ -379,4 +379,7 @@ identity evidence, requires two distinct official Internet-download receipts cro
 real asset directory, and scans Setup's held sealed package before any extraction or lifecycle mutation.
 Frozen verification passed ReleaseWorkflow 58/58, PortableRelease 5/5, InstallLifecycle 151/151, parser
 103/103, diff check, and all 39 aggregate suites. No real Defender/build/install/network/release action
-was performed. Task 5 remains review-pending; Tasks 6–8 remain blocked.
+was performed. Task 5 scoped review FAIL (1 Critical, 3 Important): the public Defender function exposes
+full-fact adapters; the central contract shallow-validates nested payload/provenance; asset identity is not
+handle-held across scan/promotion; and receipt writing lacks production read-back. Task 5 fix round 1 is in
+progress. Tasks 6–8 remain blocked.
