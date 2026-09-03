@@ -456,19 +456,21 @@ function New-CcodLifecycleProductSideEffectAdapters {
     param([Parameter(Mandatory)][hashtable]$State)
     @{
         WriteProductRegistration={param($Registration,$ReadyEvidence)if($State.FailWrites){throw 'TEST_PRODUCT_WRITE_FAILURE'};$State.Registration=$Registration;$State.ReadyEvidence=$ReadyEvidence;$State.Writes++}.GetNewClosure()
-        ReadProductRegistration={param($Registration)$State.Registration}.GetNewClosure()
+        ReadProductRegistration={param($Registration)if($State.ContainsKey('FailReadProduct')-and$State.FailReadProduct){throw 'TEST_PRODUCT_READBACK_FAILURE'};$State.Registration}.GetNewClosure()
         WriteShortcut={
             param($Kind,$Shortcut,$FileTransaction,$ReadyEvidence)
             $relative='registration/'+$(if($Kind-ceq'StartMenu'){'StartMenu.CodexRemote-fix.lnk'}else{'Desktop.CodexRemote-fix.lnk'})
             try{$fileModule=Get-Module -All|Where-Object{$null-ne$_.Path-and[IO.Path]::GetFileName($_.Path)-ceq'InstallFileTransaction.psm1'}|Select-Object -First 1;if($null-eq$fileModule){throw 'install file transaction module unavailable'};$source=&$fileModule {param($Generation,$Path,$Record)Open-CcodInstallRetainedFile -Generation $Generation -RelativePath $Path -ReadyTransaction $Record} $FileTransaction $relative $ReadyEvidence.transactionRecord}catch{$State.RetainedError=([string]$_.FullyQualifiedErrorId-split',')[0];throw}
             if($null-eq$source){throw 'retained shortcut capability missing'}
+            if($State.ContainsKey('FailShortcutKind')-and[string]$State.FailShortcutKind-ceq$Kind){throw 'TEST_PRODUCT_SHORTCUT_WRITE_FAILURE'}
             $State.ProductOnlyObserved=$true;$State.Shortcuts[$Kind]=$Shortcut;$State.ShortcutWrites++
             if($State.ContainsKey('LegacyEntries')){
                 $legacyName=if($Kind-ceq'StartMenu'){$v2521LifecycleShortcutNames[0]}else{$v2521LifecycleShortcutNames[3]}
                 if(-not$State.LegacyEntries.Contains($legacyName)){$State.LegacyEntries.Add($legacyName)}
                 if($State.ContainsKey('LegacyShortcutProofs')){
+                    $candidateBytes=[IO.File]::ReadAllBytes([string]$Shortcut.candidatePath)
                     $State.LegacyShortcutProofs[$legacyName]=[pscustomobject][ordered]@{
-                        targetPath=[string]$ReadyEvidence.targetPath;arguments=[string]$ReadyEvidence.arguments;workingDirectory='';sha256=$(if($Kind-ceq'StartMenu'){[string]$ReadyEvidence.startMenuSha256}else{[string]$ReadyEvidence.desktopSha256})
+                        targetPath=[string]$ReadyEvidence.targetPath;arguments=[string]$ReadyEvidence.arguments;workingDirectory='';sha256=$(if($Kind-ceq'StartMenu'){[string]$ReadyEvidence.startMenuSha256}else{[string]$ReadyEvidence.desktopSha256});bytesBase64=[Convert]::ToBase64String($candidateBytes)
                     }
                 }
             }
@@ -496,9 +498,14 @@ function New-CcodLifecycleProductSideEffectAdapters {
                     $base=if(([string]$entry).StartsWith('Programs\',[StringComparison]::Ordinal)){[Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)}else{[Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)}
                     $relative=([string]$entry).Substring(([string]$entry).IndexOf('\')+1);$proof=if($State.ContainsKey('LegacyShortcutProofs')){$State.LegacyShortcutProofs[[string]$entry]}else{$null}
                     $entries.Add([pscustomobject][ordered]@{kind='Shortcut';name=[string]$entry;path=[IO.Path]::GetFullPath((Join-Path $base $relative));sha256=[string]$proof.sha256;bytesBase64=[string]$proof.bytesBase64;targetPath=[string]$proof.targetPath;arguments=[string]$proof.arguments;workingDirectory=[string]$proof.workingDirectory})
-                }else{$entries.Add([string]$entry)}
+                }else{$entries.Add([pscustomobject][ordered]@{kind='Registry';path=('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\'+$State.LegacyRegistration.appId+'_is1');values=[ordered]@{DisplayVersion=[pscustomobject]@{value=[string]$State.LegacyRegistration.displayVersion;kind='String'};InstallLocation=[pscustomobject]@{value=[string]$State.LegacyRegistration.installLocation;kind='String'};UninstallString=[pscustomobject]@{value=[string]$State.LegacyRegistration.uninstallString;kind='String'}}})}
             }
             [pscustomobject][ordered]@{appId=$State.LegacyRegistration.appId;entries=@($entries)}
+        }.GetNewClosure()
+        GetCurrentShortcutProof={
+            param($Kind,$Shortcut,$ReadyEvidence)
+            $name=if($Kind-ceq'StartMenu'){$v2521LifecycleShortcutNames[0]}else{$v2521LifecycleShortcutNames[3]};$base=if($Kind-ceq'StartMenu'){[Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)}else{[Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)};$relative=$name.Substring($name.IndexOf('\')+1);$item=Get-Item -LiteralPath ([string]$Shortcut.candidatePath) -Force
+            [pscustomobject][ordered]@{kind=$Kind;name=$name;path=[IO.Path]::GetFullPath((Join-Path $base $relative));candidatePath=[IO.Path]::GetFullPath([string]$Shortcut.candidatePath);candidateLength=[int64]$item.Length;candidateSha256=$(if($Kind-ceq'StartMenu'){[string]$ReadyEvidence.startMenuSha256}else{[string]$ReadyEvidence.desktopSha256});targetPath=[string]$ReadyEvidence.targetPath;arguments=[string]$ReadyEvidence.arguments;workingDirectory=''}
         }.GetNewClosure()
         RemoveLegacyEntry={param($Entry);$name=if($Entry-is[string]){[string]$Entry}elseif($Entry.kind-ceq'Registry'){'Registry'}else{[string]$Entry.name};$State.LegacyRemovalAttempts++;[void]$State.LegacyEntries.Remove($name)}.GetNewClosure()
         ReadLegacyEntry={param($Entry);$name=if($Entry-is[string]){[string]$Entry}elseif($Entry.kind-ceq'Registry'){'Registry'}else{[string]$Entry.name};if($State.LegacyEntries.Contains($name)){'Exact'}else{$null}}.GetNewClosure()
@@ -1065,6 +1072,14 @@ $results += Invoke-CcodTest 'real v2.5.21 legacy lifecycle state upgrades throug
         Assert-CcodEqual ([uint64]2) $currentCompatibility.ActiveGeneration 'current compatibility remains bound to the selected generation'
         Assert-CcodEqual $currentManifestHash $currentCompatibility.ManifestSha256 'current compatibility remains bound to the selected manifest'
         Assert-CcodTrue $upgrade.ProductRegistrationVerified 'true legacy migration completes the real product-registration boundary'
+        $migrationPlans=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\legacy-registration-migrations') -File -Force)
+        Assert-CcodEqual 1 $migrationPlans.Count 'Ready-bound legacy migration plan is durable before any overlapping current registration write'
+        $migrationPlan=Get-Content -LiteralPath $migrationPlans[0].FullName -Raw|ConvertFrom-Json -ErrorAction Stop
+        Assert-CcodEqual $ready.transactionId $migrationPlan.transactionId 'durable migration plan binds the exact Ready transaction'
+        Assert-CcodEqual ([uint64]$ready.newGeneration) ([uint64]$migrationPlan.runtimeGeneration) 'durable migration plan binds the selected generation'
+        Assert-CcodEqual $ready.newManifestSha256 $migrationPlan.manifestSha256 'durable migration plan binds the selected manifest'
+        Assert-CcodEqual $ready.sealedPackageSha256 $migrationPlan.packageSha256 'durable migration plan binds the selected package'
+        Assert-CcodEqual 'version,runtimeId,packageSha256,shortcuts' (($migrationPlan.expectedCurrentProof.PSObject.Properties.Name)-join',') 'durable migration plan carries only the exact current proof contract'
         Assert-CcodEqual 3 $productState.LegacyRemovalAttempts 'true v2.5.21 migration removes the registry compatibility link and uninstall link'
         Assert-CcodEqual ((@($v2521LifecycleShortcutNames[0],$v2521LifecycleShortcutNames[3])|Sort-Object)-join'|') ((@($productState.LegacyEntries)|Sort-Object)-join'|') 'true v2.5.21 migration preserves both exact current shortcut replacements'
         Assert-CcodEqual 0 $productState.LegacyCompensationFailures.Count 'successful true legacy cleanup needs no unresolved compensation record'
@@ -1082,6 +1097,35 @@ $results += Invoke-CcodTest 'real v2.5.21 legacy lifecycle state upgrades throug
         Assert-CcodEqual 0 $sameFake.World.TaskStarted 'idempotent true-legacy retry starts no process'
     } finally {
         foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+    }
+}
+
+# Production mutation caught: a Ready product retry recaptures the washed live profile instead of reopening its disk plan.
+$results += Invoke-CcodTest 'new lifecycle invocation replays the disk plan after partial overlapping current writes' {
+    foreach($failurePoint in @('DesktopWrite','CurrentReadBack')){
+        $legacySource=New-CcodLifecycleTempRoot;$source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+        try{
+            New-CcodLifecycleSourceFixture -Root $legacySource -Version '2.5.21'|Out-Null;$legacy=New-CcodLifecycleV2521LegacyInstallFixture -InstallRoot $install -SourceRoot $legacySource
+            New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot
+            $legacyEntries=[Collections.Generic.List[string]]::new();foreach($entry in @('Registry')+$v2521LifecycleShortcutNames){$legacyEntries.Add($entry)}
+            $productState=@{FailWrites=$false;FailShortcutKind=$(if($failurePoint-ceq'DesktopWrite'){'Desktop'}else{$null});FailReadProduct=($failurePoint-ceq'CurrentReadBack');Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{};LegacyRegistration=[pscustomobject][ordered]@{appId='{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}';displayVersion='2.5.21';installLocation='C:\legacy\CodexControlOtherDevices-installer';uninstallString='"C:\legacy\CodexControlOtherDevices-installer\unins000.exe"';shortcutNames=@($v2521LifecycleShortcutNames);unsafeShortcutNames=@()};LegacyEntries=$legacyEntries;LegacyShortcutProofs=(New-CcodLifecycleV2521ShortcutProofs -InstallRoot $install -InstallerRoot 'C:\legacy\CodexControlOtherDevices-installer');LegacyUnsafeShortcutNames=@();LegacyRemovalAttempts=0;LegacyCompensationFailures=[Collections.Generic.List[object]]::new()}
+            $firstFake=New-CcodLifecycleFake -NodePath $node;Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $firstFake -ProductState $productState
+            $firstFailure=$null;try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters $firstFake.Adapters|Out-Null}catch{$firstFailure=$_}
+            Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' (([string]$firstFailure.FullyQualifiedErrorId-split',')[0]) "$failurePoint first invocation fails at the intended post-Ready product boundary"
+            $runtimeCount=@(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count;$selectorCount=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\active-generation') -File -Force).Count;$planFiles=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\legacy-registration-migrations') -File -Force)
+            Assert-CcodEqual 1 $planFiles.Count "$failurePoint first invocation persisted exactly one disk plan"
+            Assert-CcodEqual 0 $productState.LegacyRemovalAttempts "$failurePoint first invocation never begins legacy-only cleanup"
+            $productState.FailShortcutKind=$null;$productState.FailReadProduct=$false
+            $secondFake=New-CcodLifecycleFake -NodePath $node;Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $secondFake -ProductState $productState
+            $second=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters $secondFake.Adapters
+            Assert-CcodEqual 'AlreadyInstalled' $second.Outcome "$failurePoint new invocation reopens the same Ready installation"
+            Assert-CcodTrue $second.ProductRegistrationVerified "$failurePoint new invocation converges product registration from the disk plan"
+            Assert-CcodEqual $runtimeCount @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count "$failurePoint retry creates no runtime"
+            Assert-CcodEqual $selectorCount @(Get-ChildItem -LiteralPath (Join-Path $install 'state\active-generation') -File -Force).Count "$failurePoint retry appends no selector"
+            Assert-CcodEqual 1 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\legacy-registration-migrations') -File -Force).Count "$failurePoint retry leaves one append-only disk plan"
+            Assert-CcodEqual 3 $productState.LegacyRemovalAttempts "$failurePoint retry removes the exact registry and two legacy-only shortcuts"
+            Assert-CcodEqual ((@($v2521LifecycleShortcutNames[0],$v2521LifecycleShortcutNames[3])|Sort-Object)-join'|') ((@($productState.LegacyEntries)|Sort-Object)-join'|') "$failurePoint retry preserves only exact current overlap replacements"
+        }finally{foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}}
     }
 }
 

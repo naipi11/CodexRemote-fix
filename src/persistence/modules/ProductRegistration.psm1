@@ -13,6 +13,10 @@ $script:CcodLegacyRegistrationFields = @('appId','displayVersion','installLocati
 $script:CcodLegacyProfileFields = @('profileId','appId','minimumVersion','maximumVersion','uninstallCommandShape','shortcutNames')
 $script:CcodLegacyMigrationPlanFields = @('appId','expectedInstallRoot','legacyPresent','legacyRegistration','profile','snapshot')
 $script:CcodLegacyShortcutSnapshotFields = @('kind','name','path','sha256','bytesBase64','targetPath','arguments','workingDirectory')
+$script:CcodDurableLegacyMigrationFields = @('schemaVersion','transactionId','runtimeId','runtimeGeneration','manifestSha256','packageSha256','readyTransaction','appId','expectedInstallRoot','legacyPresent','legacyRegistration','profile','snapshot','expectedCurrentProof')
+$script:CcodDurableCurrentProofFields = @('version','runtimeId','packageSha256','shortcuts')
+$script:CcodDurableCurrentShortcutFields = @('kind','name','path','candidatePath','candidateLength','candidateSha256','targetPath','arguments','workingDirectory')
+$script:CcodReadyTransactionFields = @('schemaVersion','transactionId','oldRuntimeId','oldGeneration','oldManifestSha256','newRuntimeId','newGeneration','newManifestSha256','sealedPackageSha256','ownedObjectNames','phase','errorCode')
 $script:CcodVerifiedRegistrationFields = @('verified','runtimeId','version','packageSha256','shortcutNames','startMenuSha256','desktopSha256')
 $script:CcodCurrentShortcutNames = @('Programs\CodexRemote-fix\CodexRemote-fix.lnk','Desktop\CodexRemote-fix.lnk')
 $script:CcodLegacyRegistryValueNames=@('DisplayName','DisplayVersion','UninstallString','QuietUninstallString','DisplayIcon','InstallLocation','Publisher','URLInfoAbout','HelpLink','URLUpdateInfo','NoModify','NoRepair','InstallDate','MajorVersion','MinorVersion','VersionMajor','VersionMinor','EstimatedSize','Language','Inno Setup: App Path','Inno Setup: Icon Group','Inno Setup: Setup Version','Inno Setup: User')
@@ -223,7 +227,10 @@ function Get-CcodProductRegistrationAdapters {
         RemoveLegacyRegistration = { param($ExpectedAppId,$ExpectedShortcutNames) Remove-CcodCurrentUserLegacyRegistration -ExpectedAppId $ExpectedAppId -ExpectedShortcutNames $ExpectedShortcutNames }
         ReadCurrentProductState = { param($ExpectedRuntimeId) Read-CcodCurrentProductState -ExpectedRuntimeId $ExpectedRuntimeId }
         RemoveCurrentProductEntry = { param($Entry) Remove-CcodCurrentProductEntry -Entry $Entry }
-        ReadLegacySnapshot = { param($ExpectedAppId,$ExpectedProfile) Read-CcodLegacySnapshot -ExpectedAppId $ExpectedAppId -ExpectedProfile $ExpectedProfile }
+        ReadLegacySnapshot = { param($ExpectedAppId,$ExpectedProfile,$CapturedPlan) Read-CcodLegacySnapshot -ExpectedAppId $ExpectedAppId -ExpectedProfile $ExpectedProfile -CapturedPlan $CapturedPlan }
+        GetCurrentShortcutProof = { param($Kind,$Shortcut,$ReadyEvidence) Get-CcodCurrentShortcutProof -Kind $Kind -Shortcut $Shortcut -ReadyEvidence $ReadyEvidence }
+        ReadLegacyMigrationPlan = { param($ReadyEvidence) Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'No durable legacy migration plan reader was supplied.' $ReadyEvidence.runtimeId }
+        WriteLegacyMigrationPlan = { param($ReadyEvidence,[byte[]]$Bytes) Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'No durable legacy migration plan writer was supplied.' $ReadyEvidence.runtimeId }
         RemoveLegacyEntry = { param($Entry) Remove-CcodLegacySnapshotEntry -Entry $Entry }
         ReadLegacyEntry = { param($Entry) Read-CcodLegacySnapshotEntry -Entry $Entry }
         RestoreLegacyEntry = { param($Entry) Restore-CcodLegacySnapshotEntry -Entry $Entry }
@@ -343,6 +350,18 @@ function Read-CcodCurrentUserProductShortcut {
     if(-not[IO.File]::Exists($destination)-or-not[IO.File]::Exists($source)){return $null}
     $item=Get-Item -LiteralPath $destination -Force -ErrorAction Stop;if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0-or(Get-CcodProductFileSha256 $destination)-cne(Get-CcodProductFileSha256 $source)){return $null}
     $Shortcut
+}
+function Get-CcodCurrentShortcutProof {
+    param([Parameter(Mandatory)][ValidateSet('StartMenu','Desktop')][string]$Kind,[Parameter(Mandatory)]$Shortcut,[Parameter(Mandatory)]$ReadyEvidence)
+    $candidate=[IO.Path]::GetFullPath([string]$Shortcut.candidatePath);$item=Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+    if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0-or$item.Length-le0-or$item.Length-gt262144){throw 'current shortcut candidate is unsafe'}
+    $shell=$null;$link=$null
+    try{
+        $shell=New-Object -ComObject WScript.Shell;$link=$shell.CreateShortcut($candidate);$target=[IO.Path]::GetFullPath([string]$link.TargetPath);$arguments=[string]$link.Arguments;$working=[string]$link.WorkingDirectory
+        if(-not[string]::IsNullOrEmpty($working)){$working=[IO.Path]::GetFullPath($working).TrimEnd('\')}
+    }finally{if($null-ne$link){[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($link)};if($null-ne$shell){[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)}}
+    $name=if($Kind-ceq'StartMenu'){$script:CcodCurrentShortcutNames[0]}else{$script:CcodCurrentShortcutNames[1]}
+    [pscustomobject][ordered]@{kind=$Kind;name=$name;path=(Get-CcodLegacyShortcutPath -RelativeName $name);candidatePath=$candidate;candidateLength=[int64]$item.Length;candidateSha256=(Get-CcodProductFileSha256 $candidate);targetPath=$target;arguments=$arguments;workingDirectory=$working}
 }
 function Get-CcodLegacyShortcutPath {
     param([Parameter(Mandatory)][string]$RelativeName)
@@ -628,7 +647,7 @@ function Test-CcodLegacyShortcutSnapshotEntry {
         $sha=[Security.Cryptography.SHA256]::Create()
         try{$capturedHash=[BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
     }catch{return $false}
-    return $actualPath-cne$null-and$actualPath-ceq$expectedPath-and$target-ceq$expectedTarget-and
+    return $bytes.LongLength-gt0-and$bytes.LongLength-le262144-and$actualPath-cne$null-and$actualPath-ceq$expectedPath-and$target-ceq$expectedTarget-and
         [string]$Entry.arguments-ceq[string]$contract.arguments-and$working-ceq$expectedWorking-and$capturedHash-ceq[string]$Entry.sha256
 }
 
@@ -671,30 +690,139 @@ function Get-CcodLegacyProductRegistrationMigrationPlan {
     return $plan
 }
 
+function Test-CcodProductJsonHasNoDuplicateProperties {
+    param([AllowNull()][string]$Json)
+    if($null-eq$Json){return $false};$objects=[Collections.Generic.Stack[object]]::new()
+    for($index=0;$index-lt$Json.Length;$index++){
+        $character=$Json[$index]
+        if($character-ceq'{'){$objects.Push([Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal));continue}
+        if($character-ceq'}'){if($objects.Count-eq0){return $false};[void]$objects.Pop();continue}
+        if($character-cne'"'){continue}
+        $name=[Text.StringBuilder]::new();$index++
+        while($index-lt$Json.Length){$character=$Json[$index];if($character-ceq'"'){break};if($character-cne[char]92){[void]$name.Append($character);$index++;continue};$index++;if($index-ge$Json.Length){return $false};$escape=$Json[$index];if($escape-ceq'u'){if($index+4-ge$Json.Length){return $false};try{[void]$name.Append([char][Convert]::ToInt32($Json.Substring($index+1,4),16))}catch{return $false};$index+=5;continue};switch([string]$escape){'"'{$decoded='"'};'\'{$decoded=[char]92};'/'{$decoded='/'};'b'{$decoded=[char]8};'f'{$decoded=[char]12};'n'{$decoded=[char]10};'r'{$decoded=[char]13};'t'{$decoded=[char]9};default{return $false}};[void]$name.Append($decoded);$index++}
+        if($index-ge$Json.Length){return $false};$next=$index+1;while($next-lt$Json.Length-and[char]::IsWhiteSpace($Json[$next])){$next++};if($next-lt$Json.Length-and$Json[$next]-ceq':'){if($objects.Count-eq0-or-not$objects.Peek().Add($name.ToString())){return $false}}
+    }
+    return $objects.Count-eq0
+}
+
+function Test-CcodProductUnsignedInteger($Value){return ($Value-is[byte]-or$Value-is[uint16]-or$Value-is[uint32]-or$Value-is[uint64]-or$Value-is[int16]-or$Value-is[int32]-or$Value-is[int64])-and[decimal]$Value-ge0}
+function Test-CcodDurableReadyEvidence($ReadyEvidence,$Registration){if($null-eq$ReadyEvidence-or-not(Test-CcodProductExactProperties $ReadyEvidence.transactionRecord $script:CcodReadyTransactionFields)-or-not(Test-CcodProductUnsignedInteger $ReadyEvidence.runtimeGeneration)-or[uint64]$ReadyEvidence.runtimeGeneration-eq0){return $false};$transaction=$ReadyEvidence.transactionRecord;$guid=[guid]::Empty;if($transaction.schemaVersion-isnot[int]-or$transaction.schemaVersion-ne1-or$transaction.transactionId-isnot[string]-or-not[guid]::TryParseExact([string]$transaction.transactionId,'D',[ref]$guid)-or$guid.ToString('D')-cne[string]$transaction.transactionId-or$transaction.phase-isnot[string]-or$transaction.phase-cne'Ready'-or$transaction.newRuntimeId-isnot[string]-or$transaction.newRuntimeId-cne$Registration.runtimeId-or-not(Test-CcodProductUnsignedInteger $transaction.newGeneration)-or[uint64]$transaction.newGeneration-ne[uint64]$ReadyEvidence.runtimeGeneration-or$transaction.newManifestSha256-isnot[string]-or$transaction.newManifestSha256-cne[string]$ReadyEvidence.manifestSha256-or$transaction.sealedPackageSha256-isnot[string]-or$transaction.sealedPackageSha256-cne[string]$ReadyEvidence.packageSha256-or$transaction.sealedPackageSha256-cne$Registration.packageSha256-or-not(Test-CcodProductExactStringSet $transaction.ownedObjectNames $transaction.ownedObjectNames)-or@($transaction.ownedObjectNames)-cnotcontains[string]$Registration.runtimeId){return $false};return $true}
+function Get-CcodProductMapNames($Value){if($Value-is[Collections.IDictionary]){return @($Value.Keys)};if($Value-is[pscustomobject]){return @($Value.PSObject.Properties.Name)};return @()}
+function Get-CcodProductMapValue($Value,[string]$Name){if($Value-is[Collections.IDictionary]){return $Value[$Name]};if($Value-is[pscustomobject]){return ($Value.PSObject.Properties|Where-Object Name -CEQ $Name|Select-Object -First 1).Value};return $null}
+function ConvertTo-CcodProductOrderedMap($Value){$result=[ordered]@{};foreach($name in @(Get-CcodProductMapNames $Value)){$result[[string]$name]=Get-CcodProductMapValue $Value ([string]$name)};return $result}
+function Get-CcodDurableCurrentShortcutProof($Proof,[string]$Name){foreach($entry in @($Proof.shortcuts)){if($entry.name-is[string]-and[string]$entry.name-ceq$Name){return $entry}};return $null}
+
+function Assert-CcodDurableCurrentProof {
+    param([Parameter(Mandatory)]$Proof,[Parameter(Mandatory)]$Registration,[Parameter(Mandatory)]$ReadyEvidence)
+    if(-not(Test-CcodProductExactProperties $Proof $script:CcodDurableCurrentProofFields)-or$Proof.version-isnot[string]-or$Proof.version-cne$Registration.version-or$Proof.runtimeId-isnot[string]-or$Proof.runtimeId-cne$Registration.runtimeId-or$Proof.packageSha256-isnot[string]-or$Proof.packageSha256-cne$Registration.packageSha256-or@($Proof.shortcuts).Count-ne2){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable current shortcut proof identity is invalid.' $Proof}
+    for($index=0;$index-lt2;$index++){
+        $entry=@($Proof.shortcuts)[$index];$kind=if($index-eq0){'StartMenu'}else{'Desktop'};$name=$script:CcodCurrentShortcutNames[$index];$shortcut=if($index-eq0){$Registration.startMenuShortcut}else{$Registration.desktopShortcut};$sha=if($index-eq0){[string]$ReadyEvidence.startMenuSha256}else{[string]$ReadyEvidence.desktopSha256}
+        if(-not(Test-CcodProductExactProperties $entry $script:CcodDurableCurrentShortcutFields)-or$entry.kind-isnot[string]-or$entry.kind-cne$kind-or$entry.name-isnot[string]-or$entry.name-cne$name-or$entry.path-isnot[string]-or$entry.candidatePath-isnot[string]-or-not(Test-CcodProductUnsignedInteger $entry.candidateLength)-or[uint64]$entry.candidateLength-eq0-or[uint64]$entry.candidateLength-gt262144-or$entry.candidateSha256-isnot[string]-or$entry.candidateSha256-cne$sha-or$entry.targetPath-isnot[string]-or$entry.arguments-isnot[string]-or$entry.arguments-cne[string]$ReadyEvidence.arguments-or$entry.workingDirectory-isnot[string]){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable current shortcut proof is incomplete.' $entry}
+        try{$path=[IO.Path]::GetFullPath([string]$entry.path);$candidate=[IO.Path]::GetFullPath([string]$entry.candidatePath);$target=[IO.Path]::GetFullPath([string]$entry.targetPath);$expectedPath=Get-CcodLegacyShortcutPath -RelativeName $name;$expectedCandidate=[IO.Path]::GetFullPath([string]$shortcut.candidatePath);$expectedTarget=[IO.Path]::GetFullPath([string]$ReadyEvidence.targetPath);$working=if([string]::IsNullOrEmpty([string]$entry.workingDirectory)){''}else{[IO.Path]::GetFullPath([string]$entry.workingDirectory).TrimEnd('\')}}catch{Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable current shortcut paths are invalid.' $entry}
+        if($path-cne[string]$entry.path-or$path-cne$expectedPath-or$candidate-cne[string]$entry.candidatePath-or$candidate-cne$expectedCandidate-or$target-cne[string]$entry.targetPath-or$target-cne$expectedTarget-or$working-cne[string]$entry.workingDirectory){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable current shortcut paths changed.' $entry}
+    }
+    return $Proof
+}
+
+function New-CcodDurableCurrentProof {
+    param([Parameter(Mandatory)]$Registration,[Parameter(Mandatory)]$ReadyEvidence,[Parameter(Mandatory)][hashtable]$Adapters)
+    $entries=[Collections.Generic.List[object]]::new()
+    foreach($kind in @('StartMenu','Desktop')){$shortcut=if($kind-ceq'StartMenu'){$Registration.startMenuShortcut}else{$Registration.desktopShortcut};$entries.Add((&$Adapters.GetCurrentShortcutProof $kind $shortcut $ReadyEvidence))}
+    $proof=[pscustomobject][ordered]@{version=[string]$Registration.version;runtimeId=[string]$Registration.runtimeId;packageSha256=[string]$Registration.packageSha256;shortcuts=@($entries)}
+    [void](Assert-CcodDurableCurrentProof -Proof $proof -Registration $Registration -ReadyEvidence $ReadyEvidence);return $proof
+}
+
+function Test-CcodDurableLegacyRegistryEntry {
+    param($Entry,[Parameter(Mandatory)]$LegacyRegistration,[Parameter(Mandatory)][string]$ExpectedAppId)
+    if($null-eq$Entry-or-not(Test-CcodProductExactProperties $Entry @('kind','path','values'))-or$Entry.kind-isnot[string]-or$Entry.kind-cne'Registry'-or$Entry.path-isnot[string]-or$Entry.path-cne(Get-CcodLegacyRegistryPath $ExpectedAppId)){return $false}
+    $names=@(Get-CcodProductMapNames $Entry.values);if($names.Count-eq0-or(@($names|Where-Object{$script:CcodLegacyRegistryValueNames-cnotcontains[string]$_}).Count-ne0)){return $false}
+    foreach($required in @('DisplayVersion','InstallLocation','UninstallString')){$value=Get-CcodProductMapValue $Entry.values $required;if($null-eq$value-or-not(Test-CcodProductExactProperties $value @('value','kind'))-or$value.kind-isnot[string]-or$value.kind-cne'String'){return $false};$expected=if($required-ceq'DisplayVersion'){$LegacyRegistration.displayVersion}elseif($required-ceq'InstallLocation'){$LegacyRegistration.installLocation}else{$LegacyRegistration.uninstallString};if($value.value-isnot[string]-or[string]$value.value-cne[string]$expected){return $false}}
+    foreach($name in $names){$value=Get-CcodProductMapValue $Entry.values ([string]$name);if($null-eq$value-or-not(Test-CcodProductExactProperties $value @('value','kind'))-or$value.kind-isnot[string]-or$value.kind-cnotin@('String','ExpandString','Binary','DWord','QWord','MultiString','None')){return $false}}
+    return $true
+}
+
+function Assert-CcodDurableLegacyMigrationRecord {
+    param([Parameter(Mandatory)]$Record,[Parameter(Mandatory)][string]$ExpectedAppId,[Parameter(Mandatory)]$Registration,[Parameter(Mandatory)]$ReadyEvidence)
+    if(-not(Test-CcodProductExactProperties $Record $script:CcodDurableLegacyMigrationFields)-or$Record.schemaVersion-isnot[int]-or$Record.schemaVersion-ne1-or$Record.transactionId-isnot[string]-or$Record.transactionId-cne[string]$ReadyEvidence.transactionRecord.transactionId-or$Record.runtimeId-isnot[string]-or$Record.runtimeId-cne$Registration.runtimeId-or-not(Test-CcodProductUnsignedInteger $Record.runtimeGeneration)-or[uint64]$Record.runtimeGeneration-ne[uint64]$ReadyEvidence.runtimeGeneration-or$Record.manifestSha256-isnot[string]-or$Record.manifestSha256-cne[ string]$ReadyEvidence.manifestSha256-or$Record.packageSha256-isnot[string]-or$Record.packageSha256-cne$Registration.packageSha256-or$Record.appId-isnot[string]-or$Record.appId-cne$ExpectedAppId-or$Record.expectedInstallRoot-isnot[string]-or(Get-CcodProductFullPath ([string]$Record.expectedInstallRoot))-cne[IO.Path]::GetFullPath([string]$Registration.installRoot)-or$Record.legacyPresent-isnot[bool]){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy migration plan identity is invalid.' $Record}
+    if(-not(Test-CcodProductExactProperties $Record.readyTransaction $script:CcodReadyTransactionFields)-or($Record.readyTransaction|ConvertTo-Json -Depth 16 -Compress)-cne($ReadyEvidence.transactionRecord|ConvertTo-Json -Depth 16 -Compress)){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy migration Ready transaction changed.' $Record.readyTransaction}
+    $plan=[pscustomobject][ordered]@{appId=[string]$Record.appId;expectedInstallRoot=[string]$Record.expectedInstallRoot;legacyPresent=[bool]$Record.legacyPresent;legacyRegistration=$Record.legacyRegistration;profile=$Record.profile;snapshot=$Record.snapshot}
+    [void](Assert-CcodLegacyMigrationPlan -Plan $plan -ExpectedAppId $ExpectedAppId -ExpectedInstallRoot ([string]$Registration.installRoot))
+    if([bool]$plan.legacyPresent){$registry=@($plan.snapshot.entries|Where-Object{$_-isnot[string]-and$_.kind-ceq'Registry'});if($registry.Count-ne1-or-not(Test-CcodDurableLegacyRegistryEntry -Entry $registry[0] -LegacyRegistration $plan.legacyRegistration -ExpectedAppId $ExpectedAppId)){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy registry evidence is incomplete.' $plan.snapshot}}
+    [void](Assert-CcodDurableCurrentProof -Proof $Record.expectedCurrentProof -Registration $Registration -ReadyEvidence $ReadyEvidence)
+    return $Record
+}
+
+function ConvertTo-CcodDurableLegacyMigrationBytes($Record){$bytes=[Text.UTF8Encoding]::new($false).GetBytes(($Record|ConvertTo-Json -Depth 32 -Compress)+"`n");if($bytes.LongLength-eq0-or$bytes.LongLength-gt1048576){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy migration plan exceeds its bounded record size.' $null};return ,$bytes}
+function Get-CcodProductBytesSha256([byte[]]$Bytes){$sha=[Security.Cryptography.SHA256]::Create();try{[BitConverter]::ToString($sha.ComputeHash($Bytes)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}}
+
+function ConvertFrom-CcodDurableLegacyMigrationRead {
+    param([Parameter(Mandatory)]$Read,[Parameter(Mandatory)][string]$ExpectedAppId,[Parameter(Mandatory)]$Registration,[Parameter(Mandatory)]$ReadyEvidence)
+    if(-not(Test-CcodProductExactProperties $Read @('Bytes','Length','Sha256'))-or$Read.Bytes-isnot[byte[]]-or-not(Test-CcodProductUnsignedInteger $Read.Length)-or[uint64]$Read.Length-ne[uint64]$Read.Bytes.LongLength-or$Read.Bytes.LongLength-eq0-or$Read.Bytes.LongLength-gt1048576-or$Read.Sha256-isnot[string]-or$Read.Sha256-cnotmatch'^[0-9a-f]{64}$'-or(Get-CcodProductBytesSha256 $Read.Bytes)-cne[string]$Read.Sha256){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy migration plan read identity is invalid.' $Read}
+    try{$json=[Text.UTF8Encoding]::new($false,$true).GetString($Read.Bytes);if(-not(Test-CcodProductJsonHasNoDuplicateProperties $json)){throw 'duplicate JSON properties'};$record=$json|ConvertFrom-Json -ErrorAction Stop}catch{Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy migration plan JSON is malformed or ambiguous.' $Read.Sha256}
+    [void](Assert-CcodDurableLegacyMigrationRecord -Record $record -ExpectedAppId $ExpectedAppId -Registration $Registration -ReadyEvidence $ReadyEvidence)
+    $canonical=ConvertTo-CcodDurableLegacyMigrationBytes $record;if([Convert]::ToBase64String($canonical)-cne[Convert]::ToBase64String($Read.Bytes)){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy migration plan bytes are noncanonical.' $Read.Sha256}
+    if([bool]$record.legacyPresent){foreach($entry in @($record.snapshot.entries)){if($entry-isnot[string]-and$entry.kind-ceq'Registry'){$entry.values=ConvertTo-CcodProductOrderedMap $entry.values}}}
+    return $record
+}
+
 function Test-CcodLegacySnapshotCurrentReplacement {
     param($Entry,[Parameter(Mandatory)][string]$Name,[Parameter(Mandatory)]$CurrentProof)
-    if($Entry-is[string]-or$null-eq$Entry-or$Entry.kind-cne'Shortcut'-or$Entry.name-isnot[string]-or[string]$Entry.name-cne$Name-or
-       $Entry.path-isnot[string]-or$Entry.sha256-isnot[string]){return $false}
-    try{$expectedPath=Get-CcodLegacyShortcutPath -RelativeName $Name;$actualPath=[IO.Path]::GetFullPath([string]$Entry.path)}catch{return $false}
-    if($actualPath-cne$expectedPath){return $false}
-    $expectedSha256=if($Name-ceq$script:CcodCurrentShortcutNames[0]){[string]$CurrentProof.startMenuSha256}elseif($Name-ceq$script:CcodCurrentShortcutNames[1]){[string]$CurrentProof.desktopSha256}else{return $false}
-    return [string]$Entry.sha256-ceq$expectedSha256
+    $expected=Get-CcodDurableCurrentShortcutProof -Proof $CurrentProof -Name $Name
+    if($null-eq$expected-or$Entry-is[string]-or$null-eq$Entry-or$Entry.kind-cne'Shortcut'-or$Entry.name-isnot[string]-or[string]$Entry.name-cne$Name-or$Entry.path-isnot[string]-or$Entry.sha256-isnot[string]-or$Entry.bytesBase64-isnot[string]-or$Entry.targetPath-isnot[string]-or$Entry.arguments-isnot[string]-or$Entry.workingDirectory-isnot[string]){return $false}
+    try{$actualPath=[IO.Path]::GetFullPath([string]$Entry.path);$bytes=[Convert]::FromBase64String([string]$Entry.bytesBase64);$target=[IO.Path]::GetFullPath([string]$Entry.targetPath);$working=if([string]::IsNullOrEmpty([string]$Entry.workingDirectory)){''}else{[IO.Path]::GetFullPath([string]$Entry.workingDirectory).TrimEnd('\')}}catch{return $false}
+    return $actualPath-ceq[string]$expected.path-and$bytes.LongLength-eq[uint64]$expected.candidateLength-and(Get-CcodProductBytesSha256 $bytes)-ceq[string]$expected.candidateSha256-and[string]$Entry.sha256-ceq[string]$expected.candidateSha256-and$target-ceq[string]$expected.targetPath-and[string]$Entry.arguments-ceq[string]$expected.arguments-and$working-ceq[string]$expected.workingDirectory
+}
+
+function ConvertTo-CcodDurableLegacyPlan($Record){[pscustomobject][ordered]@{appId=[string]$Record.appId;expectedInstallRoot=[string]$Record.expectedInstallRoot;legacyPresent=[bool]$Record.legacyPresent;legacyRegistration=$Record.legacyRegistration;profile=$Record.profile;snapshot=$Record.snapshot}}
+
+function Assert-CcodDurableLegacyReplay {
+    param([Parameter(Mandatory)]$Record,[Parameter(Mandatory)][hashtable]$Adapters)
+    $plan=ConvertTo-CcodDurableLegacyPlan $Record;$legacy=&$Adapters.ReadLegacyRegistration $Record.appId
+    if(-not[bool]$Record.legacyPresent){if($null-ne$legacy){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy state appeared after an absent durable capture.' $Record.appId};return $plan}
+    if($null-eq$legacy){$start=Get-CcodDurableCurrentShortcutProof $Record.expectedCurrentProof $script:CcodCurrentShortcutNames[0];$desktop=Get-CcodDurableCurrentShortcutProof $Record.expectedCurrentProof $script:CcodCurrentShortcutNames[1];$expected=[pscustomobject][ordered]@{verified=$true;runtimeId=[string]$Record.expectedCurrentProof.runtimeId;version=[string]$Record.expectedCurrentProof.version;packageSha256=[string]$Record.expectedCurrentProof.packageSha256;shortcutNames=@($script:CcodCurrentShortcutNames);startMenuSha256=[string]$start.candidateSha256;desktopSha256=[string]$desktop.candidateSha256};$current=&$Adapters.ReadVerifiedRegistration;if(-not(Test-CcodCurrentVerifiedRegistrationUnchanged -Before $expected -After $current)){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Absent legacy registry lacks the exact current proof.' $Record.appId};foreach($entry in @($plan.snapshot.entries)){if((Get-CcodLegacySnapshotEntryName -Entry $entry -ExpectedAppId $Record.appId)-in$script:CcodCurrentShortcutNames){continue};$state=&$Adapters.ReadLegacyEntry $entry;if($entry.kind-ceq'Registry'){if($null-ne$state){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy registry observation is internally inconsistent.' $Record.appId};continue};if($null-ne$state-and$state-cne'Exact'){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Remaining legacy-only shortcut is foreign.' (Get-CcodLegacySnapshotEntryName -Entry $entry -ExpectedAppId $Record.appId)}};return $plan}
+    if($null-eq$legacy-or$legacy.appId-cne$plan.legacyRegistration.appId-or$legacy.displayVersion-cne$plan.legacyRegistration.displayVersion-or$legacy.installLocation-cne$plan.legacyRegistration.installLocation-or$legacy.uninstallString-cne$plan.legacyRegistration.uninstallString-or@($legacy.unsafeShortcutNames).Count-ne0){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Live legacy registry no longer matches the durable capture.' $Record.appId}
+    $required=@($plan.profile.shortcutNames);$allowed=@($required)+@($script:CcodCurrentShortcutNames);$actual=@($legacy.shortcutNames);$requiredOverlaps=@($required|Where-Object{$script:CcodCurrentShortcutNames-ccontains[string]$_})
+    if(-not(Test-CcodProductExactStringSet $actual $actual)-or@($actual|Where-Object{$allowed-cnotcontains[string]$_}).Count-ne0-or@($requiredOverlaps|Where-Object{$actual-cnotcontains[string]$_}).Count-ne0){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Live legacy shortcut names are outside the durable transition.' $Record.appId}
+    $live=&$Adapters.ReadLegacySnapshot $Record.appId $plan.profile $plan
+    if($null-eq$live-or$live.appId-cne$Record.appId){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Live legacy snapshot could not be recaptured.' $Record.appId}
+    $storedByName=@{};foreach($entry in @($plan.snapshot.entries)){$name=Get-CcodLegacySnapshotEntryName -Entry $entry -ExpectedAppId $Record.appId;if($null-eq$name-or$storedByName.ContainsKey($name)){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy snapshot contains ambiguous entries.' $name};$storedByName[$name]=$entry}
+    $liveByName=@{};foreach($entry in @($live.entries)){$name=Get-CcodLegacySnapshotEntryName -Entry $entry -ExpectedAppId $Record.appId;if($null-eq$name-or$liveByName.ContainsKey($name)){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Live legacy snapshot contains ambiguous entries.' $name};$liveByName[$name]=$entry}
+    if(-not$liveByName.ContainsKey('Registry')-or(Compare-CcodLegacySnapshotEntry -Expected $storedByName['Registry'] -Current $liveByName['Registry'])-cne'Exact'){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Live legacy registry evidence changed after durable capture.' $Record.appId}
+    foreach($name in $required){if(-not$liveByName.ContainsKey($name)){if($script:CcodCurrentShortcutNames-ccontains$name){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Required overlap shortcut disappeared after durable capture.' $name};continue};$current=$liveByName[$name];$historical=$storedByName[$name];if((Compare-CcodLegacySnapshotEntry -Expected $historical -Current $current)-ceq'Exact'){continue};if($script:CcodCurrentShortcutNames-ccontains$name-and(Test-CcodLegacySnapshotCurrentReplacement -Entry $current -Name $name -CurrentProof $Record.expectedCurrentProof)){continue};Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Historical shortcut changed outside the durable current replacement.' $name}
+    foreach($name in $script:CcodCurrentShortcutNames){if($required-ccontains$name-or-not$liveByName.ContainsKey($name)){continue};if(-not(Test-CcodLegacySnapshotCurrentReplacement -Entry $liveByName[$name] -Name $name -CurrentProof $Record.expectedCurrentProof)){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Optional current shortcut does not match the durable replacement.' $name}}
+    if(@($liveByName.Keys|Where-Object{$_-cne'Registry'-and$actual-cnotcontains[string]$_}).Count-ne0){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Live legacy snapshot contains an unreported shortcut.' $Record.appId}
+    return $plan
+}
+
+function Get-CcodDurableLegacyProductRegistrationMigrationPlan {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ExpectedAppId,[Parameter(Mandatory)]$Registration,[Parameter(Mandatory)]$ReadyEvidence,[hashtable]$Adapters)
+    if($ExpectedAppId-cne$script:CcodProductAppId-or-not(Test-CcodProductRegistration -Registration $Registration -ExpectedRuntimeId ([string]$Registration.runtimeId) -ExpectedVersion $script:CcodProductVersion -ExpectedPackageSha256 ([string]$Registration.packageSha256))-or-not(Test-CcodProductReadyProof $ReadyEvidence $Registration)-or-not(Test-CcodDurableReadyEvidence $ReadyEvidence $Registration)){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy migration requires the exact Ready product identity.' $ExpectedAppId}
+    $adapter=Get-CcodProductRegistrationAdapters $Adapters;$existing=&$adapter.ReadLegacyMigrationPlan $ReadyEvidence
+    if($null-ne$existing){$record=ConvertFrom-CcodDurableLegacyMigrationRead -Read $existing -ExpectedAppId $ExpectedAppId -Registration $Registration -ReadyEvidence $ReadyEvidence;return Assert-CcodDurableLegacyReplay -Record $record -Adapters $adapter}
+    $plan=Get-CcodLegacyProductRegistrationMigrationPlan -ExpectedAppId $ExpectedAppId -ExpectedInstallRoot ([string]$Registration.installRoot) -Adapters $adapter
+    $currentProof=New-CcodDurableCurrentProof -Registration $Registration -ReadyEvidence $ReadyEvidence -Adapters $adapter
+    $record=[pscustomobject][ordered]@{schemaVersion=1;transactionId=[string]$ReadyEvidence.transactionRecord.transactionId;runtimeId=[string]$Registration.runtimeId;runtimeGeneration=[uint64]$ReadyEvidence.runtimeGeneration;manifestSha256=[string]$ReadyEvidence.manifestSha256;packageSha256=[string]$Registration.packageSha256;readyTransaction=$ReadyEvidence.transactionRecord;appId=$ExpectedAppId;expectedInstallRoot=[string]$Registration.installRoot;legacyPresent=[bool]$plan.legacyPresent;legacyRegistration=$plan.legacyRegistration;profile=$plan.profile;snapshot=$plan.snapshot;expectedCurrentProof=$currentProof}
+    [void](Assert-CcodDurableLegacyMigrationRecord -Record $record -ExpectedAppId $ExpectedAppId -Registration $Registration -ReadyEvidence $ReadyEvidence);$bytes=ConvertTo-CcodDurableLegacyMigrationBytes $record
+    try{&$adapter.WriteLegacyMigrationPlan $ReadyEvidence $bytes|Out-Null}catch{Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy migration plan could not be published create-only.' $Record.transactionId}
+    $read=&$adapter.ReadLegacyMigrationPlan $ReadyEvidence;if($null-eq$read-or[Convert]::ToBase64String([byte[]]$read.Bytes)-cne[Convert]::ToBase64String($bytes)){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy migration plan did not read back exactly.' $Record.transactionId}
+    $persisted=ConvertFrom-CcodDurableLegacyMigrationRead -Read $read -ExpectedAppId $ExpectedAppId -Registration $Registration -ReadyEvidence $ReadyEvidence
+    return ConvertTo-CcodDurableLegacyPlan $persisted
 }
 
 function Read-CcodLegacySnapshot {
-    param([string]$ExpectedAppId,[Parameter(Mandatory)]$ExpectedProfile)
+    param([string]$ExpectedAppId,[Parameter(Mandatory)]$ExpectedProfile,[AllowNull()]$CapturedPlan)
     $legacy=Read-CcodCurrentUserLegacyRegistration $ExpectedAppId;if($null-eq$legacy){return $null}
-    $observedProfile=Resolve-CcodLegacyRegistrationProfile -LegacyRegistration $legacy
-    if($observedProfile.profileId-cne$ExpectedProfile.profileId){throw 'legacy profile changed before snapshot'}
+    if($null-eq$CapturedPlan){$observedProfile=Resolve-CcodLegacyRegistrationProfile -LegacyRegistration $legacy;if($observedProfile.profileId-cne$ExpectedProfile.profileId){throw 'legacy profile changed before snapshot'};$shortcutNames=@($ExpectedProfile.shortcutNames)}else{$captured=$CapturedPlan.legacyRegistration;$required=@($ExpectedProfile.shortcutNames);$allowed=@($required)+@($script:CcodCurrentShortcutNames);$requiredOverlaps=@($required|Where-Object{$script:CcodCurrentShortcutNames-ccontains[string]$_});$shortcutNames=@($legacy.shortcutNames);if($legacy.appId-cne$captured.appId-or$legacy.displayVersion-cne$captured.displayVersion-or$legacy.installLocation-cne$captured.installLocation-or$legacy.uninstallString-cne$captured.uninstallString-or@($legacy.unsafeShortcutNames).Count-ne0-or@($shortcutNames|Where-Object{$allowed-cnotcontains[string]$_}).Count-ne0-or@($requiredOverlaps|Where-Object{$shortcutNames-cnotcontains[string]$_}).Count-ne0){throw 'legacy replay profile changed before snapshot'}}
     $entries=[Collections.Generic.List[object]]::new();$keyPath=Get-CcodLegacyRegistryPath $ExpectedAppId;$key=Get-Item -LiteralPath $keyPath -ErrorAction Stop
     try{
         $names=@($key.GetValueNames());if($key.GetSubKeyNames().Count-ne0-or@($names|Where-Object{$script:CcodLegacyRegistryValueNames-cnotcontains$_}).Count-ne0){throw 'legacy registry contains unknown state'}
         $values=[ordered]@{};foreach($name in $names){$values[$name]=[pscustomobject]@{value=$key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);kind=[string]$key.GetValueKind($name)}}
     }finally{$key.Dispose()}
     $entries.Add([pscustomobject]@{kind='Registry';path=$keyPath;values=$values})
-    foreach($name in @($ExpectedProfile.shortcutNames)){
+    foreach($name in @($shortcutNames)){
         $path=Get-CcodLegacyShortcutPath -RelativeName $name;$item=Get-Item -LiteralPath $path -Force -ErrorAction Stop
-        if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0-or[string]$item.Name-cne[IO.Path]::GetFileName($name)){throw 'legacy shortcut unsafe'}
+        if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0-or[string]$item.Name-cne[IO.Path]::GetFileName($name)-or$item.Length-le0-or$item.Length-gt262144){throw 'legacy shortcut unsafe'}
         $shell=$null;$shortcut=$null
         try{
             $shell=New-Object -ComObject WScript.Shell;$shortcut=$shell.CreateShortcut($path)
@@ -980,22 +1108,18 @@ function Remove-CcodLegacyProductRegistration {
     if(-not(Test-CcodCurrentVerifiedRegistrationUnchanged -Before $ExpectedCurrentProof -After $verified)){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy product migration requires an exact current three-record read-back proof.' $ExpectedAppId}
     $profile=$MigrationPlan.profile;$snapshot=$MigrationPlan.snapshot
     $observedLegacy=&$adapter.ReadLegacyRegistration $ExpectedAppId
-    if($null-eq$observedLegacy){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Captured legacy registry disappeared before cleanup.' $ExpectedAppId}
-    $expectedObservedNames=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal);foreach($name in @($profile.shortcutNames)+@($script:CcodCurrentShortcutNames)){[void]$expectedObservedNames.Add([string]$name)}
-    if(-not(Test-CcodProductExactStringSet $observedLegacy.shortcutNames @($expectedObservedNames))-or@($observedLegacy.unsafeShortcutNames).Count-ne0-or
-       $observedLegacy.appId-cne$MigrationPlan.legacyRegistration.appId-or
-       $observedLegacy.displayVersion-cne$MigrationPlan.legacyRegistration.displayVersion-or$observedLegacy.installLocation-cne$MigrationPlan.legacyRegistration.installLocation-or
-       $observedLegacy.uninstallString-cne$MigrationPlan.legacyRegistration.uninstallString){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Captured legacy profile changed before cleanup.' $ExpectedAppId}
+    if($null-ne$observedLegacy){$allowed=@($profile.shortcutNames)+@($script:CcodCurrentShortcutNames);$actual=@($observedLegacy.shortcutNames);if(-not(Test-CcodProductExactStringSet $actual $actual)-or@($actual|Where-Object{$allowed-cnotcontains[string]$_}).Count-ne0-or@($script:CcodCurrentShortcutNames|Where-Object{$actual-cnotcontains[string]$_}).Count-ne0-or@($observedLegacy.unsafeShortcutNames).Count-ne0-or$observedLegacy.appId-cne$MigrationPlan.legacyRegistration.appId-or$observedLegacy.displayVersion-cne$MigrationPlan.legacyRegistration.displayVersion-or$observedLegacy.installLocation-cne$MigrationPlan.legacyRegistration.installLocation-or$observedLegacy.uninstallString-cne$MigrationPlan.legacyRegistration.uninstallString){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Captured legacy profile changed before cleanup.' $ExpectedAppId}}
     $removalEntries=[Collections.Generic.List[object]]::new()
     foreach($entry in @($snapshot.entries)){
         $name=Get-CcodLegacySnapshotEntryName -Entry $entry -ExpectedAppId $ExpectedAppId
         if($script:CcodCurrentShortcutNames-ccontains$name){
             continue
         }
+        $state=&$adapter.ReadLegacyEntry $entry
+        if($name-ceq'Registry'-and(($null-eq$observedLegacy)-ne($null-eq$state))){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy registry observations are inconsistent before cleanup.' $ExpectedAppId}
+        if($null-eq$state){continue}
+        if($state-cne'Exact'){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Captured legacy-only state changed before deletion.' $name}
         $removalEntries.Add($entry)
-    }
-    foreach($entry in @($removalEntries)){
-        if((&$adapter.ReadLegacyEntry $entry)-cne'Exact'){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Captured legacy-only state changed before deletion.' (Get-CcodLegacySnapshotEntryName -Entry $entry -ExpectedAppId $ExpectedAppId)}
     }
     $removed=[Collections.Generic.List[object]]::new();$failedEntry=$null
     try{
@@ -1014,4 +1138,4 @@ function Remove-CcodLegacyProductRegistration {
     }
 }
 
-Export-ModuleMember -Function New-CcodProductRegistration,Test-CcodProductRegistration,Commit-CcodProductRegistration,Remove-CcodProductRegistration,Remove-CcodLegacyProductRegistration,Get-CcodLegacyProductRegistrationMigrationPlan,Get-CcodLegacyRegistrationProfiles,Resolve-CcodLegacyRegistrationProfile,Set-CcodInstalledUninstallResumeRegistration,Test-CcodInstalledUninstallResumeRegistration,Get-CcodInstalledUninstallResumeRegistrationState,Remove-CcodInstalledUninstallProductShortcuts,Remove-CcodInstalledUninstallResumeRegistration
+Export-ModuleMember -Function New-CcodProductRegistration,Test-CcodProductRegistration,Commit-CcodProductRegistration,Remove-CcodProductRegistration,Remove-CcodLegacyProductRegistration,Get-CcodLegacyProductRegistrationMigrationPlan,Get-CcodDurableLegacyProductRegistrationMigrationPlan,Get-CcodLegacyRegistrationProfiles,Resolve-CcodLegacyRegistrationProfile,Set-CcodInstalledUninstallResumeRegistration,Test-CcodInstalledUninstallResumeRegistration,Get-CcodInstalledUninstallResumeRegistrationState,Remove-CcodInstalledUninstallProductShortcuts,Remove-CcodInstalledUninstallResumeRegistration

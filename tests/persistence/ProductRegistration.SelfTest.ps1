@@ -12,8 +12,11 @@ $runtimeId = '2.5.22-1111111111111111-22222222222222222222222222222222'
 $packageSha256 = '3' * 64
 $appId = '{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}'
 $canonicalTaskTarget=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'schtasks.exe'))
-$cleanupReady=[pscustomobject][ordered]@{phase='Ready';installRoot='C:\fixture\CodexControlOtherDevices';runtimeId=$runtimeId;runtimeGeneration=[uint64]7;packageSha256=$packageSha256;manifestSha256=('a'*64);startMenuSha256=('b'*64);desktopSha256=('c'*64);targetPath=$canonicalTaskTarget;arguments='/Run /TN "Codex Control Other Devices Supervisor"'}
-$expectedVerifiedRegistration=[pscustomobject][ordered]@{verified=$true;runtimeId=$runtimeId;version='2.5.22';packageSha256=$packageSha256;shortcutNames=@('Programs\CodexRemote-fix\CodexRemote-fix.lnk','Desktop\CodexRemote-fix.lnk');startMenuSha256=('b'*64);desktopSha256=('c'*64)}
+$startCurrentBytes=[Text.UTF8Encoding]::new($false).GetBytes('current-shortcut:Programs\CodexRemote-fix\CodexRemote-fix.lnk')
+$desktopCurrentBytes=[Text.UTF8Encoding]::new($false).GetBytes('current-shortcut:Desktop\CodexRemote-fix.lnk')
+$testSha=[Security.Cryptography.SHA256]::Create();try{$startCurrentSha=[BitConverter]::ToString($testSha.ComputeHash($startCurrentBytes)).Replace('-','').ToLowerInvariant();$desktopCurrentSha=[BitConverter]::ToString($testSha.ComputeHash($desktopCurrentBytes)).Replace('-','').ToLowerInvariant()}finally{$testSha.Dispose()}
+$cleanupReady=[pscustomobject][ordered]@{phase='Ready';installRoot='C:\fixture\CodexControlOtherDevices';runtimeId=$runtimeId;runtimeGeneration=[uint64]7;packageSha256=$packageSha256;manifestSha256=('a'*64);startMenuSha256=$startCurrentSha;desktopSha256=$desktopCurrentSha;targetPath=$canonicalTaskTarget;arguments='/Run /TN "Codex Control Other Devices Supervisor"'}
+$expectedVerifiedRegistration=[pscustomobject][ordered]@{verified=$true;runtimeId=$runtimeId;version='2.5.22';packageSha256=$packageSha256;shortcutNames=@('Programs\CodexRemote-fix\CodexRemote-fix.lnk','Desktop\CodexRemote-fix.lnk');startMenuSha256=$startCurrentSha;desktopSha256=$desktopCurrentSha}
 $fullReadyRecord=[pscustomobject][ordered]@{schemaVersion=1;transactionId='11111111-2222-3333-4444-555555555555';oldRuntimeId=$null;oldGeneration=$null;oldManifestSha256=$null;newRuntimeId=$runtimeId;newGeneration=[uint64]7;newManifestSha256=('a'*64);sealedPackageSha256=$packageSha256;ownedObjectNames=@($runtimeId);phase='Ready';errorCode=$null}
 $v210ShortcutNames = @(
     'Programs\Codex Control other devices\Codex Control other devices for Windows.lnk',
@@ -32,6 +35,8 @@ $v2521ShortcutNames = @(
 )
 $currentShortcutNames=@($v2521ShortcutNames[0],$v2521ShortcutNames[3])
 $legacyInstallLocation = 'C:\legacy\CodexControlOtherDevices-installer'
+
+function Get-CcodTestBytesSha256([byte[]]$Bytes){$sha=[Security.Cryptography.SHA256]::Create();try{[BitConverter]::ToString($sha.ComputeHash($Bytes)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}}
 
 function New-CcodLegacyRegistrationFixture {
     param(
@@ -81,6 +86,10 @@ function New-CcodProductLegacyShortcutProofs {
     $proofs
 }
 
+function New-CcodProductCurrentShortcutProofs {
+    $proofs=@{};foreach($name in $currentShortcutNames){$bytes=[Text.UTF8Encoding]::new($false).GetBytes(('current-shortcut:'+([string]$name)));$sha=[Security.Cryptography.SHA256]::Create();try{$hash=[BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()};$proofs[[string]$name]=[pscustomobject][ordered]@{targetPath=$canonicalTaskTarget;arguments='/Run /TN "Codex Control Other Devices Supervisor"';workingDirectory='';sha256=$hash;bytesBase64=[Convert]::ToBase64String($bytes)}};$proofs
+}
+
 function New-CcodRegistrationWorld {
     param([string]$InstallRoot = 'C:\fixture\CodexControlOtherDevices')
 
@@ -95,8 +104,8 @@ function New-CcodRegistrationWorld {
             packageSha256 = $packageSha256
             runtimeGeneration = [uint64]7
             manifestSha256 = 'a'*64
-            startMenuSha256 = 'b'*64
-            desktopSha256 = 'c'*64
+            startMenuSha256 = $startCurrentSha
+            desktopSha256 = $desktopCurrentSha
             targetPath = $canonicalTaskTarget
             arguments = '/Run /TN "Codex Control Other Devices Supervisor"'
             transactionRecord = $fullReadyRecord
@@ -126,6 +135,11 @@ function New-CcodRegistrationWorld {
         VerifiedRegistrationMutationAt = 0
         LegacySnapshotHashOverrides = @{}
         LegacyShortcutProofs = $null
+        CurrentShortcutProofs = (New-CcodProductCurrentShortcutProofs)
+        SimulateOverlapWrites = $false
+        LegacyMigrationPlanBytes = $null
+        LegacyMigrationPlanWrites = 0
+        LegacyMigrationPlanReads = 0
         Calls = [Collections.Generic.List[string]]::new()
     }
     $world.LegacyShortcutProofs=New-CcodProductLegacyShortcutProofs -Legacy $world.Legacy -ExpectedInstallRoot $registration.installRoot
@@ -150,6 +164,7 @@ function New-CcodRegistrationWorld {
             $world.Shortcuts[$Kind] = $Shortcut
             $legacyName=if($Kind-ceq'StartMenu'){$currentShortcutNames[0]}else{$currentShortcutNames[1]}
             if(-not$world.LegacyEntries.Contains($legacyName)){$world.LegacyEntries.Add($legacyName)}
+            if($world.SimulateOverlapWrites){$world.LegacyShortcutProofs[$legacyName]=$world.CurrentShortcutProofs[$legacyName]}
         }.GetNewClosure()
         ReadShortcut = {
             param($Kind,$Shortcut)
@@ -160,10 +175,10 @@ function New-CcodRegistrationWorld {
         ReadLegacyRegistration = {param($ExpectedAppId)$world.Calls.Add('ReadLegacy');if(-not$world.LegacyEntries.Contains('Registry')){return $null};[pscustomobject][ordered]@{appId=[string]$world.Legacy.appId;displayVersion=[string]$world.Legacy.displayVersion;installLocation=[string]$world.Legacy.installLocation;uninstallString=[string]$world.Legacy.uninstallString;shortcutNames=@($world.LegacyEntries|Where-Object{[string]$_-cne'Registry'});unsafeShortcutNames=@($world.Legacy.unsafeShortcutNames)}}.GetNewClosure()
         ReadVerifiedRegistration = {
             $world.VerifiedRegistrationReads++
-            $startMenuSha256=if($world.VerifiedRegistrationMutationAt-eq$world.VerifiedRegistrationReads){'d'*64}else{'b'*64}
+            $startMenuSha256=if($world.VerifiedRegistrationMutationAt-eq$world.VerifiedRegistrationReads){'d'*64}else{[string]$world.Ready.startMenuSha256}
             [pscustomobject][ordered]@{
                 verified=($null-ne$world.Product-and$world.Shortcuts.Count-eq2);runtimeId=$runtimeId;version='2.5.22';packageSha256=$packageSha256
-                shortcutNames=@($currentShortcutNames);startMenuSha256=$startMenuSha256;desktopSha256=('c'*64)
+                shortcutNames=@($currentShortcutNames);startMenuSha256=$startMenuSha256;desktopSha256=[string]$world.Ready.desktopSha256
             }
         }.GetNewClosure()
         RemoveLegacyRegistration = { param($ExpectedAppId,$ExpectedShortcutNames) $world.Calls.Add('RemoveLegacy'); $world.LegacyRemovalCalls++; $world.LegacyRemoved = $true }.GetNewClosure()
@@ -178,12 +193,20 @@ function New-CcodRegistrationWorld {
                     $relative=([string]$entry).Substring(([string]$entry).IndexOf('\')+1);$proof=$world.LegacyShortcutProofs[[string]$entry];$sha=[string]$proof.sha256
                     if($world.LegacySnapshotHashOverrides.ContainsKey([string]$entry)){$sha=[string]$world.LegacySnapshotHashOverrides[[string]$entry]}
                     $entries.Add([pscustomobject][ordered]@{kind='Shortcut';name=[string]$entry;path=[IO.Path]::GetFullPath((Join-Path $base $relative));sha256=$sha;bytesBase64=[string]$proof.bytesBase64;targetPath=[string]$proof.targetPath;arguments=[string]$proof.arguments;workingDirectory=[string]$proof.workingDirectory})
-                }else{$entries.Add([string]$entry)}
+                }else{$entries.Add([pscustomobject][ordered]@{kind='Registry';path=('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\'+$world.Legacy.appId+'_is1');values=[ordered]@{DisplayVersion=[pscustomobject]@{value=[string]$world.Legacy.displayVersion;kind='String'};InstallLocation=[pscustomobject]@{value=[string]$world.Legacy.installLocation;kind='String'};UninstallString=[pscustomobject]@{value=[string]$world.Legacy.uninstallString;kind='String'}}})}
             }
             [pscustomobject][ordered]@{appId=$world.Legacy.appId;entries=@($entries)}
         }.GetNewClosure()
+        GetCurrentShortcutProof = {
+            param($Kind,$Shortcut,$ReadyEvidence)
+            $name=if($Kind-ceq'StartMenu'){$currentShortcutNames[0]}else{$currentShortcutNames[1]};$proof=$world.CurrentShortcutProofs[$name]
+            $base=if($Kind-ceq'StartMenu'){[Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)}else{[Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)};$relative=$name.Substring($name.IndexOf('\')+1)
+            [pscustomobject][ordered]@{kind=$Kind;name=$name;path=[IO.Path]::GetFullPath((Join-Path $base $relative));candidatePath=[IO.Path]::GetFullPath([string]$Shortcut.candidatePath);candidateLength=[int64]([Convert]::FromBase64String([string]$proof.bytesBase64).LongLength);candidateSha256=[string]$proof.sha256;targetPath=[string]$proof.targetPath;arguments=[string]$proof.arguments;workingDirectory=[string]$proof.workingDirectory}
+        }.GetNewClosure()
+        ReadLegacyMigrationPlan = {param($ReadyEvidence)$world.LegacyMigrationPlanReads++;if($null-eq$world.LegacyMigrationPlanBytes){return $null};$bytes=[byte[]]$world.LegacyMigrationPlanBytes.Clone();[pscustomobject]@{Bytes=$bytes;Length=[int64]$bytes.LongLength;Sha256=(Get-CcodTestBytesSha256 $bytes)}}.GetNewClosure()
+        WriteLegacyMigrationPlan = {param($ReadyEvidence,[byte[]]$Bytes)if($null-ne$world.LegacyMigrationPlanBytes){throw 'fixture durable plan collision'};$world.LegacyMigrationPlanWrites++;$world.LegacyMigrationPlanBytes=[byte[]]$Bytes.Clone();[pscustomobject]@{Length=[int64]$Bytes.LongLength;Sha256=(Get-CcodTestBytesSha256 $Bytes)}}.GetNewClosure()
         RemoveLegacyEntry = {param($Entry);$name=if($Entry-is[string]){[string]$Entry}elseif($Entry.kind-ceq'Registry'){'Registry'}else{[string]$Entry.name};$world.LegacyRemoveAttempts++;if($world.LegacyRemoveFailureAt-eq$world.LegacyRemoveAttempts){throw 'fixture legacy delete failure'};[void]$world.LegacyEntries.Remove($name)}.GetNewClosure()
-        ReadLegacyEntry = {param($Entry);$name=if($Entry-is[string]){[string]$Entry}elseif($Entry.kind-ceq'Registry'){'Registry'}else{[string]$Entry.name};if($world.LegacyReplacementEntry-ceq$name-and$world.LegacyRemoveFailureAt-gt0-and$world.LegacyRemoveAttempts-ge$world.LegacyRemoveFailureAt){return 'Mismatch'};if($world.LegacyEntries.Contains($name)){'Exact'}else{$null}}.GetNewClosure()
+        ReadLegacyEntry = {param($Entry);$name=if($Entry-is[string]){[string]$Entry}elseif($Entry.kind-ceq'Registry'){'Registry'}else{[string]$Entry.name};if($world.LegacyReplacementEntry-ceq$name-and$world.LegacyRemoveFailureAt-gt0-and$world.LegacyRemoveAttempts-ge$world.LegacyRemoveFailureAt){return 'Mismatch'};if(-not$world.LegacyEntries.Contains($name)){return $null};if($Entry-isnot[string]-and$Entry.kind-ceq'Shortcut' -and [string]$Entry.sha256-cne[string]$world.LegacyShortcutProofs[$name].sha256){return 'Mismatch'};'Exact'}.GetNewClosure()
         RestoreLegacyEntry = {param($Entry);$name=if($Entry-is[string]){[string]$Entry}elseif($Entry.kind-ceq'Registry'){'Registry'}else{[string]$Entry.name};if($world.LegacyRestoreFailureEntry-ceq$name){throw 'fixture restore failed'};if(-not$world.LegacyEntries.Contains($name)){$world.LegacyEntries.Add($name)};$world.LegacyRestoreOrder.Add($name);$world.LegacyRestores++}.GetNewClosure()
         WriteLegacyCompensationFailure = {param($Record)$world.LegacyUnresolvedRecords.Add($Record)}.GetNewClosure()
     }
@@ -208,7 +231,7 @@ function Set-CcodRegistrationLegacyFixture {
 
 function Get-CcodProductTestLegacyMigrationPlan {
     param([Parameter(Mandatory)]$World)
-    Get-CcodLegacyProductRegistrationMigrationPlan -ExpectedAppId $appId -ExpectedInstallRoot ([string]$World.Registration.installRoot) -Adapters $World.Adapters
+    Get-CcodDurableLegacyProductRegistrationMigrationPlan -ExpectedAppId $appId -Registration $World.Registration -ReadyEvidence $World.Ready -Adapters $World.Adapters
 }
 
 function New-CcodFix1RegistryKey {
@@ -298,7 +321,7 @@ function Invoke-CcodFix1RegistryCompensationScenario {
         $snapshotEntries=[Collections.Generic.List[object]]::new();$snapshotEntries.Add($registryEntry)
         foreach($name in $v2521ShortcutNames){$base=if($name.StartsWith('Programs\',[StringComparison]::Ordinal)){$programs}else{$desktop};$relative=$name.Substring($name.IndexOf('\')+1);$shortcut=$proofs[$name];$snapshotEntries.Add([pscustomobject][ordered]@{kind='Shortcut';name=$name;path=[IO.Path]::GetFullPath((Join-Path $base $relative));sha256=[string]$shortcut.sha256;bytesBase64=[string]$shortcut.bytesBase64;targetPath=[string]$shortcut.targetPath;arguments=[string]$shortcut.arguments;workingDirectory=[string]$shortcut.workingDirectory})}
         $snapshot=[pscustomobject][ordered]@{appId=$appId;entries=@($snapshotEntries)}
-        $proof=[pscustomobject][ordered]@{verified=$true;runtimeId=$runtimeId;version='2.5.22';packageSha256=$packageSha256;shortcutNames=@($currentShortcutNames);startMenuSha256=('b'*64);desktopSha256=('c'*64)}
+        $proof=[pscustomobject][ordered]@{verified=$true;runtimeId=$runtimeId;version='2.5.22';packageSha256=$packageSha256;shortcutNames=@($currentShortcutNames);startMenuSha256=$startCurrentSha;desktopSha256=$desktopCurrentSha}
         $removeRegistry={param($Entry)&$isolated {param($Value)Remove-CcodLegacySnapshotEntry -Entry $Value} $Entry}.GetNewClosure()
         $readRegistry={param($Entry)&$isolated {param($Value)Read-CcodLegacySnapshotEntry -Entry $Value} $Entry}.GetNewClosure()
         $restoreRegistry={param($Entry)&$isolated {param($Value)Restore-CcodLegacySnapshotEntry -Entry $Value} $Entry}.GetNewClosure()
@@ -361,6 +384,95 @@ $results += Invoke-CcodTest 'write and read-back failures preserve every legacy 
         Assert-CcodEqual $legacyUninstallString $world.Legacy.uninstallString 'failure before read-back retains the legacy entry'
         Assert-CcodEqual ($legacyShortcutNames -join '|') (@($world.Legacy.shortcutNames) -join '|') 'failure before read-back retains exact legacy shortcut names'
         Assert-CcodEqual 0 $world.LegacyRemovalCalls 'failed registration never removes legacy state'
+    }
+}
+
+# Production mutation caught: the pre-capture plan exists only in memory, so a failed current
+# overlap write permanently destroys the historical proof needed by the next process.
+$results += Invoke-CcodTest 'second registration recovers from partial current overlap writes only through a durable pre-capture plan' {
+    $outcomes=[Collections.Generic.List[string]]::new()
+    foreach($failurePoint in @('DesktopWrite','CurrentReadBack')){
+        $world=New-CcodRegistrationWorld;$world.SimulateOverlapWrites=$true;$world.Ready.startMenuSha256=[string]$world.CurrentShortcutProofs[$currentShortcutNames[0]].sha256;$world.Ready.desktopSha256=[string]$world.CurrentShortcutProofs[$currentShortcutNames[1]].sha256
+        if($failurePoint-ceq'DesktopWrite'){$world.WriteShortcutFailure='Desktop'}else{$world.ReadProductFailure=$true}
+        $firstPlan=Get-CcodProductTestLegacyMigrationPlan $world;$firstFailure=$null;try{Commit-CcodProductRegistration -Registration $world.Registration -FileTransaction ([pscustomobject]@{}) -Adapters $world.Adapters|Out-Null}catch{$firstFailure=$_}
+        Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' (([string]$firstFailure.FullyQualifiedErrorId-split',')[0]) "$failurePoint first attempt fails after its intended overlap boundary"
+        $firstPlan=$null;$world.WriteShortcutFailure=$null;$world.ReadProductFailure=$false
+        $secondFailure=$null;$secondReceipt=$null;try{$secondPlan=Get-CcodProductTestLegacyMigrationPlan $world;$secondReceipt=Commit-CcodProductRegistration -Registration $world.Registration -FileTransaction ([pscustomobject]@{}) -Adapters $world.Adapters}catch{$secondFailure=$_}
+        $outcome=if($null-ne$secondReceipt-and$secondReceipt.verified){'Recovered'}else{([string]$secondFailure.FullyQualifiedErrorId-split',')[0]};$outcomes.Add(('{0}:{1}'-f$failurePoint,$outcome))
+    }
+    Assert-CcodEqual 'DesktopWrite:Recovered|CurrentReadBack:Recovered' (@($outcomes)-join'|') 'a new process reuses durable historical evidence after either overlap failure'
+}
+
+# Production mutation caught: durable replay assumes Start-menu is always replaced before Desktop and rejects another valid crash ordering.
+$results += Invoke-CcodTest 'durable replay converges all four independent historical and current overlap states' {
+    foreach($state in @('HistoricalHistorical','CurrentHistorical','HistoricalCurrent','CurrentCurrent')){
+        $world=New-CcodRegistrationWorld;$null=Get-CcodProductTestLegacyMigrationPlan $world
+        if($state-in@('CurrentHistorical','CurrentCurrent')){$world.LegacyShortcutProofs[$currentShortcutNames[0]]=$world.CurrentShortcutProofs[$currentShortcutNames[0]]}
+        if($state-in@('HistoricalCurrent','CurrentCurrent')){$world.LegacyShortcutProofs[$currentShortcutNames[1]]=$world.CurrentShortcutProofs[$currentShortcutNames[1]]}
+        $plan=Get-CcodProductTestLegacyMigrationPlan $world;$world.SimulateOverlapWrites=$true;$null=Commit-CcodProductRegistration -Registration $world.Registration -FileTransaction ([pscustomobject]@{}) -Adapters $world.Adapters
+        Remove-CcodLegacyProductRegistration -ExpectedAppId $appId -MigrationPlan $plan -ExpectedCurrentProof $expectedVerifiedRegistration -Adapters $world.Adapters
+        Assert-CcodEqual (($currentShortcutNames|Sort-Object)-join'|') ((@($world.LegacyEntries)|Sort-Object)-join'|') "$state converges to only the two exact current overlaps"
+        Assert-CcodEqual 1 $world.LegacyMigrationPlanWrites "$state reuses one append-only plan"
+    }
+}
+
+# Production mutation caught: a later idempotent registration mistakes already-completed exact legacy cleanup for evidence loss.
+$results += Invoke-CcodTest 'durable migration replay continues every registry-first legacy cleanup crash boundary' {
+    $legacyOnly=@($v2521ShortcutNames[1],$v2521ShortcutNames[2])
+    foreach($removedCount in 0..2){
+        $world=New-CcodRegistrationWorld;$world.SimulateOverlapWrites=$true;$null=Get-CcodProductTestLegacyMigrationPlan $world;$null=Commit-CcodProductRegistration -Registration $world.Registration -FileTransaction ([pscustomobject]@{}) -Adapters $world.Adapters
+        [void]$world.LegacyEntries.Remove('Registry');for($index=0;$index-lt$removedCount;$index++){[void]$world.LegacyEntries.Remove($legacyOnly[$index])}
+        $second=Get-CcodProductTestLegacyMigrationPlan $world
+        Assert-CcodEqual $true $second.legacyPresent "registry-first crash boundary $removedCount retains the durable cleanup plan"
+        $before=$world.LegacyRemoveAttempts;$null=Commit-CcodProductRegistration -Registration $world.Registration -FileTransaction ([pscustomobject]@{}) -Adapters $world.Adapters;Remove-CcodLegacyProductRegistration -ExpectedAppId $appId -MigrationPlan $second -ExpectedCurrentProof $expectedVerifiedRegistration -Adapters $world.Adapters
+        Assert-CcodEqual (2-$removedCount) ($world.LegacyRemoveAttempts-$before) "registry-first crash boundary $removedCount removes only remaining exact legacy-only shortcuts"
+        Assert-CcodEqual (($currentShortcutNames|Sort-Object)-join'|') ((@($world.LegacyEntries)|Sort-Object)-join'|') "registry-first crash boundary $removedCount converges without restoring removed entries"
+        Assert-CcodEqual 1 $world.LegacyMigrationPlanWrites "registry-first crash boundary $removedCount preserves one append-only plan"
+    }
+    $partial=New-CcodRegistrationWorld;$partial.SimulateOverlapWrites=$true;$null=Get-CcodProductTestLegacyMigrationPlan $partial;$null=Commit-CcodProductRegistration -Registration $partial.Registration -FileTransaction ([pscustomobject]@{}) -Adapters $partial.Adapters;[void]$partial.LegacyEntries.Remove($legacyOnly[0]);$plan=Get-CcodProductTestLegacyMigrationPlan $partial;$null=Commit-CcodProductRegistration -Registration $partial.Registration -FileTransaction ([pscustomobject]@{}) -Adapters $partial.Adapters;Remove-CcodLegacyProductRegistration -ExpectedAppId $appId -MigrationPlan $plan -ExpectedCurrentProof $expectedVerifiedRegistration -Adapters $partial.Adapters
+    Assert-CcodEqual (($currentShortcutNames|Sort-Object)-join'|') ((@($partial.LegacyEntries)|Sort-Object)-join'|') 'registry-present partial legacy-only cleanup also converges absent-or-exact'
+    $foreign=New-CcodRegistrationWorld;$foreign.SimulateOverlapWrites=$true;$null=Get-CcodProductTestLegacyMigrationPlan $foreign;$null=Commit-CcodProductRegistration -Registration $foreign.Registration -FileTransaction ([pscustomobject]@{}) -Adapters $foreign.Adapters;[void]$foreign.LegacyEntries.Remove('Registry');$bytes=[Text.UTF8Encoding]::new($false).GetBytes('foreign-legacy-only');$foreign.LegacyShortcutProofs[$legacyOnly[0]]=[pscustomobject][ordered]@{targetPath=$canonicalTaskTarget;arguments='foreign';workingDirectory='';sha256=(Get-CcodTestBytesSha256 $bytes);bytesBase64=[Convert]::ToBase64String($bytes)}
+    Assert-CcodThrows {Get-CcodProductTestLegacyMigrationPlan $foreign|Out-Null} 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID'
+}
+
+# Production mutations caught: accepting a washed hybrid without a plan, or trusting changed durable identity/evidence.
+$results += Invoke-CcodTest 'durable migration plan rejects absent tampered foreign and wrong Ready identities before current writes' {
+    $absent=New-CcodRegistrationWorld;$foreignBytes=[Text.UTF8Encoding]::new($false).GetBytes('foreign-current-overlap');$foreignSha=Get-CcodTestBytesSha256 $foreignBytes
+    $absent.LegacyShortcutProofs[$currentShortcutNames[0]]=[pscustomobject][ordered]@{targetPath=$canonicalTaskTarget;arguments='/Run /TN "foreign"';workingDirectory='';sha256=$foreignSha;bytesBase64=[Convert]::ToBase64String($foreignBytes)}
+    Assert-CcodThrows {Get-CcodProductTestLegacyMigrationPlan $absent|Out-Null} 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID'
+    Assert-CcodEqual 0 $absent.LegacyMigrationPlanWrites 'washed hybrid without a prior plan publishes no replacement authority'
+    Assert-CcodEqual 0 $absent.Shortcuts.Count 'washed hybrid without a prior plan performs zero current shortcut writes'
+
+    $oversized=New-CcodRegistrationWorld;$oversizedBytes=[byte[]]::new(262145);$oversizedName=$v2521ShortcutNames[1];$oversizedProof=$oversized.LegacyShortcutProofs[$oversizedName];$oversizedProof.bytesBase64=[Convert]::ToBase64String($oversizedBytes);$oversizedProof.sha256=Get-CcodTestBytesSha256 $oversizedBytes
+    Assert-CcodThrows {Get-CcodProductTestLegacyMigrationPlan $oversized|Out-Null} 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID'
+    Assert-CcodEqual 0 $oversized.LegacyMigrationPlanWrites 'oversized historical shortcut is rejected before durable publication'
+
+    foreach($inconsistency in @('Generation','Manifest','TransactionPackage')){$world=New-CcodRegistrationWorld;$world.Ready.transactionRecord=(($world.Ready.transactionRecord|ConvertTo-Json -Depth 8 -Compress)|ConvertFrom-Json);if($inconsistency-ceq'Generation'){$world.Ready.runtimeGeneration=[uint64]8}elseif($inconsistency-ceq'Manifest'){$world.Ready.manifestSha256='e'*64}else{$world.Ready.transactionRecord.sealedPackageSha256='e'*64};Assert-CcodThrows {Get-CcodProductTestLegacyMigrationPlan $world|Out-Null} 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID';Assert-CcodEqual 0 $world.LegacyMigrationPlanWrites "$inconsistency inconsistent Ready proof publishes no plan"}
+
+    foreach($mutation in @('TamperedCurrentProof','WrongReady','WrongPackage','WrongGeneration','Duplicate','UnsafeShortcut','ForeignHybrid')){
+        $world=New-CcodRegistrationWorld;$null=Get-CcodProductTestLegacyMigrationPlan $world
+        if($mutation-ceq'ForeignHybrid'){
+            $world.LegacyShortcutProofs[$currentShortcutNames[0]]=[pscustomobject][ordered]@{targetPath=$canonicalTaskTarget;arguments='/Run /TN "foreign"';workingDirectory='';sha256=$foreignSha;bytesBase64=[Convert]::ToBase64String($foreignBytes)}
+        }else{
+            $json=[Text.UTF8Encoding]::new($false,$true).GetString($world.LegacyMigrationPlanBytes)
+            if($mutation-ceq'Duplicate'){$json=$json.Replace('{"schemaVersion":1','{"schemaVersion":1,"schemaVersion":1')}
+            else{
+                $record=$json|ConvertFrom-Json -ErrorAction Stop
+                switch($mutation){
+                    'TamperedCurrentProof' {$record.expectedCurrentProof.shortcuts[0].candidateSha256='f'*64}
+                    'WrongReady' {$record.readyTransaction.transactionId='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'}
+                    'WrongPackage' {$record.packageSha256='e'*64}
+                    'WrongGeneration' {$record.runtimeGeneration=[uint64]8}
+                    'UnsafeShortcut' {$record.snapshot.entries[1].path='C:\outside\foreign.lnk'}
+                }
+                $json=($record|ConvertTo-Json -Depth 32 -Compress)+"`n"
+            }
+            $world.LegacyMigrationPlanBytes=[Text.UTF8Encoding]::new($false).GetBytes($json)
+        }
+        Assert-CcodThrows {Get-CcodProductTestLegacyMigrationPlan $world|Out-Null} 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID'
+        Assert-CcodEqual 1 $world.LegacyMigrationPlanWrites "$mutation never republishes or overwrites the first plan"
+        Assert-CcodEqual 0 $world.Shortcuts.Count "$mutation fails before a current shortcut write"
+        Assert-CcodEqual $null $world.Product "$mutation fails before a current registry write"
     }
 }
 

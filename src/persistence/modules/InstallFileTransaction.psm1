@@ -10,7 +10,7 @@ function Throw-CcodInstallFileError {
 }
 
 function Initialize-CcodInstallRuntime {
-    $marker = 'CcodInstallGenerationCapabilityMarkerV5' -as [type]
+    $marker = 'CcodInstallGenerationCapabilityMarkerV6' -as [type]
     if ($null -eq $marker) {
         Add-Type -TypeDefinition @'
 using System;
@@ -19,19 +19,21 @@ using System.ComponentModel;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
 
-public sealed class CcodInstallGenerationCapabilityMarkerV5
+public sealed class CcodInstallGenerationCapabilityMarkerV6
 {
-    private CcodInstallGenerationCapabilityMarkerV5() { }
-    public static int CapabilityAbi { get { return 5; } }
+    private CcodInstallGenerationCapabilityMarkerV6() { }
+    public static int CapabilityAbi { get { return 6; } }
 }
 
-internal sealed class CcodInstallGenerationRuntimeV5 : IDisposable
+internal sealed class CcodInstallGenerationRuntimeV6 : IDisposable
 {
-    private const uint READ = 0x80000000, WRITE = 0x40000000, DELETE = 0x00010000, SYNC = 0x00100000;
+    private const uint READ = 0x80000000, WRITE = 0x40000000, DELETE = 0x00010000, READ_CONTROL = 0x00020000, WRITE_DAC = 0x00040000, WRITE_OWNER = 0x00080000, SYNC = 0x00100000;
     private const uint READ_ATTRIBUTES = 0x80, WRITE_ATTRIBUTES = 0x100, LIST_DIRECTORY = 0x1, ADD_FILE = 0x2, ADD_SUBDIRECTORY = 0x4;
     private const uint SHARE_READ = 1, SHARE_WRITE = 2, SHARE_DELETE = 4;
     private const uint OPEN = 1, CREATE = 2;
@@ -59,6 +61,8 @@ internal sealed class CcodInstallGenerationRuntimeV5 : IDisposable
     [DllImport("ntdll.dll")] private static extern int NtQueryDirectoryFile(SafeFileHandle handle,IntPtr evt,IntPtr apc,IntPtr context,out IO_STATUS_BLOCK io,IntPtr info,uint length,int infoClass,bool single,IntPtr name,bool restart);
     [DllImport("ntdll.dll")] private static extern int NtSetInformationFile(SafeFileHandle handle,out IO_STATUS_BLOCK io,IntPtr info,uint length,int infoClass);
     [DllImport("ntdll.dll")] private static extern uint RtlNtStatusToDosError(int status);
+    [DllImport("advapi32.dll", SetLastError=true)] private static extern bool GetKernelObjectSecurity(SafeFileHandle handle,int requestedInformation,byte[] securityDescriptor,uint length,out uint needed);
+    [DllImport("advapi32.dll", SetLastError=true)] private static extern bool SetKernelObjectSecurity(SafeFileHandle handle,int securityInformation,byte[] securityDescriptor);
 
     private sealed class Pin : IDisposable
     {
@@ -86,10 +90,10 @@ internal sealed class CcodInstallGenerationRuntimeV5 : IDisposable
     private bool disposed; private string cleanupError;
 
     private readonly bool stateOnly,productOnly,retryOnly;
-    private CcodInstallGenerationRuntimeV5(string installRoot,Pin root,Pin runtimeParent,bool stateOnly,bool productOnly,bool retryOnly)
+    private CcodInstallGenerationRuntimeV6(string installRoot,Pin root,Pin runtimeParent,bool stateOnly,bool productOnly,bool retryOnly)
     { this.installRoot=installRoot;this.root=root;this.runtimeParent=runtimeParent;this.stateOnly=stateOnly;this.productOnly=productOnly;this.retryOnly=retryOnly;AddPin(root);if(runtimeParent!=null)AddPin(runtimeParent); }
 
-    internal static object Open(string path,string runtimeId,out CcodInstallGenerationRuntimeV5 runtime)
+    internal static object Open(string path,string runtimeId,out CcodInstallGenerationRuntimeV6 runtime)
     {
         runtime=null;string full=Path.GetFullPath(path).TrimEnd('\\');SafeFileHandle rootHandle=OpenAbsoluteDirectory(full,true);Pin rootPin=null,runtimePin=null;
         try
@@ -104,30 +108,30 @@ internal sealed class CcodInstallGenerationRuntimeV5 : IDisposable
             try
             {
                 Pin generation=ValidateDirectoryPin(runtimePin,runtimeId,Path.Combine(runtimePin.Path,runtimeId),true,generationResult.Handle);generationResult.Handle=null;
-                runtime=new CcodInstallGenerationRuntimeV5(full,rootPin,runtimePin,false,false,false);rootPin=null;runtimePin=null;runtime.AddPin(generation);return generation.Token;
+                runtime=new CcodInstallGenerationRuntimeV6(full,rootPin,runtimePin,false,false,false);rootPin=null;runtimePin=null;runtime.AddPin(generation);return generation.Token;
             }
             finally { if(generationResult.Handle!=null)generationResult.Handle.Dispose(); }
         }
         catch { if(runtimePin!=null)runtimePin.Dispose();if(rootPin!=null)rootPin.Dispose();if(rootHandle!=null)rootHandle.Dispose();throw; }
     }
 
-    internal static object OpenState(string path,out CcodInstallGenerationRuntimeV5 runtime)
+    internal static object OpenState(string path,out CcodInstallGenerationRuntimeV6 runtime)
     {
         runtime=null;string full=Path.GetFullPath(path).TrimEnd('\\');SafeFileHandle rootHandle=OpenAbsoluteDirectory(full,true);Pin rootPin=null;
-        try{rootPin=ValidateDirectoryPin(null,"",full,false,rootHandle);rootHandle=null;runtime=new CcodInstallGenerationRuntimeV5(full,rootPin,null,true,false,false);rootPin=null;return runtime.root.Token;}
+        try{rootPin=ValidateDirectoryPin(null,"",full,false,rootHandle);rootHandle=null;runtime=new CcodInstallGenerationRuntimeV6(full,rootPin,null,true,false,false);rootPin=null;return runtime.root.Token;}
         catch{if(rootPin!=null)rootPin.Dispose();if(rootHandle!=null)rootHandle.Dispose();throw;}
     }
 
-    internal static object OpenRetry(string path,out CcodInstallGenerationRuntimeV5 runtime)
+    internal static object OpenRetry(string path,out CcodInstallGenerationRuntimeV6 runtime)
     {
         runtime=null;string full=Path.GetFullPath(path).TrimEnd('\\');SafeFileHandle rootHandle=OpenAbsoluteDirectory(full,true);Pin rootPin=null,runtimePin=null;
-        try{rootPin=ValidateDirectoryPin(null,"",full,false,rootHandle);rootHandle=null;OpenResult result=OpenRelative(rootPin.Native,"runtime",LIST_DIRECTORY|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);try{runtimePin=ValidateDirectoryPin(rootPin,"runtime",Path.Combine(full,"runtime"),false,result.Handle);result.Handle=null;}finally{if(result.Handle!=null)result.Handle.Dispose();};runtime=new CcodInstallGenerationRuntimeV5(full,rootPin,runtimePin,false,false,true);rootPin=null;runtimePin=null;return runtime.root.Token;}catch{if(runtimePin!=null)runtimePin.Dispose();if(rootPin!=null)rootPin.Dispose();if(rootHandle!=null)rootHandle.Dispose();throw;}
+        try{rootPin=ValidateDirectoryPin(null,"",full,false,rootHandle);rootHandle=null;OpenResult result=OpenRelative(rootPin.Native,"runtime",LIST_DIRECTORY|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);try{runtimePin=ValidateDirectoryPin(rootPin,"runtime",Path.Combine(full,"runtime"),false,result.Handle);result.Handle=null;}finally{if(result.Handle!=null)result.Handle.Dispose();};runtime=new CcodInstallGenerationRuntimeV6(full,rootPin,runtimePin,false,false,true);rootPin=null;runtimePin=null;return runtime.root.Token;}catch{if(runtimePin!=null)runtimePin.Dispose();if(rootPin!=null)rootPin.Dispose();if(rootHandle!=null)rootHandle.Dispose();throw;}
     }
 
-    internal static object OpenProduct(string path,out CcodInstallGenerationRuntimeV5 runtime)
+    internal static object OpenProduct(string path,out CcodInstallGenerationRuntimeV6 runtime)
     {
         runtime=null;string full=Path.GetFullPath(path).TrimEnd('\\');SafeFileHandle rootHandle=OpenAbsoluteDirectory(full,false);Pin rootPin=null,runtimePin=null;
-        try{rootPin=ValidateDirectoryPin(null,"",full,false,rootHandle);rootHandle=null;OpenResult result=OpenRelative(rootPin.Native,"runtime",LIST_DIRECTORY|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);try{runtimePin=ValidateDirectoryPin(rootPin,"runtime",Path.Combine(full,"runtime"),false,result.Handle);result.Handle=null;}finally{if(result.Handle!=null)result.Handle.Dispose();};runtime=new CcodInstallGenerationRuntimeV5(full,rootPin,runtimePin,false,true,false);rootPin=null;runtimePin=null;return runtime.root.Token;}catch{if(runtimePin!=null)runtimePin.Dispose();if(rootPin!=null)rootPin.Dispose();if(rootHandle!=null)rootHandle.Dispose();throw;}
+        try{rootPin=ValidateDirectoryPin(null,"",full,false,rootHandle);rootHandle=null;OpenResult result=OpenRelative(rootPin.Native,"runtime",LIST_DIRECTORY|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);try{runtimePin=ValidateDirectoryPin(rootPin,"runtime",Path.Combine(full,"runtime"),false,result.Handle);result.Handle=null;}finally{if(result.Handle!=null)result.Handle.Dispose();};runtime=new CcodInstallGenerationRuntimeV6(full,rootPin,runtimePin,false,true,false);rootPin=null;runtimePin=null;return runtime.root.Token;}catch{if(runtimePin!=null)runtimePin.Dispose();if(rootPin!=null)rootPin.Dispose();if(rootHandle!=null)rootHandle.Dispose();throw;}
     }
 
     private bool IsStateScope(Pin pin){for(Pin cursor=pin;cursor!=null;cursor=cursor.Parent)if(Object.ReferenceEquals(cursor.Parent,root)&&String.Equals(cursor.Leaf,"state",StringComparison.Ordinal))return true;return false;}
@@ -183,6 +187,18 @@ internal sealed class CcodInstallGenerationRuntimeV5 : IDisposable
     [MethodImpl(MethodImplOptions.Synchronized)] internal object Write(object parentToken,string leaf,byte[] bytes,bool manifest)
     {
         if(productOnly)throw new InvalidOperationException("product-only scope");Pin parent=Require(parentToken,true);ValidateCurrent(parent);if(stateOnly&&(manifest||!IsStateScope(parent)))throw new InvalidOperationException("state-only scope");if(retryOnly&&(manifest||!IsStateScope(parent)))throw new InvalidOperationException("migration-retry scope");Pin pin=CreateTemporaryFile(parent);pin.Stream.Write(bytes,0,bytes.Length);pin.Stream.Flush(true);string sha=Sha(pin.Stream);if(pin.Stream.Length!=bytes.LongLength)throw new InvalidDataException("destination mismatch");SealAndPublish(pin,leaf,bytes.LongLength,sha,manifest);return pin.Token;
+    }
+
+    [MethodImpl(MethodImplOptions.Synchronized)] internal object WriteLegacyPlan(object rootToken,string leaf,byte[] bytes)
+    {
+        if(!productOnly||bytes==null||bytes.LongLength==0||bytes.LongLength>1048576)throw new InvalidOperationException("product-only scope");Pin requestedRoot=Require(rootToken,true);ValidateCurrent(requestedRoot);if(!Object.ReferenceEquals(requestedRoot,root))throw new InvalidOperationException("product-only scope");ValidateLegacyPlanLeaf(leaf);Pin state=OpenExistingDirectory(root,"state");if(state==null)throw new InvalidOperationException("product-only scope");Pin plans=OpenOrCreateLegacyPlanDirectory(state);if(names.ContainsKey(Key(plans,leaf)))throw new Win32Exception(183);Pin pin=CreateLegacyPlanTemporaryFile(plans);pin.Stream.Write(bytes,0,bytes.Length);pin.Stream.Flush(true);SetExactLegacyPlanSecurity(pin.Native,false);ValidateExactLegacyPlanSecurity(pin.Native,false);string sha=Sha(pin.Stream);if(pin.Stream.Length!=bytes.LongLength)throw new InvalidDataException("destination mismatch");SealAndPublish(pin,leaf,bytes.LongLength,sha,false);EnsurePublishedPin(pin);return pin.Token;
+    }
+
+    [MethodImpl(MethodImplOptions.Synchronized)] internal object[] ReadLegacyPlan(object rootToken,string leaf)
+    {
+        if(!productOnly)throw new InvalidOperationException("product-only scope");Pin requestedRoot=Require(rootToken,true);ValidateCurrent(requestedRoot);if(!Object.ReferenceEquals(requestedRoot,root))throw new InvalidOperationException("product-only scope");ValidateLegacyPlanLeaf(leaf);Pin state=OpenExistingDirectory(root,"state");if(state==null)return new object[0];Pin plans=OpenExistingLegacyPlanDirectory(state);if(plans==null)return new object[0];OpenResult result;
+        try{result=OpenRelative(plans.Native,leaf,READ|READ_ATTRIBUTES|READ_CONTROL|SYNC,SHARE_READ,OPEN,NON_DIRECTORY);}catch(Win32Exception exception){if(exception.NativeErrorCode==2||exception.NativeErrorCode==3)return new object[0];throw;}FileStream stream=null;
+        try{stream=new FileStream(result.Handle,FileAccess.Read,65536,false);result.Handle=null;FILE_INFO before=Info(stream.SafeFileHandle);ValidatePlain(before,stream.SafeFileHandle);ValidateExactLegacyPlanSecurity(stream.SafeFileHandle,false);string expected=Path.Combine(plans.Path,leaf),finalPath=FinalPath(stream.SafeFileHandle);if(!SamePath(finalPath,expected)||stream.Length<=0||stream.Length>1048576)throw new InvalidDataException("legacy plan invalid");byte[] bytes=new byte[(int)stream.Length];int offset=0;while(offset<bytes.Length){int read=stream.Read(bytes,offset,bytes.Length-offset);if(read==0)throw new EndOfStreamException();offset+=read;}FILE_INFO after=Info(stream.SafeFileHandle);ValidatePlain(after,stream.SafeFileHandle);ValidateExactLegacyPlanSecurity(stream.SafeFileHandle,false);if(before.VolumeSerialNumber!=after.VolumeSerialNumber||before.FileIndexHigh!=after.FileIndexHigh||before.FileIndexLow!=after.FileIndexLow||!SamePath(FinalPath(stream.SafeFileHandle),finalPath))throw new InvalidDataException("path changed");string sha;using(SHA256 hash=SHA256.Create()){sha=BitConverter.ToString(hash.ComputeHash(bytes)).Replace("-","").ToLowerInvariant();}return new object[]{Convert.ToBase64String(bytes),sha};}finally{if(stream!=null)stream.Dispose();if(result.Handle!=null)result.Handle.Dispose();}
     }
 
     [MethodImpl(MethodImplOptions.Synchronized)] internal object CommitPointer(object generationToken,ulong previousGeneration,string runtimeId,byte[] bytes)
@@ -247,6 +263,32 @@ internal sealed class CcodInstallGenerationRuntimeV5 : IDisposable
         finally { if(result.Handle!=null)result.Handle.Dispose(); }
     }
 
+    private Pin OpenExistingDirectory(Pin parent,string leaf)
+    {
+        Pin existing;if(names.TryGetValue(Key(parent,leaf),out existing)){ValidateCurrent(existing);return existing;}OpenResult result;
+        try{result=OpenRelative(parent.Native,leaf,LIST_DIRECTORY|ADD_FILE|ADD_SUBDIRECTORY|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);}catch(Win32Exception exception){if(exception.NativeErrorCode==2||exception.NativeErrorCode==3)return null;throw;}
+        try{Pin pin=ValidateDirectoryPin(parent,leaf,Path.Combine(parent.Path,leaf),false,result.Handle);result.Handle=null;AddPin(pin);return pin;}finally{if(result.Handle!=null)result.Handle.Dispose();}
+    }
+
+    private Pin OpenOrCreateLegacyPlanDirectory(Pin state)
+    {
+        const string leaf="legacy-registration-migrations";Pin existing;if(names.TryGetValue(Key(state,leaf),out existing)){ValidateCurrent(existing);ValidateExactLegacyPlanSecurity(existing.Native,true);return existing;}OpenResult result;
+        try{result=OpenRelative(state.Native,leaf,LIST_DIRECTORY|ADD_FILE|ADD_SUBDIRECTORY|READ_ATTRIBUTES|READ_CONTROL|WRITE_DAC|WRITE_OWNER|DELETE|SYNC,SHARE_READ|SHARE_WRITE,CREATE,DIRECTORY|BACKUP_INTENT);}catch(Win32Exception exception){if(exception.NativeErrorCode!=80&&exception.NativeErrorCode!=183)throw;result=OpenRelative(state.Native,leaf,LIST_DIRECTORY|ADD_FILE|ADD_SUBDIRECTORY|READ_ATTRIBUTES|READ_CONTROL|WRITE_DAC|WRITE_OWNER|DELETE|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);}
+        try{Pin pin=ValidateDirectoryPin(state,leaf,Path.Combine(state.Path,leaf),result.Created,result.Handle);result.Handle=null;if(result.Created)SetExactLegacyPlanSecurity(pin.Native,true);ValidateExactLegacyPlanSecurity(pin.Native,true);AddPin(pin);return pin;}finally{if(result.Handle!=null)result.Handle.Dispose();}
+    }
+
+    private Pin OpenExistingLegacyPlanDirectory(Pin state)
+    {
+        const string leaf="legacy-registration-migrations";Pin existing;if(names.TryGetValue(Key(state,leaf),out existing)){ValidateCurrent(existing);ValidateExactLegacyPlanSecurity(existing.Native,true);return existing;}OpenResult result;
+        try{result=OpenRelative(state.Native,leaf,LIST_DIRECTORY|READ_ATTRIBUTES|READ_CONTROL|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);}catch(Win32Exception exception){if(exception.NativeErrorCode==2||exception.NativeErrorCode==3)return null;throw;}
+        try{Pin pin=ValidateDirectoryPin(state,leaf,Path.Combine(state.Path,leaf),false,result.Handle);result.Handle=null;ValidateExactLegacyPlanSecurity(pin.Native,true);AddPin(pin);return pin;}finally{if(result.Handle!=null)result.Handle.Dispose();}
+    }
+
+    private static void ValidateLegacyPlanLeaf(string leaf)
+    {
+        if(leaf==null||leaf.Length!=62||leaf[20]!='.'||!leaf.EndsWith(".json",StringComparison.Ordinal))throw new InvalidOperationException("product-only scope");ulong generation;Guid transactionId;if(!UInt64.TryParse(leaf.Substring(0,20),out generation)||generation==0||!Guid.TryParseExact(leaf.Substring(21,36),"D",out transactionId)||!String.Equals(leaf,generation.ToString("D20")+"."+transactionId.ToString("D")+".json",StringComparison.Ordinal))throw new InvalidOperationException("product-only scope");
+    }
+
     private void ValidateOwnedTree(Pin directory)
     {
         ValidateCurrent(directory);foreach(string leaf in Enumerate(directory.Native)){Pin child;if(!names.TryGetValue(Key(directory,leaf),out child)||!child.Owned)throw new InvalidDataException("unknown leaf");if(child.Directory){ValidateCurrent(child);ValidateOwnedTree(child);}else{if(!child.Sealed||!child.Published)throw new InvalidDataException("unsealed leaf");EnsurePublishedPin(child);}}
@@ -264,6 +306,10 @@ internal sealed class CcodInstallGenerationRuntimeV5 : IDisposable
     private Pin CreateTemporaryFile(Pin parent)
     {
         string temporary=".ccod."+Guid.NewGuid().ToString("N")+".tmp";OpenResult result=OpenRelative(parent.Native,temporary,READ|WRITE|DELETE|SYNC,SHARE_READ,CREATE,NON_DIRECTORY|WRITE_THROUGH);FileStream stream=null;try{stream=new FileStream(result.Handle,FileAccess.ReadWrite,65536,false);result.Handle=null;FILE_INFO info=Info(stream.SafeFileHandle);ValidatePlain(info,stream.SafeFileHandle);Pin pin=new Pin(parent,temporary,Path.Combine(parent.Path,temporary),false,true,null,stream,info);AddPin(pin);stream=null;return pin;}finally{if(stream!=null)stream.Dispose();if(result.Handle!=null)result.Handle.Dispose();}
+    }
+    private Pin CreateLegacyPlanTemporaryFile(Pin parent)
+    {
+        string temporary=".ccod."+Guid.NewGuid().ToString("N")+".tmp";OpenResult result=OpenRelative(parent.Native,temporary,READ|WRITE|DELETE|READ_CONTROL|WRITE_DAC|WRITE_OWNER|SYNC,SHARE_READ,CREATE,NON_DIRECTORY|WRITE_THROUGH);FileStream stream=null;try{stream=new FileStream(result.Handle,FileAccess.ReadWrite,65536,false);result.Handle=null;FILE_INFO info=Info(stream.SafeFileHandle);ValidatePlain(info,stream.SafeFileHandle);Pin pin=new Pin(parent,temporary,Path.Combine(parent.Path,temporary),false,true,null,stream,info);AddPin(pin);stream=null;return pin;}finally{if(stream!=null)stream.Dispose();if(result.Handle!=null)result.Handle.Dispose();}
     }
     private static ulong CurrentPointerGeneration(Pin pointer)
     {
@@ -306,6 +352,19 @@ internal sealed class CcodInstallGenerationRuntimeV5 : IDisposable
     private static SafeFileHandle OpenAbsoluteDirectory(string path,bool allowWrite){uint access=LIST_DIRECTORY|READ_ATTRIBUTES|SYNC;if(allowWrite)access|=ADD_FILE|ADD_SUBDIRECTORY;SafeFileHandle handle=CreateFileW(path,access,SHARE_READ|SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,FLAG_BACKUP|FLAG_REPARSE,IntPtr.Zero);if(handle.IsInvalid)throw new Win32Exception(Marshal.GetLastWin32Error());return handle;}
     private static void ValidateCurrent(Pin pin){FILE_INFO info=Info(pin.Native);if(info.VolumeSerialNumber!=pin.Volume||(((ulong)info.FileIndexHigh<<32)|info.FileIndexLow)!=pin.Index||IsDirectory(info)!=pin.Directory||(info.FileAttributes&ATTR_REPARSE)!=0||!SamePath(FinalPath(pin.Native),pin.Path))throw new InvalidDataException("pin changed");if(!OnlyDefaultStream(pin.Native))throw new InvalidDataException("alternate stream");if(!pin.Directory&&info.NumberOfLinks!=1)throw new InvalidDataException("multi-link");}
     private static void ValidatePlain(FILE_INFO info,SafeFileHandle handle){if(IsDirectory(info))throw new InvalidDataException("file type");if((info.FileAttributes&ATTR_REPARSE)!=0)throw new InvalidDataException("reparse leaf");if(info.NumberOfLinks!=1)throw new InvalidDataException("multi-link");if(!OnlyDefaultStream(handle))throw new InvalidDataException("alternate stream");}
+    private static byte[] GetExactLegacyPlanSecurity(bool directory)
+    {
+        WindowsIdentity identity=WindowsIdentity.GetCurrent();try{SecurityIdentifier user=identity.User;if(user==null)throw new InvalidDataException("legacy plan owner unavailable");FileSystemSecurity security=directory?(FileSystemSecurity)new DirectorySecurity():(FileSystemSecurity)new FileSecurity();security.SetOwner(user);security.SetAccessRuleProtection(true,false);SecurityIdentifier[] principals=new SecurityIdentifier[]{user,new SecurityIdentifier(WellKnownSidType.LocalSystemSid,null),new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid,null)};foreach(SecurityIdentifier principal in principals){FileSystemAccessRule rule=directory?new FileSystemAccessRule(principal,FileSystemRights.FullControl,InheritanceFlags.ContainerInherit|InheritanceFlags.ObjectInherit,PropagationFlags.None,AccessControlType.Allow):new FileSystemAccessRule(principal,FileSystemRights.FullControl,AccessControlType.Allow);security.AddAccessRule(rule);}return security.GetSecurityDescriptorBinaryForm();}finally{identity.Dispose();}
+    }
+    private static byte[] ReadLegacyPlanSecurity(SafeFileHandle handle)
+    {
+        const int information=1|4;uint needed;GetKernelObjectSecurity(handle,information,null,0,out needed);int error=Marshal.GetLastWin32Error();if(needed==0||(error!=0&&error!=122))throw new Win32Exception(error);byte[] descriptor=new byte[needed];if(!GetKernelObjectSecurity(handle,information,descriptor,(uint)descriptor.Length,out needed))throw new Win32Exception(Marshal.GetLastWin32Error());return descriptor;
+    }
+    private static void SetExactLegacyPlanSecurity(SafeFileHandle handle,bool directory){byte[] descriptor=GetExactLegacyPlanSecurity(directory);if(!SetKernelObjectSecurity(handle,1|4,descriptor))throw new Win32Exception(Marshal.GetLastWin32Error());}
+    private static void ValidateExactLegacyPlanSecurity(SafeFileHandle handle,bool directory)
+    {
+        byte[] descriptor=ReadLegacyPlanSecurity(handle);RawSecurityDescriptor raw=new RawSecurityDescriptor(descriptor,0);WindowsIdentity identity=WindowsIdentity.GetCurrent();try{SecurityIdentifier user=identity.User;if(user==null||raw.Owner==null||!raw.Owner.Equals(user)||(raw.ControlFlags&ControlFlags.DiscretionaryAclProtected)==0||raw.DiscretionaryAcl==null||raw.DiscretionaryAcl.Count!=3)throw new InvalidDataException("legacy plan security");HashSet<string> expected=new HashSet<string>(StringComparer.Ordinal){user.Value,new SecurityIdentifier(WellKnownSidType.LocalSystemSid,null).Value,new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid,null).Value};AceFlags expectedFlags=directory?(AceFlags.ContainerInherit|AceFlags.ObjectInherit):AceFlags.None;foreach(GenericAce generic in raw.DiscretionaryAcl){CommonAce ace=generic as CommonAce;if(ace==null||ace.IsCallback||ace.AceQualifier!=AceQualifier.AccessAllowed||ace.AceFlags!=expectedFlags||ace.AccessMask!=(int)FileSystemRights.FullControl||ace.SecurityIdentifier==null||!expected.Remove(ace.SecurityIdentifier.Value))throw new InvalidDataException("legacy plan security");}if(expected.Count!=0)throw new InvalidDataException("legacy plan security");}finally{identity.Dispose();}
+    }
     internal static object[] ReadAuthorityFile(string path){SafeFileHandle handle=CreateFileW(path,READ|READ_ATTRIBUTES|SYNC,SHARE_READ,IntPtr.Zero,OPEN_EXISTING,NON_DIRECTORY|FLAG_BACKUP|FLAG_REPARSE,IntPtr.Zero);if(handle.IsInvalid){int error=Marshal.GetLastWin32Error();handle.Dispose();throw new Win32Exception(error);}FileStream stream=null;try{stream=new FileStream(handle,FileAccess.Read,65536,false);handle=null;FILE_INFO before=Info(stream.SafeFileHandle);ValidatePlain(before,stream.SafeFileHandle);string finalPath=FinalPath(stream.SafeFileHandle);if(!SamePath(finalPath,path)||stream.Length<0||stream.Length>4194304)throw new InvalidDataException("authority file invalid");byte[] bytes=new byte[(int)stream.Length];int offset=0;while(offset<bytes.Length){int read=stream.Read(bytes,offset,bytes.Length-offset);if(read==0)throw new EndOfStreamException();offset+=read;}FILE_INFO after=Info(stream.SafeFileHandle);ValidatePlain(after,stream.SafeFileHandle);if(before.VolumeSerialNumber!=after.VolumeSerialNumber||before.FileIndexHigh!=after.FileIndexHigh||before.FileIndexLow!=after.FileIndexLow||!SamePath(FinalPath(stream.SafeFileHandle),finalPath))throw new InvalidDataException("path changed");string sha;using(SHA256 hash=SHA256.Create()){sha=BitConverter.ToString(hash.ComputeHash(bytes)).Replace("-","").ToLowerInvariant();}return new object[]{Convert.ToBase64String(bytes),sha};}finally{if(stream!=null)stream.Dispose();if(handle!=null)handle.Dispose();}}
     private static bool IsDirectory(FILE_INFO info){return(info.FileAttributes&ATTR_DIRECTORY)!=0;}
     private static FILE_INFO Info(SafeFileHandle handle){FILE_INFO info;if(handle==null||handle.IsClosed||!GetFileInformationByHandle(handle,out info))throw new Win32Exception(Marshal.GetLastWin32Error());return info;}
@@ -319,10 +378,10 @@ internal sealed class CcodInstallGenerationRuntimeV5 : IDisposable
     private static int RenameReplacing(SafeFileHandle source,SafeFileHandle parent,string destination){byte[] name=Encoding.Unicode.GetBytes(destination);int rootOffset=IntPtr.Size,lengthOffset=rootOffset+IntPtr.Size,nameOffset=lengthOffset+4,size=nameOffset+name.Length+2;IntPtr buffer=Marshal.AllocHGlobal(size);bool parentAdded=false,sourceAdded=false;try{source.DangerousAddRef(ref sourceAdded);parent.DangerousAddRef(ref parentAdded);for(int i=0;i<size;i++)Marshal.WriteByte(buffer,i,0);Marshal.WriteByte(buffer,0,1);Marshal.WriteIntPtr(buffer,rootOffset,parent.DangerousGetHandle());Marshal.WriteInt32(buffer,lengthOffset,name.Length);Marshal.Copy(name,0,IntPtr.Add(buffer,nameOffset),name.Length);IO_STATUS_BLOCK io;int status=NtSetInformationFile(source,out io,buffer,(uint)size,FileRenameInformation);return status>=0?0:(int)RtlNtStatusToDosError(status);}finally{if(parentAdded)parent.DangerousRelease();if(sourceAdded)source.DangerousRelease();Marshal.FreeHGlobal(buffer);}}
 }
 '@
-        $marker = 'CcodInstallGenerationCapabilityMarkerV5' -as [type]
+        $marker = 'CcodInstallGenerationCapabilityMarkerV6' -as [type]
     }
-    if ($null -eq $marker -or [int]$marker.GetProperty('CapabilityAbi').GetValue($null,$null) -ne 5) { Throw-CcodInstallFileError 'CCOD_INSTALL_RUNTIME_ABI_INVALID' 'Install generation runtime ABI is unavailable' $null }
-    $script:CcodRuntimeType = $marker.Assembly.GetType('CcodInstallGenerationRuntimeV5',$true)
+    if ($null -eq $marker -or [int]$marker.GetProperty('CapabilityAbi').GetValue($null,$null) -ne 6) { Throw-CcodInstallFileError 'CCOD_INSTALL_RUNTIME_ABI_INVALID' 'Install generation runtime ABI is unavailable' $null }
+    $script:CcodRuntimeType = $marker.Assembly.GetType('CcodInstallGenerationRuntimeV6',$true)
 }
 
 function Assert-CcodInstallLeaf([string]$Leaf,[string]$ErrorId='CCOD_INSTALL_LEAF_INVALID') {
@@ -486,6 +545,32 @@ function Assert-CcodInstallProductCleanupFenceBound($State){
     if(($record|ConvertTo-Json -Depth 8 -Compress)-cne$proof.Canonical-or$record.state-cne'Pending'){Throw-CcodInstallFileError 'CCOD_INSTALL_CLOSE_FAILED' 'Durable Pending cleanup fence changed before close' $proof.Path}
     return $true
 }
+function Get-CcodInstallLegacyMigrationPlanScope($Transaction,$ReadyTransaction){
+    $scope=Get-CcodInstallTransaction $Transaction 'CCOD_INSTALL_PRODUCT_SCOPE'
+    if(-not[object]::ReferenceEquals($scope.Record.Transaction,$Transaction)-or$scope.Record.Kind-cne'ProductTransaction'-or-not$scope.State.ProductOnly){Throw-CcodInstallFileError 'CCOD_INSTALL_PRODUCT_SCOPE' 'Legacy migration plan requires the strict product transaction root' $null}
+    [void](Assert-CcodInstallProductAuthorityLease $scope.State)
+    try{[void](Assert-CcodInstallProductCleanupFenceBound $scope.State);$authority=Get-CcodInstallProductReadyAuthority $scope.State.InstallRoot $ReadyTransaction}catch{if(([string]$_.FullyQualifiedErrorId-split',')[0]-ceq'CCOD_INSTALL_PRODUCT_SCOPE'){throw};Throw-CcodInstallFileError 'CCOD_INSTALL_PRODUCT_SCOPE' 'Legacy migration plan requires the live cleanup fence and Ready authority' $null}
+    $stored=$scope.State.ReadyAuthority
+    if($null-eq$stored-or$authority.ReadyCanonical-cne$stored.ReadyCanonical-or$authority.PersistedReadyCanonical-cne$stored.PersistedReadyCanonical-or$authority.RuntimeId-cne$stored.RuntimeId-or[uint64]$authority.Generation-ne[uint64]$stored.Generation-or$authority.ManifestSha256-cne$stored.ManifestSha256-or$authority.PackageSha256-cne$stored.PackageSha256){Throw-CcodInstallFileError 'CCOD_INSTALL_PRODUCT_SCOPE' 'Legacy migration plan Ready authority changed after capability open' $ReadyTransaction}
+    [pscustomobject]@{Scope=$scope;Leaf=('{0:D20}.{1}.json'-f[uint64]$authority.Generation,[string]$ReadyTransaction.transactionId)}
+}
+function Write-CcodInstallLegacyMigrationPlan {
+    param([Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)]$ReadyTransaction,[Parameter(Mandatory)][byte[]]$Bytes)
+    if($null-eq$Bytes-or$Bytes.LongLength-eq0-or$Bytes.LongLength-gt1048576){Throw-CcodInstallFileError 'CCOD_INSTALL_PRODUCT_SCOPE' 'Legacy migration plan bytes are outside the bounded contract' $null}
+    $context=Get-CcodInstallLegacyMigrationPlanScope $Transaction $ReadyTransaction;$result=[pscustomobject]@{Length=[int64]$Bytes.LongLength;Sha256=(Get-CcodInstallBytesSha256 $Bytes)}
+    try{Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $context.Scope.State.Runtime WriteLegacyPlan @($context.Scope.State.RootToken,$context.Leaf,$Bytes)|Out-Null} 'CCOD_INSTALL_LEGACY_PLAN_WRITE_FAILED'}catch{if($_.FullyQualifiedErrorId-like'CCOD_INSTALL_LEAF_EXISTS*'){Throw-CcodInstallFileError 'CCOD_INSTALL_LEGACY_PLAN_EXISTS' 'Legacy migration plan already exists' $context.Leaf};throw}
+    return $result
+}
+function Read-CcodInstallLegacyMigrationPlan {
+    param([Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)]$ReadyTransaction)
+    $context=Get-CcodInstallLegacyMigrationPlanScope $Transaction $ReadyTransaction
+    try{$native=@(Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $context.Scope.State.Runtime ReadLegacyPlan @($context.Scope.State.RootToken,$context.Leaf)} 'CCOD_INSTALL_LEGACY_PLAN_READ_FAILED')}catch{$id=([string]$_.FullyQualifiedErrorId-split',')[0];if($id-in@('CCOD_INSTALL_PRODUCT_SCOPE','CCOD_INSTALL_TRANSACTION_CLOSED')){throw};Throw-CcodInstallFileError 'CCOD_INSTALL_LEGACY_PLAN_READ_FAILED' 'Legacy migration plan file identity or security is invalid' $context.Leaf}
+    if($native.Count-eq0){return $null}
+    if($native.Count-ne2-or$native[0]-isnot[string]-or$native[1]-isnot[string]-or$native[1]-cnotmatch'^[0-9a-f]{64}$'){Throw-CcodInstallFileError 'CCOD_INSTALL_LEGACY_PLAN_READ_FAILED' 'Legacy migration plan native read result is invalid' $context.Leaf}
+    try{$bytes=[Convert]::FromBase64String([string]$native[0])}catch{Throw-CcodInstallFileError 'CCOD_INSTALL_LEGACY_PLAN_READ_FAILED' 'Legacy migration plan native bytes are invalid' $context.Leaf}
+    if($bytes.LongLength-eq0-or$bytes.LongLength-gt1048576-or(Get-CcodInstallBytesSha256 $bytes)-cne[string]$native[1]){Throw-CcodInstallFileError 'CCOD_INSTALL_LEGACY_PLAN_READ_FAILED' 'Legacy migration plan native identity is invalid' $context.Leaf}
+    [pscustomobject]@{Bytes=$bytes;Length=[int64]$bytes.LongLength;Sha256=[string]$native[1]}
+}
 function Open-CcodInstallRetainedFile {
     param([Parameter(Mandatory)]$Generation,[Parameter(Mandatory)][string]$RelativePath,[Parameter(Mandatory)]$ReadyTransaction)
     if($RelativePath-cnotin@('registration/StartMenu.CodexRemote-fix.lnk','registration/Desktop.CodexRemote-fix.lnk')){Throw-CcodInstallFileError 'CCOD_INSTALL_PRODUCT_SHORTCUT_INVALID' 'Product shortcut source must be one fixed manifest-relative candidate' $RelativePath};$scope=Get-CcodInstallTransaction $Generation 'CCOD_INSTALL_PRODUCT_SHORTCUT_INVALID';[void](Assert-CcodInstallProductAuthorityLease $scope.State);$authority=Get-CcodInstallProductReadyAuthority $scope.State.InstallRoot $ReadyTransaction;$stored=$scope.State.ReadyAuthority;if($null-eq$stored-or$authority.ReadyCanonical-cne$stored.ReadyCanonical-or$authority.PersistedReadyCanonical-cne$stored.PersistedReadyCanonical-or$authority.RuntimeId-cne$stored.RuntimeId-or$authority.Generation-ne$stored.Generation-or$authority.ManifestSha256-cne$stored.ManifestSha256-or$authority.PackageSha256-cne$stored.PackageSha256-or$authority.RuntimeId-cne$scope.Record.RuntimeId){Throw-CcodInstallFileError 'CCOD_INSTALL_PRODUCT_SCOPE' 'Retained shortcut source authority changed after capability open' $ReadyTransaction};$result=Convert-CcodInstallRuntimeError {Invoke-CcodRuntimeMethod $scope.State.Runtime OpenRetainedFile @($scope.Record.Token,$RelativePath)} 'CCOD_INSTALL_PRODUCT_SHORTCUT_INVALID';if(@($result).Count-ne3-or[int64]$result[1]-lt0-or[string]$result[2]-cnotmatch'^[0-9a-f]{64}$'){Throw-CcodInstallFileError 'CCOD_INSTALL_PRODUCT_SHORTCUT_INVALID' 'Retained product shortcut identity is invalid' $RelativePath};Add-CcodInstallScope $scope.Record.Transaction $result[0] RetainedFile $true $scope.Record.RuntimeId
@@ -532,4 +617,4 @@ function Close-CcodInstallFileTransaction {
 }
 
 Initialize-CcodInstallRuntime
-Export-ModuleMember -Function Open-CcodInstallGeneration,Open-CcodInstallStateTransaction,Open-CcodInstallProductRegistrationTransaction,Open-CcodInstallRetainedGeneration,Open-CcodInstallRetainedFile,New-CcodInstallDirectory,New-CcodInstallGenerationLeaf,Copy-CcodInstallSealedSource,Write-CcodInstallGenerationManifest,Write-CcodInstallRecord,Commit-CcodInstallActivePointer,Retire-CcodInstallGeneration,Open-CcodInstallProductSpecialFolder,Copy-CcodInstallProductShortcut,Close-CcodInstallFileTransaction
+Export-ModuleMember -Function Open-CcodInstallGeneration,Open-CcodInstallStateTransaction,Open-CcodInstallProductRegistrationTransaction,Open-CcodInstallRetainedGeneration,Open-CcodInstallRetainedFile,New-CcodInstallDirectory,New-CcodInstallGenerationLeaf,Copy-CcodInstallSealedSource,Write-CcodInstallGenerationManifest,Write-CcodInstallLegacyMigrationPlan,Read-CcodInstallLegacyMigrationPlan,Write-CcodInstallRecord,Commit-CcodInstallActivePointer,Retire-CcodInstallGeneration,Open-CcodInstallProductSpecialFolder,Copy-CcodInstallProductShortcut,Close-CcodInstallFileTransaction

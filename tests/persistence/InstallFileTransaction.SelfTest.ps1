@@ -148,11 +148,11 @@ function Assert-CcodProductTransactionRejected {
 }
 
 Invoke-CcodTest 'exports only immutable generation operations and an inert CLR marker' {
-    $expected=@('Close-CcodInstallFileTransaction','Commit-CcodInstallActivePointer','Copy-CcodInstallProductShortcut','Copy-CcodInstallSealedSource','New-CcodInstallDirectory','New-CcodInstallGenerationLeaf','Open-CcodInstallGeneration','Open-CcodInstallProductRegistrationTransaction','Open-CcodInstallProductSpecialFolder','Open-CcodInstallRetainedFile','Open-CcodInstallRetainedGeneration','Open-CcodInstallStateTransaction','Retire-CcodInstallGeneration','Write-CcodInstallGenerationManifest','Write-CcodInstallRecord')
+    $expected=@('Close-CcodInstallFileTransaction','Commit-CcodInstallActivePointer','Copy-CcodInstallProductShortcut','Copy-CcodInstallSealedSource','New-CcodInstallDirectory','New-CcodInstallGenerationLeaf','Open-CcodInstallGeneration','Open-CcodInstallProductRegistrationTransaction','Open-CcodInstallProductSpecialFolder','Open-CcodInstallRetainedFile','Open-CcodInstallRetainedGeneration','Open-CcodInstallStateTransaction','Read-CcodInstallLegacyMigrationPlan','Retire-CcodInstallGeneration','Write-CcodInstallGenerationManifest','Write-CcodInstallLegacyMigrationPlan','Write-CcodInstallRecord')
     Assert-CcodEqual ($expected -join '|') ((@($module.ExportedCommands.Keys)|Sort-Object)-join '|') 'module export surface is capability-only'
-    Assert-CcodEqual 5 ([CcodInstallGenerationCapabilityMarkerV5]::CapabilityAbi) 'marker exposes the current non-mutating ABI value'
-    Assert-CcodEqual 'CcodInstallGenerationCapabilityMarkerV5' ((@([CcodInstallGenerationCapabilityMarkerV5].Assembly.GetExportedTypes()|ForEach-Object FullName)) -join '|') 'current CLR bridge exports only the inert marker'
-    $dangerous=@([CcodInstallGenerationCapabilityMarkerV5].GetMethods([Reflection.BindingFlags]'Public,Static,DeclaredOnly')|Where-Object{@($_.GetParameters()|Where-Object{$_.ParameterType-in@([string],[IntPtr],[IO.Stream])-or[Microsoft.Win32.SafeHandles.SafeHandle].IsAssignableFrom($_.ParameterType)}).Count-ne 0})
+    Assert-CcodEqual 6 ([CcodInstallGenerationCapabilityMarkerV6]::CapabilityAbi) 'marker exposes the current non-mutating ABI value'
+    Assert-CcodEqual 'CcodInstallGenerationCapabilityMarkerV6' ((@([CcodInstallGenerationCapabilityMarkerV6].Assembly.GetExportedTypes()|ForEach-Object FullName)) -join '|') 'current CLR bridge exports only the inert marker'
+    $dangerous=@([CcodInstallGenerationCapabilityMarkerV6].GetMethods([Reflection.BindingFlags]'Public,Static,DeclaredOnly')|Where-Object{@($_.GetParameters()|Where-Object{$_.ParameterType-in@([string],[IntPtr],[IO.Stream])-or[Microsoft.Win32.SafeHandles.SafeHandle].IsAssignableFrom($_.ParameterType)}).Count-ne 0})
     Assert-CcodEqual 0 $dangerous.Count 'marker accepts no path stream or bare handle'
     Assert-CcodTrue (-not $module.ExportedCommands['Copy-CcodInstallProductShortcut'].Parameters.ContainsKey('SourcePath')) 'product shortcut copy accepts no arbitrary absolute source path'
 }
@@ -194,6 +194,91 @@ function New-CcodProductAuthorityFixture {
     $ready=[pscustomobject][ordered]@{schemaVersion=1;transactionId='33333333-4444-4555-8666-777777777777';oldRuntimeId=$null;oldGeneration=$null;oldManifestSha256=$null;newRuntimeId=$runtimeId;newGeneration=[uint64]1;newManifestSha256=$manifest.Sha256;sealedPackageSha256=('a'*64);ownedObjectNames=@($runtimeId);phase='Ready';errorCode=$null}
     $readyPath=Write-CcodProductReadyTransactionChain -InstallRoot $fixture.Install -ReadyRecord $ready
     [pscustomobject]@{Fixture=$fixture;RuntimeId=$runtimeId;Manifest=$manifest;Ready=$ready;ReadyPath=$readyPath}
+}
+
+# Production mutation caught: product code can persist or read arbitrary state instead of one Ready-derived, cleanup-fence-bound plan.
+Invoke-CcodTest 'product transaction publishes and rereads only its exact Ready-derived legacy migration plan create-only' {
+    $authority=New-CcodProductAuthorityFixture;$fixture=$authority.Fixture
+    $outer=$null;$product=$null;$lifecycleModule=$null;$fence=$null
+    try {
+        $lifecycleModule=Import-Module (Join-Path $projectRoot 'src\persistence\modules\InstallLifecycle.psm1') -Force -PassThru -DisableNameChecking
+        $outer=&$lifecycleModule {Enter-CcodLifecycleProductCleanupLease}
+        $fence=&$lifecycleModule {param($Root,$Ready,$Identity)New-CcodLifecycleProductCleanupFence -InstallRoot $Root -ReadyTransaction $Ready -OwnerIdentity $Identity} $fixture.Install $authority.Ready $outer.OwnerIdentity
+        $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready;$fixture.Transactions.Add($product)
+        &$module {param($Transaction,$Fence)Set-CcodInstallProductCleanupFence -Transaction $Transaction -Fence $Fence|Out-Null} $product $fence
+        $bytes=[Text.UTF8Encoding]::new($false).GetBytes('{"schemaVersion":1,"transactionId":"33333333-4444-4555-8666-777777777777"}')
+        $written=Write-CcodInstallLegacyMigrationPlan -Transaction $product -ReadyTransaction $authority.Ready -Bytes $bytes
+        $read=Read-CcodInstallLegacyMigrationPlan -Transaction $product -ReadyTransaction $authority.Ready
+        $expectedPath=Join-Path $fixture.Install ('state\legacy-registration-migrations\00000000000000000001.'+$authority.Ready.transactionId+'.json')
+        Assert-CcodEqual ([int64]$bytes.LongLength) ([int64]$written.Length) 'specialized plan write returns exact length'
+        Assert-CcodEqual (Get-CcodTestFileSha256 $expectedPath) $written.Sha256 'specialized plan write returns exact digest'
+        Assert-CcodEqual ([Convert]::ToBase64String($bytes)) ([Convert]::ToBase64String($read.Bytes)) 'specialized plan reader returns exact persisted bytes'
+        Assert-CcodEqual $written.Sha256 $read.Sha256 'specialized plan reader hashes the same pinned file'
+        Assert-CcodThrows {Write-CcodInstallLegacyMigrationPlan -Transaction $product -ReadyTransaction $authority.Ready -Bytes $bytes|Out-Null} 'CCOD_INSTALL_LEGACY_PLAN_EXISTS'
+        $wrong=$authority.Ready.PSObject.Copy();$wrong.newGeneration=[uint64]2
+        Assert-CcodThrows {Read-CcodInstallLegacyMigrationPlan -Transaction $product -ReadyTransaction $wrong|Out-Null} 'CCOD_INSTALL_PRODUCT_SCOPE'
+        $other=Open-CcodInstallStateTransaction -InstallRoot $fixture.Install;$fixture.Transactions.Add($other)
+        Assert-CcodThrows {Write-CcodInstallLegacyMigrationPlan -Transaction $other -ReadyTransaction $authority.Ready -Bytes $bytes|Out-Null} 'CCOD_INSTALL_PRODUCT_SCOPE'
+        Close-CcodInstallFileTransaction -Transaction $product -Disposition Ready;$product=$null
+        &$lifecycleModule {param($Fence)Complete-CcodLifecycleProductCleanupFence -Fence $Fence -Outcome Completed|Out-Null} $fence
+    } finally {
+        if($null-ne$product){try{Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed}catch{}}
+        if($null-ne$outer){try{&$lifecycleModule {param($Context)Exit-CcodLifecycleProductCleanupLease -Context $Context|Out-Null} $outer}catch{}}
+        Remove-CcodInstallFileFixture $fixture
+    }
+}
+
+# Production mutations caught: a generic product capability writes a plan without its durable cleanup authority or size bound.
+Invoke-CcodTest 'legacy migration plan requires its live cleanup fence and bounded specialized scope' {
+    $authority=New-CcodProductAuthorityFixture;$fixture=$authority.Fixture;$outer=$null;$product=$null;$lifecycleModule=$null;$fence=$null
+    try{
+        $lifecycleModule=Import-Module (Join-Path $projectRoot 'src\persistence\modules\InstallLifecycle.psm1') -Force -PassThru -DisableNameChecking;$outer=&$lifecycleModule {Enter-CcodLifecycleProductCleanupLease}
+        $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready;$fixture.Transactions.Add($product)
+        Assert-CcodThrows {Write-CcodInstallLegacyMigrationPlan -Transaction $product -ReadyTransaction $authority.Ready -Bytes ([byte[]]@(1))|Out-Null} 'CCOD_INSTALL_PRODUCT_SCOPE'
+        Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed;$product=$null
+        $fence=&$lifecycleModule {param($Root,$Ready,$Identity)New-CcodLifecycleProductCleanupFence -InstallRoot $Root -ReadyTransaction $Ready -OwnerIdentity $Identity} $fixture.Install $authority.Ready $outer.OwnerIdentity
+        $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready;$fixture.Transactions.Add($product);&$module {param($Transaction,$Fence)Set-CcodInstallProductCleanupFence -Transaction $Transaction -Fence $Fence|Out-Null} $product $fence
+        Assert-CcodThrows {Write-CcodInstallLegacyMigrationPlan -Transaction $product -ReadyTransaction $authority.Ready -Bytes ([byte[]]::new(1048577))|Out-Null} 'CCOD_INSTALL_PRODUCT_SCOPE'
+        Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $fixture.Install 'state\legacy-registration-migrations')) 'rejected specialized writes create no plan directory'
+        Close-CcodInstallFileTransaction -Transaction $product -Disposition Ready;$product=$null;&$lifecycleModule {param($Fence)Complete-CcodLifecycleProductCleanupFence -Fence $Fence -Outcome Completed|Out-Null} $fence
+    }finally{if($null-ne$product){try{Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed}catch{}};if($null-ne$outer){try{&$lifecycleModule {param($Context)Exit-CcodLifecycleProductCleanupLease -Context $Context|Out-Null} $outer}catch{}};Remove-CcodInstallFileFixture $fixture}
+}
+
+# Production mutation caught: the just-published plan is not held by identity until the product transaction closes.
+Invoke-CcodTest 'legacy migration plan remains identity-pinned for the live product transaction' {
+    $authority=New-CcodProductAuthorityFixture;$fixture=$authority.Fixture;$outer=$null;$product=$null;$lifecycleModule=$null;$fence=$null
+    try{
+        $lifecycleModule=Import-Module (Join-Path $projectRoot 'src\persistence\modules\InstallLifecycle.psm1') -Force -PassThru -DisableNameChecking;$outer=&$lifecycleModule {Enter-CcodLifecycleProductCleanupLease};$fence=&$lifecycleModule {param($Root,$Ready,$Identity)New-CcodLifecycleProductCleanupFence -InstallRoot $Root -ReadyTransaction $Ready -OwnerIdentity $Identity} $fixture.Install $authority.Ready $outer.OwnerIdentity
+        $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready;$fixture.Transactions.Add($product);&$module {param($Transaction,$Fence)Set-CcodInstallProductCleanupFence -Transaction $Transaction -Fence $Fence|Out-Null} $product $fence
+        $bytes=[Text.UTF8Encoding]::new($false).GetBytes('{"schemaVersion":1}');Write-CcodInstallLegacyMigrationPlan -Transaction $product -ReadyTransaction $authority.Ready -Bytes $bytes|Out-Null
+        $path=Join-Path $fixture.Install ('state\legacy-registration-migrations\00000000000000000001.'+$authority.Ready.transactionId+'.json');$moved=$false;try{[IO.File]::Move($path,$path+'.replacement');$moved=$true}catch [IO.IOException]{}catch [UnauthorizedAccessException]{}
+        Assert-CcodEqual $false $moved 'live plan handle denies replacement until the authority transaction closes'
+        Assert-CcodEqual ([Convert]::ToBase64String($bytes)) ([Convert]::ToBase64String((Read-CcodInstallLegacyMigrationPlan -Transaction $product -ReadyTransaction $authority.Ready).Bytes)) 'identity-pinned plan remains readable'
+        Close-CcodInstallFileTransaction -Transaction $product -Disposition Ready;$product=$null;&$lifecycleModule {param($Fence)Complete-CcodLifecycleProductCleanupFence -Fence $Fence -Outcome Completed|Out-Null} $fence
+    }finally{if($null-ne$product){try{Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed}catch{}};if($null-ne$outer){try{&$lifecycleModule {param($Context)Exit-CcodLifecycleProductCleanupLease -Context $Context|Out-Null} $outer}catch{}};Remove-CcodInstallFileFixture $fixture}
+}
+
+# Production mutations caught: delayed authority accepts changed ACL, ADS, multilink, or reparse plan objects.
+Invoke-CcodTest 'delayed legacy migration plan read rejects hostile file identity and security mutations' {
+    foreach($mutation in @('Acl','DirectoryAcl','Ads','Multilink','Reparse','DirectoryReparse')){
+        $authority=New-CcodProductAuthorityFixture;$fixture=$authority.Fixture;$outer=$null;$product=$null;$lifecycleModule=$null;$fence=$null;$outsidePath=$null
+        try{
+            $lifecycleModule=Import-Module (Join-Path $projectRoot 'src\persistence\modules\InstallLifecycle.psm1') -Force -PassThru -DisableNameChecking;$outer=&$lifecycleModule {Enter-CcodLifecycleProductCleanupLease};$fence=&$lifecycleModule {param($Root,$Ready,$Identity)New-CcodLifecycleProductCleanupFence -InstallRoot $Root -ReadyTransaction $Ready -OwnerIdentity $Identity} $fixture.Install $authority.Ready $outer.OwnerIdentity
+            $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready;$fixture.Transactions.Add($product);&$module {param($Transaction,$Fence)Set-CcodInstallProductCleanupFence -Transaction $Transaction -Fence $Fence|Out-Null} $product $fence
+            Write-CcodInstallLegacyMigrationPlan -Transaction $product -ReadyTransaction $authority.Ready -Bytes ([Text.UTF8Encoding]::new($false).GetBytes('{"schemaVersion":1}'))|Out-Null;Close-CcodInstallFileTransaction -Transaction $product -Disposition Ready;$product=$null;&$lifecycleModule {param($Fence)Complete-CcodLifecycleProductCleanupFence -Fence $Fence -Outcome Completed|Out-Null} $fence
+            $path=Join-Path $fixture.Install ('state\legacy-registration-migrations\00000000000000000001.'+$authority.Ready.transactionId+'.json')
+            if($mutation-ceq'Acl'){$acl=[Security.AccessControl.FileSecurity]::new($path,[Security.AccessControl.AccessControlSections]::Access);$rule=[Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-1-0'),[Security.AccessControl.FileSystemRights]::Read,[Security.AccessControl.AccessControlType]::Allow);$acl.AddAccessRule($rule)|Out-Null;[IO.File]::SetAccessControl($path,$acl)}
+            elseif($mutation-ceq'DirectoryAcl'){$directory=Split-Path $path -Parent;$acl=[Security.AccessControl.DirectorySecurity]::new($directory,[Security.AccessControl.AccessControlSections]::Access);$rule=[Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-1-0'),[Security.AccessControl.FileSystemRights]::ReadAndExecute,[Security.AccessControl.InheritanceFlags]::ContainerInherit-bor[Security.AccessControl.InheritanceFlags]::ObjectInherit,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow);$acl.AddAccessRule($rule)|Out-Null;[IO.Directory]::SetAccessControl($directory,$acl)}
+            elseif($mutation-ceq'Ads'){$item=Get-Item -LiteralPath $path -Force;$item.IsReadOnly=$false;Set-Content -LiteralPath $path -Stream hostile -Value x -NoNewline;$item.Refresh();$item.IsReadOnly=$true}
+            elseif($mutation-ceq'Multilink'){$outsidePath=Join-Path $fixture.Outside 'plan-link.json';New-CcodHardLink -Path $outsidePath -Existing $path}
+            elseif($mutation-ceq'Reparse'){$item=Get-Item -LiteralPath $path -Force;$item.IsReadOnly=$false;Remove-Item -LiteralPath $path -Force;$outsidePath=Join-Path $fixture.Outside 'plan-target';[IO.Directory]::CreateDirectory($outsidePath)|Out-Null;New-CcodJunction -Path $path -Target $outsidePath}
+            else{$directory=Split-Path $path -Parent;$item=Get-Item -LiteralPath $path -Force;$item.IsReadOnly=$false;Remove-Item -LiteralPath $directory -Recurse -Force;$outsidePath=Join-Path $fixture.Outside 'plan-directory-target';[IO.Directory]::CreateDirectory($outsidePath)|Out-Null;New-CcodJunction -Path $directory -Target $outsidePath}
+            $fence=&$lifecycleModule {param($Root,$Ready,$Identity)New-CcodLifecycleProductCleanupFence -InstallRoot $Root -ReadyTransaction $Ready -OwnerIdentity $Identity} $fixture.Install $authority.Ready $outer.OwnerIdentity
+            $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready;$fixture.Transactions.Add($product);&$module {param($Transaction,$Fence)Set-CcodInstallProductCleanupFence -Transaction $Transaction -Fence $Fence|Out-Null} $product $fence
+            Assert-CcodThrows {Read-CcodInstallLegacyMigrationPlan -Transaction $product -ReadyTransaction $authority.Ready|Out-Null} 'CCOD_INSTALL_LEGACY_PLAN_READ_FAILED'
+            Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed;$product=$null;&$lifecycleModule {param($Fence)Complete-CcodLifecycleProductCleanupFence -Fence $Fence -Outcome Completed|Out-Null} $fence
+        }finally{if($null-ne$product){try{Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed}catch{}};if($null-ne$outer){try{&$lifecycleModule {param($Context)Exit-CcodLifecycleProductCleanupLease -Context $Context|Out-Null} $outer}catch{}};Remove-CcodInstallFileFixture $fixture}
+    }
 }
 
 # Production mutation caught: a selected Ready chain cannot authorize product access while an unrelated install remains nonterminal.
@@ -336,7 +421,7 @@ Invoke-CcodTest 'product authority rejects incomplete pointer stores and changed
     }
 }
 
-Invoke-CcodTest 'V5 state-only transaction writes records but cannot reach generation or pointer operations' {
+Invoke-CcodTest 'V6 state-only transaction writes records but cannot reach generation or pointer operations' {
     $fixture=New-CcodInstallFileFixture;$transaction=$null
     try{$transaction=Open-CcodInstallStateTransaction -InstallRoot $fixture.Install;$fixture.Transactions.Add($transaction);$state=New-CcodInstallDirectory -Transaction $transaction -Parent $transaction -Leaf 'state' -CreateIfMissing;$records=New-CcodInstallDirectory -Transaction $transaction -Parent $state -Leaf 'install-transactions' -CreateIfMissing;Write-CcodInstallRecord -Transaction $transaction -Parent $records -Leaf 'ready.json' -Record ([ordered]@{schemaVersion=1;phase='Ready'})|Out-Null;Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $fixture.Install 'state\install-transactions\ready.json')) 'state-only transaction writes a create-only state record';Assert-CcodThrows {Write-CcodInstallRecord -Transaction $transaction -Parent $records -Leaf 'ready.json' -Record ([ordered]@{schemaVersion=1;phase='Ready'})|Out-Null} 'CCOD_INSTALL_RECORD_EXISTS';Assert-CcodThrows {New-CcodInstallDirectory -Transaction $transaction -Parent $transaction -Leaf 'runtime' -CreateIfMissing|Out-Null} 'CCOD_INSTALL_STATE_SCOPE';Assert-CcodThrows {New-CcodInstallGenerationLeaf -Generation $transaction -Leaf 'payload'|Out-Null} 'CCOD_INSTALL_STATE_SCOPE';$source=New-CcodSourceFile $fixture 'state-source.txt' 'x';Assert-CcodThrows {Copy-CcodInstallSealedSource -Generation $transaction -SourcePath $source.Path -Leaf 'payload.bin' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null} 'CCOD_INSTALL_STATE_SCOPE';Assert-CcodThrows {Write-CcodInstallGenerationManifest -Generation $transaction -Manifest (New-CcodGenerationManifest 'state-runtime')|Out-Null} 'CCOD_INSTALL_STATE_SCOPE';Assert-CcodThrows {Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId 'state-runtime' -ExpectedManifestSha256 ('0'*64) -FileTransaction $transaction|Out-Null} 'CCOD_INSTALL_STATE_SCOPE';Assert-CcodThrows {Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $transaction -ExpectedPreviousGeneration 0 -FileTransaction $transaction|Out-Null} 'CCOD_INSTALL_POINTER_TARGET_INVALID';Assert-CcodThrows {Retire-CcodInstallGeneration -InstallRoot $fixture.Install -RuntimeId 'state-runtime' -FileTransaction $transaction|Out-Null} 'CCOD_INSTALL_GENERATION_NOT_OWNED';Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $fixture.Install 'runtime')) 'state-only transaction creates no runtime tree';Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $fixture.Install 'state\active-generation')) 'state-only transaction creates no active pointer';Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $fixture.Install 'state\retired-generations')) 'state-only transaction creates no retirement record'}finally{Remove-CcodInstallFileFixture $fixture}
 }
@@ -836,17 +921,17 @@ Invoke-CcodExtensionRedTest 'child-transaction' 'rejects a child directory capab
     } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
-Invoke-CcodExtensionRedTest 'v4-reimport' 'a child process loads V4 first then proves the V5 state-only export boundary' {
+Invoke-CcodExtensionRedTest 'v4-reimport' 'a child process loads V4 first then proves the V6 state-only export boundary' {
     $fixture=New-CcodInstallFileFixture
     try {
-        $source=New-CcodSourceFile $fixture 'v5-state-source.txt' 'state-only-after-v4'
+        $source=New-CcodSourceFile $fixture 'v6-state-source.txt' 'state-only-after-v4'
         $escapedModule=$modulePath.Replace("'","''");$escapedInstall=$fixture.Install.Replace("'","''");$escapedSource=$source.Path.Replace("'","''")
         $child=@"
 `$ErrorActionPreference='Stop';`$ProgressPreference='SilentlyContinue'
 Add-Type -TypeDefinition 'public sealed class CcodInstallGenerationCapabilityMarkerV4 { private CcodInstallGenerationCapabilityMarkerV4() {} public static int CapabilityAbi { get { return 4; } } }'
-if([CcodInstallGenerationCapabilityMarkerV4]::CapabilityAbi-ne4-or`$null-ne('CcodInstallGenerationCapabilityMarkerV5'-as[type])){throw 'V4 was not loaded first'}
+if([CcodInstallGenerationCapabilityMarkerV4]::CapabilityAbi-ne4-or`$null-ne('CcodInstallGenerationCapabilityMarkerV6'-as[type])){throw 'V4 was not loaded first'}
 Import-Module '$escapedModule' -Force -DisableNameChecking -ErrorAction Stop
-if([CcodInstallGenerationCapabilityMarkerV5]::CapabilityAbi-ne5){throw 'V5 ABI missing'}
+if([CcodInstallGenerationCapabilityMarkerV6]::CapabilityAbi-ne6){throw 'V6 ABI missing'}
 function Assert-ChildThrows([scriptblock]`$Action,[string]`$ErrorId){try{&`$Action;throw "EXPECTED_`$ErrorId"}catch{if(`$_.FullyQualifiedErrorId-notlike"`$ErrorId*"){throw}}}
 `$transaction=Open-CcodInstallStateTransaction -InstallRoot '$escapedInstall'
 try{
@@ -863,11 +948,11 @@ try{
   Assert-ChildThrows {Retire-CcodInstallGeneration -InstallRoot '$escapedInstall' -RuntimeId 'runtime-v3-old' -FileTransaction `$transaction|Out-Null} 'CCOD_INSTALL_GENERATION_NOT_OWNED'
   if([IO.Directory]::Exists((Join-Path '$escapedInstall' 'runtime'))-or[IO.Directory]::Exists((Join-Path '$escapedInstall' 'state\active-generation'))-or[IO.Directory]::Exists((Join-Path '$escapedInstall' 'state\retired-generations'))){throw 'state-only escape observed'}
 }finally{Close-CcodInstallFileTransaction -Transaction `$transaction -Disposition Ready}
-[Console]::Out.WriteLine('V4_FIRST_V5_STATE_ONLY_OK')
+[Console]::Out.WriteLine('V4_FIRST_V6_STATE_ONLY_OK')
 "@
         $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child));$output=@(& powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded 2>&1);$exitCode=$LASTEXITCODE
-        Assert-CcodEqual 0 $exitCode 'fresh child process accepts V5 after loading only V4 first'
-        Assert-CcodEqual 'V4_FIRST_V5_STATE_ONLY_OK' ($output -join '') 'child proves only the exported V5 state-only boundary'
+        Assert-CcodEqual 0 $exitCode 'fresh child process accepts V6 after loading only V4 first'
+        Assert-CcodEqual 'V4_FIRST_V6_STATE_ONLY_OK' ($output -join '') 'child proves only the exported V6 state-only boundary'
     } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
