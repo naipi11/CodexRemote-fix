@@ -30,5 +30,10 @@ InstallFileTransaction 44 groups, ProductRegistration 30/30, InstallLifecycle 15
 Fix round 1 frozen gate: complete, including UninstallBootstrap 45/45, RuntimeManifest 21 groups,
 InstalledLifecycleHarness 21 groups, Bootstrap 26/26, ManualWrappers 12 groups, and
 `tests\PersistenceSelfTest.ps1` exit 0. Fix-round scoped re-review: Spec Compliance PASS, Task Quality PASS,
-0 Critical, 0 Important. Task 2 is complete. Successor whole-plan final review remains pending; Tasks 5–8
-remain blocked.
+0 Critical, 0 Important. Task 2 is complete.
+
+Successor whole-plan final review: FAIL (0 Critical, 1 Important). All Task 1/2 behavioral and interaction
+boundaries passed, but the Task 2 fix modified embedded CLR RuntimeV6 without advancing its marker/type ABI;
+a process that preloaded the pre-fix V6 can silently reuse it after force re-import. Per the fixed review scope,
+this successor plan is closed as failed rather than receiving another whole-plan fix wave. Successor micro-plan:
+`docs/superpowers/plans/2026-09-03-v2522-runtime-v7-closure.md`. Tasks 5–8 remain blocked.
