@@ -16,4 +16,10 @@ new PowerShell source.
 
 ## Status
 
-Runtime V7 task: pending. Tasks 5–8 remain blocked.
+Runtime V7 task: complete. Implementation `9d7cc90`; evidence is recorded by the commit containing
+`runtime-v7-report.md` and this ledger update. Frozen evidence: InstallFileTransaction 45 groups,
+ProductRegistration 30/30, InstallLifecycle 151/151, UninstallBootstrap 45/45, RuntimeManifest 21 groups,
+InstalledLifecycleHarness 21 groups, Bootstrap 26/26, ManualWrappers 12 groups, parser 2/2,
+`git diff --check` exit 0, and `tests\PersistenceSelfTest.ps1` exit 0. No real system action.
+
+Fresh scoped V7 review: pending. Tasks 5–8 remain blocked.
