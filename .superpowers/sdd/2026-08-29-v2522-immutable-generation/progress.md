@@ -372,3 +372,11 @@ review acceptance through `3eea951`. The true v2.5.21 lifecycle bridge, exact hi
 profiles, durable pre-write migration plan, same-SID/new-session TaskRemoved recovery, post-reclamation
 staged resume, pinned generation reclamation, and Runtime V7 ABI closure all passed their scoped reviews.
 The latest frozen persistence aggregate exited 0. Task 5 is now in progress; Tasks 6–8 remain blocked.
+
+Task 5 implementation `fb163b7b6b594e302cf4dffe1dedd055b5f8d9d4` centralizes the exact ordered
+11-asset contract, binds schema-two Defender receipts to explicit origin/status/clock and post-scan
+identity evidence, requires two distinct official Internet-download receipts cross-checked against the
+real asset directory, and scans Setup's held sealed package before any extraction or lifecycle mutation.
+Frozen verification passed ReleaseWorkflow 58/58, PortableRelease 5/5, InstallLifecycle 151/151, parser
+103/103, diff check, and all 39 aggregate suites. No real Defender/build/install/network/release action
+was performed. Task 5 remains review-pending; Tasks 6–8 remain blocked.
