@@ -156,3 +156,91 @@ Lifecycle 的既有 cross-process guard 仍输出：
 
 Task 2 与 successor plan 的本地 final gate 已完成；fresh scoped review 仍待 parent agent 发起。
 本报告不声明 Tasks 5–8、合并、发布或 release readiness 完成。
+
+## Fix round 1 — CREATE/ACL recovery、exact nested schema 与独立进程 replay
+
+### Review findings 与 RED
+
+Task 2 scoped review 对 `148f6ee..66a91aa` 判定 FAIL（0 Critical、3 Important）。本轮在
+production 未修改时分别运行三组 RED：
+
+```text
+IFT reader-first safe empty recovery:
+  exit 1
+  safe inherited empty directory reached OpenExistingLegacyPlanDirectory
+  ACL validation threw after result.Handle was detached
+  fixture cleanup failed with "being used by another process"
+
+IFT CREATE Set/Validate failure seam:
+  exit 1
+  InvokeMethodOnNull (the exact native failure boundary did not exist)
+
+Product exact nested schema:
+  exit 1
+  ProfileExtra was accepted
+  ASSERT_THROWS: expected CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID
+
+Product post-write read-back:
+  exit 1
+  raw "fixture durable plan read-back failure" escaped instead of the stable product error
+```
+
+在第一轮 production 修复后，独立 `powershell.exe` replay 又得到一条真实 RED：serialized live
+registry 的 `values` 被独立反序列化为 `PSCustomObject`，旧 comparator 直接访问 `.Keys`，child
+返回 `The property 'Keys' cannot be found`。该失败证明先前同进程 adapter 测试依赖了 parent
+object identity。
+
+### Fix
+
+实现提交：`a0c8d71`（`fix: harden durable legacy plan recovery`）。
+
+- V6 保持不变。新建 plan 目录的 Pin 在 ACL Set/Validate 前注册；任何后续失败均由 transaction
+  close 释放，避免 detached native handle。
+- writer 与 reader-first 共用同一恢复判定。只允许 current SID owner、空目录、无 reparse/ADS、
+  未 protected 且仅继承 current SID/SYSTEM/Administrators 三项 FullControl 的 CREATE artifact；
+  normalization 前后都复验 exact native identity，之后设置并验证既有 protected exact ACL。
+- nonempty、untrusted ACE、foreign owner、错误 flags/rights/principal、identity drift 均 fail closed，
+  且不会被 normalization 改写。测试对 Set 与 Validate 两个 crash seam 都证明 live handle 阻止
+  replacement、close 后立即释放、later reader-first 返回 no-plan 并收敛。
+- persisted profile 必须严格为
+  `profileId,appId,minimumVersion,maximumVersion,uninstallCommandShape,shortcutNames` 六字段、原顺序，
+  canonical JSON 值与 `Resolve-CcodLegacyRegistrationProfile` 完全一致，并将 `profile.appId` 与顶层
+  AppId 交叉绑定。
+- `expectedInstallRoot` 与每条 historical shortcut 的 path/target/workingDirectory 现在既要解析到
+  expected identity，也要求 raw string 本身就是 canonical string；等价的 `\.\` spelling 被拒绝。
+- initial plan read 与 post-write read-back adapter failures 都归一化为
+  `CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID`。published-then-threw 与 read-back-failed 两种首调均保持
+  零 current write；later invocation 只读取 existing bytes，publish count 保持 `1` 并完成 cleanup。
+- registry comparator 通过同一个 strict map facade 同时处理 ordered dictionary 与独立反序列化的
+  `PSCustomObject`，不再依赖 parent-process object shape。
+
+### Fix round 1 tests 与 frozen gate
+
+新增覆盖 reader-first safe empty recovery、Set/Validate registered-handle cleanup、nonempty/untrusted
+ACE/foreign-owner shared native predicate、profile extra/missing/reordered/value、raw root/path/target/
+working-directory、published-then-threw、post-write read-back failure，以及完全独立
+`powershell.exe` serialized plan/live-state replay。
+
+focused 结果：InstallFileTransaction 44 groups、ProductRegistration 30/30、InstallLifecycle 151/151，
+均 exit 0。source freeze 后完整 gate：
+
+```text
+InstallFileTransaction.SelfTest.ps1   44 groups   exit 0
+ProductRegistration.SelfTest.ps1      30/30       exit 0
+InstallLifecycle.SelfTest.ps1         151/151     exit 0
+UninstallBootstrap.SelfTest.ps1       45/45       exit 0
+RuntimeManifest.SelfTest.ps1          21 groups   exit 0
+InstalledLifecycleHarness.SelfTest.ps1 21 groups  exit 0
+Bootstrap.SelfTest.ps1                26/26       exit 0
+ManualWrappers.SelfTest.ps1           12 groups   exit 0
+PowerShell parser                     4/4 changed files, 0 errors
+git diff --check                                  exit 0
+tests\PersistenceSelfTest.ps1                     exit 0 (silent success)
+```
+
+Lifecycle cross-process guard 仍为
+`exit=23 mutex=True authority=False product=False verified=False error=CCOD_PRODUCT_REGISTRATION_FAILED`。
+未执行任何真实 registry、shortcut、scheduled task、安装、卸载、重启、网络、push、tag、release
+或发布操作；失败 RED 遗留的单一临时 fixture 已在进程退出后按 exact temp path 清理。
+
+Fix round 1 的 fresh scoped review 仍待 parent agent 发起；不作 release-readiness 声明。
