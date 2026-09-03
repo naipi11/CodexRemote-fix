@@ -10,7 +10,7 @@ function Throw-CcodInstallFileError {
 }
 
 function Initialize-CcodInstallRuntime {
-    $marker = 'CcodInstallGenerationCapabilityMarkerV6' -as [type]
+    $marker = 'CcodInstallGenerationCapabilityMarkerV7' -as [type]
     if ($null -eq $marker) {
         Add-Type -TypeDefinition @'
 using System;
@@ -25,13 +25,13 @@ using System.Security.Principal;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
 
-public sealed class CcodInstallGenerationCapabilityMarkerV6
+public sealed class CcodInstallGenerationCapabilityMarkerV7
 {
-    private CcodInstallGenerationCapabilityMarkerV6() { }
-    public static int CapabilityAbi { get { return 6; } }
+    private CcodInstallGenerationCapabilityMarkerV7() { }
+    public static int CapabilityAbi { get { return 7; } }
 }
 
-internal sealed class CcodInstallGenerationRuntimeV6 : IDisposable
+internal sealed class CcodInstallGenerationRuntimeV7 : IDisposable
 {
     private const uint READ = 0x80000000, WRITE = 0x40000000, DELETE = 0x00010000, READ_CONTROL = 0x00020000, WRITE_DAC = 0x00040000, WRITE_OWNER = 0x00080000, SYNC = 0x00100000;
     private const uint READ_ATTRIBUTES = 0x80, WRITE_ATTRIBUTES = 0x100, LIST_DIRECTORY = 0x1, ADD_FILE = 0x2, ADD_SUBDIRECTORY = 0x4;
@@ -90,10 +90,10 @@ internal sealed class CcodInstallGenerationRuntimeV6 : IDisposable
     private bool disposed; private string cleanupError,legacyPlanDirectoryFailureForTest;
 
     private readonly bool stateOnly,productOnly,retryOnly;
-    private CcodInstallGenerationRuntimeV6(string installRoot,Pin root,Pin runtimeParent,bool stateOnly,bool productOnly,bool retryOnly)
+    private CcodInstallGenerationRuntimeV7(string installRoot,Pin root,Pin runtimeParent,bool stateOnly,bool productOnly,bool retryOnly)
     { this.installRoot=installRoot;this.root=root;this.runtimeParent=runtimeParent;this.stateOnly=stateOnly;this.productOnly=productOnly;this.retryOnly=retryOnly;AddPin(root);if(runtimeParent!=null)AddPin(runtimeParent); }
 
-    internal static object Open(string path,string runtimeId,out CcodInstallGenerationRuntimeV6 runtime)
+    internal static object Open(string path,string runtimeId,out CcodInstallGenerationRuntimeV7 runtime)
     {
         runtime=null;string full=Path.GetFullPath(path).TrimEnd('\\');SafeFileHandle rootHandle=OpenAbsoluteDirectory(full,true);Pin rootPin=null,runtimePin=null;
         try
@@ -108,30 +108,30 @@ internal sealed class CcodInstallGenerationRuntimeV6 : IDisposable
             try
             {
                 Pin generation=ValidateDirectoryPin(runtimePin,runtimeId,Path.Combine(runtimePin.Path,runtimeId),true,generationResult.Handle);generationResult.Handle=null;
-                runtime=new CcodInstallGenerationRuntimeV6(full,rootPin,runtimePin,false,false,false);rootPin=null;runtimePin=null;runtime.AddPin(generation);return generation.Token;
+                runtime=new CcodInstallGenerationRuntimeV7(full,rootPin,runtimePin,false,false,false);rootPin=null;runtimePin=null;runtime.AddPin(generation);return generation.Token;
             }
             finally { if(generationResult.Handle!=null)generationResult.Handle.Dispose(); }
         }
         catch { if(runtimePin!=null)runtimePin.Dispose();if(rootPin!=null)rootPin.Dispose();if(rootHandle!=null)rootHandle.Dispose();throw; }
     }
 
-    internal static object OpenState(string path,out CcodInstallGenerationRuntimeV6 runtime)
+    internal static object OpenState(string path,out CcodInstallGenerationRuntimeV7 runtime)
     {
         runtime=null;string full=Path.GetFullPath(path).TrimEnd('\\');SafeFileHandle rootHandle=OpenAbsoluteDirectory(full,true);Pin rootPin=null;
-        try{rootPin=ValidateDirectoryPin(null,"",full,false,rootHandle);rootHandle=null;runtime=new CcodInstallGenerationRuntimeV6(full,rootPin,null,true,false,false);rootPin=null;return runtime.root.Token;}
+        try{rootPin=ValidateDirectoryPin(null,"",full,false,rootHandle);rootHandle=null;runtime=new CcodInstallGenerationRuntimeV7(full,rootPin,null,true,false,false);rootPin=null;return runtime.root.Token;}
         catch{if(rootPin!=null)rootPin.Dispose();if(rootHandle!=null)rootHandle.Dispose();throw;}
     }
 
-    internal static object OpenRetry(string path,out CcodInstallGenerationRuntimeV6 runtime)
+    internal static object OpenRetry(string path,out CcodInstallGenerationRuntimeV7 runtime)
     {
         runtime=null;string full=Path.GetFullPath(path).TrimEnd('\\');SafeFileHandle rootHandle=OpenAbsoluteDirectory(full,true);Pin rootPin=null,runtimePin=null;
-        try{rootPin=ValidateDirectoryPin(null,"",full,false,rootHandle);rootHandle=null;OpenResult result=OpenRelative(rootPin.Native,"runtime",LIST_DIRECTORY|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);try{runtimePin=ValidateDirectoryPin(rootPin,"runtime",Path.Combine(full,"runtime"),false,result.Handle);result.Handle=null;}finally{if(result.Handle!=null)result.Handle.Dispose();};runtime=new CcodInstallGenerationRuntimeV6(full,rootPin,runtimePin,false,false,true);rootPin=null;runtimePin=null;return runtime.root.Token;}catch{if(runtimePin!=null)runtimePin.Dispose();if(rootPin!=null)rootPin.Dispose();if(rootHandle!=null)rootHandle.Dispose();throw;}
+        try{rootPin=ValidateDirectoryPin(null,"",full,false,rootHandle);rootHandle=null;OpenResult result=OpenRelative(rootPin.Native,"runtime",LIST_DIRECTORY|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);try{runtimePin=ValidateDirectoryPin(rootPin,"runtime",Path.Combine(full,"runtime"),false,result.Handle);result.Handle=null;}finally{if(result.Handle!=null)result.Handle.Dispose();};runtime=new CcodInstallGenerationRuntimeV7(full,rootPin,runtimePin,false,false,true);rootPin=null;runtimePin=null;return runtime.root.Token;}catch{if(runtimePin!=null)runtimePin.Dispose();if(rootPin!=null)rootPin.Dispose();if(rootHandle!=null)rootHandle.Dispose();throw;}
     }
 
-    internal static object OpenProduct(string path,out CcodInstallGenerationRuntimeV6 runtime)
+    internal static object OpenProduct(string path,out CcodInstallGenerationRuntimeV7 runtime)
     {
         runtime=null;string full=Path.GetFullPath(path).TrimEnd('\\');SafeFileHandle rootHandle=OpenAbsoluteDirectory(full,false);Pin rootPin=null,runtimePin=null;
-        try{rootPin=ValidateDirectoryPin(null,"",full,false,rootHandle);rootHandle=null;OpenResult result=OpenRelative(rootPin.Native,"runtime",LIST_DIRECTORY|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);try{runtimePin=ValidateDirectoryPin(rootPin,"runtime",Path.Combine(full,"runtime"),false,result.Handle);result.Handle=null;}finally{if(result.Handle!=null)result.Handle.Dispose();};runtime=new CcodInstallGenerationRuntimeV6(full,rootPin,runtimePin,false,true,false);rootPin=null;runtimePin=null;return runtime.root.Token;}catch{if(runtimePin!=null)runtimePin.Dispose();if(rootPin!=null)rootPin.Dispose();if(rootHandle!=null)rootHandle.Dispose();throw;}
+        try{rootPin=ValidateDirectoryPin(null,"",full,false,rootHandle);rootHandle=null;OpenResult result=OpenRelative(rootPin.Native,"runtime",LIST_DIRECTORY|READ_ATTRIBUTES|SYNC,SHARE_READ|SHARE_WRITE,OPEN,DIRECTORY|BACKUP_INTENT);try{runtimePin=ValidateDirectoryPin(rootPin,"runtime",Path.Combine(full,"runtime"),false,result.Handle);result.Handle=null;}finally{if(result.Handle!=null)result.Handle.Dispose();};runtime=new CcodInstallGenerationRuntimeV7(full,rootPin,runtimePin,false,true,false);rootPin=null;runtimePin=null;return runtime.root.Token;}catch{if(runtimePin!=null)runtimePin.Dispose();if(rootPin!=null)rootPin.Dispose();if(rootHandle!=null)rootHandle.Dispose();throw;}
     }
 
     private bool IsStateScope(Pin pin){for(Pin cursor=pin;cursor!=null;cursor=cursor.Parent)if(Object.ReferenceEquals(cursor.Parent,root)&&String.Equals(cursor.Leaf,"state",StringComparison.Ordinal))return true;return false;}
@@ -391,10 +391,10 @@ internal sealed class CcodInstallGenerationRuntimeV6 : IDisposable
     private static int RenameReplacing(SafeFileHandle source,SafeFileHandle parent,string destination){byte[] name=Encoding.Unicode.GetBytes(destination);int rootOffset=IntPtr.Size,lengthOffset=rootOffset+IntPtr.Size,nameOffset=lengthOffset+4,size=nameOffset+name.Length+2;IntPtr buffer=Marshal.AllocHGlobal(size);bool parentAdded=false,sourceAdded=false;try{source.DangerousAddRef(ref sourceAdded);parent.DangerousAddRef(ref parentAdded);for(int i=0;i<size;i++)Marshal.WriteByte(buffer,i,0);Marshal.WriteByte(buffer,0,1);Marshal.WriteIntPtr(buffer,rootOffset,parent.DangerousGetHandle());Marshal.WriteInt32(buffer,lengthOffset,name.Length);Marshal.Copy(name,0,IntPtr.Add(buffer,nameOffset),name.Length);IO_STATUS_BLOCK io;int status=NtSetInformationFile(source,out io,buffer,(uint)size,FileRenameInformation);return status>=0?0:(int)RtlNtStatusToDosError(status);}finally{if(parentAdded)parent.DangerousRelease();if(sourceAdded)source.DangerousRelease();Marshal.FreeHGlobal(buffer);}}
 }
 '@
-        $marker = 'CcodInstallGenerationCapabilityMarkerV6' -as [type]
+        $marker = 'CcodInstallGenerationCapabilityMarkerV7' -as [type]
     }
-    if ($null -eq $marker -or [int]$marker.GetProperty('CapabilityAbi').GetValue($null,$null) -ne 6) { Throw-CcodInstallFileError 'CCOD_INSTALL_RUNTIME_ABI_INVALID' 'Install generation runtime ABI is unavailable' $null }
-    $script:CcodRuntimeType = $marker.Assembly.GetType('CcodInstallGenerationRuntimeV6',$true)
+    if ($null -eq $marker -or [int]$marker.GetProperty('CapabilityAbi').GetValue($null,$null) -ne 7) { Throw-CcodInstallFileError 'CCOD_INSTALL_RUNTIME_ABI_INVALID' 'Install generation runtime ABI is unavailable' $null }
+    $script:CcodRuntimeType = $marker.Assembly.GetType('CcodInstallGenerationRuntimeV7',$true)
 }
 
 function Assert-CcodInstallLeaf([string]$Leaf,[string]$ErrorId='CCOD_INSTALL_LEAF_INVALID') {

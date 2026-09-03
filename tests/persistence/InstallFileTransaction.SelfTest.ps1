@@ -172,9 +172,9 @@ function Assert-CcodProductTransactionRejected {
 Invoke-CcodTest 'exports only immutable generation operations and an inert CLR marker' {
     $expected=@('Close-CcodInstallFileTransaction','Commit-CcodInstallActivePointer','Copy-CcodInstallProductShortcut','Copy-CcodInstallSealedSource','New-CcodInstallDirectory','New-CcodInstallGenerationLeaf','Open-CcodInstallGeneration','Open-CcodInstallProductRegistrationTransaction','Open-CcodInstallProductSpecialFolder','Open-CcodInstallRetainedFile','Open-CcodInstallRetainedGeneration','Open-CcodInstallStateTransaction','Read-CcodInstallLegacyMigrationPlan','Retire-CcodInstallGeneration','Write-CcodInstallGenerationManifest','Write-CcodInstallLegacyMigrationPlan','Write-CcodInstallRecord')
     Assert-CcodEqual ($expected -join '|') ((@($module.ExportedCommands.Keys)|Sort-Object)-join '|') 'module export surface is capability-only'
-    Assert-CcodEqual 6 ([CcodInstallGenerationCapabilityMarkerV6]::CapabilityAbi) 'marker exposes the current non-mutating ABI value'
-    Assert-CcodEqual 'CcodInstallGenerationCapabilityMarkerV6' ((@([CcodInstallGenerationCapabilityMarkerV6].Assembly.GetExportedTypes()|ForEach-Object FullName)) -join '|') 'current CLR bridge exports only the inert marker'
-    $dangerous=@([CcodInstallGenerationCapabilityMarkerV6].GetMethods([Reflection.BindingFlags]'Public,Static,DeclaredOnly')|Where-Object{@($_.GetParameters()|Where-Object{$_.ParameterType-in@([string],[IntPtr],[IO.Stream])-or[Microsoft.Win32.SafeHandles.SafeHandle].IsAssignableFrom($_.ParameterType)}).Count-ne 0})
+    Assert-CcodEqual 7 ([CcodInstallGenerationCapabilityMarkerV7]::CapabilityAbi) 'marker exposes the current non-mutating ABI value'
+    Assert-CcodEqual 'CcodInstallGenerationCapabilityMarkerV7' ((@([CcodInstallGenerationCapabilityMarkerV7].Assembly.GetExportedTypes()|ForEach-Object FullName)) -join '|') 'current CLR bridge exports only the inert marker'
+    $dangerous=@([CcodInstallGenerationCapabilityMarkerV7].GetMethods([Reflection.BindingFlags]'Public,Static,DeclaredOnly')|Where-Object{@($_.GetParameters()|Where-Object{$_.ParameterType-in@([string],[IntPtr],[IO.Stream])-or[Microsoft.Win32.SafeHandles.SafeHandle].IsAssignableFrom($_.ParameterType)}).Count-ne 0})
     Assert-CcodEqual 0 $dangerous.Count 'marker accepts no path stream or bare handle'
     Assert-CcodTrue (-not $module.ExportedCommands['Copy-CcodInstallProductShortcut'].Parameters.ContainsKey('SourcePath')) 'product shortcut copy accepts no arbitrary absolute source path'
 }
@@ -495,7 +495,7 @@ Invoke-CcodTest 'product authority rejects incomplete pointer stores and changed
     }
 }
 
-Invoke-CcodTest 'V6 state-only transaction writes records but cannot reach generation or pointer operations' {
+Invoke-CcodTest 'V7 state-only transaction writes records but cannot reach generation or pointer operations' {
     $fixture=New-CcodInstallFileFixture;$transaction=$null
     try{$transaction=Open-CcodInstallStateTransaction -InstallRoot $fixture.Install;$fixture.Transactions.Add($transaction);$state=New-CcodInstallDirectory -Transaction $transaction -Parent $transaction -Leaf 'state' -CreateIfMissing;$records=New-CcodInstallDirectory -Transaction $transaction -Parent $state -Leaf 'install-transactions' -CreateIfMissing;Write-CcodInstallRecord -Transaction $transaction -Parent $records -Leaf 'ready.json' -Record ([ordered]@{schemaVersion=1;phase='Ready'})|Out-Null;Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $fixture.Install 'state\install-transactions\ready.json')) 'state-only transaction writes a create-only state record';Assert-CcodThrows {Write-CcodInstallRecord -Transaction $transaction -Parent $records -Leaf 'ready.json' -Record ([ordered]@{schemaVersion=1;phase='Ready'})|Out-Null} 'CCOD_INSTALL_RECORD_EXISTS';Assert-CcodThrows {New-CcodInstallDirectory -Transaction $transaction -Parent $transaction -Leaf 'runtime' -CreateIfMissing|Out-Null} 'CCOD_INSTALL_STATE_SCOPE';Assert-CcodThrows {New-CcodInstallGenerationLeaf -Generation $transaction -Leaf 'payload'|Out-Null} 'CCOD_INSTALL_STATE_SCOPE';$source=New-CcodSourceFile $fixture 'state-source.txt' 'x';Assert-CcodThrows {Copy-CcodInstallSealedSource -Generation $transaction -SourcePath $source.Path -Leaf 'payload.bin' -ExpectedLength $source.Length -ExpectedSha256 $source.Sha256|Out-Null} 'CCOD_INSTALL_STATE_SCOPE';Assert-CcodThrows {Write-CcodInstallGenerationManifest -Generation $transaction -Manifest (New-CcodGenerationManifest 'state-runtime')|Out-Null} 'CCOD_INSTALL_STATE_SCOPE';Assert-CcodThrows {Open-CcodInstallRetainedGeneration -InstallRoot $fixture.Install -RuntimeId 'state-runtime' -ExpectedManifestSha256 ('0'*64) -FileTransaction $transaction|Out-Null} 'CCOD_INSTALL_STATE_SCOPE';Assert-CcodThrows {Commit-CcodInstallActivePointer -InstallRoot $fixture.Install -TargetGeneration $transaction -ExpectedPreviousGeneration 0 -FileTransaction $transaction|Out-Null} 'CCOD_INSTALL_POINTER_TARGET_INVALID';Assert-CcodThrows {Retire-CcodInstallGeneration -InstallRoot $fixture.Install -RuntimeId 'state-runtime' -FileTransaction $transaction|Out-Null} 'CCOD_INSTALL_GENERATION_NOT_OWNED';Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $fixture.Install 'runtime')) 'state-only transaction creates no runtime tree';Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $fixture.Install 'state\active-generation')) 'state-only transaction creates no active pointer';Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $fixture.Install 'state\retired-generations')) 'state-only transaction creates no retirement record'}finally{Remove-CcodInstallFileFixture $fixture}
 }
@@ -535,6 +535,46 @@ Invoke-CcodTest 'force re-import rebinds the current runtime ABI before real use
         $child = New-CcodInstallGenerationLeaf -Generation $generation -Leaf 'child'
         Assert-CcodEqual '' (@($child.PSObject.Properties.Name) -join ',') 'second import uses the current runtime type binding'
     } finally { Remove-CcodInstallFileFixture $fixture }
+}
+
+# Production mutation caught: a long-lived AppDomain already owns the V6 marker/runtime, so force-import silently selects stale CLR code.
+Invoke-CcodTest 'stale V6 preload cannot capture the final runtime ABI across force re-imports' {
+    $escapedModule=$modulePath.Replace("'","''")
+    $child=@'
+$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
+Add-Type -TypeDefinition @"
+public sealed class CcodInstallGenerationCapabilityMarkerV6
+{
+    private CcodInstallGenerationCapabilityMarkerV6() { }
+    public static int CapabilityAbi { get { return 6; } }
+}
+internal sealed class CcodInstallGenerationRuntimeV6 { }
+"@
+$root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-v7-preload-'+[guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($root)|Out-Null;$transaction=$null
+try{
+    $module=Import-Module '__MODULE__' -Force -PassThru -DisableNameChecking -ErrorAction Stop
+    $selected=&$module {$script:CcodRuntimeType.FullName}
+    if($selected-cne'CcodInstallGenerationRuntimeV7'){[Console]::Out.WriteLine('SELECTED_RUNTIME='+$selected);exit 17}
+    $marker='CcodInstallGenerationCapabilityMarkerV7'-as[type];$staleMarker='CcodInstallGenerationCapabilityMarkerV6'-as[type];$staleRuntime=if($null-eq$staleMarker){$null}else{$staleMarker.Assembly.GetType('CcodInstallGenerationRuntimeV6',$false)}
+    if($null-eq$marker-or[int]$marker.GetProperty('CapabilityAbi').GetValue($null,$null)-ne7-or$null-eq$staleRuntime){throw 'V7 coexistence contract failed'}
+    $first=&$module {$script:CcodRuntimeType}
+    $module=Import-Module '__MODULE__' -Force -PassThru -DisableNameChecking -ErrorAction Stop
+    $second=&$module {$script:CcodRuntimeType}
+    if($first-ne$second-or$second.FullName-cne'CcodInstallGenerationRuntimeV7'){throw 'V7 force re-import selected a different runtime'}
+    $transaction=Open-CcodInstallStateTransaction -InstallRoot $root
+    $state=New-CcodInstallDirectory -Transaction $transaction -Parent $transaction -Leaf 'state' -CreateIfMissing
+    $records=New-CcodInstallDirectory -Transaction $transaction -Parent $state -Leaf 'v7-preload-proof' -CreateIfMissing
+    Write-CcodInstallRecord -Transaction $transaction -Parent $records -Leaf 'ready.json' -Record ([ordered]@{schemaVersion=1;phase='Ready'})|Out-Null
+    if(-not[IO.File]::Exists((Join-Path $root 'state\v7-preload-proof\ready.json'))){throw 'V7 runtime behavior missing'}
+    [Console]::Out.WriteLine('STALE_V6_SKIPPED_V7_OK')
+}finally{
+    if($null-ne$transaction){try{Close-CcodInstallFileTransaction -Transaction $transaction -Disposition Ready}catch{}}
+    $full=[IO.Path]::GetFullPath($root);$temp=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')+'\';if($full.StartsWith($temp,[StringComparison]::OrdinalIgnoreCase)-and(Test-Path -LiteralPath $full)){Remove-Item -LiteralPath $full -Recurse -Force}
+}
+'@.Replace('__MODULE__',$escapedModule)
+    $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child));$output=@(& powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded 2>&1);$exitCode=$LASTEXITCODE
+    Assert-CcodEqual 0 $exitCode "stale V6 preload must select final V7 output=$($output-join'|')"
+    Assert-CcodEqual 'STALE_V6_SKIPPED_V7_OK' ($output-join'') 'final V7 remains selected across force re-import and real state use'
 }
 
 Invoke-CcodTest 'creates nested scoped directories and publishes sanitized records create-only' {
@@ -995,17 +1035,17 @@ Invoke-CcodExtensionRedTest 'child-transaction' 'rejects a child directory capab
     } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
-Invoke-CcodExtensionRedTest 'v4-reimport' 'a child process loads V4 first then proves the V6 state-only export boundary' {
+Invoke-CcodExtensionRedTest 'v4-reimport' 'a child process loads V4 first then proves the V7 state-only export boundary' {
     $fixture=New-CcodInstallFileFixture
     try {
-        $source=New-CcodSourceFile $fixture 'v6-state-source.txt' 'state-only-after-v4'
+        $source=New-CcodSourceFile $fixture 'v7-state-source.txt' 'state-only-after-v4'
         $escapedModule=$modulePath.Replace("'","''");$escapedInstall=$fixture.Install.Replace("'","''");$escapedSource=$source.Path.Replace("'","''")
         $child=@"
 `$ErrorActionPreference='Stop';`$ProgressPreference='SilentlyContinue'
 Add-Type -TypeDefinition 'public sealed class CcodInstallGenerationCapabilityMarkerV4 { private CcodInstallGenerationCapabilityMarkerV4() {} public static int CapabilityAbi { get { return 4; } } }'
-if([CcodInstallGenerationCapabilityMarkerV4]::CapabilityAbi-ne4-or`$null-ne('CcodInstallGenerationCapabilityMarkerV6'-as[type])){throw 'V4 was not loaded first'}
+if([CcodInstallGenerationCapabilityMarkerV4]::CapabilityAbi-ne4-or`$null-ne('CcodInstallGenerationCapabilityMarkerV7'-as[type])){throw 'V4 was not loaded first'}
 Import-Module '$escapedModule' -Force -DisableNameChecking -ErrorAction Stop
-if([CcodInstallGenerationCapabilityMarkerV6]::CapabilityAbi-ne6){throw 'V6 ABI missing'}
+if([CcodInstallGenerationCapabilityMarkerV7]::CapabilityAbi-ne7){throw 'V7 ABI missing'}
 function Assert-ChildThrows([scriptblock]`$Action,[string]`$ErrorId){try{&`$Action;throw "EXPECTED_`$ErrorId"}catch{if(`$_.FullyQualifiedErrorId-notlike"`$ErrorId*"){throw}}}
 `$transaction=Open-CcodInstallStateTransaction -InstallRoot '$escapedInstall'
 try{
@@ -1022,11 +1062,11 @@ try{
   Assert-ChildThrows {Retire-CcodInstallGeneration -InstallRoot '$escapedInstall' -RuntimeId 'runtime-v3-old' -FileTransaction `$transaction|Out-Null} 'CCOD_INSTALL_GENERATION_NOT_OWNED'
   if([IO.Directory]::Exists((Join-Path '$escapedInstall' 'runtime'))-or[IO.Directory]::Exists((Join-Path '$escapedInstall' 'state\active-generation'))-or[IO.Directory]::Exists((Join-Path '$escapedInstall' 'state\retired-generations'))){throw 'state-only escape observed'}
 }finally{Close-CcodInstallFileTransaction -Transaction `$transaction -Disposition Ready}
-[Console]::Out.WriteLine('V4_FIRST_V6_STATE_ONLY_OK')
+[Console]::Out.WriteLine('V4_FIRST_V7_STATE_ONLY_OK')
 "@
         $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child));$output=@(& powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded 2>&1);$exitCode=$LASTEXITCODE
-        Assert-CcodEqual 0 $exitCode 'fresh child process accepts V6 after loading only V4 first'
-        Assert-CcodEqual 'V4_FIRST_V6_STATE_ONLY_OK' ($output -join '') 'child proves only the exported V6 state-only boundary'
+        Assert-CcodEqual 0 $exitCode 'fresh child process accepts V7 after loading only V4 first'
+        Assert-CcodEqual 'V4_FIRST_V7_STATE_ONLY_OK' ($output -join '') 'child proves only the exported V7 state-only boundary'
     } finally {Remove-CcodInstallFileFixture $fixture}
 }
 
