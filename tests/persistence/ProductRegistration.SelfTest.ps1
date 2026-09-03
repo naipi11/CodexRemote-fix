@@ -37,6 +37,7 @@ $currentShortcutNames=@($v2521ShortcutNames[0],$v2521ShortcutNames[3])
 $legacyInstallLocation = 'C:\legacy\CodexControlOtherDevices-installer'
 
 function Get-CcodTestBytesSha256([byte[]]$Bytes){$sha=[Security.Cryptography.SHA256]::Create();try{[BitConverter]::ToString($sha.ComputeHash($Bytes)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}}
+function Invoke-CcodTask2Fix1ProductTest([string]$Id,[string]$Name,[scriptblock]$Action){if(-not[string]::IsNullOrWhiteSpace($env:CCOD_TASK2_FIX1_RED_CASE)-and$env:CCOD_TASK2_FIX1_RED_CASE-cne$Id){return};Invoke-CcodTest $Name $Action}
 
 function New-CcodLegacyRegistrationFixture {
     param(
@@ -140,6 +141,8 @@ function New-CcodRegistrationWorld {
         LegacyMigrationPlanBytes = $null
         LegacyMigrationPlanWrites = 0
         LegacyMigrationPlanReads = 0
+        LegacyMigrationPlanWriteMode = $null
+        LegacyMigrationPlanReadFailureAt = 0
         Calls = [Collections.Generic.List[string]]::new()
     }
     $world.LegacyShortcutProofs=New-CcodProductLegacyShortcutProofs -Legacy $world.Legacy -ExpectedInstallRoot $registration.installRoot
@@ -203,8 +206,8 @@ function New-CcodRegistrationWorld {
             $base=if($Kind-ceq'StartMenu'){[Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)}else{[Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)};$relative=$name.Substring($name.IndexOf('\')+1)
             [pscustomobject][ordered]@{kind=$Kind;name=$name;path=[IO.Path]::GetFullPath((Join-Path $base $relative));candidatePath=[IO.Path]::GetFullPath([string]$Shortcut.candidatePath);candidateLength=[int64]([Convert]::FromBase64String([string]$proof.bytesBase64).LongLength);candidateSha256=[string]$proof.sha256;targetPath=[string]$proof.targetPath;arguments=[string]$proof.arguments;workingDirectory=[string]$proof.workingDirectory}
         }.GetNewClosure()
-        ReadLegacyMigrationPlan = {param($ReadyEvidence)$world.LegacyMigrationPlanReads++;if($null-eq$world.LegacyMigrationPlanBytes){return $null};$bytes=[byte[]]$world.LegacyMigrationPlanBytes.Clone();[pscustomobject]@{Bytes=$bytes;Length=[int64]$bytes.LongLength;Sha256=(Get-CcodTestBytesSha256 $bytes)}}.GetNewClosure()
-        WriteLegacyMigrationPlan = {param($ReadyEvidence,[byte[]]$Bytes)if($null-ne$world.LegacyMigrationPlanBytes){throw 'fixture durable plan collision'};$world.LegacyMigrationPlanWrites++;$world.LegacyMigrationPlanBytes=[byte[]]$Bytes.Clone();[pscustomobject]@{Length=[int64]$Bytes.LongLength;Sha256=(Get-CcodTestBytesSha256 $Bytes)}}.GetNewClosure()
+        ReadLegacyMigrationPlan = {param($ReadyEvidence)$world.LegacyMigrationPlanReads++;if($world.LegacyMigrationPlanReadFailureAt-eq$world.LegacyMigrationPlanReads){throw 'fixture durable plan read-back failure'};if($null-eq$world.LegacyMigrationPlanBytes){return $null};$bytes=[byte[]]$world.LegacyMigrationPlanBytes.Clone();[pscustomobject]@{Bytes=$bytes;Length=[int64]$bytes.LongLength;Sha256=(Get-CcodTestBytesSha256 $bytes)}}.GetNewClosure()
+        WriteLegacyMigrationPlan = {param($ReadyEvidence,[byte[]]$Bytes)if($null-ne$world.LegacyMigrationPlanBytes){throw 'fixture durable plan collision'};$world.LegacyMigrationPlanWrites++;$world.LegacyMigrationPlanBytes=[byte[]]$Bytes.Clone();if($world.LegacyMigrationPlanWriteMode-ceq'PublishedThenThrow'){throw 'fixture published durable plan then threw'};[pscustomobject]@{Length=[int64]$Bytes.LongLength;Sha256=(Get-CcodTestBytesSha256 $Bytes)}}.GetNewClosure()
         RemoveLegacyEntry = {param($Entry);$name=if($Entry-is[string]){[string]$Entry}elseif($Entry.kind-ceq'Registry'){'Registry'}else{[string]$Entry.name};$world.LegacyRemoveAttempts++;if($world.LegacyRemoveFailureAt-eq$world.LegacyRemoveAttempts){throw 'fixture legacy delete failure'};[void]$world.LegacyEntries.Remove($name)}.GetNewClosure()
         ReadLegacyEntry = {param($Entry);$name=if($Entry-is[string]){[string]$Entry}elseif($Entry.kind-ceq'Registry'){'Registry'}else{[string]$Entry.name};if($world.LegacyReplacementEntry-ceq$name-and$world.LegacyRemoveFailureAt-gt0-and$world.LegacyRemoveAttempts-ge$world.LegacyRemoveFailureAt){return 'Mismatch'};if(-not$world.LegacyEntries.Contains($name)){return $null};if($Entry-isnot[string]-and$Entry.kind-ceq'Shortcut' -and [string]$Entry.sha256-cne[string]$world.LegacyShortcutProofs[$name].sha256){return 'Mismatch'};'Exact'}.GetNewClosure()
         RestoreLegacyEntry = {param($Entry);$name=if($Entry-is[string]){[string]$Entry}elseif($Entry.kind-ceq'Registry'){'Registry'}else{[string]$Entry.name};if($world.LegacyRestoreFailureEntry-ceq$name){throw 'fixture restore failed'};if(-not$world.LegacyEntries.Contains($name)){$world.LegacyEntries.Add($name)};$world.LegacyRestoreOrder.Add($name);$world.LegacyRestores++}.GetNewClosure()
@@ -474,6 +477,70 @@ $results += Invoke-CcodTest 'durable migration plan rejects absent tampered fore
         Assert-CcodEqual 0 $world.Shortcuts.Count "$mutation fails before a current shortcut write"
         Assert-CcodEqual $null $world.Product "$mutation fails before a current registry write"
     }
+}
+
+# Production mutation caught: persisted nested evidence is accepted by normalized meaning instead of exact canonical bytes and order.
+$results += Invoke-CcodTask2Fix1ProductTest 'schema' 'durable plan requires exact six-field profile and raw canonical identity paths' {
+    foreach($mutation in @('ProfileExtra','ProfileMissing','ProfileReordered','ProfileValue','ExpectedRoot','ShortcutPath','ShortcutTarget','ShortcutWorking')){
+        $world=New-CcodRegistrationWorld;$null=Get-CcodProductTestLegacyMigrationPlan $world;$json=[Text.UTF8Encoding]::new($false,$true).GetString($world.LegacyMigrationPlanBytes);$record=$json|ConvertFrom-Json -ErrorAction Stop
+        switch($mutation){
+            'ProfileExtra' {$record.profile|Add-Member -NotePropertyName unexpected -NotePropertyValue 'foreign'}
+            'ProfileMissing' {$record.profile.PSObject.Properties.Remove('minimumVersion')}
+            'ProfileReordered' {$names=@($record.profile.PSObject.Properties.Name);$profile=[ordered]@{};for($index=$names.Count-1;$index-ge0;$index--){$profile[$names[$index]]=$record.profile.($names[$index])};$record.profile=[pscustomobject]$profile}
+            'ProfileValue' {$record.profile.minimumVersion='2.2.1'}
+            'ExpectedRoot' {$record.expectedInstallRoot=[string]$record.expectedInstallRoot+'\.'}
+            'ShortcutPath' {$entry=@($record.snapshot.entries|Where-Object{$_.kind-ceq'Shortcut'})[0];$entry.path=(Split-Path ([string]$entry.path) -Parent)+'\.\'+[IO.Path]::GetFileName([string]$entry.path)}
+            'ShortcutTarget' {$entry=@($record.snapshot.entries|Where-Object{$_.kind-ceq'Shortcut'})[0];$entry.targetPath=(Split-Path ([string]$entry.targetPath) -Parent)+'\.\'+[IO.Path]::GetFileName([string]$entry.targetPath)}
+            'ShortcutWorking' {$entry=@($record.snapshot.entries|Where-Object{$_.kind-ceq'Shortcut'-and-not[string]::IsNullOrEmpty([string]$_.workingDirectory)})[0];$entry.workingDirectory=[string]$entry.workingDirectory+'\.'}
+        }
+        $world.LegacyMigrationPlanBytes=[Text.UTF8Encoding]::new($false).GetBytes(($record|ConvertTo-Json -Depth 32 -Compress)+"`n")
+        Assert-CcodThrows {Get-CcodProductTestLegacyMigrationPlan $world|Out-Null} 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID'
+        Assert-CcodEqual 1 $world.LegacyMigrationPlanWrites "$mutation never republishes the changed durable plan"
+        Assert-CcodEqual 0 $world.Shortcuts.Count "$mutation fails before current shortcut writes"
+    }
+    $exact=New-CcodRegistrationWorld;$null=Get-CcodProductTestLegacyMigrationPlan $exact;$persisted=[Text.UTF8Encoding]::new($false,$true).GetString($exact.LegacyMigrationPlanBytes)|ConvertFrom-Json -ErrorAction Stop
+    Assert-CcodEqual 'profileId,appId,minimumVersion,maximumVersion,uninstallCommandShape,shortcutNames' (($persisted.profile.PSObject.Properties.Name)-join',') 'persisted profile has the six canonical fields in canonical order'
+}
+
+# Production mutation caught: a post-publish exception or read-back error causes the later process to republish instead of consuming the exact existing plan.
+$results += Invoke-CcodTask2Fix1ProductTest 'replay' 'published writer and read-back failures converge without duplicate plan publication' {
+    foreach($failure in @('PublishedThenThrow','PostWriteReadBack')){
+        $world=New-CcodRegistrationWorld;if($failure-ceq'PublishedThenThrow'){$world.LegacyMigrationPlanWriteMode='PublishedThenThrow'}else{$world.LegacyMigrationPlanReadFailureAt=2}
+        Assert-CcodThrows {Get-CcodProductTestLegacyMigrationPlan $world|Out-Null} 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID'
+        Assert-CcodEqual 1 $world.LegacyMigrationPlanWrites "$failure first invocation published exactly once"
+        Assert-CcodTrue ($null-ne$world.LegacyMigrationPlanBytes) "$failure first invocation left the exact published bytes"
+        Assert-CcodEqual 0 $world.Shortcuts.Count "$failure first invocation performs zero current shortcut writes"
+        Assert-CcodEqual $null $world.Product "$failure first invocation performs zero current registry writes"
+        $plan=Get-CcodProductTestLegacyMigrationPlan $world;$world.SimulateOverlapWrites=$true;$null=Commit-CcodProductRegistration -Registration $world.Registration -FileTransaction ([pscustomobject]@{}) -Adapters $world.Adapters;Remove-CcodLegacyProductRegistration -ExpectedAppId $appId -MigrationPlan $plan -ExpectedCurrentProof $expectedVerifiedRegistration -Adapters $world.Adapters
+        Assert-CcodEqual 1 $world.LegacyMigrationPlanWrites "$failure later invocation never republishes"
+        Assert-CcodEqual (($currentShortcutNames|Sort-Object)-join'|') ((@($world.LegacyEntries)|Sort-Object)-join'|') "$failure later invocation converges from the existing plan"
+    }
+
+    $world=New-CcodRegistrationWorld;$null=Get-CcodProductTestLegacyMigrationPlan $world;$world.LegacyShortcutProofs[$currentShortcutNames[0]]=$world.CurrentShortcutProofs[$currentShortcutNames[0]]
+    $profile=Resolve-CcodLegacyRegistrationProfile -LegacyRegistration $world.Legacy;$liveRegistration=&$world.Adapters.ReadLegacyRegistration $appId;$liveSnapshot=&$world.Adapters.ReadLegacySnapshot $appId $profile $null
+    $payload=[ordered]@{module=$modulePath;appId=$appId;registration=$world.Registration;ready=$world.Ready;planBase64=[Convert]::ToBase64String($world.LegacyMigrationPlanBytes);legacyRegistration=$liveRegistration;legacySnapshot=$liveSnapshot}
+    $child=@'
+param([Parameter(Mandatory)][string]$PayloadPath)
+$ErrorActionPreference='Stop'
+$payload=[IO.File]::ReadAllText([IO.Path]::GetFullPath($PayloadPath),[Text.UTF8Encoding]::new($false,$true))|ConvertFrom-Json -ErrorAction Stop
+Import-Module ([string]$payload.module) -Force -DisableNameChecking -ErrorAction Stop
+function Get-BytesSha([byte[]]$Bytes){$sha=[Security.Cryptography.SHA256]::Create();try{[BitConverter]::ToString($sha.ComputeHash($Bytes)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}}
+$bytes=[Convert]::FromBase64String([string]$payload.planBase64);$writes=0
+$adapters=@{
+  ReadLegacyMigrationPlan={param($Ready)$copy=[byte[]]$bytes.Clone();[pscustomobject]@{Bytes=$copy;Length=[int64]$copy.LongLength;Sha256=(Get-BytesSha $copy)}}.GetNewClosure()
+  WriteLegacyMigrationPlan={param($Ready,[byte[]]$Value)$writes++;throw 'CHILD_UNEXPECTED_REPUBLISH'}.GetNewClosure()
+  ReadLegacyRegistration={param($ExpectedAppId)(($payload.legacyRegistration|ConvertTo-Json -Depth 16 -Compress)|ConvertFrom-Json)}.GetNewClosure()
+  ReadLegacySnapshot={param($ExpectedAppId,$ExpectedProfile,$CapturedPlan)(($payload.legacySnapshot|ConvertTo-Json -Depth 32 -Compress)|ConvertFrom-Json)}.GetNewClosure()
+}
+$registration=(($payload.registration|ConvertTo-Json -Depth 16 -Compress)|ConvertFrom-Json);$ready=(($payload.ready|ConvertTo-Json -Depth 16 -Compress)|ConvertFrom-Json)
+$plan=Get-CcodDurableLegacyProductRegistrationMigrationPlan -ExpectedAppId ([string]$payload.appId) -Registration $registration -ReadyEvidence $ready -Adapters $adapters
+if($null-eq$plan-or-not$plan.legacyPresent-or$writes-ne0){throw 'CHILD_REPLAY_FAILED'}
+[Console]::Out.WriteLine('CHILD_DURABLE_REPLAY_OK')
+'@
+    $childRoot=Join-Path ([IO.Path]::GetTempPath()) ('ccod-product-replay-'+[guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($childRoot)|Out-Null;$payloadPath=Join-Path $childRoot 'payload.json';$childPath=Join-Path $childRoot 'replay.ps1'
+    try{[IO.File]::WriteAllText($payloadPath,($payload|ConvertTo-Json -Depth 32 -Compress),[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllText($childPath,$child,[Text.UTF8Encoding]::new($false));$output=@(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $childPath -PayloadPath $payloadPath 2>&1);$exitCode=$LASTEXITCODE}finally{$full=[IO.Path]::GetFullPath($childRoot);$temp=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')+'\';if(-not$full.StartsWith($temp,[StringComparison]::OrdinalIgnoreCase)){throw 'refusing non-temp child cleanup'};if(Test-Path -LiteralPath $full){Remove-Item -LiteralPath $full -Recurse -Force}}
+    Assert-CcodEqual 0 $exitCode 'fresh powershell process replays serialized durable/live evidence'
+    Assert-CcodEqual 'CHILD_DURABLE_REPLAY_OK' ($output -join'') 'fresh powershell process consumes existing plan without parent object identity'
 }
 
 # Production mutation caught: trusting a shortcut read-back that resolves outside the selected sealed generation.

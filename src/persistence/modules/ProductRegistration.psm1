@@ -647,15 +647,16 @@ function Test-CcodLegacyShortcutSnapshotEntry {
         $sha=[Security.Cryptography.SHA256]::Create()
         try{$capturedHash=[BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
     }catch{return $false}
-    return $bytes.LongLength-gt0-and$bytes.LongLength-le262144-and$actualPath-cne$null-and$actualPath-ceq$expectedPath-and$target-ceq$expectedTarget-and
-        [string]$Entry.arguments-ceq[string]$contract.arguments-and$working-ceq$expectedWorking-and$capturedHash-ceq[string]$Entry.sha256
+    return $bytes.LongLength-gt0-and$bytes.LongLength-le262144-and$actualPath-cne$null-and[string]$Entry.path-ceq$actualPath-and$actualPath-ceq$expectedPath-and
+        [string]$Entry.targetPath-ceq$target-and$target-ceq$expectedTarget-and[string]$Entry.arguments-ceq[string]$contract.arguments-and
+        [string]$Entry.workingDirectory-ceq$working-and$working-ceq$expectedWorking-and$capturedHash-ceq[string]$Entry.sha256
 }
 
 function Assert-CcodLegacyMigrationPlan {
     param([Parameter(Mandatory)]$Plan,[Parameter(Mandatory)][string]$ExpectedAppId,[Parameter(Mandatory)][string]$ExpectedInstallRoot)
     $root=Get-CcodProductFullPath $ExpectedInstallRoot
     if(-not(Test-CcodProductExactProperties $Plan $script:CcodLegacyMigrationPlanFields)-or$Plan.appId-isnot[string]-or$Plan.appId-cne$ExpectedAppId-or
-       $Plan.expectedInstallRoot-isnot[string]-or(Get-CcodProductFullPath ([string]$Plan.expectedInstallRoot))-cne$root-or$Plan.legacyPresent-isnot[bool]){
+       $Plan.expectedInstallRoot-isnot[string]-or[string]$Plan.expectedInstallRoot-cne$root-or(Get-CcodProductFullPath ([string]$Plan.expectedInstallRoot))-cne$root-or$Plan.legacyPresent-isnot[bool]){
         Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy migration plan identity is invalid.' $Plan
     }
     if(-not[bool]$Plan.legacyPresent){
@@ -663,7 +664,9 @@ function Assert-CcodLegacyMigrationPlan {
         return $Plan
     }
     $profile=Resolve-CcodLegacyRegistrationProfile -LegacyRegistration $Plan.legacyRegistration
-    if($null-eq$Plan.profile-or$profile.profileId-cne[string]$Plan.profile.profileId-or-not(Test-CcodLegacySnapshotForProfile -Snapshot $Plan.snapshot -Profile $profile -ExpectedAppId $ExpectedAppId)){
+    if($null-eq$Plan.profile-or-not(Test-CcodProductExactProperties $Plan.profile $script:CcodLegacyProfileFields)-or
+       ($Plan.profile|ConvertTo-Json -Depth 8 -Compress)-cne($profile|ConvertTo-Json -Depth 8 -Compress)-or
+       $Plan.profile.appId-cne$ExpectedAppId-or-not(Test-CcodLegacySnapshotForProfile -Snapshot $Plan.snapshot -Profile $profile -ExpectedAppId $ExpectedAppId)){
         Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Legacy migration plan no longer matches one exact profile.' $Plan
     }
     foreach($entry in @($Plan.snapshot.entries)){
@@ -798,14 +801,14 @@ function Get-CcodDurableLegacyProductRegistrationMigrationPlan {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ExpectedAppId,[Parameter(Mandatory)]$Registration,[Parameter(Mandatory)]$ReadyEvidence,[hashtable]$Adapters)
     if($ExpectedAppId-cne$script:CcodProductAppId-or-not(Test-CcodProductRegistration -Registration $Registration -ExpectedRuntimeId ([string]$Registration.runtimeId) -ExpectedVersion $script:CcodProductVersion -ExpectedPackageSha256 ([string]$Registration.packageSha256))-or-not(Test-CcodProductReadyProof $ReadyEvidence $Registration)-or-not(Test-CcodDurableReadyEvidence $ReadyEvidence $Registration)){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy migration requires the exact Ready product identity.' $ExpectedAppId}
-    $adapter=Get-CcodProductRegistrationAdapters $Adapters;$existing=&$adapter.ReadLegacyMigrationPlan $ReadyEvidence
+    $adapter=Get-CcodProductRegistrationAdapters $Adapters;try{$existing=&$adapter.ReadLegacyMigrationPlan $ReadyEvidence}catch{Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy migration plan could not be read.' $ReadyEvidence.transactionRecord.transactionId}
     if($null-ne$existing){$record=ConvertFrom-CcodDurableLegacyMigrationRead -Read $existing -ExpectedAppId $ExpectedAppId -Registration $Registration -ReadyEvidence $ReadyEvidence;return Assert-CcodDurableLegacyReplay -Record $record -Adapters $adapter}
     $plan=Get-CcodLegacyProductRegistrationMigrationPlan -ExpectedAppId $ExpectedAppId -ExpectedInstallRoot ([string]$Registration.installRoot) -Adapters $adapter
     $currentProof=New-CcodDurableCurrentProof -Registration $Registration -ReadyEvidence $ReadyEvidence -Adapters $adapter
     $record=[pscustomobject][ordered]@{schemaVersion=1;transactionId=[string]$ReadyEvidence.transactionRecord.transactionId;runtimeId=[string]$Registration.runtimeId;runtimeGeneration=[uint64]$ReadyEvidence.runtimeGeneration;manifestSha256=[string]$ReadyEvidence.manifestSha256;packageSha256=[string]$Registration.packageSha256;readyTransaction=$ReadyEvidence.transactionRecord;appId=$ExpectedAppId;expectedInstallRoot=[string]$Registration.installRoot;legacyPresent=[bool]$plan.legacyPresent;legacyRegistration=$plan.legacyRegistration;profile=$plan.profile;snapshot=$plan.snapshot;expectedCurrentProof=$currentProof}
     [void](Assert-CcodDurableLegacyMigrationRecord -Record $record -ExpectedAppId $ExpectedAppId -Registration $Registration -ReadyEvidence $ReadyEvidence);$bytes=ConvertTo-CcodDurableLegacyMigrationBytes $record
     try{&$adapter.WriteLegacyMigrationPlan $ReadyEvidence $bytes|Out-Null}catch{Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy migration plan could not be published create-only.' $Record.transactionId}
-    $read=&$adapter.ReadLegacyMigrationPlan $ReadyEvidence;if($null-eq$read-or[Convert]::ToBase64String([byte[]]$read.Bytes)-cne[Convert]::ToBase64String($bytes)){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy migration plan did not read back exactly.' $Record.transactionId}
+    try{$read=&$adapter.ReadLegacyMigrationPlan $ReadyEvidence}catch{Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy migration plan read-back failed after publication.' $Record.transactionId};if($null-eq$read-or[Convert]::ToBase64String([byte[]]$read.Bytes)-cne[Convert]::ToBase64String($bytes)){Throw-CcodProductRegistrationError 'CCOD_LEGACY_PRODUCT_REGISTRATION_INVALID' 'Durable legacy migration plan did not read back exactly.' $Record.transactionId}
     $persisted=ConvertFrom-CcodDurableLegacyMigrationRead -Read $read -ExpectedAppId $ExpectedAppId -Registration $Registration -ReadyEvidence $ReadyEvidence
     return ConvertTo-CcodDurableLegacyPlan $persisted
 }
@@ -1001,8 +1004,8 @@ function Compare-CcodLegacySnapshotEntry {
     if($null-eq$Current){return 'Absent'}
     if($null-eq$Expected-or$Expected.kind-cne$Current.kind){return 'Mismatch'};$pathMatches=if($Expected.kind-ceq'Registry'){[string]$Expected.path-ceq[string]$Current.path}else{[IO.Path]::GetFullPath([string]$Expected.path)-ceq[IO.Path]::GetFullPath([string]$Current.path)};if(-not$pathMatches){return 'Mismatch'}
     if($Expected.kind-ceq'Registry'){
-        $subkeys=@(if($null-ne$Current.PSObject.Properties['subKeyNames']){@($Current.subKeyNames)});if($subkeys.Count-ne0-or(@($Expected.values.Keys|Sort-Object)-join"`0")-cne(@($Current.values.Keys|Sort-Object)-join"`0")){return 'Mismatch'}
-        foreach($name in @($Expected.values.Keys)){if([string]$Expected.values[$name].kind-cne[string]$Current.values[$name].kind-or($Expected.values[$name].value|ConvertTo-Json -Compress)-cne($Current.values[$name].value|ConvertTo-Json -Compress)){return 'Mismatch'}}
+        $subkeys=@(if($null-ne$Current.PSObject.Properties['subKeyNames']){@($Current.subKeyNames)});$expectedNames=@(Get-CcodProductMapNames $Expected.values);$currentNames=@(Get-CcodProductMapNames $Current.values);if($subkeys.Count-ne0-or(@($expectedNames|Sort-Object)-join"`0")-cne(@($currentNames|Sort-Object)-join"`0")){return 'Mismatch'}
+        foreach($name in $expectedNames){$expectedValue=Get-CcodProductMapValue $Expected.values ([string]$name);$currentValue=Get-CcodProductMapValue $Current.values ([string]$name);if($null-eq$expectedValue-or$null-eq$currentValue-or[string]$expectedValue.kind-cne[string]$currentValue.kind-or($expectedValue.value|ConvertTo-Json -Compress)-cne($currentValue.value|ConvertTo-Json -Compress)){return 'Mismatch'}}
         return 'Exact'
     }
     if($Expected.kind-ceq'Shortcut'-and$Expected.sha256-is[string]-and$Current.sha256-is[string]-and$Expected.sha256-ceq$Current.sha256){return 'Exact'}

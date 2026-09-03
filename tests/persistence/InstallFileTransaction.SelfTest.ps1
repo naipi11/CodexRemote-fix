@@ -116,6 +116,28 @@ function Invoke-CcodExtensionRedTest {
     Invoke-CcodTest $Name $Action
 }
 
+function Invoke-CcodTask2Fix1Test {
+    param([Parameter(Mandatory)][string]$Id,[Parameter(Mandatory)][string]$Name,[Parameter(Mandatory)][scriptblock]$Action)
+    if(-not[string]::IsNullOrWhiteSpace($env:CCOD_TASK2_FIX1_RED_CASE)-and$env:CCOD_TASK2_FIX1_RED_CASE-cne$Id){return}
+    Invoke-CcodTest $Name $Action
+}
+
+function Set-CcodInstallTestTrustedDirectoryAcl {
+    param([Parameter(Mandatory)][string]$Path)
+    $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+    try{
+        $security=[Security.AccessControl.DirectorySecurity]::new();$security.SetOwner($identity.User);$security.SetAccessRuleProtection($true,$false)
+        foreach($sid in @($identity.User.Value,'S-1-5-18','S-1-5-32-544')){[void]$security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid),[Security.AccessControl.FileSystemRights]::FullControl,[Security.AccessControl.InheritanceFlags]::ContainerInherit-bor[Security.AccessControl.InheritanceFlags]::ObjectInherit,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow))}
+        [IO.Directory]::SetAccessControl($Path,$security)
+    }finally{$identity.Dispose()}
+}
+
+function Assert-CcodInstallTestExactPlanDirectoryAcl {
+    param([Parameter(Mandatory)][string]$Path)
+    $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+    try{$security=[IO.Directory]::GetAccessControl($Path);$rules=@($security.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]));Assert-CcodEqual $identity.User.Value $security.GetOwner([Security.Principal.SecurityIdentifier]).Value 'normalized plan directory owner is exact';Assert-CcodEqual $true $security.AreAccessRulesProtected 'normalized plan directory ACL is protected';Assert-CcodEqual 3 $rules.Count 'normalized plan directory ACL has exactly three rules';Assert-CcodEqual (($identity.User.Value,'S-1-5-18','S-1-5-32-544'|Sort-Object)-join'|') ((@($rules.IdentityReference.Value)|Sort-Object)-join'|') 'normalized plan directory ACL has only trusted principals'}finally{$identity.Dispose()}
+}
+
 function Invoke-CcodMoveAttempt {
     param([Parameter(Mandatory)][string]$Path)
     try { [IO.File]::Move($Path,$Path+'.moved'); 'moved' } catch [IO.IOException] { 'blocked' } catch [UnauthorizedAccessException] { 'blocked' }
@@ -279,6 +301,58 @@ Invoke-CcodTest 'delayed legacy migration plan read rejects hostile file identit
             Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed;$product=$null;&$lifecycleModule {param($Fence)Complete-CcodLifecycleProductCleanupFence -Fence $Fence -Outcome Completed|Out-Null} $fence
         }finally{if($null-ne$product){try{Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed}catch{}};if($null-ne$outer){try{&$lifecycleModule {param($Context)Exit-CcodLifecycleProductCleanupLease -Context $Context|Out-Null} $outer}catch{}};Remove-CcodInstallFileFixture $fixture}
     }
+}
+
+# Production mutation caught: reader-first retry permanently rejects the exact empty directory left between CREATE and ACL initialization.
+Invoke-CcodTask2Fix1Test 'reader-recovery' 'reader-first plan retry normalizes only the safe empty CREATE-to-ACL artifact' {
+    $authority=New-CcodProductAuthorityFixture;$fixture=$authority.Fixture;$outer=$null;$product=$null;$lifecycleModule=$null;$fence=$null
+    try{
+        $statePath=Join-Path $fixture.Install 'state';Set-CcodInstallTestTrustedDirectoryAcl $statePath;$planDirectory=Join-Path $statePath 'legacy-registration-migrations';[IO.Directory]::CreateDirectory($planDirectory)|Out-Null
+        Assert-CcodEqual $false ([IO.Directory]::GetAccessControl($planDirectory).AreAccessRulesProtected) 'fixture is an inherited safe empty CREATE artifact'
+        $lifecycleModule=Import-Module (Join-Path $projectRoot 'src\persistence\modules\InstallLifecycle.psm1') -Force -PassThru -DisableNameChecking;$outer=&$lifecycleModule {Enter-CcodLifecycleProductCleanupLease};$fence=&$lifecycleModule {param($Root,$Ready,$Identity)New-CcodLifecycleProductCleanupFence -InstallRoot $Root -ReadyTransaction $Ready -OwnerIdentity $Identity} $fixture.Install $authority.Ready $outer.OwnerIdentity
+        $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready;$fixture.Transactions.Add($product);&$module {param($Transaction,$Fence)Set-CcodInstallProductCleanupFence -Transaction $Transaction -Fence $Fence|Out-Null} $product $fence
+        Assert-CcodEqual $null (Read-CcodInstallLegacyMigrationPlan -Transaction $product -ReadyTransaction $authority.Ready) 'reader-first recovery returns no plan after normalizing the empty artifact'
+        Assert-CcodInstallTestExactPlanDirectoryAcl $planDirectory
+        Close-CcodInstallFileTransaction -Transaction $product -Disposition Ready;$product=$null;&$lifecycleModule {param($Fence)Complete-CcodLifecycleProductCleanupFence -Fence $Fence -Outcome Completed|Out-Null} $fence
+    }finally{if($null-ne$product){try{Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed}catch{}};if($null-ne$outer){try{&$lifecycleModule {param($Context)Exit-CcodLifecycleProductCleanupLease -Context $Context|Out-Null} $outer}catch{}};Remove-CcodInstallFileFixture $fixture}
+}
+
+# Production mutation caught: Set/Validate failure loses the newly created directory Pin outside transaction cleanup.
+Invoke-CcodTask2Fix1Test 'create-handle' 'CREATE security failures retain and then release the exact registered directory handle' {
+    foreach($mode in @('Set','Validate')){
+        $authority=New-CcodProductAuthorityFixture;$fixture=$authority.Fixture;$outer=$null;$product=$null;$lifecycleModule=$null;$fence=$null
+        try{
+            $statePath=Join-Path $fixture.Install 'state';Set-CcodInstallTestTrustedDirectoryAcl $statePath;$planDirectory=Join-Path $statePath 'legacy-registration-migrations'
+            $lifecycleModule=Import-Module (Join-Path $projectRoot 'src\persistence\modules\InstallLifecycle.psm1') -Force -PassThru -DisableNameChecking;$outer=&$lifecycleModule {Enter-CcodLifecycleProductCleanupLease};$fence=&$lifecycleModule {param($Root,$Ready,$Identity)New-CcodLifecycleProductCleanupFence -InstallRoot $Root -ReadyTransaction $Ready -OwnerIdentity $Identity} $fixture.Install $authority.Ready $outer.OwnerIdentity
+            $product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready;$fixture.Transactions.Add($product);&$module {param($Transaction,$Fence)Set-CcodInstallProductCleanupFence -Transaction $Transaction -Fence $Fence|Out-Null} $product $fence
+            &$module {param($Transaction,$FailureMode)$scope=Get-CcodInstallTransaction $Transaction 'CCOD_INSTALL_PRODUCT_SCOPE';Invoke-CcodRuntimeMethod $scope.State.Runtime SetLegacyPlanDirectoryFailureForTest @($FailureMode)|Out-Null} $product $mode
+            Assert-CcodThrows {Write-CcodInstallLegacyMigrationPlan -Transaction $product -ReadyTransaction $authority.Ready -Bytes ([Text.UTF8Encoding]::new($false).GetBytes('{"schemaVersion":1}'))|Out-Null} 'CCOD_INSTALL_LEGACY_PLAN_WRITE_FAILED'
+            Assert-CcodTrue ([IO.Directory]::Exists($planDirectory)) "$mode failure leaves the known empty directory artifact"
+            $liveMove=$false;try{[IO.Directory]::Move($planDirectory,$planDirectory+'.live');$liveMove=$true}catch [IO.IOException]{}catch [UnauthorizedAccessException]{};Assert-CcodEqual $false $liveMove "$mode failure keeps the directory identity pinned until close"
+            Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed;$product=$null;&$lifecycleModule {param($Fence)Complete-CcodLifecycleProductCleanupFence -Fence $Fence -Outcome Completed|Out-Null} $fence
+            $moved=$planDirectory+'.closed';[IO.Directory]::Move($planDirectory,$moved);[IO.Directory]::Move($moved,$planDirectory)
+            $fence=&$lifecycleModule {param($Root,$Ready,$Identity)New-CcodLifecycleProductCleanupFence -InstallRoot $Root -ReadyTransaction $Ready -OwnerIdentity $Identity} $fixture.Install $authority.Ready $outer.OwnerIdentity;$product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready;$fixture.Transactions.Add($product);&$module {param($Transaction,$Fence)Set-CcodInstallProductCleanupFence -Transaction $Transaction -Fence $Fence|Out-Null} $product $fence
+            Assert-CcodEqual $null (Read-CcodInstallLegacyMigrationPlan -Transaction $product -ReadyTransaction $authority.Ready) "$mode artifact is recoverable by a later reader-first transaction"
+            Close-CcodInstallFileTransaction -Transaction $product -Disposition Ready;$product=$null;&$lifecycleModule {param($Fence)Complete-CcodLifecycleProductCleanupFence -Fence $Fence -Outcome Completed|Out-Null} $fence
+        }finally{if($null-ne$product){try{Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed}catch{}};if($null-ne$outer){try{&$lifecycleModule {param($Context)Exit-CcodLifecycleProductCleanupLease -Context $Context|Out-Null} $outer}catch{}};Remove-CcodInstallFileFixture $fixture}
+    }
+}
+
+# Production mutation caught: recovery normalizes a nonempty or untrusted inherited directory merely because the final leaf is absent.
+Invoke-CcodTask2Fix1Test 'unsafe-recovery' 'empty-directory recovery rejects nonempty untrusted-ACE and foreign-owner evidence' {
+    foreach($mutation in @('NonEmpty','UntrustedAce')){
+        $authority=New-CcodProductAuthorityFixture;$fixture=$authority.Fixture;$outer=$null;$product=$null;$lifecycleModule=$null;$fence=$null
+        try{
+            $statePath=Join-Path $fixture.Install 'state';Set-CcodInstallTestTrustedDirectoryAcl $statePath;$planDirectory=Join-Path $statePath 'legacy-registration-migrations';[IO.Directory]::CreateDirectory($planDirectory)|Out-Null
+            if($mutation-ceq'NonEmpty'){[IO.File]::WriteAllText((Join-Path $planDirectory 'foreign.bin'),'foreign',[Text.UTF8Encoding]::new($false))}else{$security=[Security.AccessControl.DirectorySecurity]::new($planDirectory,[Security.AccessControl.AccessControlSections]::Access);[void]$security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-1-0'),[Security.AccessControl.FileSystemRights]::FullControl,[Security.AccessControl.InheritanceFlags]::ContainerInherit-bor[Security.AccessControl.InheritanceFlags]::ObjectInherit,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow));[IO.Directory]::SetAccessControl($planDirectory,$security)}
+            $before=[IO.Directory]::GetAccessControl($planDirectory).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Owner-bor[Security.AccessControl.AccessControlSections]::Access)
+            $lifecycleModule=Import-Module (Join-Path $projectRoot 'src\persistence\modules\InstallLifecycle.psm1') -Force -PassThru -DisableNameChecking;$outer=&$lifecycleModule {Enter-CcodLifecycleProductCleanupLease};$fence=&$lifecycleModule {param($Root,$Ready,$Identity)New-CcodLifecycleProductCleanupFence -InstallRoot $Root -ReadyTransaction $Ready -OwnerIdentity $Identity} $fixture.Install $authority.Ready $outer.OwnerIdentity;$product=Open-CcodInstallProductRegistrationTransaction -InstallRoot $fixture.Install -ReadyTransaction $authority.Ready;$fixture.Transactions.Add($product);&$module {param($Transaction,$Fence)Set-CcodInstallProductCleanupFence -Transaction $Transaction -Fence $Fence|Out-Null} $product $fence
+            Assert-CcodThrows {Read-CcodInstallLegacyMigrationPlan -Transaction $product -ReadyTransaction $authority.Ready|Out-Null} 'CCOD_INSTALL_LEGACY_PLAN_READ_FAILED'
+            $after=[IO.Directory]::GetAccessControl($planDirectory).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Owner-bor[Security.AccessControl.AccessControlSections]::Access);Assert-CcodEqual $before $after "$mutation unsafe directory is never normalized"
+            Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed;$product=$null;&$lifecycleModule {param($Fence)Complete-CcodLifecycleProductCleanupFence -Fence $Fence -Outcome Completed|Out-Null} $fence
+        }finally{if($null-ne$product){try{Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed}catch{}};if($null-ne$outer){try{&$lifecycleModule {param($Context)Exit-CcodLifecycleProductCleanupLease -Context $Context|Out-Null} $outer}catch{}};Remove-CcodInstallFileFixture $fixture}
+    }
+    $identity=[Security.Principal.WindowsIdentity]::GetCurrent();try{$sddl='O:WDG:{0}D:AI(A;OICIID;FA;;;{0})(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)'-f$identity.User.Value;$descriptor=[Security.AccessControl.RawSecurityDescriptor]::new($sddl);$bytes=[byte[]]::new($descriptor.BinaryLength);$descriptor.GetBinaryForm($bytes,0);$recoverable=&$module {param([byte[]]$Value)[bool](Invoke-CcodRuntimeStatic IsRecoverableLegacyPlanDirectorySecurity @((,$Value)))} $bytes;Assert-CcodEqual $false $recoverable 'foreign owner is rejected by the same native recovery predicate'}finally{$identity.Dispose()}
 }
 
 # Production mutation caught: a selected Ready chain cannot authorize product access while an unrelated install remains nonterminal.
