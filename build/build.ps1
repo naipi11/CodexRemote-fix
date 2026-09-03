@@ -490,9 +490,6 @@ try {
         )
     }
     Write-CcodBuildUtf8 -Path $releaseManifest -Text (($releaseRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
-    $releaseValidationTool = Join-Path $repoRoot 'tools\Test-ReleaseDefender.ps1'
-    if (-not (Test-Path -LiteralPath $releaseValidationTool -PathType Leaf)) { throw "Release manifest validator is missing: $releaseValidationTool" }
-    . $releaseValidationTool -Library
     Test-CcodReleaseAssetManifest -ManifestPath $releaseManifest -AssetDirectory $dist -ExpectedVersion $Version | Out-Null
 } finally {
     if ([IO.Directory]::Exists($stageRoot)) {

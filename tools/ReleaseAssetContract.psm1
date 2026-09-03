@@ -1,6 +1,137 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Initialize-CcodReleaseFileAuthority {
+    if ($null -ne ('CcodReleaseFileAuthorityV1' -as [type])) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+public sealed class CcodReleaseFileIdentityV1
+{
+    public uint Attributes;
+    public uint Volume;
+    public ulong FileId;
+    public uint Links;
+    public string FinalPath;
+    public string[] Streams;
+}
+
+public static class CcodReleaseFileAuthorityV1
+{
+    private const uint ListDirectory=0x00000001U, ReadAttributes=0x00000080U, Synchronize=0x00100000U, GenericRead=0x80000000U, GenericWrite=0x40000000U, DeleteAccess=0x00010000U;
+    private const uint ShareRead=0x00000001U, ShareWrite=0x00000002U, ShareDelete=0x00000004U, CreateNew=1U, OpenExisting=3U, FileCreate=2U, AttributeNormal=0x00000080U, FlagWriteThrough=0x80000000U, FlagBackup=0x02000000U, FlagReparse=0x00200000U;
+    private const uint AttributeDirectory=0x00000010U, AttributeReparse=0x00000400U;
+    private const uint ObjectCaseInsensitive=0x00000040U, OptionSynchronous=0x00000020U, OptionNonDirectory=0x00000040U, OptionOpenReparse=0x00200000U;
+    private const int FileDirectoryInformation=1, FileStreamInfo=7, FileRenameInfo=3, FileDispositionInfo=4, NtFileRenameInformation=10;
+    private const int StatusNoMoreFiles=unchecked((int)0x80000006);
+
+    [StructLayout(LayoutKind.Sequential)] private struct NativeTime { public uint Low,High; }
+    [StructLayout(LayoutKind.Sequential)] private struct UnicodeString { public ushort Length,MaximumLength; public IntPtr Buffer; }
+    [StructLayout(LayoutKind.Sequential)] private struct ObjectAttributes { public int Length; public IntPtr RootDirectory,ObjectName; public uint Attributes; public IntPtr SecurityDescriptor,SecurityQualityOfService; }
+    [StructLayout(LayoutKind.Sequential)] private struct IoStatus { public IntPtr Status; public UIntPtr Information; }
+    [StructLayout(LayoutKind.Sequential)] private struct NativeInfo
+    {
+        public uint Attributes; public NativeTime Creation,Access,Write;
+        public uint Volume,SizeHigh,SizeLow,Links,IndexHigh,IndexLow;
+    }
+
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+    private static extern SafeFileHandle CreateFileW(string path,uint access,uint share,IntPtr security,uint creation,uint flags,IntPtr template);
+    [DllImport("kernel32.dll",SetLastError=true)] private static extern bool GetFileInformationByHandle(SafeFileHandle handle,out NativeInfo info);
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] private static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle,StringBuilder value,uint length,uint flags);
+    [DllImport("kernel32.dll",SetLastError=true)] private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle,int infoClass,IntPtr info,uint size);
+    [DllImport("kernel32.dll",SetLastError=true)] private static extern bool SetFileInformationByHandle(SafeFileHandle handle,int infoClass,IntPtr info,uint size);
+    [DllImport("ntdll.dll")] private static extern int NtCreateFile(out IntPtr handle,uint access,ref ObjectAttributes attributes,out IoStatus io,IntPtr allocationSize,uint fileAttributes,uint share,uint disposition,uint options,IntPtr ea,uint eaLength);
+    [DllImport("ntdll.dll")] private static extern int NtSetInformationFile(SafeFileHandle handle,out IoStatus io,IntPtr info,uint length,int infoClass);
+    [DllImport("ntdll.dll")] private static extern int NtQueryDirectoryFile(SafeFileHandle handle,IntPtr evt,IntPtr apc,IntPtr context,out IoStatus io,IntPtr info,uint length,int infoClass,bool single,IntPtr name,bool restart);
+    [DllImport("ntdll.dll")] private static extern uint RtlNtStatusToDosError(int status);
+
+    public static SafeFileHandle OpenDirectory(string path,bool allowChildMutation)
+    {
+        uint share=allowChildMutation?ShareRead|ShareWrite|ShareDelete:ShareRead;SafeFileHandle handle=CreateFileW(Path.GetFullPath(path),ListDirectory|ReadAttributes|Synchronize,share,IntPtr.Zero,OpenExisting,FlagBackup|FlagReparse,IntPtr.Zero);
+        if(handle.IsInvalid){int error=Marshal.GetLastWin32Error();handle.Dispose();throw new Win32Exception(error);}return handle;
+    }
+
+    public static FileStream CreateReceiptFile(string path)
+    {
+        SafeFileHandle handle=CreateFileW(Path.GetFullPath(path),GenericRead|GenericWrite|DeleteAccess|ReadAttributes|Synchronize,ShareRead,IntPtr.Zero,CreateNew,AttributeNormal|FlagWriteThrough|FlagReparse,IntPtr.Zero);
+        if(handle.IsInvalid){int error=Marshal.GetLastWin32Error();handle.Dispose();throw new Win32Exception(error);}try{return new FileStream(handle,FileAccess.ReadWrite,4096,false);}catch{handle.Dispose();throw;}
+    }
+
+    public static FileStream CreateReceiptFileRelative(SafeFileHandle directory,string leaf)
+    {
+        ValidateLeaf(leaf);IntPtr nameBuffer=IntPtr.Zero,unicodePointer=IntPtr.Zero;bool added=false;
+        try
+        {
+            directory.DangerousAddRef(ref added);nameBuffer=Marshal.StringToHGlobalUni(leaf);UnicodeString unicode=new UnicodeString{Length=(ushort)(leaf.Length*2),MaximumLength=(ushort)((leaf.Length+1)*2),Buffer=nameBuffer};unicodePointer=Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));Marshal.StructureToPtr(unicode,unicodePointer,false);ObjectAttributes attributes=new ObjectAttributes{Length=Marshal.SizeOf(typeof(ObjectAttributes)),RootDirectory=directory.DangerousGetHandle(),ObjectName=unicodePointer,Attributes=ObjectCaseInsensitive};IoStatus io;IntPtr raw;int status=NtCreateFile(out raw,GenericRead|GenericWrite|DeleteAccess|ReadAttributes|Synchronize,ref attributes,out io,IntPtr.Zero,AttributeNormal,ShareRead,FileCreate,OptionSynchronous|OptionNonDirectory|OptionOpenReparse,IntPtr.Zero,0);if(status<0)throw new Win32Exception((int)RtlNtStatusToDosError(status));SafeFileHandle handle=new SafeFileHandle(raw,true);try{return new FileStream(handle,FileAccess.ReadWrite,4096,false);}catch{handle.Dispose();throw;}
+        }
+        finally{if(unicodePointer!=IntPtr.Zero)Marshal.FreeHGlobal(unicodePointer);if(nameBuffer!=IntPtr.Zero)Marshal.FreeHGlobal(nameBuffer);if(added)directory.DangerousRelease();}
+    }
+
+    public static FileStream OpenReadFile(string path,bool shareExistingWriter)
+    {
+        uint share=ShareRead|(shareExistingWriter?ShareWrite|ShareDelete:0U);SafeFileHandle handle=CreateFileW(path,GenericRead|ReadAttributes|Synchronize,share,IntPtr.Zero,OpenExisting,FlagReparse,IntPtr.Zero);
+        if(handle.IsInvalid){int error=Marshal.GetLastWin32Error();handle.Dispose();throw new Win32Exception(error);}try{return new FileStream(handle,FileAccess.Read,65536,false);}catch{handle.Dispose();throw;}
+    }
+
+    public static CcodReleaseFileIdentityV1 Identity(SafeFileHandle handle)
+    {
+        if(handle==null||handle.IsClosed||handle.IsInvalid)throw new ObjectDisposedException("release file authority");
+        NativeInfo value;if(!GetFileInformationByHandle(handle,out value))throw new Win32Exception(Marshal.GetLastWin32Error());
+        return new CcodReleaseFileIdentityV1{Attributes=value.Attributes,Volume=value.Volume,FileId=((ulong)value.IndexHigh<<32)|value.IndexLow,Links=value.Links,FinalPath=FinalPath(handle),Streams=Streams(handle)};
+    }
+
+    public static bool IsDirectory(CcodReleaseFileIdentityV1 value){return(value.Attributes&AttributeDirectory)!=0U;}
+    public static bool IsReparse(CcodReleaseFileIdentityV1 value){return(value.Attributes&AttributeReparse)!=0U;}
+
+    public static int MoveNoReplace(SafeFileHandle source,string destination)
+    {
+        string full=Path.GetFullPath(destination),native=full.StartsWith(@"\\",StringComparison.Ordinal)?@"\??\UNC\"+full.Substring(2):@"\??\"+full;
+        byte[] name=Encoding.Unicode.GetBytes(native);int rootOffset=IntPtr.Size,lengthOffset=rootOffset+IntPtr.Size,nameOffset=lengthOffset+sizeof(uint),size=checked(nameOffset+name.Length+sizeof(char));
+        IntPtr buffer=Marshal.AllocHGlobal(size);try{for(int i=0;i<size;i++)Marshal.WriteByte(buffer,i,0);Marshal.WriteByte(buffer,0,0);Marshal.WriteIntPtr(buffer,rootOffset,IntPtr.Zero);Marshal.WriteInt32(buffer,lengthOffset,name.Length);Marshal.Copy(name,0,IntPtr.Add(buffer,nameOffset),name.Length);return SetFileInformationByHandle(source,FileRenameInfo,buffer,(uint)size)?0:Marshal.GetLastWin32Error();}finally{Marshal.FreeHGlobal(buffer);}
+    }
+
+    public static int MoveNoReplaceRelative(SafeFileHandle source,SafeFileHandle directory,string leaf)
+    {
+        ValidateLeaf(leaf);byte[] name=Encoding.Unicode.GetBytes(leaf);int rootOffset=IntPtr.Size,lengthOffset=rootOffset+IntPtr.Size,nameOffset=lengthOffset+sizeof(uint),size=checked(nameOffset+name.Length+sizeof(char));IntPtr buffer=Marshal.AllocHGlobal(size);bool added=false;
+        try{directory.DangerousAddRef(ref added);for(int i=0;i<size;i++)Marshal.WriteByte(buffer,i,0);Marshal.WriteByte(buffer,0,0);Marshal.WriteIntPtr(buffer,rootOffset,directory.DangerousGetHandle());Marshal.WriteInt32(buffer,lengthOffset,name.Length);Marshal.Copy(name,0,IntPtr.Add(buffer,nameOffset),name.Length);IoStatus io;int status=NtSetInformationFile(source,out io,buffer,(uint)size,NtFileRenameInformation);return status<0?(int)RtlNtStatusToDosError(status):0;}finally{if(added)directory.DangerousRelease();Marshal.FreeHGlobal(buffer);}
+    }
+
+    public static int Delete(SafeFileHandle file)
+    {
+        IntPtr buffer=Marshal.AllocHGlobal(1);try{Marshal.WriteByte(buffer,0,1);return SetFileInformationByHandle(file,FileDispositionInfo,buffer,1)?0:Marshal.GetLastWin32Error();}finally{Marshal.FreeHGlobal(buffer);}
+    }
+
+    public static string[] EnumerateDirectory(SafeFileHandle directory)
+    {
+        System.Collections.Generic.List<string> values=new System.Collections.Generic.List<string>();System.Collections.Generic.HashSet<string> seen=new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);IntPtr buffer=Marshal.AllocHGlobal(65536);bool restart=true;
+        try{while(true){IoStatus io;int status=NtQueryDirectoryFile(directory,IntPtr.Zero,IntPtr.Zero,IntPtr.Zero,out io,buffer,65536,FileDirectoryInformation,false,IntPtr.Zero,restart);restart=false;if(status==StatusNoMoreFiles)break;if(status<0)throw new Win32Exception((int)RtlNtStatusToDosError(status));int offset=0;while(true){uint next=(uint)Marshal.ReadInt32(buffer,offset),length=(uint)Marshal.ReadInt32(buffer,offset+60);string value=Marshal.PtrToStringUni(IntPtr.Add(buffer,offset+64),(int)length/2);if(value!="."&&value!=".."){if(!seen.Add(value))throw new InvalidDataException("duplicate directory member");values.Add(value);}if(next==0)break;offset+=(int)next;}}values.Sort(StringComparer.Ordinal);return values.ToArray();}finally{Marshal.FreeHGlobal(buffer);}
+    }
+
+    private static void ValidateLeaf(string leaf){if(String.IsNullOrWhiteSpace(leaf)||leaf=="."||leaf==".."||leaf.IndexOfAny(new[]{'\\','/',':'})>=0||leaf.EndsWith(".",StringComparison.Ordinal)||leaf.EndsWith(" ",StringComparison.Ordinal))throw new ArgumentException("unsafe leaf");}
+
+    private static string FinalPath(SafeFileHandle handle)
+    {
+        StringBuilder value=new StringBuilder(512);uint length=GetFinalPathNameByHandleW(handle,value,(uint)value.Capacity,0);
+        if(length==0)throw new Win32Exception(Marshal.GetLastWin32Error());if(length>=value.Capacity){value.Capacity=(int)length+1;length=GetFinalPathNameByHandleW(handle,value,(uint)value.Capacity,0);if(length==0||length>=value.Capacity)throw new Win32Exception(Marshal.GetLastWin32Error());}
+        string path=value.ToString();if(path.StartsWith(@"\\?\UNC\",StringComparison.OrdinalIgnoreCase))return@"\\"+path.Substring(8);if(path.StartsWith(@"\\?\",StringComparison.OrdinalIgnoreCase))return path.Substring(4);return path;
+    }
+
+    private static string[] Streams(SafeFileHandle handle)
+    {
+        IntPtr buffer=Marshal.AllocHGlobal(65536);try{if(!GetFileInformationByHandleEx(handle,FileStreamInfo,buffer,65536)){int error=Marshal.GetLastWin32Error();if(error==38)return new[]{"::$DATA"};throw new Win32Exception(error);}System.Collections.Generic.List<string> values=new System.Collections.Generic.List<string>();int offset=0;while(true){uint next=(uint)Marshal.ReadInt32(buffer,offset),nameLength=(uint)Marshal.ReadInt32(buffer,offset+4);values.Add(Marshal.PtrToStringUni(IntPtr.Add(buffer,offset+24),(int)nameLength/2));if(next==0)break;offset+=(int)next;}return values.ToArray();}finally{Marshal.FreeHGlobal(buffer);}
+    }
+}
+'@
+}
+
+Initialize-CcodReleaseFileAuthority
+
 $script:CcodReleaseReceiptFields = @(
     'schemaVersion','assetType','assetName','assetSha256','checksumName','checksumSha256',
     'manifestName','manifestSha256','version','gitCommit','origin','workflowArtifactIdentity',
@@ -14,6 +145,116 @@ function Throw-CcodReleaseContractError {
     throw [Management.Automation.ErrorRecord]::new(
         [InvalidOperationException]::new($Message),$Id,
         [Management.Automation.ErrorCategory]::InvalidData,$Target)
+}
+
+function Test-CcodReleaseAuthorityFinalPath {
+    param([string]$Actual,[string]$Expected,[switch]$Zone)
+    try{$right=[IO.Path]::GetFullPath($Expected).TrimEnd('\');$left=if($Zone){$Actual.TrimEnd('\')}else{[IO.Path]::GetFullPath($Actual).TrimEnd('\')}}catch{return $false}
+    if($Zone){return $left.Equals($right+':Zone.Identifier',[StringComparison]::OrdinalIgnoreCase)-or$left.Equals($right+':Zone.Identifier:$DATA',[StringComparison]::OrdinalIgnoreCase)}
+    return $left.Equals($right,[StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-CcodReleaseAuthorityStreams {
+    param($Identity,[switch]$Directory,[switch]$AllowZone)
+    $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach($name in @($Identity.Streams)){
+        if($name-isnot[string]-or-not$seen.Add([string]$name)){return $false}
+        if($Directory){if($name-cnotin@('::$DATA','::$INDEX_ALLOCATION')){return $false}}
+        elseif($name-cne'::$DATA'-and(-not$AllowZone-or$name-cne':Zone.Identifier:$DATA')){return $false}
+    }
+    if($Directory){return $seen.Contains('::$DATA')-or$seen.Contains('::$INDEX_ALLOCATION')};return $seen.Contains('::$DATA')
+}
+
+function Get-CcodReleaseAuthorityStreamSha256 {
+    param([Parameter(Mandatory)][IO.FileStream]$Stream)
+    $position=$Stream.Position;$sha=[Security.Cryptography.SHA256]::Create()
+    try{$Stream.Position=0;return [BitConverter]::ToString($sha.ComputeHash($Stream)).Replace('-','').ToLowerInvariant()}finally{$Stream.Position=$position;$sha.Dispose()}
+}
+
+function Get-CcodReleaseAuthorityStreamBytes {
+    param([Parameter(Mandatory)][IO.FileStream]$Stream,[Parameter(Mandatory)][long]$MaximumBytes)
+    if($Stream.Length-lt1-or$Stream.Length-gt$MaximumBytes){throw 'release file length'}
+    $position=$Stream.Position
+    try{$Stream.Position=0;$bytes=[byte[]]::new([int]$Stream.Length);$offset=0;while($offset-lt$bytes.Length){$read=$Stream.Read($bytes,$offset,$bytes.Length-$offset);if($read-le0){throw 'release file truncated'};$offset+=$read};return ,$bytes}finally{$Stream.Position=$position}
+}
+
+function Open-CcodReleaseDirectoryAuthority {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$ErrorId,[switch]$AllowChildMutation)
+    $handle=$null
+    try{
+        $full=Assert-CcodReleaseContractPlainPath -Path $Path -Directory $true -ErrorId $ErrorId
+        $handle=[CcodReleaseFileAuthorityV1]::OpenDirectory($full,[bool]$AllowChildMutation);$identity=[CcodReleaseFileAuthorityV1]::Identity($handle)
+        if(-not[CcodReleaseFileAuthorityV1]::IsDirectory($identity)-or[CcodReleaseFileAuthorityV1]::IsReparse($identity)-or-not(Test-CcodReleaseAuthorityFinalPath $identity.FinalPath $full)-or-not(Test-CcodReleaseAuthorityStreams $identity -Directory)){throw ('directory identity attrs='+$identity.Attributes+' final='+$identity.FinalPath+' expected='+$full+' streams='+(@($identity.Streams)-join'|'))}
+        $children=[CcodReleaseFileAuthorityV1]::EnumerateDirectory($handle)
+        $result=[pscustomobject]@{Kind='Directory';Path=$full;Handle=$handle;Identity=$identity;Children=[string[]]$children;Closed=$false};$handle=$null;return $result
+    }catch{if($null-ne$handle){$handle.Dispose()};Throw-CcodReleaseContractError $ErrorId 'Release directory authority is unsafe or changed.' $Path}
+}
+
+function Open-CcodReleaseFileAuthority {
+    param([Parameter(Mandatory)]$Directory,[Parameter(Mandatory)][string]$Leaf,[Parameter(Mandatory)][string]$ErrorId,[long]$MaximumBytes=536870912,[switch]$AllowZone,[switch]$ShareDelete)
+    $stream=$null
+    try{
+        if($null-eq$Directory-or$Directory.Closed-or$Directory.Kind-cne'Directory'-or$Leaf-cnotmatch'^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$'-or$Leaf.EndsWith('.')-or$Leaf.EndsWith(' ')){throw 'file leaf'}
+        [void](Assert-CcodReleaseAuthorityCurrent -Authority $Directory -ErrorId $ErrorId)
+        $path=Join-Path $Directory.Path $Leaf;$full=Assert-CcodReleaseContractPlainPath -Path $path -Directory $false -ErrorId $ErrorId
+        $stream=[CcodReleaseFileAuthorityV1]::OpenReadFile($full,[bool]$ShareDelete);$identity=[CcodReleaseFileAuthorityV1]::Identity($stream.SafeFileHandle)
+        if([CcodReleaseFileAuthorityV1]::IsDirectory($identity)-or[CcodReleaseFileAuthorityV1]::IsReparse($identity)-or$identity.Links-ne1-or$identity.Volume-ne$Directory.Identity.Volume-or-not(Test-CcodReleaseAuthorityFinalPath $identity.FinalPath $full)-or-not(Test-CcodReleaseAuthorityStreams $identity -AllowZone:$AllowZone)-or$stream.Length-lt1-or$stream.Length-gt$MaximumBytes){throw 'file identity'}
+        $sha=Get-CcodReleaseAuthorityStreamSha256 $stream;$result=[pscustomobject]@{Kind='File';Path=$full;Leaf=$Leaf;Stream=$stream;Identity=$identity;Length=[long]$stream.Length;Sha256=$sha;AllowZone=[bool]$AllowZone;Closed=$false};$stream=$null;return $result
+    }catch{if($null-ne$stream){$stream.Dispose()};Throw-CcodReleaseContractError $ErrorId 'Release file authority is unsafe or changed.' $Leaf}
+}
+
+function Open-CcodReleaseZoneAuthority {
+    param([Parameter(Mandatory)]$File,[Parameter(Mandatory)][string]$ErrorId)
+    $stream=$null
+    try{
+        [void](Assert-CcodReleaseAuthorityCurrent -Authority $File -ErrorId $ErrorId)
+        $stream=[CcodReleaseFileAuthorityV1]::OpenReadFile($File.Path+':Zone.Identifier',$false);$identity=[CcodReleaseFileAuthorityV1]::Identity($stream.SafeFileHandle)
+        if([CcodReleaseFileAuthorityV1]::IsDirectory($identity)-or[CcodReleaseFileAuthorityV1]::IsReparse($identity)-or$identity.Links-ne1-or$identity.Volume-ne$File.Identity.Volume-or$identity.FileId-ne$File.Identity.FileId-or-not(Test-CcodReleaseAuthorityFinalPath $identity.FinalPath $File.Path -Zone)-or$stream.Length-lt1-or$stream.Length-gt65536){throw 'zone identity'}
+        $sha=Get-CcodReleaseAuthorityStreamSha256 $stream;$result=[pscustomobject]@{Kind='Zone';Path=$File.Path;Stream=$stream;Identity=$identity;Length=[long]$stream.Length;Sha256=$sha;Closed=$false};$stream=$null;return $result
+    }catch{if($null-ne$stream){$stream.Dispose()};Throw-CcodReleaseContractError $ErrorId 'Release Zone authority is missing, unsafe, or changed.' $File.Path}
+}
+
+function Assert-CcodReleaseAuthorityCurrent {
+    param([Parameter(Mandatory)]$Authority,[Parameter(Mandatory)][string]$ErrorId,[switch]$CheckBytes)
+    try{
+        if($null-eq$Authority-or$Authority.Closed){throw 'closed authority'}
+        $handle=if($Authority.Kind-ceq'Directory'){$Authority.Handle}else{$Authority.Stream.SafeFileHandle};$current=[CcodReleaseFileAuthorityV1]::Identity($handle);$expected=$Authority.Identity
+        if($current.Volume-ne$expected.Volume-or$current.FileId-ne$expected.FileId-or$current.Links-ne$expected.Links-or$current.Attributes-ne$expected.Attributes){throw 'identity drift'}
+        if($Authority.Kind-ceq'Directory'){
+            if(-not(Test-CcodReleaseAuthorityFinalPath $current.FinalPath $Authority.Path)-or-not(Test-CcodReleaseAuthorityStreams $current -Directory)){throw 'directory drift'}
+            $children=[CcodReleaseFileAuthorityV1]::EnumerateDirectory($Authority.Handle);if(($children-join"`0")-cne(@($Authority.Children)-join"`0")){throw 'membership drift'}
+        }elseif($Authority.Kind-ceq'Zone'){
+            if(-not(Test-CcodReleaseAuthorityFinalPath $current.FinalPath $Authority.Path -Zone)-or$Authority.Stream.Length-ne$Authority.Length){throw 'zone drift'}
+        }else{
+            if(-not(Test-CcodReleaseAuthorityFinalPath $current.FinalPath $Authority.Path)-or-not(Test-CcodReleaseAuthorityStreams $current -AllowZone:$Authority.AllowZone)-or$Authority.Stream.Length-ne$Authority.Length){throw 'file drift'}
+        }
+        if($CheckBytes-and(Get-CcodReleaseAuthorityStreamSha256 $Authority.Stream)-cne$Authority.Sha256){throw 'byte drift'}
+        return $true
+    }catch{Throw-CcodReleaseContractError $ErrorId 'Held release authority changed or closed.' $Authority.Path}
+}
+
+function Close-CcodReleaseAuthority {
+    param($Authority)
+    if($null-eq$Authority-or$Authority.Closed){return};try{if($Authority.Kind-ceq'Directory'){$Authority.Handle.Dispose()}else{$Authority.Stream.Dispose()}}finally{$Authority.Closed=$true}
+}
+
+function Publish-CcodReleaseReceiptAuthority {
+    param([Parameter(Mandatory)]$Directory,[Parameter(Mandatory)][string]$Leaf,[Parameter(Mandatory)][byte[]]$Bytes,[Parameter(Mandatory)][string]$ErrorId)
+    $stream=$null;$temporary=$null;$committed=$false
+    try{
+        [void](Assert-CcodReleaseAuthorityCurrent -Authority $Directory -ErrorId $ErrorId)
+        if($Leaf-cnotmatch'^[A-Za-z0-9][A-Za-z0-9._-]{0,255}\.json$'-or$Bytes.Length-lt1-or$Bytes.Length-gt65536){throw 'receipt input'}
+        $target=Join-Path $Directory.Path $Leaf;if([IO.File]::Exists($target)-or[IO.Directory]::Exists($target)){throw 'receipt exists'}
+        $temporaryLeaf='.ccod-defender-receipt-'+[guid]::NewGuid().ToString('N')+'.tmp';$temporary=Join-Path $Directory.Path $temporaryLeaf;$stream=[CcodReleaseFileAuthorityV1]::CreateReceiptFileRelative($Directory.Handle,$temporaryLeaf);$stream.Write($Bytes,0,$Bytes.Length);$stream.Flush($true)
+        $before=[CcodReleaseFileAuthorityV1]::Identity($stream.SafeFileHandle);if([CcodReleaseFileAuthorityV1]::IsDirectory($before)-or[CcodReleaseFileAuthorityV1]::IsReparse($before)-or$before.Links-ne1-or-not(Test-CcodReleaseAuthorityFinalPath $before.FinalPath $temporary)-or-not(Test-CcodReleaseAuthorityStreams $before)){throw 'temporary identity'}
+        $move=[CcodReleaseFileAuthorityV1]::MoveNoReplaceRelative($stream.SafeFileHandle,$Directory.Handle,$Leaf);if($move-ne0){throw "receipt rename $move"};$committed=$true
+        $after=[CcodReleaseFileAuthorityV1]::Identity($stream.SafeFileHandle);if($after.Volume-ne$before.Volume-or$after.FileId-ne$before.FileId-or-not(Test-CcodReleaseAuthorityFinalPath $after.FinalPath $target)){throw 'receipt publish identity'}
+        $sha=Get-CcodReleaseAuthorityStreamSha256 $stream;$result=[pscustomobject]@{Kind='File';Path=$target;Leaf=$Leaf;Stream=$stream;Identity=$after;Length=[long]$stream.Length;Sha256=$sha;AllowZone=$false;Closed=$false};$stream=$null;return $result
+    }catch{
+        $detail=$_.Exception.Message
+        if($null-ne$stream){if(-not$committed){try{[void][CcodReleaseFileAuthorityV1]::Delete($stream.SafeFileHandle)}catch{}};$stream.Dispose()}
+        Throw-CcodReleaseContractError $ErrorId ('Defender receipt could not be durably published: '+$detail) $Leaf
+    }
 }
 
 function Get-CcodExpectedReleaseAssetNames {
@@ -34,6 +275,27 @@ function Get-CcodExpectedReleaseAssetNames {
     )
 }
 
+function Open-CcodExactReleaseAssetAuthority {
+    param([Parameter(Mandatory)][string]$AssetDirectory,[Parameter(Mandatory)][string]$Version,[Parameter(Mandatory)][string]$ErrorId)
+    $directory=$null;$files=[Collections.Generic.List[object]]::new()
+    try{
+        $names=@(Get-CcodExpectedReleaseAssetNames -Version $Version);$directory=Open-CcodReleaseDirectoryAuthority -Path $AssetDirectory -ErrorId $ErrorId;$expectedSorted=[string[]]@($names);[Array]::Sort($expectedSorted,[StringComparer]::Ordinal)
+        if($directory.Children.Count-ne$names.Count-or($directory.Children-join"`0")-cne($expectedSorted-join"`0")){throw ('exact asset membership actual='+($directory.Children-join'|')+' expected='+($expectedSorted-join'|'))}
+        for($index=0;$index-lt$names.Count;$index++){$files.Add((Open-CcodReleaseFileAuthority -Directory $directory -Leaf $names[$index] -ErrorId $ErrorId -AllowZone:($index-in@(0,5))))}
+        return [pscustomobject]@{Directory=$directory;Files=@($files);Names=$names;Closed=$false}
+    }catch{foreach($file in @($files)){Close-CcodReleaseAuthority $file};Close-CcodReleaseAuthority $directory;Throw-CcodReleaseContractError $ErrorId 'Exact release asset authority could not be pinned.' $AssetDirectory}
+}
+
+function Assert-CcodExactReleaseAssetAuthorityCurrent {
+    param([Parameter(Mandatory)]$Authority,[Parameter(Mandatory)][string]$ErrorId)
+    if($Authority.Closed){Throw-CcodReleaseContractError $ErrorId 'Exact release asset authority is closed.' $Authority.Directory.Path};Assert-CcodReleaseAuthorityCurrent $Authority.Directory $ErrorId|Out-Null;foreach($file in @($Authority.Files)){Assert-CcodReleaseAuthorityCurrent $file $ErrorId -CheckBytes|Out-Null};return $true
+}
+
+function Close-CcodExactReleaseAssetAuthority {
+    param($Authority)
+    if($null-eq$Authority-or$Authority.Closed){return};for($index=$Authority.Files.Count-1;$index-ge0;$index--){Close-CcodReleaseAuthority $Authority.Files[$index]};Close-CcodReleaseAuthority $Authority.Directory;$Authority.Closed=$true
+}
+
 function Test-CcodReleaseContractCanonicalUtc {
     param($Value)
     if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Value)) { return $false }
@@ -41,6 +303,11 @@ function Test-CcodReleaseContractCanonicalUtc {
     return [datetime]::TryParseExact($Value,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$parsed) -and
         $parsed.Kind -eq [DateTimeKind]::Utc -and
         $parsed.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture) -ceq $Value
+}
+
+function Test-CcodReleaseContractJsonInteger {
+    param($Value,[long]$Minimum=0)
+    return ($Value-is[int]-or$Value-is[long])-and[decimal]$Value-eq[decimal][long]$Value-and[long]$Value-ge$Minimum
 }
 
 function Assert-CcodReleaseContractPlainPath {
@@ -193,6 +460,99 @@ function Read-CcodReleaseContractJson {
     }
 }
 
+function Read-CcodReleaseContractPinnedJson {
+    param([Parameter(Mandatory)]$Authority,[Parameter(Mandatory)][string]$ErrorId,[int64]$MaximumBytes=4194304)
+    try{
+        Assert-CcodReleaseAuthorityCurrent $Authority $ErrorId -CheckBytes|Out-Null;$bytes=Get-CcodReleaseAuthorityStreamBytes $Authority.Stream $MaximumBytes;$raw=[Text.UTF8Encoding]::new($false,$true).GetString($bytes);Assert-CcodReleaseContractJsonLexicalShape $raw;$value=$raw|ConvertFrom-Json -ErrorAction Stop;if($value-isnot[pscustomobject]){throw 'json shape'};Assert-CcodReleaseAuthorityCurrent $Authority $ErrorId -CheckBytes|Out-Null;return [pscustomobject]@{Raw=$raw;Value=$value;Bytes=$bytes}
+    }catch{Throw-CcodReleaseContractError $ErrorId 'Pinned release JSON is malformed, changed, or outside its bound.' $Authority.Path}
+}
+
+function Get-CcodReleaseContractStreamHash {
+    param([Parameter(Mandatory)][IO.Stream]$Stream)
+    $sha=[Security.Cryptography.SHA256]::Create();try{return [BitConverter]::ToString($sha.ComputeHash($Stream)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+}
+
+function Test-CcodReleaseContractTrayProvenance {
+    param([string]$Path,[string]$Version,[string]$GitCommit,[string]$Timestamp,[string]$ErrorId)
+    $record=(Read-CcodReleaseContractJson -Path $Path -ErrorId $ErrorId).Value
+    $top='schemaVersion,product,version,gitCommit,buildTimestampUtc,targetFramework,compiler,referenceRoot,sourceFiles,iconSha256,manifestSha256,configSha256,artifactSha256,configArtifactSha256'
+    if((@($record.PSObject.Properties.Name)-join',')-cne$top-or$record.schemaVersion-isnot[int]-or$record.schemaVersion-ne1-or$record.product-cne'CodexRemote-fix'-or$record.version-cne$Version-or$record.gitCommit-cne$GitCommit-or$record.buildTimestampUtc-cne$Timestamp-or-not(Test-CcodReleaseContractCanonicalUtc $record.buildTimestampUtc)-or$record.targetFramework-cne'net48'-or$record.referenceRoot-cne'locked-net48'-or
+       $record.compiler-isnot[pscustomobject]-or(@($record.compiler.PSObject.Properties.Name)-join',')-cne'name,sha256'-or$record.compiler.name-cne'csc.exe'-or$record.compiler.sha256-cnotmatch'^[0-9a-f]{64}$'){
+        Throw-CcodReleaseContractError $ErrorId 'TrayHost provenance schema or common identity is invalid.' $Path
+    }
+    $previous=$null;$seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach($source in @($record.sourceFiles)){
+        if($source-isnot[pscustomobject]-or(@($source.PSObject.Properties.Name)-join',')-cne'name,sha256'-or$source.name-isnot[string]-or$source.name-cnotmatch'^[A-Za-z0-9._-]{1,128}$'-or$source.sha256-isnot[string]-or$source.sha256-cnotmatch'^[0-9a-f]{64}$'-or-not$seen.Add([string]$source.name)-or($null-ne$previous-and[StringComparer]::Ordinal.Compare($previous,[string]$source.name)-ge0)){Throw-CcodReleaseContractError $ErrorId 'TrayHost provenance source records are malformed, duplicate, or unordered.' $Path};$previous=[string]$source.name
+    }
+    if($seen.Count-eq0){Throw-CcodReleaseContractError $ErrorId 'TrayHost provenance source records are empty.' $Path}
+    foreach($field in @('iconSha256','manifestSha256','configSha256','artifactSha256','configArtifactSha256')){if($record.$field-isnot[string]-or$record.$field-cnotmatch'^[0-9a-f]{64}$'){Throw-CcodReleaseContractError $ErrorId 'TrayHost provenance hashes are malformed.' $Path}}
+    return $record
+}
+
+function Test-CcodReleaseContractInventory {
+    param([string]$Path,[string]$ErrorId)
+    try{$text=[IO.File]::ReadAllText($Path,[Text.UTF8Encoding]::new($false,$true));if($text.Length-lt70-or$text.Length-gt1048576){throw 'inventory bounds'};$lines=@($text-split'\r?\n');while($lines.Count-gt0-and$lines[-1]-ceq''){$lines=$lines[0..($lines.Count-2)]};if($lines.Count-lt3-or$lines[0]-cne'procedure AddCcodExpectedSetupDirectories(Directories: TStrings);'-or$lines[1]-cne'begin'-or$lines[-1]-cne'end;'){throw 'inventory frame'};$previous=$null;$seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal);for($index=2;$index-lt$lines.Count-1;$index++){if($lines[$index]-cnotmatch"^  Directories\.Add\('(?<path>[A-Za-z0-9._-]+(?:\\[A-Za-z0-9._-]+)*)'\);$"){throw 'inventory line'};$value=[string]$Matches.path;if(-not$seen.Add($value)-or($null-ne$previous-and[StringComparer]::Ordinal.Compare($previous,$value)-ge0)){throw 'inventory order'};$previous=$value};return $text}catch{Throw-CcodReleaseContractError $ErrorId 'Setup destination inventory is not the exact generated grammar.' $Path}
+}
+
+function Test-CcodReleasePortableManifestDeep {
+    param($Manifest,[string]$ManifestRaw,[string]$ManifestPath,[string]$Directory,[string]$Version,[string]$ErrorId)
+    $names=@(Get-CcodExpectedReleaseAssetNames -Version $Version);$expected=@($names[0],$names[1],$names[2],$names[3],'CodexRemote-fix.exe','CodexRemote-fix.exe.config')
+    if((@($Manifest.PSObject.Properties.Name)-join',')-cne'schemaVersion,product,version,gitCommit,buildTimestampUtc,distribution,assets'-or$Manifest.schemaVersion-isnot[int]-or$Manifest.schemaVersion-ne2-or$Manifest.product-cne'CodexRemote-fix'-or$Manifest.version-cne$Version-or$Manifest.gitCommit-isnot[string]-or$Manifest.gitCommit-cnotmatch'^[0-9a-f]{40}$'-or-not(Test-CcodReleaseContractCanonicalUtc $Manifest.buildTimestampUtc)-or$Manifest.distribution-cne'portable-zip'){Throw-CcodReleaseContractError $ErrorId 'Portable release manifest metadata is invalid.' $ManifestPath}
+    $map=Get-CcodReleaseContractManifestMap -Manifest $Manifest -ExpectedNames $expected -ErrorId $ErrorId -Target $ManifestPath
+    foreach($name in $expected[0..3]){if((Get-CcodReleaseContractHash (Join-Path $Directory $name))-cne$map[$name]){Throw-CcodReleaseContractError 'CCOD_RELEASE_ASSET_HASH_MISMATCH' 'Portable public asset hash mismatch.' $name}}
+    $checksum=[IO.File]::ReadAllText((Join-Path $Directory $names[1]),[Text.UTF8Encoding]::new($false,$true)).TrimEnd("`r","`n");if($checksum-cne("$($map[$names[0]]) *$($names[0])")){Throw-CcodReleaseContractError $ErrorId 'Portable checksum is invalid.' $names[1]}
+    [void](Test-CcodReleaseContractTrayProvenance -Path (Join-Path $Directory $names[2]) -Version $Version -GitCommit $Manifest.gitCommit -Timestamp $Manifest.buildTimestampUtc -ErrorId $ErrorId)
+    $payloadPath=Join-Path $Directory $names[3];$payload=(Read-CcodReleaseContractJson -Path $payloadPath -ErrorId $ErrorId).Value
+    if((@($payload.PSObject.Properties.Name)-join',')-cne'schemaVersion,product,version,gitCommit,buildTimestampUtc,files'-or$payload.schemaVersion-isnot[int]-or$payload.schemaVersion-ne1-or$payload.product-cne'CodexRemote-fix'-or$payload.version-cne$Version-or$payload.gitCommit-cne$Manifest.gitCommit-or$payload.buildTimestampUtc-cne$Manifest.buildTimestampUtc){Throw-CcodReleaseContractError $ErrorId 'Portable payload manifest metadata is invalid.' $payloadPath}
+    $fileRecords=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal);$previous=$null
+    foreach($record in @($payload.files)){if($record-isnot[pscustomobject]-or(@($record.PSObject.Properties.Name)-join',')-cne'path,length,sha256'-or$record.path-isnot[string]-or$record.path-cnotmatch'^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$'-or$record.path.Contains('//')-or$record.path.Contains(':')-or$record.path-match'(^|/)\.\.?(?:/|$)'-or($record.length-isnot[int]-and$record.length-isnot[long])-or[long]$record.length-lt0-or$record.sha256-isnot[string]-or$record.sha256-cnotmatch'^[0-9a-f]{64}$'-or$fileRecords.ContainsKey([string]$record.path)-or($null-ne$previous-and[StringComparer]::Ordinal.Compare($previous,[string]$record.path)-ge0)){Throw-CcodReleaseContractError $ErrorId 'Portable payload records are malformed, duplicate, or unordered.' $payloadPath};$fileRecords.Add([string]$record.path,$record);$previous=[string]$record.path}
+    if($fileRecords.Count-eq0){Throw-CcodReleaseContractError $ErrorId 'Portable payload manifest is empty.' $payloadPath}
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop;$archive=$null
+    try{
+        $archive=[IO.Compression.ZipFile]::OpenRead((Join-Path $Directory $names[0]));$zip=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+        foreach($entry in @($archive.Entries)){$name=([string]$entry.FullName).Replace('\','/');if($name.EndsWith('/')){if($name-cne'payload/'-and-not$name.StartsWith('payload/',[StringComparison]::Ordinal)){throw 'unexpected directory'};continue};if($name-isnot[string]-or$name-cmatch'(^|/)\.\.?(?:/|$)|:'-or$zip.ContainsKey($name)){throw 'zip entry'};$zip.Add($name,$entry)}
+        $expectedZip=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal);foreach($root in @('CodexRemote-fix.exe','CodexRemote-fix.exe.config','Install-CodexRemote-fix.ps1','payload-manifest.json')){[void]$expectedZip.Add($root)};foreach($path in $fileRecords.Keys){[void]$expectedZip.Add('payload/'+$path)}
+        if($zip.Count-ne$expectedZip.Count-or@($zip.Keys|Where-Object{-not$expectedZip.Contains($_)}).Count-ne0){throw 'zip membership'}
+        $entry=$zip['payload-manifest.json'];$stream=$entry.Open();try{if((Get-CcodReleaseContractStreamHash $stream)-cne(Get-CcodReleaseContractHash $payloadPath)){throw 'embedded manifest'}}finally{$stream.Dispose()}
+        foreach($root in @('CodexRemote-fix.exe','CodexRemote-fix.exe.config')){$stream=$zip[$root].Open();try{if((Get-CcodReleaseContractStreamHash $stream)-cne$map[$root]){throw 'root launcher'}}finally{$stream.Dispose()}}
+        foreach($path in $fileRecords.Keys){$record=$fileRecords[$path];$entry=$zip['payload/'+$path];if([long]$entry.Length-ne[long]$record.length){throw 'payload length'};$stream=$entry.Open();try{if((Get-CcodReleaseContractStreamHash $stream)-cne$record.sha256){throw 'payload hash'}}finally{$stream.Dispose()}}
+    }catch{Throw-CcodReleaseContractError 'CCOD_RELEASE_ASSET_HASH_MISMATCH' 'Portable ZIP does not match its deep payload contract.' $names[0]}finally{if($null-ne$archive){$archive.Dispose()}}
+    return [pscustomobject][ordered]@{Valid=$true;Version=$Version;GitCommit=[string]$Manifest.gitCommit;BuildTimestampUtc=[string]$Manifest.buildTimestampUtc;InstallerSha256=[string]$map[$names[0]];InstallerName=$names[0];Distribution='portable-zip'}
+}
+
+function Test-CcodReleaseSetupManifestDeep {
+    param($Manifest,[string]$ManifestPath,[string]$Directory,[string]$Version,[string]$ErrorId)
+    $names=@(Get-CcodExpectedReleaseAssetNames -Version $Version);$expected=@($names[5],$names[6],$names[2],$names[7],$names[8],$names[9])
+    if((@($Manifest.PSObject.Properties.Name)-join',')-cne'schemaVersion,product,version,gitCommit,buildTimestampUtc,assets'-or$Manifest.schemaVersion-isnot[int]-or$Manifest.schemaVersion-ne1-or$Manifest.product-cne'CodexRemote-fix'-or$Manifest.version-cne$Version-or$Manifest.gitCommit-isnot[string]-or$Manifest.gitCommit-cnotmatch'^[0-9a-f]{40}$'-or-not(Test-CcodReleaseContractCanonicalUtc $Manifest.buildTimestampUtc)){Throw-CcodReleaseContractError $ErrorId 'Setup release manifest metadata is invalid.' $ManifestPath}
+    $map=Get-CcodReleaseContractManifestMap -Manifest $Manifest -ExpectedNames $expected -ErrorId $ErrorId -Target $ManifestPath;foreach($name in $expected){if((Get-CcodReleaseContractHash (Join-Path $Directory $name))-cne$map[$name]){Throw-CcodReleaseContractError 'CCOD_RELEASE_ASSET_HASH_MISMATCH' 'Setup public asset hash mismatch.' $name}}
+    $checksum=[IO.File]::ReadAllText((Join-Path $Directory $names[6]),[Text.UTF8Encoding]::new($false,$true)).TrimEnd("`r","`n");if($checksum-cne("$($map[$names[5]]) *$($names[5])")){Throw-CcodReleaseContractError $ErrorId 'Setup checksum is invalid.' $names[6]}
+    [void](Test-CcodReleaseContractTrayProvenance -Path (Join-Path $Directory $names[2]) -Version $Version -GitCommit $Manifest.gitCommit -Timestamp $Manifest.buildTimestampUtc -ErrorId $ErrorId)
+    $packageManifestPath=Join-Path $Directory $names[8];$package=(Read-CcodReleaseContractJson -Path $packageManifestPath -ErrorId $ErrorId).Value
+    if((@($package.PSObject.Properties.Name)-join',')-cne'schemaVersion,product,version,gitCommit,payloadManifest,files'-or$package.schemaVersion-isnot[int]-or$package.schemaVersion-ne1-or$package.product-cne'CodexRemote-fix'-or$package.version-cne$Version-or$package.gitCommit-cne$Manifest.gitCommit-or$package.payloadManifest-isnot[pscustomobject]-or(@($package.payloadManifest.PSObject.Properties.Name)-join',')-cne'name,length,sha256'-or$package.payloadManifest.name-cne'installer-payload.manifest.json'-or($package.payloadManifest.length-isnot[int]-and$package.payloadManifest.length-isnot[long])-or[long]$package.payloadManifest.length-lt1-or$package.payloadManifest.sha256-cnotmatch'^[0-9a-f]{64}$'){Throw-CcodReleaseContractError $ErrorId 'Setup package manifest nested payload binding is invalid.' $packageManifestPath}
+    $previous=$null;$seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal);foreach($file in @($package.files)){if($file-isnot[pscustomobject]-or(@($file.PSObject.Properties.Name)-join',')-cne'path,length,sha256'-or$file.path-isnot[string]-or$file.path-cnotmatch'^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$'-or$file.path-cmatch'(^|/)\.\.?(?:/|$)|:'-or($file.length-isnot[int]-and$file.length-isnot[long])-or[long]$file.length-lt0-or$file.sha256-cnotmatch'^[0-9a-f]{64}$'-or-not$seen.Add([string]$file.path)-or($null-ne$previous-and[StringComparer]::Ordinal.Compare($previous,[string]$file.path)-ge0)){Throw-CcodReleaseContractError $ErrorId 'Setup package manifest files are malformed, duplicate, or unordered.' $packageManifestPath};$previous=[string]$file.path};if($seen.Count-eq0){Throw-CcodReleaseContractError $ErrorId 'Setup package manifest files are empty.' $packageManifestPath}
+    $provenancePath=Join-Path $Directory $names[7];$provenance=(Read-CcodReleaseContractJson -Path $provenancePath -ErrorId $ErrorId).Value;$top='schemaVersion,product,version,gitCommit,buildTimestampUtc,installerPackage,installerPackageManifest,activationBootstrap,buildInputs,peContract'
+    $artifactFields='name,length,sha256';$manifestFields='name,length,sha256,fileCount,payloadManifestSha256';$buildFields='innoTemplateSha256,destinationInventorySha256,compilerSha256,compilerFileVersion';$peFields='fileVersion,packageManifestFirst,packageManifestLast,bootstrapFirst,bootstrapLast,companyName,legalCopyright'
+    if((@($provenance.PSObject.Properties.Name)-join',')-cne$top-or$provenance.schemaVersion-isnot[int]-or$provenance.schemaVersion-ne2-or$provenance.product-cne'CodexRemote-fix'-or$provenance.version-cne$Version-or$provenance.gitCommit-cne$Manifest.gitCommit-or$provenance.buildTimestampUtc-cne$Manifest.buildTimestampUtc-or
+       (@($provenance.installerPackage.PSObject.Properties.Name)-join',')-cne$artifactFields-or(@($provenance.installerPackageManifest.PSObject.Properties.Name)-join',')-cne$manifestFields-or(@($provenance.activationBootstrap.PSObject.Properties.Name)-join',')-cne$artifactFields-or(@($provenance.buildInputs.PSObject.Properties.Name)-join',')-cne$buildFields-or(@($provenance.peContract.PSObject.Properties.Name)-join',')-cne$peFields){Throw-CcodReleaseContractError $ErrorId 'Setup provenance nested property schema is invalid.' $provenancePath}
+    $packageManifestHash=Get-CcodReleaseContractHash $packageManifestPath;$inventoryPath=Join-Path $Directory $names[9];[void](Test-CcodReleaseContractInventory $inventoryPath $ErrorId)
+    if($provenance.installerPackage.name-cne'installer-package.zip'-or$provenance.installerPackage.length-isnot[long]-and$provenance.installerPackage.length-isnot[int]-or[long]$provenance.installerPackage.length-lt1-or$provenance.installerPackage.sha256-cnotmatch'^[0-9a-f]{64}$'-or
+       $provenance.installerPackageManifest.name-cne'installer-package.manifest.json'-or[long]$provenance.installerPackageManifest.length-ne[long](Get-Item $packageManifestPath -Force).Length-or$provenance.installerPackageManifest.sha256-cne$packageManifestHash-or$provenance.installerPackageManifest.fileCount-isnot[int]-or$provenance.installerPackageManifest.fileCount-ne@($package.files).Count-or$provenance.installerPackageManifest.payloadManifestSha256-cne$package.payloadManifest.sha256-or
+       $provenance.activationBootstrap.name-cne'Activate-CcodRemoteFix.ps1'-or[long]$provenance.activationBootstrap.length-lt1-or$provenance.activationBootstrap.sha256-cnotmatch'^[0-9a-f]{64}$'-or$provenance.buildInputs.innoTemplateSha256-cnotmatch'^[0-9a-f]{64}$'-or$provenance.buildInputs.destinationInventorySha256-cne(Get-CcodReleaseContractHash $inventoryPath)-or$provenance.buildInputs.compilerSha256-cnotmatch'^[0-9a-f]{64}$'-or[string]::IsNullOrWhiteSpace([string]$provenance.buildInputs.compilerFileVersion)-or
+       $provenance.peContract.fileVersion-cne"$Version.0"-or$provenance.peContract.packageManifestFirst-cne$packageManifestHash.Substring(0,32)-or$provenance.peContract.packageManifestLast-cne$packageManifestHash.Substring(32,32)-or$provenance.peContract.bootstrapFirst-cne$provenance.activationBootstrap.sha256.Substring(0,32)-or$provenance.peContract.bootstrapLast-cne$provenance.activationBootstrap.sha256.Substring(32,32)-or$provenance.peContract.companyName-cne$Manifest.gitCommit-or$provenance.peContract.legalCopyright-cne$provenance.installerPackage.sha256){Throw-CcodReleaseContractError $ErrorId 'Setup provenance values do not bind package manifest, inventory, PE, and common identity.' $provenancePath}
+    $setupModule=Join-Path (Split-Path $PSScriptRoot -Parent) 'build\SetupArtifact.psm1';Import-Module $setupModule -Force -ErrorAction Stop
+    try{$setup=Test-CcodSetupArtifact -SetupPath (Join-Path $Directory $names[5]) -ExpectedVersion $Version -ExpectedGitCommit $Manifest.gitCommit -ExpectedPackageSha256 $provenance.installerPackage.sha256 -ExpectedPackageManifestSha256 $packageManifestHash -ExpectedActivationBootstrapSha256 $provenance.activationBootstrap.sha256}catch{Throw-CcodReleaseContractError $ErrorId 'Setup PE does not bind its nested provenance.' $names[5]}
+    return [pscustomobject][ordered]@{Valid=$true;Version=$Version;GitCommit=[string]$Manifest.gitCommit;BuildTimestampUtc=[string]$Manifest.buildTimestampUtc;InstallerSha256=[string]$map[$names[5]];InstallerName=$names[5];PackageManifestSha256=$packageManifestHash;SetupProvenanceName=$names[7];SetupPayloadInputName=$names[8];SetupInventoryInputName=$names[9]}
+}
+
+function Test-CcodReleaseAssetManifest {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ManifestPath,[Parameter(Mandatory)][string]$AssetDirectory,[Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$ExpectedVersion)
+    $errorId='CCOD_RELEASE_MANIFEST_INVALID';$directory=Assert-CcodReleaseContractPlainPath -Path $AssetDirectory -Directory $true -ErrorId $errorId;$manifestFile=Assert-CcodReleaseContractPlainPath -Path $ManifestPath -Directory $false -ErrorId $errorId;$json=Read-CcodReleaseContractJson -Path $manifestFile -ErrorId $errorId;$manifest=$json.Value
+    if($manifest.schemaVersion-is[int]-and$manifest.schemaVersion-eq2){return Test-CcodReleasePortableManifestDeep -Manifest $manifest -ManifestRaw $json.Raw -ManifestPath $manifestFile -Directory $directory -Version $ExpectedVersion -ErrorId $errorId}
+    if($manifest.schemaVersion-is[int]-and$manifest.schemaVersion-eq1){return Test-CcodReleaseSetupManifestDeep -Manifest $manifest -ManifestPath $manifestFile -Directory $directory -Version $ExpectedVersion -ErrorId $errorId}
+    Throw-CcodReleaseContractError $errorId 'Release manifest schema is unsupported.' $manifestFile
+}
+
 function Assert-CcodReleaseContractMetadata {
     param($Value,[string]$Version,[string]$GitCommit,[string]$Timestamp,[string]$ErrorId,$Target,[switch]$TimestampOptional)
     if ($null -eq $Value -or $Value -isnot [pscustomobject] -or
@@ -238,6 +598,8 @@ function Test-CcodExactReleaseAssetSet {
         [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version
     )
     $errorId = 'CCOD_RELEASE_ASSET_SET_INVALID'
+    $authority=Open-CcodExactReleaseAssetAuthority -AssetDirectory $AssetDirectory -Version $Version -ErrorId $errorId
+    try {
     $directory = Assert-CcodReleaseContractPlainPath -Path $AssetDirectory -Directory $true -ErrorId $errorId
     $expected = @(Get-CcodExpectedReleaseAssetNames -Version $Version)
     try { $children = @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop) }
@@ -259,6 +621,11 @@ function Test-CcodExactReleaseAssetSet {
 
     $portablePath = Join-Path $directory $expected[4]
     $setupPath = Join-Path $directory $expected[10]
+    try {
+        $portableDeep = Test-CcodReleaseAssetManifest -ManifestPath $portablePath -AssetDirectory $directory -ExpectedVersion $Version
+        $setupDeep = Test-CcodReleaseAssetManifest -ManifestPath $setupPath -AssetDirectory $directory -ExpectedVersion $Version
+        if($portableDeep.GitCommit-cne$setupDeep.GitCommit-or$portableDeep.BuildTimestampUtc-cne$setupDeep.BuildTimestampUtc){throw 'distribution provenance mismatch'}
+    } catch { Throw-CcodReleaseContractError $errorId 'Release distributions do not satisfy the shared deep asset contract.' $directory }
     $portableJson = Read-CcodReleaseContractJson -Path $portablePath -ErrorId $errorId
     $setupJson = Read-CcodReleaseContractJson -Path $setupPath -ErrorId $errorId
     $portable = $portableJson.Value; $setup = $setupJson.Value
@@ -301,7 +668,9 @@ function Test-CcodExactReleaseAssetSet {
 
     $records = [Collections.Generic.List[object]]::new()
     foreach ($name in $expected) { $records.Add([pscustomobject][ordered]@{name=$name;sha256=Get-CcodReleaseContractHash (Join-Path $directory $name)}) }
+    Assert-CcodExactReleaseAssetAuthorityCurrent $authority $errorId|Out-Null
     return [pscustomobject][ordered]@{Valid=$true;Version=$Version;GitCommit=[string]$portable.gitCommit;BuildTimestampUtc=[string]$portable.buildTimestampUtc;Assets=@($records)}
+    } finally { Close-CcodExactReleaseAssetAuthority $authority }
 }
 
 function Get-CcodReleasePromotionReceiptNames {
@@ -354,30 +723,32 @@ function Test-CcodReleasePromotionReceipt {
     return $Receipt
 }
 
-function Test-CcodReleasePromotionEvidence {
+function Test-CcodReleasePromotionEvidenceCore {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$EvidenceDirectory,
         [Parameter(Mandatory)][string]$AssetDirectory,
         [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version,
-        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedGitCommit
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedGitCommit,
+        [scriptblock]$BeforeReturn
     )
     $errorId = 'CCOD_RELEASE_PROMOTION_EVIDENCE_INVALID'
+    $assetAuthority=$null;$evidenceAuthority=$null;$receiptAuthorities=[Collections.Generic.List[object]]::new()
+    try {
+    $assetAuthority=Open-CcodExactReleaseAssetAuthority -AssetDirectory $AssetDirectory -Version $Version -ErrorId $errorId
     $directory = Assert-CcodReleaseContractPlainPath -Path $EvidenceDirectory -Directory $true -ErrorId $errorId
     try { $assetContract = Test-CcodExactReleaseAssetSet -AssetDirectory $AssetDirectory -Version $Version }
     catch { Throw-CcodReleaseContractError $errorId 'Promotion assets do not satisfy the exact eleven-file authority.' $AssetDirectory }
     if ($assetContract.GitCommit -cne $ExpectedGitCommit) { Throw-CcodReleaseContractError $errorId 'Promotion assets do not bind the expected commit.' $AssetDirectory }
+    for($assetIndex=0;$assetIndex-lt11;$assetIndex++){if($assetAuthority.Files[$assetIndex].Sha256-cne$assetContract.Assets[$assetIndex].sha256){Throw-CcodReleaseContractError $errorId 'Pinned promotion asset differs from its validated contract.' $assetAuthority.Files[$assetIndex].Path}}
     $names = @(Get-CcodReleasePromotionReceiptNames -Version $Version)
-    try { $children = @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop) }
-    catch { Throw-CcodReleaseContractError $errorId 'Promotion evidence directory cannot be read exactly.' $directory }
-    if ($children.Count -ne 2) { Throw-CcodReleaseContractError $errorId 'Promotion requires exactly two receipt leaves.' $directory }
+    $evidenceAuthority=Open-CcodReleaseDirectoryAuthority -Path $directory -ErrorId $errorId;$expectedReceiptNames=[string[]]@($names);[Array]::Sort($expectedReceiptNames,[StringComparer]::Ordinal)
+    if($evidenceAuthority.Children.Count-ne2-or($evidenceAuthority.Children-join"`0")-cne($expectedReceiptNames-join"`0")){Throw-CcodReleaseContractError $errorId 'Promotion requires exactly two named receipt leaves.' $directory}
     $assets = @(Get-CcodExpectedReleaseAssetNames -Version $Version)
     $receipts = [Collections.Generic.List[object]]::new()
     for ($index=0; $index -lt 2; $index++) {
-        $matching = @($children | Where-Object { $_.Name -ceq $names[$index] })
-        if ($matching.Count -ne 1 -or $matching[0].PSIsContainer -or ($matching[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Throw-CcodReleaseContractError $errorId 'Promotion receipt names and kinds are not exact.' $names[$index] }
-        $path = Assert-CcodReleaseContractPlainPath -Path ([string]$matching[0].FullName) -Directory $false -ErrorId $errorId
-        $json = Read-CcodReleaseContractJson -Path $path -ErrorId $errorId -MaximumBytes 65536
+        $receiptAuthority=Open-CcodReleaseFileAuthority -Directory $evidenceAuthority -Leaf $names[$index] -ErrorId $errorId -MaximumBytes 65536;$receiptAuthorities.Add($receiptAuthority);$path=$receiptAuthority.Path
+        $json = Read-CcodReleaseContractPinnedJson -Authority $receiptAuthority -ErrorId $errorId -MaximumBytes 65536
         $type = if ($index -eq 0) { 'Setup' } else { 'PortableZip' }
         $receipts.Add((Test-CcodReleasePromotionReceipt -Receipt $json.Value -Raw $json.Raw -Path $path -AssetType $type -Version $Version -GitCommit $ExpectedGitCommit -AssetNames $assets))
     }
@@ -397,7 +768,16 @@ function Test-CcodReleasePromotionEvidence {
         $receipts[0].manifestSha256 -ceq $receipts[1].manifestSha256) {
         Throw-CcodReleaseContractError $errorId 'Setup and portable receipts reuse an evidence identity.' $directory
     }
+    if($null-ne$BeforeReturn){&$BeforeReturn $assetAuthority $evidenceAuthority @($receiptAuthorities)}
+    Assert-CcodExactReleaseAssetAuthorityCurrent $assetAuthority $errorId|Out-Null;Assert-CcodReleaseAuthorityCurrent $evidenceAuthority $errorId|Out-Null;foreach($authority in @($receiptAuthorities)){Assert-CcodReleaseAuthorityCurrent $authority $errorId -CheckBytes|Out-Null}
     return [pscustomobject][ordered]@{Valid=$true;Version=$Version;GitCommit=$ExpectedGitCommit;Receipts=@($receipts)}
+    } finally {for($index=$receiptAuthorities.Count-1;$index-ge0;$index--){Close-CcodReleaseAuthority $receiptAuthorities[$index]};Close-CcodReleaseAuthority $evidenceAuthority;Close-CcodExactReleaseAssetAuthority $assetAuthority}
 }
 
-Export-ModuleMember -Function Get-CcodExpectedReleaseAssetNames,Test-CcodExactReleaseAssetSet,Test-CcodReleasePromotionEvidence
+function Test-CcodReleasePromotionEvidence {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$EvidenceDirectory,[Parameter(Mandatory)][string]$AssetDirectory,[Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version,[Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedGitCommit)
+    Test-CcodReleasePromotionEvidenceCore -EvidenceDirectory $EvidenceDirectory -AssetDirectory $AssetDirectory -Version $Version -ExpectedGitCommit $ExpectedGitCommit
+}
+
+Export-ModuleMember -Function Get-CcodExpectedReleaseAssetNames,Test-CcodExactReleaseAssetSet,Test-CcodReleaseAssetManifest,Test-CcodReleasePromotionEvidence
