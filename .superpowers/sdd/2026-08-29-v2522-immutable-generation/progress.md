@@ -383,3 +383,14 @@ was performed. Task 5 scoped review FAIL (1 Critical, 3 Important): the public D
 full-fact adapters; the central contract shallow-validates nested payload/provenance; asset identity is not
 handle-held across scan/promotion; and receipt writing lacks production read-back. Task 5 fix round 1 is in
 progress. Tasks 6–8 remain blocked.
+
+Task 5 fix round 1 implementation `9f8a9e7f4aa8ba6028941026cbca776cbd908610`
+closes the four scoped-review findings without changing the 11 public names,
+receipt schema, candidate docs, or Setup/portable ordering. Public Defender
+surfaces no longer accept adapters or a library bypass; nested portable/Setup
+payload and provenance are exact; scan and promotion hold asset/receipt
+identities through the decision; and receipts require production write/read-back.
+Frozen verification passed ReleaseWorkflow 63 declared cases, PortableRelease
+5/5, InstallLifecycle 151/151, parser 104/104, diff check, and all 39 aggregate
+suites. No real Defender/build/install/network/release action was performed.
+Task 5 scoped re-review of `fb163b7..9f8a9e7` is required. Tasks 6–8 remain blocked.
