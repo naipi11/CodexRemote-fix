@@ -29,4 +29,6 @@ InstallFileTransaction 44 groups, ProductRegistration 30/30, InstallLifecycle 15
 
 Fix round 1 frozen gate: complete, including UninstallBootstrap 45/45, RuntimeManifest 21 groups,
 InstalledLifecycleHarness 21 groups, Bootstrap 26/26, ManualWrappers 12 groups, and
-`tests\PersistenceSelfTest.ps1` exit 0. Fresh scoped fix-round review: pending. Tasks 5–8 remain blocked.
+`tests\PersistenceSelfTest.ps1` exit 0. Fix-round scoped re-review: Spec Compliance PASS, Task Quality PASS,
+0 Critical, 0 Important. Task 2 is complete. Successor whole-plan final review remains pending; Tasks 5–8
+remain blocked.
