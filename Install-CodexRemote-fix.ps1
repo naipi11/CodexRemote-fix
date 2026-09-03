@@ -62,21 +62,29 @@ function Get-CcodPortableInstallerDetectionKeys {
 function Invoke-CcodPortableInstallerDefenderGate {
     param([Parameter(Mandatory)][string]$PayloadRoot)
     try {
-        $status = Get-MpComputerStatus -ErrorAction Stop
-        if ($null -eq $status -or $null -eq $status.PSObject.Properties['AMProductVersion'] -or
-            $null -eq $status.PSObject.Properties['AntivirusSignatureVersion'] -or
-            $status.AMProductVersion -isnot [string] -or [string]::IsNullOrWhiteSpace($status.AMProductVersion) -or
-            $status.AntivirusSignatureVersion -isnot [string] -or [string]::IsNullOrWhiteSpace($status.AntivirusSignatureVersion) -or
-            $null -eq $status.PSObject.Properties['RealTimeProtectionEnabled'] -or $status.RealTimeProtectionEnabled -isnot [bool] -or
-            -not $status.RealTimeProtectionEnabled) {
-            throw 'Defender status is incomplete or real-time protection is not enabled.'
-        }
-        $before = Get-CcodPortableInstallerDetectionKeys -Records @(Get-MpThreatDetection -ErrorAction Stop)
         $started = [DateTime]::UtcNow
+        $status = Get-MpComputerStatus -ErrorAction Stop
+        if ($null -eq $status -or
+            $null -eq $status.PSObject.Properties['AMServiceEnabled'] -or $status.AMServiceEnabled -isnot [bool] -or -not $status.AMServiceEnabled -or
+            $null -eq $status.PSObject.Properties['AntivirusEnabled'] -or $status.AntivirusEnabled -isnot [bool] -or -not $status.AntivirusEnabled -or
+            $null -eq $status.PSObject.Properties['RealTimeProtectionEnabled'] -or $status.RealTimeProtectionEnabled -isnot [bool] -or -not $status.RealTimeProtectionEnabled -or
+            $null -eq $status.PSObject.Properties['AMProductVersion'] -or
+            $status.AMProductVersion -isnot [string] -or [string]::IsNullOrWhiteSpace($status.AMProductVersion) -or
+            $null -eq $status.PSObject.Properties['AMEngineVersion'] -or
+            $status.AMEngineVersion -isnot [string] -or [string]::IsNullOrWhiteSpace($status.AMEngineVersion) -or
+            $null -eq $status.PSObject.Properties['AntivirusSignatureVersion'] -or
+            $status.AntivirusSignatureVersion -isnot [string] -or [string]::IsNullOrWhiteSpace($status.AntivirusSignatureVersion) -or
+            $null -eq $status.PSObject.Properties['AntivirusSignatureLastUpdated'] -or $status.AntivirusSignatureLastUpdated -isnot [datetime]) {
+            throw 'Defender status is incomplete or protection is not enabled.'
+        }
+        $signatureUpdated = ([datetime]$status.AntivirusSignatureLastUpdated).ToUniversalTime()
+        if ($signatureUpdated -lt $started.AddHours(-72) -or $signatureUpdated -gt $started.AddMinutes(5)) { throw 'Defender signature timestamp is stale or future-dated.' }
+        $before = Get-CcodPortableInstallerDetectionKeys -Records @(Get-MpThreatDetection -ErrorAction Stop)
         $scanError = $null
         try { Start-MpScan -ScanType CustomScan -ScanPath $PayloadRoot -ErrorAction Stop }
         catch { $scanError = $_ }
         $completed = [DateTime]::UtcNow
+        if ($completed -lt $started -or $completed -gt $started.AddHours(2)) { throw 'Defender scan clock is reversed or exceeds the two-hour bound.' }
         $after = Get-CcodPortableInstallerDetectionKeys -Records @(Get-MpThreatDetection -ErrorAction Stop)
         $newDetections = @($after | Where-Object { -not $before.Contains($_) })
         if ($null -ne $scanError) {
@@ -89,10 +97,16 @@ function Invoke-CcodPortableInstallerDefenderGate {
             Throw-CcodPortableInstallerError 'CCOD_PORTABLE_DEFENDER_DETECTIONS_FOUND' 'The portable payload disappeared during its Defender scan.' $PayloadRoot
         }
         return [pscustomobject][ordered]@{
+            defenderServiceEnabled = $true
+            antivirusEnabled = $true
+            realTimeProtectionEnabled = $true
             defenderPlatformVersion = [string]$status.AMProductVersion
+            defenderEngineVersion = [string]$status.AMEngineVersion
             signatureVersion = [string]$status.AntivirusSignatureVersion
+            signatureUpdatedAtUtc = $signatureUpdated.ToString('o',[Globalization.CultureInfo]::InvariantCulture)
             scanStartedAtUtc = $started.ToString('o',[Globalization.CultureInfo]::InvariantCulture)
             scanCompletedAtUtc = $completed.ToString('o',[Globalization.CultureInfo]::InvariantCulture)
+            detectionCount = 0
         }
     } catch {
         if ($_.FullyQualifiedErrorId -match '^CCOD_PORTABLE_') { throw }

@@ -46,19 +46,19 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 ## 快速开始
 
-1. 从 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 下载 `CodexRemote-fix-2.5.22-setup.exe`（推荐安装包）或便携 ZIP `CodexRemote-fix-2.5.22-windows-x64.zip`；下载并核对对应的 `.sha256.txt`。
+1. 当 v2.5.22 候选资产已出现在 [Releases](https://github.com/naipi11/CodexRemote-fix/releases) 页面时，下载 `CodexRemote-fix-2.5.22-setup.exe`（推荐安装包）或便携 ZIP `CodexRemote-fix-2.5.22-windows-x64.zip`；下载并核对对应的 `.sha256.txt`。
 2. 选择安装包时直接运行并跟随向导；选择便携 ZIP 时解压到新空目录，然后双击 `CodexRemote-fix.exe`。
 
    两条路径都会校验载荷、执行 Microsoft Defender 自定义扫描，并保留 DPAPI 设备密钥。
 3. 托盘守护程序会自动启动。连接状态显示 **已连接** 后，打开 **设置 → 连接 → 控制其他设备** 即可注册或使用。Windows 10 用户请确认已安装 .NET Framework 4.8，原生 TrayHost 需要该组件。
 
-当前便携 ZIP、SHA-256、release manifest 与 payload manifest 始终发布在
-[Releases](https://github.com/naipi11/CodexRemote-fix/releases) 页面。
+仅在候选版本的精确资产集合与校验值已经发布后，才从
+[Releases](https://github.com/naipi11/CodexRemote-fix/releases) 页面获取文件。
 
 替换便携版本前，请先运行已安装的 `Uninstall-CodexControlOtherDevices.ps1`；设置和 DPAPI 设备密钥会保留。
 
-已验证：Windows 11 · Codex Desktop `26.820.7780.0` · Node.js `22.23.1`；
-隐藏的控制器标签、重启并修复流程以及常驻远程连接均可用。
+历史开发检查使用 Windows 11、Codex Desktop `26.820.7780.0` 与 Node.js `22.23.1`；
+这些记录不构成当前 v2.5.22 的实机验收。
 
 ## 日常使用
 
@@ -81,12 +81,26 @@ CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、�
 
 ## 发布（Releases）
 
-每个带 tag 的发布都会附带 Windows 安装包和以 EXE 启动的便携 ZIP，并分别提供 SHA-256 校验文件与 release manifest。便携发行版会外发自己的 payload manifest；Setup 则内嵌并以哈希绑定版本化的 `installer-payload.manifest.json`。v2.5.22 提供：
+v2.5.22 候选版本采用精确的 11 文件公开资产契约。Defender 扫描收据仅作为验收证据，不是公开资产。
 
-- `CodexRemote-fix-2.5.22-setup.exe` 及其校验文件
-- `CodexRemote-fix-2.5.22-windows-x64.zip` 及其校验文件
+<details>
+<summary>精确的 11 文件候选资产契约</summary>
+
+- `CodexRemote-fix-2.5.22-windows-x64.zip`
+- `CodexRemote-fix-2.5.22-windows-x64.zip.sha256.txt`
+- `CodexRemote-fix-2.5.22-trayhost-provenance.json`
 - `CodexRemote-fix-2.5.22-payload-manifest.json`
-- `CodexRemote-fix-2.5.22-release-manifest.json` 和 `CodexRemote-fix-2.5.22-setup-release-manifest.json`
+- `CodexRemote-fix-2.5.22-release-manifest.json`
+- `CodexRemote-fix-2.5.22-setup.exe`
+- `CodexRemote-fix-2.5.22-setup.exe.sha256.txt`
+- `CodexRemote-fix-2.5.22-setup-provenance.json`
+- `CodexRemote-fix-2.5.22-setup-payload-manifest.json`
+- `CodexRemote-fix-2.5.22-setup-destination-inventory.iss`
+- `CodexRemote-fix-2.5.22-setup-release-manifest.json`
+
+</details>
+
+便携发行版会外发自己的 payload manifest；Setup 则内嵌并以哈希绑定版本化的 `installer-payload.manifest.json`。
 
 GitHub Release 正文只发布英文更新说明；本 README 继续保留中英文使用说明。
 完整历史见 [CHANGELOG.md](CHANGELOG.md)。

@@ -14,6 +14,7 @@ No unreleased changes.
 - Rejected hard-linked install leaves before writes and added independent Setup PE/provenance validation for version, commit, and the activation payload-manifest hash.
 - Added bounded same-root process-tree rereads while preserving strict root and per-process identity checks during close and remote rebind.
 - Correlated native tray actions with the acknowledged presentation revision and durable, bounded terminal diagnostics; stale actions now produce a sanitized support code.
+- Made v2.5.22 candidate promotion require two distinct InternetDownload Defender receipts for the exact Setup and portable ZIP identities; workflow-artifact evidence cannot substitute.
 
 ### 简体中文
 
@@ -21,6 +22,7 @@ No unreleased changes.
 - 在写入前拒绝安装目录中的硬链接叶子，并独立校验 Setup PE/构建 provenance 所绑定的版本、commit 与激活 payload-manifest 哈希。
 - 为同一根进程加入有界 process-tree 重读，同时在关闭和远程重绑定时继续严格校验根进程与每个成员的身份。
 - 将原生托盘操作绑定到已确认的 presentation revision 和持久、有界的终态诊断；过期操作会记录清理后的支持代码。
+- v2.5.22 候选版本只有在精确 Setup 与便携 ZIP 分别具备不同的 InternetDownload Defender 收据后才能提升；工作流产物证据不能替代它们。
 
 ## v2.5.21
 

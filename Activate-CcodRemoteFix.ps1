@@ -66,6 +66,60 @@ function Get-CcodActivationFileSha256 {
     finally{if($null-ne$stream){$stream.Dispose()};$sha.Dispose()}
 }
 
+function Get-CcodSetupDefenderDetectionKeys {
+    param($Records)
+    $keys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($record in @($Records)) {
+        if ($null -eq $record) { continue }
+        $threat = if ($null -ne $record.PSObject.Properties['ThreatID']) { [string]$record.ThreatID } else { '' }
+        $time = if ($null -ne $record.PSObject.Properties['InitialDetectionTime']) { [string]$record.InitialDetectionTime } else { '' }
+        $resources = if ($null -ne $record.PSObject.Properties['Resources']) { (@($record.Resources) -join '|') } else { '' }
+        if (-not [string]::IsNullOrWhiteSpace($threat) -or -not [string]::IsNullOrWhiteSpace($time) -or -not [string]::IsNullOrWhiteSpace($resources)) { [void]$keys.Add("$threat|$time|$resources") }
+    }
+    Write-Output -NoEnumerate $keys
+}
+
+function Invoke-CcodSetupPackageDefenderGate {
+    param([Parameter(Mandatory)][string]$PackagePath)
+    $started = [datetime]::UtcNow
+    try { $status = Get-MpComputerStatus -ErrorAction Stop }
+    catch { throw 'CCOD_SETUP_DEFENDER_STATUS_INVALID' }
+    if ($null -eq $status -or
+        $null -eq $status.PSObject.Properties['AMServiceEnabled'] -or $status.AMServiceEnabled -isnot [bool] -or -not $status.AMServiceEnabled -or
+        $null -eq $status.PSObject.Properties['AntivirusEnabled'] -or $status.AntivirusEnabled -isnot [bool] -or -not $status.AntivirusEnabled -or
+        $null -eq $status.PSObject.Properties['RealTimeProtectionEnabled'] -or $status.RealTimeProtectionEnabled -isnot [bool] -or -not $status.RealTimeProtectionEnabled -or
+        $null -eq $status.PSObject.Properties['AMProductVersion'] -or $status.AMProductVersion -isnot [string] -or [string]::IsNullOrWhiteSpace($status.AMProductVersion) -or
+        $null -eq $status.PSObject.Properties['AMEngineVersion'] -or $status.AMEngineVersion -isnot [string] -or [string]::IsNullOrWhiteSpace($status.AMEngineVersion) -or
+        $null -eq $status.PSObject.Properties['AntivirusSignatureVersion'] -or $status.AntivirusSignatureVersion -isnot [string] -or [string]::IsNullOrWhiteSpace($status.AntivirusSignatureVersion) -or
+        $null -eq $status.PSObject.Properties['AntivirusSignatureLastUpdated'] -or $status.AntivirusSignatureLastUpdated -isnot [datetime]) {
+        throw 'CCOD_SETUP_DEFENDER_STATUS_INVALID'
+    }
+    $signatureUpdated = ([datetime]$status.AntivirusSignatureLastUpdated).ToUniversalTime()
+    if ($signatureUpdated -lt $started.AddHours(-72) -or $signatureUpdated -gt $started.AddMinutes(5)) { throw 'CCOD_SETUP_DEFENDER_STATUS_INVALID' }
+    try { $before = Get-CcodSetupDefenderDetectionKeys -Records @(Get-MpThreatDetection -ErrorAction Stop) }
+    catch { throw 'CCOD_SETUP_DEFENDER_STATUS_INVALID' }
+    try { Start-MpScan -ScanType CustomScan -ScanPath $PackagePath -ErrorAction Stop }
+    catch { throw 'CCOD_SETUP_DEFENDER_SCAN_FAILED' }
+    $completed = [datetime]::UtcNow
+    if ($completed -lt $started -or $completed -gt $started.AddHours(2)) { throw 'CCOD_SETUP_DEFENDER_CLOCK_INVALID' }
+    try { $after = Get-CcodSetupDefenderDetectionKeys -Records @(Get-MpThreatDetection -ErrorAction Stop) }
+    catch { throw 'CCOD_SETUP_DEFENDER_STATUS_INVALID' }
+    $newDetections = @($after | Where-Object { -not $before.Contains($_) })
+    if ($newDetections.Count -ne 0) { throw 'CCOD_SETUP_DEFENDER_DETECTIONS_FOUND' }
+    return [pscustomobject][ordered]@{
+        defenderServiceEnabled=$true
+        antivirusEnabled=$true
+        realTimeProtectionEnabled=$true
+        defenderPlatformVersion=[string]$status.AMProductVersion
+        defenderEngineVersion=[string]$status.AMEngineVersion
+        signatureVersion=[string]$status.AntivirusSignatureVersion
+        signatureUpdatedAtUtc=$signatureUpdated.ToString('o',[Globalization.CultureInfo]::InvariantCulture)
+        scanStartedAtUtc=$started.ToString('o',[Globalization.CultureInfo]::InvariantCulture)
+        scanCompletedAtUtc=$completed.ToString('o',[Globalization.CultureInfo]::InvariantCulture)
+        detectionCount=0
+    }
+}
+
 function Test-CcodActivationPackageRelativePath {
     param($Path)
     return $Path-is[string]-and$Path-cmatch'^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$'-and-not$Path.Contains('//')-and-not$Path.Contains('..')-and-not$Path.Contains(':')-and-not$Path.Contains('\')-and-not$Path.EndsWith('/')
@@ -89,7 +143,7 @@ function Open-CcodInstallerPackageSeal {
         if($entries.Count-ne$expected.Count+1-or-not$entries.ContainsKey('installer-payload.manifest.json')){throw 'CCOD_INSTALLER_PACKAGE_INVALID'}
         foreach($pair in $expected.GetEnumerator()){$entry=$entries[$pair.Key];$record=$pair.Value;if([int64]$entry.Length-ne[int64]$record.length){throw 'CCOD_INSTALLER_PACKAGE_INVALID'};$stream=$entry.Open();$sha=[Security.Cryptography.SHA256]::Create();try{$hash=[BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose();$stream.Dispose()};if($hash-cne[string]$record.sha256){throw 'CCOD_INSTALLER_PACKAGE_INVALID'}}
         $payloadEntry=$entries['installer-payload.manifest.json'];$stream=$payloadEntry.Open();$sha=[Security.Cryptography.SHA256]::Create();try{$payloadHash=[BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose();$stream.Dispose()};if([int64]$payloadEntry.Length-ne[int64]$manifest.payloadManifest.length-or$payloadHash-cne[string]$manifest.payloadManifest.sha256){throw 'CCOD_INSTALLER_PACKAGE_INVALID'}
-        return [pscustomobject]@{PackageStream=$packageStream;ManifestStream=$manifestStream;Archive=$archive;Manifest=$manifest;Entries=$entries;PayloadManifestSha256=$payloadHash}
+        return [pscustomobject]@{PackagePath=$package;PackageStream=$packageStream;ManifestStream=$manifestStream;Archive=$archive;Manifest=$manifest;Entries=$entries;PayloadManifestSha256=$payloadHash}
     }catch{if($null-ne$archive){$archive.Dispose()};if($null-ne$manifestStream){$manifestStream.Dispose()};if($null-ne$packageStream){$packageStream.Dispose()};throw}
 }
 
@@ -851,6 +905,7 @@ if ($packageBound) {
     if ([string]::IsNullOrWhiteSpace($PackagePath) -or [string]::IsNullOrWhiteSpace($PackageManifestPath) -or [string]::IsNullOrWhiteSpace($ExpectedPackageSha256) -or [string]::IsNullOrWhiteSpace($ExpectedPackageManifestSha256) -or [string]::IsNullOrWhiteSpace($ExpectedVersion) -or [string]::IsNullOrWhiteSpace($ExpectedGitCommit)) { throw 'CCOD_INSTALLER_PACKAGE_INVALID' }
     try {
         $packageSeal = Open-CcodInstallerPackageSeal -PackagePath $PackagePath -PackageManifestPath $PackageManifestPath -ExpectedPackageSha256 $ExpectedPackageSha256 -ExpectedPackageManifestSha256 $ExpectedPackageManifestSha256 -ExpectedVersion $ExpectedVersion -ExpectedGitCommit $ExpectedGitCommit
+        $packageDefender = Invoke-CcodSetupPackageDefenderGate -PackagePath ([string]$packageSeal.PackagePath)
         $packageAppRoot = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-package-' + [guid]::NewGuid().ToString('N'))
         [IO.Directory]::CreateDirectory((Join-Path $packageAppRoot 'payload')) | Out-Null
         $PayloadRoot = Join-Path (Join-Path $packageAppRoot 'payload') $ExpectedVersion

@@ -338,6 +338,11 @@ $Version = $Version.TrimStart('v')
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid project version for the portable bundle: $Version" }
 if ($Version -cne $packageVersion) { throw "Requested release version $Version does not match package.json version $packageVersion" }
 Assert-CcodBuildCleanCheckout -RepositoryRoot $repoRoot
+$releaseAssetContractPath = Join-Path $repoRoot 'tools\ReleaseAssetContract.psm1'
+if (-not [IO.File]::Exists($releaseAssetContractPath)) { throw "Release asset contract is missing: $releaseAssetContractPath" }
+Import-Module $releaseAssetContractPath -Force -ErrorAction Stop
+$releaseAssetNames = @(Get-CcodExpectedReleaseAssetNames -Version $Version)
+if ($releaseAssetNames.Count -ne 11) { throw 'Release asset contract did not return exactly eleven ordered names.' }
 $gitCommit = Get-CcodBuildGitCommit -RepositoryRoot $repoRoot
 $buildTimestampUtc = [DateTime]::UtcNow.ToString('o',[Globalization.CultureInfo]::InvariantCulture)
 
@@ -351,17 +356,17 @@ if ($UseExistingTrayHost) {
 
 $dist = Join-Path $PSScriptRoot 'dist'
 [IO.Directory]::CreateDirectory($dist) | Out-Null
-$bundle = Join-Path $dist "CodexRemote-fix-$Version-windows-x64.zip"
-$checksum = "$bundle.sha256.txt"
-$provenance = Join-Path $dist "CodexRemote-fix-$Version-trayhost-provenance.json"
-$payloadManifestAsset = Join-Path $dist "CodexRemote-fix-$Version-payload-manifest.json"
-$releaseManifest = Join-Path $dist "CodexRemote-fix-$Version-release-manifest.json"
-$setupExe = Join-Path $dist "CodexRemote-fix-$Version-setup.exe"
-$setupChecksum = "$setupExe.sha256.txt"
-$setupProvenance = Join-Path $dist "CodexRemote-fix-$Version-setup-provenance.json"
-$setupPayloadInput = Join-Path $dist "CodexRemote-fix-$Version-setup-payload-manifest.json"
-$setupInventoryInput = Join-Path $dist "CodexRemote-fix-$Version-setup-destination-inventory.iss"
-$setupReleaseManifest = Join-Path $dist "CodexRemote-fix-$Version-setup-release-manifest.json"
+$bundle = Join-Path $dist $releaseAssetNames[0]
+$checksum = Join-Path $dist $releaseAssetNames[1]
+$provenance = Join-Path $dist $releaseAssetNames[2]
+$payloadManifestAsset = Join-Path $dist $releaseAssetNames[3]
+$releaseManifest = Join-Path $dist $releaseAssetNames[4]
+$setupExe = Join-Path $dist $releaseAssetNames[5]
+$setupChecksum = Join-Path $dist $releaseAssetNames[6]
+$setupProvenance = Join-Path $dist $releaseAssetNames[7]
+$setupPayloadInput = Join-Path $dist $releaseAssetNames[8]
+$setupInventoryInput = Join-Path $dist $releaseAssetNames[9]
+$setupReleaseManifest = Join-Path $dist $releaseAssetNames[10]
 foreach ($path in @($bundle,$checksum,$provenance,$payloadManifestAsset,$releaseManifest,$setupExe,$setupChecksum,$setupProvenance,$setupPayloadInput,$setupInventoryInput,$setupReleaseManifest)) {
     if ([IO.File]::Exists($path) -or [IO.Directory]::Exists($path)) { throw "Refusing to overwrite immutable release output: $path" }
 }
@@ -556,6 +561,7 @@ $setupRecord = [ordered]@{
 }
 Write-CcodBuildUtf8 -Path $setupReleaseManifest -Text (($setupRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
 Test-CcodReleaseAssetManifest -ManifestPath $setupReleaseManifest -AssetDirectory $dist -ExpectedVersion $Version | Out-Null
+Test-CcodExactReleaseAssetSet -AssetDirectory $dist -Version $Version | Out-Null
 
 Write-Host ''
 Write-Host 'Installer build completed:' -ForegroundColor Green

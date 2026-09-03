@@ -148,6 +148,7 @@ foreach ($required in @(
     'tests\persistence\UninstallBootstrap.SelfTest.ps1',
     'tests\persistence\InstalledLifecycleHarness.SelfTest.ps1',
     'tests\persistence\ReleaseWorkflow.SelfTest.ps1',
+    'tools\ReleaseAssetContract.psm1',
     'tools\Test-ReleaseDefender.ps1',
     'tests\persistence\WorkerRuntime.SelfTest.ps1'
 )) {

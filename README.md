@@ -50,14 +50,13 @@ that existing page and leaves the Codex UI, account authorization, and enrollmen
 ## Quick start
 
 
-1. Download either `CodexRemote-fix-2.5.22-setup.exe` (recommended installer) or `CodexRemote-fix-2.5.22-windows-x64.zip` from [Releases](https://github.com/naipi11/CodexRemote-fix/releases). Download and verify the matching `.sha256.txt` before continuing.
+1. When the v2.5.22 candidate assets are available on [Releases](https://github.com/naipi11/CodexRemote-fix/releases), download either `CodexRemote-fix-2.5.22-setup.exe` (recommended installer) or `CodexRemote-fix-2.5.22-windows-x64.zip`. Download and verify the matching `.sha256.txt` before continuing.
 2. If you chose the setup installer, run it and follow the wizard. If you chose the portable ZIP, extract it into a new empty folder and double-click `CodexRemote-fix.exe`.
 
    Both paths validate the payload, run a Microsoft Defender custom scan, and preserve the DPAPI device-key store.
 3. The tray supervisor starts automatically. When the connection reports **Connected**, open **Settings → Connections → Control other devices** to enroll or use the device. Windows 10 users should ensure that .NET Framework 4.8 is installed for the native TrayHost.
 
-The current portable bundle, checksum, release manifest, and payload manifest are always published on the
-[Releases](https://github.com/naipi11/CodexRemote-fix/releases) page.
+Use the [Releases](https://github.com/naipi11/CodexRemote-fix/releases) page only after the candidate's exact asset set and checksums have been posted.
 
 Before replacing a portable build, use its installed `Uninstall-CodexControlOtherDevices.ps1`;
 settings and the DPAPI device-key store stay in place.
@@ -86,12 +85,26 @@ The tray reports two independent, truthful status lines instead of inferring rea
 
 ## Releases
 
-Every tagged release ships a Windows setup installer and an EXE-entry portable ZIP with separate SHA-256 checksums and release manifests. The portable distribution publishes its payload manifest as an asset; Setup embeds and hash-binds its versioned `installer-payload.manifest.json`. For v2.5.22, download:
+The v2.5.22 candidate has an exact 11-file public asset contract. Defender scan receipts are acceptance evidence and are not public assets.
 
-- `CodexRemote-fix-2.5.22-setup.exe` and its checksum
-- `CodexRemote-fix-2.5.22-windows-x64.zip` and its checksum
+<details>
+<summary>Exact 11-file candidate asset contract</summary>
+
+- `CodexRemote-fix-2.5.22-windows-x64.zip`
+- `CodexRemote-fix-2.5.22-windows-x64.zip.sha256.txt`
+- `CodexRemote-fix-2.5.22-trayhost-provenance.json`
 - `CodexRemote-fix-2.5.22-payload-manifest.json`
-- `CodexRemote-fix-2.5.22-release-manifest.json` and `CodexRemote-fix-2.5.22-setup-release-manifest.json`
+- `CodexRemote-fix-2.5.22-release-manifest.json`
+- `CodexRemote-fix-2.5.22-setup.exe`
+- `CodexRemote-fix-2.5.22-setup.exe.sha256.txt`
+- `CodexRemote-fix-2.5.22-setup-provenance.json`
+- `CodexRemote-fix-2.5.22-setup-payload-manifest.json`
+- `CodexRemote-fix-2.5.22-setup-destination-inventory.iss`
+- `CodexRemote-fix-2.5.22-setup-release-manifest.json`
+
+</details>
+
+The portable distribution publishes its payload manifest as an asset. Setup embeds and hash-binds its versioned `installer-payload.manifest.json`.
 
 Each release appends a short English change summary to the GitHub release body. The bilingual release history is kept in [CHANGELOG.md](CHANGELOG.md).
 

@@ -3774,8 +3774,8 @@ $results += Invoke-CcodTest 'installer exposes CodexRemote-fix as the searchable
     Assert-CcodEqual 4 @($lines | Where-Object { $_ -cmatch '^Source: .*Flags: dontcopy$' }).Count 'Setup carries only four sealed temporary inputs'
 
     $buildScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
-    Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-windows-x64\.zip') 'build script locates the public portable ZIP filename'
-    Assert-CcodTrue ($buildScript -cmatch '\$bundle\.sha256\.txt') 'build script writes a hash beside the public portable ZIP filename'
+    Assert-CcodTrue ($buildScript -cmatch 'ReleaseAssetContract\.psm1' -and $buildScript -cmatch '\$bundle\s*=\s*Join-Path\s+\$dist\s+\$releaseAssetNames\[0\]') 'build script locates the public portable ZIP through the central contract'
+    Assert-CcodTrue ($buildScript -cmatch '\$checksum\s*=\s*Join-Path\s+\$dist\s+\$releaseAssetNames\[1\]') 'build script locates the public ZIP checksum through the central contract'
 }
 
 $results += Invoke-CcodTest 'portable builder publishes the exact CodexRemote-fix 2.5.22 release artifact contract' {
@@ -3783,8 +3783,8 @@ $results += Invoke-CcodTest 'portable builder publishes the exact CodexRemote-fi
     Assert-CcodEqual '2.5.22' ([string]$package.version) 'package version is exactly 2.5.22'
 
     $buildScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
-    Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-windows-x64\.zip') 'portable build resolves the exact public ZIP filename'
-    Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-payload-manifest\.json') 'portable build publishes a separately bound payload manifest'
+    Assert-CcodTrue ($buildScript -cmatch '\$bundle\s*=\s*Join-Path\s+\$dist\s+\$releaseAssetNames\[0\]') 'portable build resolves the exact public ZIP through the central contract'
+    Assert-CcodTrue ($buildScript -cmatch '\$payloadManifestAsset\s*=\s*Join-Path\s+\$dist\s+\$releaseAssetNames\[3\]') 'portable build publishes the separately bound payload manifest through the central contract'
     Assert-CcodTrue ($buildScript -cmatch 'schemaVersion = 2') 'portable build writes a schema-two release manifest'
     Assert-CcodTrue ($buildScript -cmatch "distribution = 'portable-zip'") 'portable build labels the release distribution explicitly'
 }

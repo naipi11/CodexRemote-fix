@@ -3,6 +3,9 @@ $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $defenderPath = Join-Path $repositoryRoot 'tools\Test-ReleaseDefender.ps1'
+$assetContractPath = Join-Path $repositoryRoot 'tools\ReleaseAssetContract.psm1'
+
+function Invoke-CcodTask5Test([string]$Id,[string]$Name,[scriptblock]$Action){if(-not[string]::IsNullOrWhiteSpace($env:CCOD_TASK5_RED_CASE)-and$env:CCOD_TASK5_RED_CASE-cne$Id){return};Invoke-CcodTest $Name $Action}
 
 function ConvertFrom-CcodWorkflowScalar {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
@@ -264,6 +267,95 @@ function New-CcodPortableReleaseFixture {
     return [pscustomobject]@{Root=$root;Bundle=$bundle;Checksum=$checksum;PayloadManifest=$payloadAsset;Manifest=$manifest}
 }
 
+function Get-CcodTask5ExpectedAssetNames([string]$Version='2.5.22'){
+    @(
+        "CodexRemote-fix-$Version-windows-x64.zip",
+        "CodexRemote-fix-$Version-windows-x64.zip.sha256.txt",
+        "CodexRemote-fix-$Version-trayhost-provenance.json",
+        "CodexRemote-fix-$Version-payload-manifest.json",
+        "CodexRemote-fix-$Version-release-manifest.json",
+        "CodexRemote-fix-$Version-setup.exe",
+        "CodexRemote-fix-$Version-setup.exe.sha256.txt",
+        "CodexRemote-fix-$Version-setup-provenance.json",
+        "CodexRemote-fix-$Version-setup-payload-manifest.json",
+        "CodexRemote-fix-$Version-setup-destination-inventory.iss",
+        "CodexRemote-fix-$Version-setup-release-manifest.json"
+    )
+}
+
+function New-CcodTask5ExactAssetFixture {
+    $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-task5-assets-'+[guid]::NewGuid().ToString('N'));$outside=Join-Path ([IO.Path]::GetTempPath()) ('ccod-task5-assets-outside-'+[guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($root)|Out-Null;[IO.Directory]::CreateDirectory($outside)|Out-Null
+    $version='2.5.22';$commit='c'*40;$timestamp='2030-02-03T04:05:06.0000000Z';$names=Get-CcodTask5ExpectedAssetNames $version
+    $stage=Join-Path $root '.stage';$payload=Join-Path $stage 'payload';[IO.Directory]::CreateDirectory($payload)|Out-Null
+    [IO.File]::WriteAllText((Join-Path $stage 'Install-CodexRemote-fix.ps1'),'Write-Output portable',[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllBytes((Join-Path $stage 'CodexRemote-fix.exe'),[byte[]](1,2,3,4));[IO.File]::WriteAllText((Join-Path $stage 'CodexRemote-fix.exe.config'),'<configuration/>',[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllText((Join-Path $payload 'hello.txt'),'payload',[Text.UTF8Encoding]::new($false))
+    $payloadFile=Join-Path $payload 'hello.txt';$payloadRecord=[ordered]@{path='hello.txt';length=[int64](Get-Item $payloadFile).Length;sha256=Get-CcodTestFileSha256 $payloadFile};$payloadManifest=[ordered]@{schemaVersion=1;product='CodexRemote-fix';version=$version;gitCommit=$commit;buildTimestampUtc=$timestamp;files=@($payloadRecord)}
+    [IO.File]::WriteAllText((Join-Path $stage 'payload-manifest.json'),($payloadManifest|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false));Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop;[IO.Compression.ZipFile]::CreateFromDirectory($stage,(Join-Path $root $names[0]),[IO.Compression.CompressionLevel]::Optimal,$false);Remove-Item -LiteralPath $stage -Recurse -Force
+    [IO.File]::WriteAllText((Join-Path $root $names[1]),((Get-CcodTestFileSha256 (Join-Path $root $names[0]))+' *'+$names[0]),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $root $names[2]),([ordered]@{schemaVersion=1;product='CodexRemote-fix';version=$version;gitCommit=$commit;buildTimestampUtc=$timestamp}|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $root $names[3]),($payloadManifest|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $root $names[5]),'setup-bytes',[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllText((Join-Path $root $names[6]),((Get-CcodTestFileSha256 (Join-Path $root $names[5]))+' *'+$names[5]),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $root $names[7]),([ordered]@{schemaVersion=1;product='CodexRemote-fix';version=$version;gitCommit=$commit;buildTimestampUtc=$timestamp;payloadManifest=[ordered]@{name='installer-payload.manifest.json';sha256=('d'*64)}}|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $root $names[8]),([ordered]@{schemaVersion=1;product='CodexRemote-fix';version=$version;gitCommit=$commit;payloadManifest=[ordered]@{name='installer-payload.manifest.json';sha256=('d'*64)};files=@([ordered]@{path='package.json';length=[int64]1;sha256=('e'*64)})}|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllText((Join-Path $root $names[9]),"procedure AddCcodExpectedSetupDirectories(Directories: TStrings);`r`nbegin`r`nend;`r`n",[Text.UTF8Encoding]::new($false))
+    $portableAssets=@([ordered]@{name=$names[0];sha256=Get-CcodTestFileSha256 (Join-Path $root $names[0])},[ordered]@{name=$names[1];sha256=Get-CcodTestFileSha256 (Join-Path $root $names[1])},[ordered]@{name=$names[2];sha256=Get-CcodTestFileSha256 (Join-Path $root $names[2])},[ordered]@{name=$names[3];sha256=Get-CcodTestFileSha256 (Join-Path $root $names[3])},[ordered]@{name='CodexRemote-fix.exe';sha256=('1'*64)},[ordered]@{name='CodexRemote-fix.exe.config';sha256=('2'*64)})
+    [IO.File]::WriteAllText((Join-Path $root $names[4]),([ordered]@{schemaVersion=2;product='CodexRemote-fix';version=$version;gitCommit=$commit;buildTimestampUtc=$timestamp;distribution='portable-zip';assets=$portableAssets}|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    $setupAssets=@([ordered]@{name=$names[5];sha256=Get-CcodTestFileSha256 (Join-Path $root $names[5])},[ordered]@{name=$names[6];sha256=Get-CcodTestFileSha256 (Join-Path $root $names[6])},[ordered]@{name=$names[2];sha256=Get-CcodTestFileSha256 (Join-Path $root $names[2])},[ordered]@{name=$names[7];sha256=Get-CcodTestFileSha256 (Join-Path $root $names[7])},[ordered]@{name=$names[8];sha256=Get-CcodTestFileSha256 (Join-Path $root $names[8])},[ordered]@{name=$names[9];sha256=Get-CcodTestFileSha256 (Join-Path $root $names[9])})
+    [IO.File]::WriteAllText((Join-Path $root $names[10]),([ordered]@{schemaVersion=1;product='CodexRemote-fix';version=$version;gitCommit=$commit;buildTimestampUtc=$timestamp;assets=$setupAssets}|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+    [pscustomobject]@{Root=$root;OriginalRoot=$root;Outside=$outside;Names=$names;Version=$version;GitCommit=$commit;Timestamp=$timestamp}
+}
+
+function Remove-CcodTask5ExactAssetFixture($Fixture){foreach($path in @($Fixture.Root,$Fixture.OriginalRoot,$Fixture.Outside)){if([string]::IsNullOrWhiteSpace([string]$path)){continue};$full=[IO.Path]::GetFullPath([string]$path);$temp=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')+'\';if(-not$full.StartsWith($temp,[StringComparison]::OrdinalIgnoreCase)){throw 'refusing non-temp asset fixture cleanup'};if(Test-Path -LiteralPath $full){Remove-Item -LiteralPath $full -Recurse -Force}}}
+
+function New-CcodTask5DefenderStatus {
+    [pscustomobject][ordered]@{AMServiceEnabled=$true;AntivirusEnabled=$true;RealTimeProtectionEnabled=$true;AMProductVersion='4.18.26070.1';AMEngineVersion='1.1.26070.1';AntivirusSignatureVersion='1.999.1.0';AntivirusSignatureLastUpdated=[datetime]::Parse('2030-02-03T02:05:06Z').ToUniversalTime()}
+}
+
+function New-CcodTask5DefenderAdapterFixture {
+    param($Status=(New-CcodTask5DefenderStatus),[datetime]$Started=([datetime]::Parse('2030-02-03T04:05:06Z').ToUniversalTime()),$Completed=([datetime]::Parse('2030-02-03T04:05:07Z').ToUniversalTime()),[switch]$ScanThrows,[switch]$Detects,[switch]$WriteThrows)
+    $state=[pscustomobject]@{Capture=$null;Clock=0;Threat=0;Calls=[Collections.Generic.List[string]]::new()}
+    $adapters=@{
+        GetFileSha256={param($Path)$state.Calls.Add('Hash');Get-CcodTestFileSha256 $Path}.GetNewClosure()
+        GetDefenderStatus={ $state.Calls.Add('Status');$Status }.GetNewClosure()
+        StartCustomScan={param($Path)$state.Calls.Add('Scan');if($ScanThrows){throw 'fixture scan failure'}}.GetNewClosure()
+        GetThreatDetections={$state.Calls.Add('Threat');$state.Threat++;if($Detects-and$state.Threat-gt1){@([pscustomobject]@{ThreatID=99;InitialDetectionTime='2030-02-03T04:05:06.0000000Z';Resources=@('redacted')})}else{@()}}.GetNewClosure()
+        GetUtcNow={$state.Calls.Add('Clock');$state.Clock++;if($state.Clock-eq1){$Started}else{$Completed}}.GetNewClosure()
+        WriteReceipt={param($Path,$Receipt)$state.Calls.Add('Write');if($WriteThrows){throw 'fixture evidence write failure'};$state.Capture=(($Receipt|ConvertTo-Json -Depth 12 -Compress)|ConvertFrom-Json);$Path}.GetNewClosure()
+    }
+    [pscustomobject]@{Adapters=$adapters;State=$state}
+}
+
+function New-CcodTask5WorkflowIdentity([string]$Commit=('a'*40)){
+    [pscustomobject][ordered]@{provider='GitHubActions';repository='naipi11/CodexRemote-fix';runId=[uint64]123;runAttempt=[uint64]2;artifactId=[uint64]456;artifactName='CodexRemote-fix portable bundle';artifactDigest=('sha256:'+('9'*64));gitCommit=$Commit}
+}
+
+function New-CcodTask5DefenderReceipt {
+    param([ValidateSet('Setup','PortableZip')][string]$AssetType='Setup',[string]$Version='2.5.22',[string]$Commit=('c'*40),[ValidateSet('InternetDownload','TrustedWorkflowArtifact')][string]$Origin='InternetDownload')
+    $names=Get-CcodTask5ExpectedAssetNames $Version;$setup=$AssetType-ceq'Setup'
+    [pscustomobject][ordered]@{schemaVersion=2;assetType=$AssetType;assetName=$(if($setup){$names[5]}else{$names[0]});assetSha256=$(if($setup){'5'*64}else{'0'*64});checksumName=$(if($setup){$names[6]}else{$names[1]});checksumSha256=$(if($setup){'6'*64}else{'1'*64});manifestName=$(if($setup){$names[10]}else{$names[4]});manifestSha256=$(if($setup){'a'*64}else{'4'*64});version=$Version;gitCommit=$Commit;origin=$Origin;workflowArtifactIdentity=$(if($Origin-ceq'TrustedWorkflowArtifact'){New-CcodTask5WorkflowIdentity $Commit}else{$null});zoneId=$(if($Origin-ceq'InternetDownload'){3}else{$null});defenderServiceEnabled=$true;antivirusEnabled=$true;realTimeProtectionEnabled=$true;defenderPlatformVersion='4.18.26070.1';defenderEngineVersion='1.1.26070.1';signatureVersion='1.999.1.0';signatureUpdatedAtUtc='2030-02-03T02:05:06.0000000Z';scanStartedAtUtc='2030-02-03T04:05:06.0000000Z';scanCompletedAtUtc='2030-02-03T04:05:07.0000000Z';detectionCount=0;outcome='Completed';errorCode=$null}
+}
+
+function Get-CcodTask5PromotionReceiptNames([string]$Version='2.5.22'){
+    @("CodexRemote-fix-$Version-setup.internet-download.defender.json","CodexRemote-fix-$Version-windows-x64.internet-download.defender.json")
+}
+
+function Write-CcodTask5Json {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Value)
+    [IO.File]::WriteAllText($Path,(($Value|ConvertTo-Json -Depth 12)+[Environment]::NewLine),[Text.UTF8Encoding]::new($false))
+}
+
+function New-CcodTask5PromotionFixture {
+    param([Parameter(Mandatory)]$AssetFixture)
+    $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-task5-promotion-'+[guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($root)|Out-Null
+    $names=Get-CcodTask5PromotionReceiptNames
+    $setup=New-CcodTask5DefenderReceipt -AssetType Setup
+    $portable=New-CcodTask5DefenderReceipt -AssetType PortableZip
+    $setup.assetSha256=Get-CcodTestFileSha256 (Join-Path $AssetFixture.Root $AssetFixture.Names[5]);$setup.checksumSha256=Get-CcodTestFileSha256 (Join-Path $AssetFixture.Root $AssetFixture.Names[6]);$setup.manifestSha256=Get-CcodTestFileSha256 (Join-Path $AssetFixture.Root $AssetFixture.Names[10])
+    $portable.assetSha256=Get-CcodTestFileSha256 (Join-Path $AssetFixture.Root $AssetFixture.Names[0]);$portable.checksumSha256=Get-CcodTestFileSha256 (Join-Path $AssetFixture.Root $AssetFixture.Names[1]);$portable.manifestSha256=Get-CcodTestFileSha256 (Join-Path $AssetFixture.Root $AssetFixture.Names[4])
+    Write-CcodTask5Json -Path (Join-Path $root $names[0]) -Value $setup
+    Write-CcodTask5Json -Path (Join-Path $root $names[1]) -Value $portable
+    [pscustomobject]@{Root=$root;Names=$names;Setup=$setup;Portable=$portable;Commit=('c'*40);Version='2.5.22'}
+}
+
 function Get-CcodReadOnlyProductTreeSnapshot {
     param(
         [Parameter(Mandatory)][string]$Root,
@@ -302,6 +394,106 @@ function Get-CcodReadOnlyProductTreeSnapshot {
     }
     $comparison=[System.Comparison[object]]{param($left,$right)[StringComparer]::Ordinal.Compare([string]$left.path,[string]$right.path)};$records.Sort($comparison)
     return [pscustomobject][ordered]@{root=$full;exists=$true;rootAttributes=[int]$rootItem.Attributes;rootCreationTimeUtc=$rootItem.CreationTimeUtc.ToString('o',[Globalization.CultureInfo]::InvariantCulture);rootLastWriteTimeUtc=$rootItem.LastWriteTimeUtc.ToString('o',[Globalization.CultureInfo]::InvariantCulture);entryCount=$records.Count;totalBytes=$total;records=@($records)}
+}
+
+Invoke-CcodTask5Test 'assets' 'release asset contract owns the exact ordered eleven-name set and rejects every mutation' {
+    Assert-CcodTrue (Test-Path -LiteralPath $assetContractPath -PathType Leaf) 'central release asset contract module exists'
+    $assetModule=Import-Module $assetContractPath -Force -PassThru -DisableNameChecking
+    try{
+        $expected=Get-CcodTask5ExpectedAssetNames '2.5.22';$actual=@(Get-CcodExpectedReleaseAssetNames -Version '2.5.22')
+        Assert-CcodEqual ($expected-join'|') ($actual-join'|') 'asset contract returns the literal ordered eleven-name set'
+        $baseline=New-CcodTask5ExactAssetFixture
+        try{$validated=Test-CcodExactReleaseAssetSet -AssetDirectory $baseline.Root -Version $baseline.Version;Assert-CcodEqual $baseline.GitCommit ([string]$validated.GitCommit) 'exact set returns the common 40-hex commit';Assert-CcodEqual $baseline.Timestamp ([string]$validated.BuildTimestampUtc) 'exact set returns the common timestamp';Assert-CcodEqual ($expected-join'|') ((@($validated.Assets.name))-join'|') 'exact set returns all public hashes in contract order'}finally{Remove-CcodTask5ExactAssetFixture $baseline}
+        foreach($missing in $expected){$fixture=New-CcodTask5ExactAssetFixture;try{Remove-Item -LiteralPath (Join-Path $fixture.Root $missing) -Force;Assert-CcodThrows {Test-CcodExactReleaseAssetSet -AssetDirectory $fixture.Root -Version $fixture.Version|Out-Null} 'CCOD_RELEASE_ASSET_SET_INVALID'}finally{Remove-CcodTask5ExactAssetFixture $fixture}}
+        foreach($mutation in @('Extra','CaseVaried','Directory','Reparse','UnsafeAncestry','NoncanonicalRoot','DuplicateTopProperty','DuplicateNestedProperty','DuplicateEscapedProperty','DuplicateManifest','ManifestOrder','CommitMismatch','TimestampMismatch','SharedProvenanceMismatch')){
+            $fixture=New-CcodTask5ExactAssetFixture
+            try{
+                switch($mutation){
+                    'Extra'{[IO.File]::WriteAllText((Join-Path $fixture.Root 'unexpected.txt'),'x',[Text.UTF8Encoding]::new($false))}
+                    'CaseVaried'{$source=Join-Path $fixture.Root $fixture.Names[0];$temporary=$source+'.case';Move-Item -LiteralPath $source -Destination $temporary;Move-Item -LiteralPath $temporary -Destination (Join-Path $fixture.Root $fixture.Names[0].ToUpperInvariant())}
+                    'Directory'{Remove-Item -LiteralPath (Join-Path $fixture.Root $fixture.Names[3]) -Force;[IO.Directory]::CreateDirectory((Join-Path $fixture.Root $fixture.Names[3]))|Out-Null}
+                    'Reparse'{Remove-Item -LiteralPath (Join-Path $fixture.Root $fixture.Names[3]) -Force;$target=Join-Path $fixture.Outside 'target';[IO.Directory]::CreateDirectory($target)|Out-Null;$previous=$ErrorActionPreference;try{$ErrorActionPreference='Continue';$out=&cmd.exe /d /c mklink /J (Join-Path $fixture.Root $fixture.Names[3]) $target 2>&1;$code=$LASTEXITCODE}finally{$ErrorActionPreference=$previous};if($code-ne0){throw "junction fixture failed: $($out-join' ')"}}
+                    'UnsafeAncestry'{$parent=Join-Path $fixture.Outside 'parent';[IO.Directory]::CreateDirectory($parent)|Out-Null;$link=Join-Path $parent 'assets';$previous=$ErrorActionPreference;try{$ErrorActionPreference='Continue';$out=&cmd.exe /d /c mklink /J $link $fixture.Root 2>&1;$code=$LASTEXITCODE}finally{$ErrorActionPreference=$previous};if($code-ne0){throw "ancestry fixture failed: $($out-join' ')"};$fixture.Root=$link}
+                    'NoncanonicalRoot'{$fixture.Root=[string]$fixture.Root+'\.'}
+                    'DuplicateTopProperty'{$manifestPath=Join-Path $fixture.Root $fixture.Names[4];$raw=[IO.File]::ReadAllText($manifestPath);$raw=[regex]::Replace($raw,'"schemaVersion"\s*:\s*2','"schemaVersion": 2, "schemaVersion": 2',1);[IO.File]::WriteAllText($manifestPath,$raw,[Text.UTF8Encoding]::new($false))}
+                    'DuplicateNestedProperty'{$manifestPath=Join-Path $fixture.Root $fixture.Names[4];$raw=[IO.File]::ReadAllText($manifestPath);$raw=[regex]::Replace($raw,'"name"\s*:\s*"([^"]+)"','"name": "$1", "name": "$1"',1);[IO.File]::WriteAllText($manifestPath,$raw,[Text.UTF8Encoding]::new($false))}
+                    'DuplicateEscapedProperty'{$manifestPath=Join-Path $fixture.Root $fixture.Names[4];$raw=[IO.File]::ReadAllText($manifestPath);$raw=[regex]::Replace($raw,'"gitCommit"\s*:\s*"([^"]+)"','"gitCommit": "$1", "\u0067itCommit": "$1"',1);[IO.File]::WriteAllText($manifestPath,$raw,[Text.UTF8Encoding]::new($false))}
+                    default{$manifestPath=Join-Path $fixture.Root $fixture.Names[4];$manifest=[IO.File]::ReadAllText($manifestPath)|ConvertFrom-Json;if($mutation-ceq'DuplicateManifest'){$manifest.assets=@($manifest.assets)+@($manifest.assets[0])}elseif($mutation-ceq'ManifestOrder'){$manifest.assets=@($manifest.assets[1],$manifest.assets[0])+@($manifest.assets|Select-Object -Skip 2)}elseif($mutation-ceq'CommitMismatch'){$manifest.gitCommit='d'*40}elseif($mutation-ceq'TimestampMismatch'){$manifest.buildTimestampUtc='2030-02-03T04:05:07.0000000Z'}else{$entry=@($manifest.assets|Where-Object{$_.name-ceq$fixture.Names[2]})[0];$entry.sha256='f'*64};[IO.File]::WriteAllText($manifestPath,($manifest|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))}
+                }
+                Assert-CcodThrows {Test-CcodExactReleaseAssetSet -AssetDirectory $fixture.Root -Version $fixture.Version|Out-Null} 'CCOD_RELEASE_ASSET_SET_INVALID'
+            }finally{Remove-CcodTask5ExactAssetFixture $fixture}
+        }
+    }finally{if($null-ne$assetModule){Remove-Module -Name $assetModule.Name -Force -ErrorAction SilentlyContinue}}
+}
+
+Invoke-CcodTask5Test 'promotion' 'promotion requires exactly distinct Setup and ZIP Internet-download Defender receipts' {
+    Assert-CcodTrue (Test-Path -LiteralPath $assetContractPath -PathType Leaf) 'central release asset contract module exists for promotion validation'
+    $assetModule=Import-Module $assetContractPath -Force -PassThru -DisableNameChecking
+    $assetFixture=$null
+    try{
+        $assetFixture=New-CcodTask5ExactAssetFixture
+        $baseline=New-CcodTask5PromotionFixture -AssetFixture $assetFixture
+        try{
+            $validated=Test-CcodReleasePromotionEvidence -EvidenceDirectory $baseline.Root -AssetDirectory $assetFixture.Root -Version $baseline.Version -ExpectedGitCommit $baseline.Commit
+            Assert-CcodEqual 'Setup,PortableZip' ((@($validated.Receipts.assetType))-join',') 'promotion returns the two distinct official asset types in contract order'
+            Assert-CcodTrue (@($validated.Receipts|Where-Object{$_.origin-cne'InternetDownload'-or$_.zoneId-ne3}).Count-eq0) 'promotion returns only actual Internet-download receipts'
+        }finally{if(Test-Path $baseline.Root){Remove-Item -LiteralPath $baseline.Root -Recurse -Force}}
+
+        foreach($shape in @('MissingSetup','MissingPortable','Extra','DuplicateSetup','DuplicatePortable','Swapped','ReusedHashes','ForgedTriplet','TrustedSubstitution')){
+            $fixture=New-CcodTask5PromotionFixture -AssetFixture $assetFixture
+            try{
+                $setupPath=Join-Path $fixture.Root $fixture.Names[0];$portablePath=Join-Path $fixture.Root $fixture.Names[1]
+                switch($shape){
+                    'MissingSetup'{Remove-Item -LiteralPath $setupPath -Force}
+                    'MissingPortable'{Remove-Item -LiteralPath $portablePath -Force}
+                    'Extra'{Write-CcodTask5Json -Path (Join-Path $fixture.Root 'unexpected.defender.json') -Value $fixture.Setup}
+                    'DuplicateSetup'{Write-CcodTask5Json -Path $portablePath -Value $fixture.Setup}
+                    'DuplicatePortable'{Write-CcodTask5Json -Path $setupPath -Value $fixture.Portable}
+                    'Swapped'{Write-CcodTask5Json -Path $setupPath -Value $fixture.Portable;Write-CcodTask5Json -Path $portablePath -Value $fixture.Setup}
+                    'ReusedHashes'{$fixture.Portable.assetSha256=$fixture.Setup.assetSha256;$fixture.Portable.checksumSha256=$fixture.Setup.checksumSha256;$fixture.Portable.manifestSha256=$fixture.Setup.manifestSha256;Write-CcodTask5Json -Path $portablePath -Value $fixture.Portable}
+                    'ForgedTriplet'{$fixture.Setup.assetSha256='b'*64;$fixture.Setup.checksumSha256='c'*64;$fixture.Setup.manifestSha256='d'*64;Write-CcodTask5Json -Path $setupPath -Value $fixture.Setup}
+                    'TrustedSubstitution'{$fixture.Setup.origin='TrustedWorkflowArtifact';$fixture.Setup.workflowArtifactIdentity=New-CcodTask5WorkflowIdentity $fixture.Commit;$fixture.Setup.zoneId=$null;Write-CcodTask5Json -Path $setupPath -Value $fixture.Setup}
+                }
+                Assert-CcodThrows {Test-CcodReleasePromotionEvidence -EvidenceDirectory $fixture.Root -AssetDirectory $assetFixture.Root -Version $fixture.Version -ExpectedGitCommit $fixture.Commit|Out-Null} 'CCOD_RELEASE_PROMOTION_EVIDENCE_INVALID'
+            }finally{if(Test-Path $fixture.Root){Remove-Item -LiteralPath $fixture.Root -Recurse -Force}}
+        }
+
+        foreach($field in @('schemaVersion','assetType','assetName','assetSha256','checksumName','checksumSha256','manifestName','manifestSha256','version','gitCommit','origin','workflowArtifactIdentity','zoneId','defenderServiceEnabled','antivirusEnabled','realTimeProtectionEnabled','defenderPlatformVersion','defenderEngineVersion','signatureVersion','signatureUpdatedAtUtc','scanStartedAtUtc','scanCompletedAtUtc','detectionCount','outcome','errorCode')){
+            $fixture=New-CcodTask5PromotionFixture -AssetFixture $assetFixture
+            try{
+                $receipt=$fixture.Setup
+                switch($field){
+                    'schemaVersion'{$receipt.schemaVersion=1}
+                    'assetType'{$receipt.assetType='PortableZip'}
+                    'assetName'{$receipt.assetName='foreign.exe'}
+                    'assetSha256'{$receipt.assetSha256='z'*64}
+                    'checksumName'{$receipt.checksumName='foreign.sha256.txt'}
+                    'checksumSha256'{$receipt.checksumSha256='z'*64}
+                    'manifestName'{$receipt.manifestName='foreign.json'}
+                    'manifestSha256'{$receipt.manifestSha256='z'*64}
+                    'version'{$receipt.version='2.5.21'}
+                    'gitCommit'{$receipt.gitCommit='b'*40}
+                    'origin'{$receipt.origin='TrustedWorkflowArtifact'}
+                    'workflowArtifactIdentity'{$receipt.workflowArtifactIdentity=New-CcodTask5WorkflowIdentity $fixture.Commit}
+                    'zoneId'{$receipt.zoneId=2}
+                    'defenderServiceEnabled'{$receipt.defenderServiceEnabled=$false}
+                    'antivirusEnabled'{$receipt.antivirusEnabled=$false}
+                    'realTimeProtectionEnabled'{$receipt.realTimeProtectionEnabled=$false}
+                    'defenderPlatformVersion'{$receipt.defenderPlatformVersion=''}
+                    'defenderEngineVersion'{$receipt.defenderEngineVersion=''}
+                    'signatureVersion'{$receipt.signatureVersion=''}
+                    'signatureUpdatedAtUtc'{$receipt.signatureUpdatedAtUtc='2030-01-01T00:00:00.0000000Z'}
+                    'scanStartedAtUtc'{$receipt.scanStartedAtUtc='not-a-clock'}
+                    'scanCompletedAtUtc'{$receipt.scanCompletedAtUtc='2030-02-03T04:05:05.0000000Z'}
+                    'detectionCount'{$receipt.detectionCount=1}
+                    'outcome'{$receipt.outcome='Failed'}
+                    'errorCode'{$receipt.errorCode='CCOD_DEFENDER_SCAN_FAILED'}
+                }
+                Write-CcodTask5Json -Path (Join-Path $fixture.Root $fixture.Names[0]) -Value $receipt
+                Assert-CcodThrows {Test-CcodReleasePromotionEvidence -EvidenceDirectory $fixture.Root -AssetDirectory $assetFixture.Root -Version $fixture.Version -ExpectedGitCommit $fixture.Commit|Out-Null} 'CCOD_RELEASE_PROMOTION_EVIDENCE_INVALID'
+            }finally{if(Test-Path $fixture.Root){Remove-Item -LiteralPath $fixture.Root -Recurse -Force}}
+        }
+    }finally{if($null-ne$assetFixture){Remove-CcodTask5ExactAssetFixture $assetFixture};if($null-ne$assetModule){Remove-Module -Name $assetModule.Name -Force -ErrorAction SilentlyContinue}}
 }
 
 Invoke-CcodTest 'release defender tool exposes manifest and scan functions without a live scan' {
@@ -1292,14 +1484,54 @@ Invoke-CcodTest 'temporary bootstrap verifies the sealed package and propagates 
         $created = New-CcodInstallerPackage -PayloadRoot $fixture.PayloadRoot -PayloadManifestPath $fixture.ManifestPath -Version '2.5.22' -GitCommit ('d' * 40) -OutputPath $packagePath -ManifestOutputPath $packageManifestPath
         $installRoot = Join-Path $fixture.AppRoot 'installed-state'
         $activationId = '77777777-6666-5555-4444-333333333333'
+        $setupScanObservation=[pscustomobject]@{Path=$null}
+        function Get-MpComputerStatus {[pscustomobject]@{AMServiceEnabled=$true;AntivirusEnabled=$true;RealTimeProtectionEnabled=$true;AMProductVersion='fixture-platform';AMEngineVersion='fixture-engine';AntivirusSignatureVersion='fixture-signature';AntivirusSignatureLastUpdated=[datetime]::UtcNow.AddHours(-1)}}
+        function Get-MpThreatDetection {param($ErrorAction)@()}
+        function Start-MpScan {param($ScanType,$ScanPath,$ErrorAction)$setupScanObservation.Path=[string]$ScanPath}
         $output = @(& (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -InstallRoot $installRoot -PackagePath $packagePath -PackageManifestPath $packageManifestPath -ExpectedPackageSha256 $created.PackageSha256 -ExpectedPackageManifestSha256 $created.ManifestSha256 -ExpectedVersion '2.5.22' -ExpectedGitCommit ('d' * 40) -ActivationId $activationId 2>&1)
         Assert-CcodEqual 0 $LASTEXITCODE "sealed package bootstrap completes: $($output -join ' ')"
+        Assert-CcodEqual ([IO.Path]::GetFullPath($packagePath)) ([string]$setupScanObservation.Path) 'Setup scans the canonical package path returned by the held seal'
         Assert-CcodEqual $created.PackageSha256 ([IO.File]::ReadAllText((Join-Path $installRoot 'sealed-package-sha256.txt'),[Text.UTF8Encoding]::new($false))) 'child receives the exact verified package identity'
         Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $installRoot "state\activation-receipts\$activationId.Ready.json") -PathType Leaf) 'bootstrap accepts only the append-only Ready receipt'
         Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $installRoot 'state\post-install-activation.json'))) 'bootstrap never creates or consumes the mutable legacy receipt'
     } finally {
         if ($null -ne $module) { Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue }
         if (Test-Path -LiteralPath $fixture.AppRoot) { Remove-Item -LiteralPath $fixture.AppRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Invoke-CcodTask5Test 'entrypoints' 'Setup Defender failure occurs after sealing and before temp expansion or activation mutation' {
+    $productionPath=Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1'
+    $productionSource=[IO.File]::ReadAllText($productionPath,[Text.UTF8Encoding]::new($false,$true))
+    $needle='$packageDefender = Invoke-CcodSetupPackageDefenderGate -PackagePath ([string]$packageSeal.PackagePath)'
+    Assert-CcodEqual 1 ([regex]::Matches($productionSource,[regex]::Escape($needle)).Count) 'Setup invokes the package Defender gate exactly once from the sealed-package branch'
+    $sealIndex=$productionSource.IndexOf('$packageSeal = Open-CcodInstallerPackageSeal',[StringComparison]::Ordinal)
+    $scanIndex=$productionSource.IndexOf($needle,[StringComparison]::Ordinal)
+    $tempIndex=$productionSource.IndexOf('$packageAppRoot = Join-Path',[StringComparison]::Ordinal)
+    Assert-CcodTrue ($sealIndex-ge0-and$scanIndex-gt$sealIndex-and$tempIndex-gt$scanIndex) 'Setup scan is ordered after exact seal and before the first extraction temp path'
+
+    $fixture=New-CcodActivationPayloadFixture
+    $module=$null
+    try{
+        $packagePath=Join-Path $fixture.AppRoot 'sealed-installer.zip';$packageManifestPath=Join-Path $fixture.AppRoot 'sealed-installer.manifest.json'
+        $module=Import-Module (Join-Path $repositoryRoot 'build\InstallerPackage.psm1') -Force -PassThru
+        $created=New-CcodInstallerPackage -PayloadRoot $fixture.PayloadRoot -PayloadManifestPath $fixture.ManifestPath -Version '2.5.22' -GitCommit ('d'*40) -OutputPath $packagePath -ManifestOutputPath $packageManifestPath
+        $injectedPath=Join-Path $fixture.AppRoot 'Activate-CcodRemoteFix-defender-failure.ps1'
+        $injectedSource=$productionSource.Replace($needle,"throw 'CCOD_SETUP_DEFENDER_SCAN_FAILED'")
+        Assert-CcodTrue ($injectedSource-cne$productionSource) 'test injection replaces only the real Setup Defender call boundary'
+        [IO.File]::WriteAllText($injectedPath,$injectedSource,[Text.UTF8Encoding]::new($false))
+        $installRoot=Join-Path $fixture.AppRoot 'must-remain-absent';$before=Get-CcodReadOnlyProductTreeSnapshot -Root $installRoot
+        $tempRoot=[IO.Path]::GetFullPath([IO.Path]::GetTempPath());$beforeTemps=@(Get-ChildItem -LiteralPath $tempRoot -Directory -Filter 'ccod-activation-package-*' -Force -ErrorAction Stop|ForEach-Object{$_.FullName}|Sort-Object)
+        $output=@(&$injectedPath -InstallRoot $installRoot -PackagePath $packagePath -PackageManifestPath $packageManifestPath -ExpectedPackageSha256 $created.PackageSha256 -ExpectedPackageManifestSha256 $created.ManifestSha256 -ExpectedVersion '2.5.22' -ExpectedGitCommit ('d'*40) -ActivationId '77777777-6666-5555-4444-333333333333' 2>&1)
+        Assert-CcodEqual 3 $LASTEXITCODE "injected sealed-package Defender failure is rejected: $($output-join' ')"
+        Assert-CcodTrue (($output-join"`n")-cmatch'CCOD_SETUP_DEFENDER_SCAN_FAILED') 'Setup preserves the stable scan failure code'
+        $after=Get-CcodReadOnlyProductTreeSnapshot -Root $installRoot
+        Assert-CcodEqual ($before|ConvertTo-Json -Depth 8 -Compress) ($after|ConvertTo-Json -Depth 8 -Compress) 'Setup scan failure creates no Prepared receipt transaction product or worker state'
+        $afterTemps=@(Get-ChildItem -LiteralPath $tempRoot -Directory -Filter 'ccod-activation-package-*' -Force -ErrorAction Stop|ForEach-Object{$_.FullName}|Sort-Object)
+        Assert-CcodEqual ($beforeTemps-join'|') ($afterTemps-join'|') 'Setup scan failure creates no package expansion directory'
+    }finally{
+        if($null-ne$module){Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue}
+        if(Test-Path $fixture.AppRoot){Remove-Item -LiteralPath $fixture.AppRoot -Recurse -Force -ErrorAction SilentlyContinue}
     }
 }
 
@@ -2208,56 +2440,69 @@ Invoke-CcodTest 'release manifest binds the TrayHost provenance timestamp to its
     }
 }
 
-Invoke-CcodTest 'Defender gate requires Internet Zone before a custom scan and writes a redacted receipt after a clean scan' {
+Invoke-CcodTask5Test 'defender' 'Defender gate binds exact origins status clocks manifests and a redacted receipt' {
+    . $defenderPath -Library;$fixture=New-CcodReleaseFixture
+    try{
+        Set-Content -LiteralPath $fixture.Installer -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3`r`n" -NoNewline
+        $clean=New-CcodTask5DefenderAdapterFixture;$receipt=Invoke-CcodReleaseDefenderCheck -CandidatePath $fixture.Installer -ChecksumPath $fixture.Checksum -ManifestPath $fixture.Manifest -Origin InternetDownload -ExpectedVersion '2.5.0' -ExpectedGitCommit ('a'*40) -EvidencePath (Join-Path $fixture.Root 'internet.json') -Adapters $clean.Adapters
+        $fields='schemaVersion,assetType,assetName,assetSha256,checksumName,checksumSha256,manifestName,manifestSha256,version,gitCommit,origin,workflowArtifactIdentity,zoneId,defenderServiceEnabled,antivirusEnabled,realTimeProtectionEnabled,defenderPlatformVersion,defenderEngineVersion,signatureVersion,signatureUpdatedAtUtc,scanStartedAtUtc,scanCompletedAtUtc,detectionCount,outcome,errorCode'
+        Assert-CcodEqual $fields (($receipt.PSObject.Properties.Name)-join',') 'receipt exposes only the exact ordered schema';Assert-CcodEqual 'InternetDownload' $receipt.origin 'official download receipt is origin-bound';Assert-CcodEqual 3 $receipt.zoneId 'official download receipt binds actual ZoneId 3';Assert-CcodEqual $null $receipt.workflowArtifactIdentity 'official download receipt has no workflow identity';Assert-CcodEqual (Get-CcodTestFileSha256 $fixture.Installer) $receipt.assetSha256 'receipt binds exact candidate hash';Assert-CcodEqual (Get-CcodTestFileSha256 $fixture.Manifest) $receipt.manifestSha256 'receipt binds exact matching manifest hash';Assert-CcodTrue (-not(($receipt|ConvertTo-Json -Depth 12 -Compress).Contains($fixture.Root))) 'receipt contains no source path or raw output'
+        $originalCandidate=[IO.File]::ReadAllBytes($fixture.Installer);$race=New-CcodTask5DefenderAdapterFixture;$race.Adapters.StartCustomScan={param($Path)$race.State.Calls.Add('Scan');$stream=[IO.File]::Open($Path,[IO.FileMode]::Append,[IO.FileAccess]::Write,[IO.FileShare]::Read);try{$stream.WriteByte(255);$stream.Flush($true)}finally{$stream.Dispose()}}.GetNewClosure()
+        try{Assert-CcodThrows {Invoke-CcodReleaseDefenderCheck -CandidatePath $fixture.Installer -ChecksumPath $fixture.Checksum -ManifestPath $fixture.Manifest -Origin InternetDownload -ExpectedVersion '2.5.0' -ExpectedGitCommit ('a'*40) -EvidencePath (Join-Path $fixture.Root 'identity-race.json') -Adapters $race.Adapters|Out-Null} 'CCOD_RELEASE_ASSET_HASH_MISMATCH';Assert-CcodTrue (-not($race.State.Calls-contains'Write')) 'post-scan candidate mutation blocks receipt write'}finally{[IO.File]::WriteAllBytes($fixture.Installer,$originalCandidate);Set-Content -LiteralPath $fixture.Installer -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3`r`n" -NoNewline}
+        Remove-Item -LiteralPath $fixture.Installer -Stream Zone.Identifier
+        foreach($zone in @($null,2)){$case=New-CcodTask5DefenderAdapterFixture;$case.Adapters.GetZoneId={param($Path)$zone}.GetNewClosure();Assert-CcodThrows {Invoke-CcodReleaseDefenderCheck -CandidatePath $fixture.Installer -ChecksumPath $fixture.Checksum -ManifestPath $fixture.Manifest -Origin InternetDownload -ExpectedVersion '2.5.0' -ExpectedGitCommit ('a'*40) -EvidencePath (Join-Path $fixture.Root "zone-$zone.json") -Adapters $case.Adapters|Out-Null} 'CCOD_DEFENDER_ZONE_REQUIRED';Assert-CcodTrue (-not($case.State.Calls-contains'Scan')) 'invalid Zone blocks scan'}
+        foreach($zoneShape in @([pscustomobject]@{Name='duplicate';Text="[ZoneTransfer]`r`nZoneId=3`r`nZoneId=3`r`n"},[pscustomobject]@{Name='mixed';Text="[ZoneTransfer]`r`nZoneId=3`r`nZoneId=2`r`n"})){Set-Content -LiteralPath $fixture.Installer -Stream Zone.Identifier -Value $zoneShape.Text -NoNewline;$case=New-CcodTask5DefenderAdapterFixture;Assert-CcodThrows {Invoke-CcodReleaseDefenderCheck -CandidatePath $fixture.Installer -ChecksumPath $fixture.Checksum -ManifestPath $fixture.Manifest -Origin InternetDownload -ExpectedVersion '2.5.0' -ExpectedGitCommit ('a'*40) -EvidencePath (Join-Path $fixture.Root "zone-$($zoneShape.Name).json") -Adapters $case.Adapters|Out-Null} 'CCOD_DEFENDER_ZONE_REQUIRED';Assert-CcodTrue (-not($case.State.Calls-contains'Scan')) "$($zoneShape.Name) ZoneId metadata blocks scan";Remove-Item -LiteralPath $fixture.Installer -Stream Zone.Identifier}
+        $identity=New-CcodTask5WorkflowIdentity ('a'*40);$trusted=New-CcodTask5DefenderAdapterFixture;$trustedReceipt=Invoke-CcodReleaseDefenderCheck -CandidatePath $fixture.Installer -ChecksumPath $fixture.Checksum -ManifestPath $fixture.Manifest -Origin TrustedWorkflowArtifact -WorkflowArtifactIdentity $identity -ExpectedVersion '2.5.0' -ExpectedGitCommit ('a'*40) -EvidencePath (Join-Path $fixture.Root 'trusted.json') -Adapters $trusted.Adapters;Assert-CcodEqual $null $trustedReceipt.zoneId 'trusted workflow receipt never claims Internet Zone';Assert-CcodEqual ($identity|ConvertTo-Json -Compress) ($trustedReceipt.workflowArtifactIdentity|ConvertTo-Json -Compress) 'trusted receipt binds exact workflow artifact identity'
+        Assert-CcodThrows {Invoke-CcodReleaseDefenderCheck -CandidatePath $fixture.Installer -ChecksumPath $fixture.Checksum -ManifestPath $fixture.Manifest -Origin TrustedWorkflowArtifact -ExpectedVersion '2.5.0' -ExpectedGitCommit ('a'*40) -EvidencePath (Join-Path $fixture.Root 'trusted-missing.json') -Adapters (New-CcodTask5DefenderAdapterFixture).Adapters|Out-Null} 'CCOD_DEFENDER_ORIGIN_INVALID'
+        Assert-CcodThrows {Invoke-CcodReleaseDefenderCheck -CandidatePath $fixture.Installer -ChecksumPath $fixture.Checksum -ManifestPath $fixture.Manifest -Origin InternetDownload -WorkflowArtifactIdentity $identity -ExpectedVersion '2.5.0' -ExpectedGitCommit ('a'*40) -EvidencePath (Join-Path $fixture.Root 'internet-identity.json') -Adapters (New-CcodTask5DefenderAdapterFixture).Adapters|Out-Null} 'CCOD_DEFENDER_ORIGIN_INVALID'
+        foreach($field in @('provider','repository','runId','runAttempt','artifactId','artifactName','artifactDigest','gitCommit')){$bad=(($identity|ConvertTo-Json -Compress)|ConvertFrom-Json);if($field-in@('runId','runAttempt','artifactId')){$bad.$field=0}elseif($field-ceq'artifactDigest'){$bad.$field='sha256:bad'}elseif($field-ceq'gitCommit'){$bad.$field='b'*40}else{$bad.$field='foreign'};Assert-CcodThrows {Invoke-CcodReleaseDefenderCheck -CandidatePath $fixture.Installer -ChecksumPath $fixture.Checksum -ManifestPath $fixture.Manifest -Origin TrustedWorkflowArtifact -WorkflowArtifactIdentity $bad -ExpectedVersion '2.5.0' -ExpectedGitCommit ('a'*40) -EvidencePath (Join-Path $fixture.Root "trusted-$field.json") -Adapters (New-CcodTask5DefenderAdapterFixture).Adapters|Out-Null} 'CCOD_DEFENDER_ORIGIN_INVALID'}
+        foreach($mutation in @('Service','Antivirus','Realtime','Platform','Engine','Signature','SignatureMissing','SignatureStale','SignatureFuture')){$status=New-CcodTask5DefenderStatus;switch($mutation){'Service'{$status.AMServiceEnabled=$false};'Antivirus'{$status.AntivirusEnabled=$false};'Realtime'{$status.RealTimeProtectionEnabled=$false};'Platform'{$status.AMProductVersion=''};'Engine'{$status.AMEngineVersion=''};'Signature'{$status.AntivirusSignatureVersion=''};'SignatureMissing'{$status.AntivirusSignatureLastUpdated=$null};'SignatureStale'{$status.AntivirusSignatureLastUpdated=[datetime]::Parse('2030-01-30T04:05:05Z')};'SignatureFuture'{$status.AntivirusSignatureLastUpdated=[datetime]::Parse('2030-02-03T04:10:07Z')}};$case=New-CcodTask5DefenderAdapterFixture -Status $status;Assert-CcodThrows {Invoke-CcodReleaseDefenderCheck -CandidatePath $fixture.Installer -ChecksumPath $fixture.Checksum -ManifestPath $fixture.Manifest -Origin TrustedWorkflowArtifact -WorkflowArtifactIdentity $identity -ExpectedVersion '2.5.0' -ExpectedGitCommit ('a'*40) -EvidencePath (Join-Path $fixture.Root "status-$mutation.json") -Adapters $case.Adapters|Out-Null} 'CCOD_DEFENDER_STATUS_INVALID';Assert-CcodTrue (-not($case.State.Calls-contains'Scan')) "$mutation blocks scan"}
+        foreach($clock in @('Reverse','TooLong','Invalid')){$completed=if($clock-ceq'Reverse'){[datetime]::Parse('2030-02-03T04:05:05Z')}elseif($clock-ceq'TooLong'){[datetime]::Parse('2030-02-03T06:05:07Z')}else{'not-a-clock'};$case=New-CcodTask5DefenderAdapterFixture -Completed $completed;Assert-CcodThrows {Invoke-CcodReleaseDefenderCheck -CandidatePath $fixture.Installer -ChecksumPath $fixture.Checksum -ManifestPath $fixture.Manifest -Origin TrustedWorkflowArtifact -WorkflowArtifactIdentity $identity -ExpectedVersion '2.5.0' -ExpectedGitCommit ('a'*40) -EvidencePath (Join-Path $fixture.Root "clock-$clock.json") -Adapters $case.Adapters|Out-Null} 'CCOD_DEFENDER_CLOCK_INVALID'}
+        foreach($failure in @('Scan','Detection','Write')){$case=if($failure-ceq'Scan'){New-CcodTask5DefenderAdapterFixture -ScanThrows}elseif($failure-ceq'Detection'){New-CcodTask5DefenderAdapterFixture -Detects}else{New-CcodTask5DefenderAdapterFixture -WriteThrows};$error=if($failure-ceq'Scan'){'CCOD_DEFENDER_SCAN_FAILED'}elseif($failure-ceq'Detection'){'CCOD_DEFENDER_DETECTIONS_FOUND'}else{'CCOD_DEFENDER_EVIDENCE_WRITE_FAILED'};Assert-CcodThrows {Invoke-CcodReleaseDefenderCheck -CandidatePath $fixture.Installer -ChecksumPath $fixture.Checksum -ManifestPath $fixture.Manifest -Origin TrustedWorkflowArtifact -WorkflowArtifactIdentity $identity -ExpectedVersion '2.5.0' -ExpectedGitCommit ('a'*40) -EvidencePath (Join-Path $fixture.Root "failure-$failure.json") -Adapters $case.Adapters|Out-Null} $error}
+        $command=Get-Command $defenderPath;Assert-CcodTrue (-not$command.Parameters.ContainsKey('ZoneId')) 'public tool exposes no Zone synthesis parameter'
+    }finally{if(Test-Path $fixture.Root){Remove-Item -LiteralPath $fixture.Root -Recurse -Force}}
+}
+
+Invoke-CcodTask5Test 'evidence' 'Defender default evidence writer is create-only and rejects unsafe targets before scan' {
     . $defenderPath -Library
-    $fixture = New-CcodReleaseFixture
-    try {
-        $calls = [Collections.Generic.List[string]]::new()
-        $capture = [pscustomobject]@{ Value = $null }
-        $base = @{
-            GetFileSha256 = { param($Path) $calls.Add('GetFileSha256'); Get-CcodTestFileSha256 -Path $Path }.GetNewClosure()
-            GetDefenderStatus = { $calls.Add('GetDefenderStatus'); [pscustomobject]@{ AMProductVersion = '4.18.26070.1'; AntivirusSignatureVersion = '1.999.1.0' } }.GetNewClosure()
-            StartCustomScan = { param($Path) $calls.Add('StartCustomScan') }.GetNewClosure()
-            GetThreatDetections = { $calls.Add('GetThreatDetections'); @() }.GetNewClosure()
-            GetUtcNow = { $calls.Add('GetUtcNow'); [datetime]::Parse('2026-08-24T00:00:00Z').ToUniversalTime() }.GetNewClosure()
-            WriteReceipt = { param($Path, $Receipt) $calls.Add('WriteReceipt'); $capture.Value = $Receipt; $Path }.GetNewClosure()
+    $fixture=New-CcodReleaseFixture
+    $unsafeOutside=$null;$unsafeLink=$null
+    try{
+        $identity=New-CcodTask5WorkflowIdentity ('a'*40)
+        $clean=New-CcodTask5DefenderAdapterFixture;$adapters=@{};foreach($key in @($clean.Adapters.Keys)){if([string]$key-cne'WriteReceipt'){$adapters[[string]$key]=$clean.Adapters[$key]}}
+        $evidence=Join-Path $fixture.Root 'create-only-receipt.json'
+        $receipt=Invoke-CcodReleaseDefenderCheck -CandidatePath $fixture.Installer -ChecksumPath $fixture.Checksum -ManifestPath $fixture.Manifest -Origin TrustedWorkflowArtifact -WorkflowArtifactIdentity $identity -ExpectedVersion '2.5.0' -ExpectedGitCommit ('a'*40) -EvidencePath $evidence -Adapters $adapters
+        Assert-CcodTrue (Test-Path -LiteralPath $evidence -PathType Leaf) 'default writer creates the requested regular evidence leaf'
+        $persisted=[IO.File]::ReadAllText($evidence,[Text.UTF8Encoding]::new($false,$true))|ConvertFrom-Json
+        Assert-CcodEqual ($receipt|ConvertTo-Json -Depth 12 -Compress) ($persisted|ConvertTo-Json -Depth 12 -Compress) 'default writer persists only the returned canonical receipt'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath $fixture.Root -Force|Where-Object{$_.Name-like'.ccod-defender-receipt-*'}).Count 'default writer leaves no temporary evidence leaf'
+
+        foreach($shape in @('ExistingFile','Directory','ReparseLeaf','UnsafeAncestry','Noncanonical','AlternateStream')){
+            $case=New-CcodTask5DefenderAdapterFixture;$caseAdapters=@{};foreach($key in @($case.Adapters.Keys)){if([string]$key-cne'WriteReceipt'){$caseAdapters[[string]$key]=$case.Adapters[$key]}}
+            $target=Join-Path $fixture.Root ("invalid-$shape.json")
+            $existingText=$null;$cleanupLink=$null
+            switch($shape){
+                'ExistingFile'{$existingText='do-not-overwrite';[IO.File]::WriteAllText($target,$existingText,[Text.UTF8Encoding]::new($false))}
+                'Directory'{[IO.Directory]::CreateDirectory($target)|Out-Null}
+                'ReparseLeaf'{$outside=Join-Path ([IO.Path]::GetTempPath()) ('ccod-task5-evidence-leaf-'+[guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($outside)|Out-Null;$cleanupLink=$target;New-Item -ItemType Junction -Path $target -Target $outside|Out-Null}
+                'UnsafeAncestry'{$unsafeOutside=Join-Path ([IO.Path]::GetTempPath()) ('ccod-task5-evidence-parent-'+[guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($unsafeOutside)|Out-Null;$unsafeLink=Join-Path $fixture.Root 'unsafe-evidence-parent';New-Item -ItemType Junction -Path $unsafeLink -Target $unsafeOutside|Out-Null;$target=Join-Path $unsafeLink 'receipt.json';$cleanupLink=$unsafeLink}
+                'Noncanonical'{$target=$fixture.Root+'\.\noncanonical-receipt.json'}
+                'AlternateStream'{$target=(Join-Path $fixture.Root 'alternate-receipt.json:stream')}
+            }
+            try{
+                Assert-CcodThrows {Invoke-CcodReleaseDefenderCheck -CandidatePath $fixture.Installer -ChecksumPath $fixture.Checksum -ManifestPath $fixture.Manifest -Origin TrustedWorkflowArtifact -WorkflowArtifactIdentity $identity -ExpectedVersion '2.5.0' -ExpectedGitCommit ('a'*40) -EvidencePath $target -Adapters $caseAdapters|Out-Null} 'CCOD_DEFENDER_EVIDENCE_INVALID'
+                Assert-CcodTrue (-not($case.State.Calls-contains'Scan')) "$shape evidence target is rejected before Defender scan"
+                if($shape-ceq'ExistingFile'){Assert-CcodEqual $existingText ([IO.File]::ReadAllText($target,[Text.UTF8Encoding]::new($false,$true))) 'existing evidence remains byte-for-byte unchanged'}
+            }finally{
+                if($null-ne$cleanupLink-and(Test-Path -LiteralPath $cleanupLink)){[IO.Directory]::Delete($cleanupLink)}
+                if($shape-ceq'ReparseLeaf'-and$null-ne$outside-and(Test-Path -LiteralPath $outside)){Remove-Item -LiteralPath $outside -Recurse -Force}
+                if($shape-ceq'UnsafeAncestry'-and$null-ne$unsafeOutside-and(Test-Path -LiteralPath $unsafeOutside)){Remove-Item -LiteralPath $unsafeOutside -Recurse -Force;$unsafeOutside=$null;$unsafeLink=$null}
+            }
         }
-        $blocked = @{} + $base
-        $blocked.GetZoneId = { param($Path) $calls.Add('GetZoneId'); $null }.GetNewClosure()
-        Assert-CcodThrows {
-            Invoke-CcodReleaseDefenderCheck -InstallerPath $fixture.Installer -ChecksumPath $fixture.Checksum -EvidencePath (Join-Path $fixture.Root 'receipt.json') -Adapters $blocked
-        } 'CCOD_DEFENDER_ZONE_REQUIRED'
-        Assert-CcodTrue (-not ($calls -contains 'StartCustomScan')) 'missing Internet Zone blocks Defender scan'
-
-        $calls.Clear()
-        $capture.Value = $null
-        $clean = @{} + $base
-        $clean.GetZoneId = { param($Path) $calls.Add('GetZoneId'); 3 }.GetNewClosure()
-        $receipt = Invoke-CcodReleaseDefenderCheck -InstallerPath $fixture.Installer -ChecksumPath $fixture.Checksum -EvidencePath (Join-Path $fixture.Root 'receipt.json') -Adapters $clean
-        Assert-CcodEqual 0 ([int]$receipt.detectionCount) 'clean scan records no detections'
-        Assert-CcodTrue ($calls -contains 'StartCustomScan') 'clean verified asset invokes the custom scan'
-        $serialized = $capture.Value | ConvertTo-Json -Depth 8 -Compress
-        Assert-CcodTrue (-not $serialized.Contains($fixture.Root)) 'Defender receipt does not persist the private artifact path'
-        Assert-CcodTrue ($serialized.Contains($fixture.Installer.Substring(0,0))) 'receipt is serializable'
-
-        $calls.Clear()
-        $capture.Value = $null
-        $threatCalls = [pscustomobject]@{ Count = 0 }
-        $detected = @{} + $base
-        $detected.GetZoneId = { param($Path) $calls.Add('GetZoneId'); 3 }.GetNewClosure()
-        $detected.GetThreatDetections = {
-            $calls.Add('GetThreatDetections')
-            $threatCalls.Count++
-            if ($threatCalls.Count -eq 1) { return @() }
-            return @([pscustomobject]@{ ThreatID = 99; InitialDetectionTime = '2026-08-24T00:00:00.0000000Z'; Resources = 'redacted-by-gate' })
-        }.GetNewClosure()
-        Assert-CcodThrows {
-            Invoke-CcodReleaseDefenderCheck -InstallerPath $fixture.Installer -ChecksumPath $fixture.Checksum -EvidencePath (Join-Path $fixture.Root 'detection.json') -Adapters $detected
-        } 'CCOD_DEFENDER_DETECTIONS_FOUND'
-        Assert-CcodEqual 'Failed' ([string]$capture.Value.outcome) 'detection receipt records failure'
-        Assert-CcodEqual 1 ([int]$capture.Value.detectionCount) 'detection receipt counts only the newly observed detection'
-    } finally {
-        if (Test-Path -LiteralPath $fixture.Root) { Remove-Item -LiteralPath $fixture.Root -Recurse -Force }
+    }finally{
+        if($null-ne$unsafeLink-and(Test-Path -LiteralPath $unsafeLink)){[IO.Directory]::Delete($unsafeLink)}
+        if($null-ne$unsafeOutside-and(Test-Path -LiteralPath $unsafeOutside)){Remove-Item -LiteralPath $unsafeOutside -Recurse -Force}
+        if(Test-Path $fixture.Root){Remove-Item -LiteralPath $fixture.Root -Recurse -Force}
     }
 }
 
@@ -2450,7 +2695,7 @@ Invoke-CcodTest 'package scripts build provenance and workflows retain the relea
     Assert-CcodTrue ($null -ne $package.scripts.'test:installed-lifecycle') 'package exposes installed-lifecycle deterministic tests'
     Assert-CcodTrue ($null -ne $package.scripts.'test:release-contract') 'package exposes release contract tests'
     $build = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
-    Assert-CcodTrue ($build -match 'release-manifest\.json') 'build emits a release manifest'
+    Assert-CcodTrue ($build -match '\$releaseManifest\s*=\s*Join-Path\s+\$dist\s+\$releaseAssetNames\[4\]') 'build emits the central-contract portable release manifest'
     Assert-CcodTrue ($build -match 'gitCommit') 'build records the source commit'
     Assert-CcodTrue ($build -match 'buildTimestampUtc') 'build records a canonical build timestamp'
     Assert-CcodTrue ($build -match 'does not match package\.json version') 'build refuses a requested version that differs from package metadata'
@@ -2536,6 +2781,27 @@ Invoke-CcodTest 'release notes extraction emits only the target release English 
 Invoke-CcodTest 'release build validates the portable launcher artifact before payload copy' {
     $build = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
     Assert-CcodTrue ($build -cmatch '(?s)Invoke-CcodPortableLauncherBuild.*?Test-CcodPortableLauncherArtifact.*?foreach \(\$portableFile in') 'portable build validates the generated artifact before copying it into the payload'
+}
+
+Invoke-CcodTask5Test 'docs' 'candidate documentation and build consume the exact non-receipt eleven-asset contract' {
+    $expected=Get-CcodTask5ExpectedAssetNames '2.5.22'
+    $readme=[IO.File]::ReadAllText((Join-Path $repositoryRoot 'README.md'),[Text.UTF8Encoding]::new($false,$true))
+    $readmeZh=[IO.File]::ReadAllText((Join-Path $repositoryRoot 'README.zh-CN.md'),[Text.UTF8Encoding]::new($false,$true))
+    Assert-CcodTrue (-not($readme-cmatch'(?i)always published|every tagged release ships|verified and available')) 'English README makes no unconditional publication or verification claim'
+    Assert-CcodTrue (-not($readmeZh-cmatch'\u5DF2\u9A8C\u8BC1|\u5747\u53EF\u7528|\u59CB\u7EC8\u53D1\u5E03')) 'Chinese README makes no prior verified or unconditional publication claim'
+    $englishRelease=[regex]::Match($readme,'(?ms)^## Releases\s*\r?\n(?<body>.*?)(?=^## |\z)').Groups['body'].Value
+    $chineseRelease=[regex]::Match($readmeZh,'(?ms)^## \u53D1\u5E03\uFF08Releases\uFF09\s*\r?\n(?<body>.*?)(?=^## |\z)').Groups['body'].Value
+    $englishContract=[regex]::Match($englishRelease,'(?ms)<details>\s*<summary>Exact 11-file candidate asset contract</summary>(?<body>.*?)</details>')
+    $chineseContract=[regex]::Match($chineseRelease,'(?ms)<details>\s*<summary>\u7CBE\u786E\u7684 11 \u6587\u4EF6\u5019\u9009\u8D44\u4EA7\u5951\u7EA6</summary>(?<body>.*?)</details>')
+    Assert-CcodTrue ($englishContract.Success-and$chineseContract.Success) 'both README asset lists are collapsed by default in an exact details block'
+    foreach($name in $expected){$literal='`'+$name+'`';Assert-CcodEqual 1 ([regex]::Matches($englishContract.Groups['body'].Value,[regex]::Escape($literal)).Count) "English candidate list names $name exactly once";Assert-CcodEqual 1 ([regex]::Matches($chineseContract.Groups['body'].Value,[regex]::Escape($literal)).Count) "Chinese candidate list names $name exactly once"}
+    Assert-CcodTrue ($englishRelease-cmatch'(?i)candidate'-and$chineseRelease-cmatch'\u5019\u9009') 'both release sections scope the eleven files to the v2.5.22 candidate'
+    Assert-CcodTrue ($englishRelease-cnotmatch'(?i)defender[^\r\n]*\.json'-and$chineseRelease-cnotmatch'(?i)defender[^\r\n]*\.json') 'Defender receipts are not listed as public assets'
+    $build=[IO.File]::ReadAllText((Join-Path $repositoryRoot 'build\build.ps1'),[Text.UTF8Encoding]::new($false,$true))
+    Assert-CcodTrue ($build-cmatch'ReleaseAssetContract\.psm1'-and$build-cmatch'Get-CcodExpectedReleaseAssetNames') 'build consumes the central release asset contract'
+    foreach($suffix in @('windows-x64.zip','windows-x64.zip.sha256.txt','trayhost-provenance.json','payload-manifest.json','release-manifest.json','setup.exe','setup.exe.sha256.txt','setup-provenance.json','setup-payload-manifest.json','setup-destination-inventory.iss','setup-release-manifest.json')){Assert-CcodTrue ($build-cnotmatch[regex]::Escape('CodexRemote-fix-$Version-'+$suffix)) "build no longer reconstructs $suffix outside the central contract"}
+    $changelog=[IO.File]::ReadAllText((Join-Path $repositoryRoot 'CHANGELOG.md'),[Text.UTF8Encoding]::new($false,$true));$section=[regex]::Match($changelog,'(?ms)^## v2\.5\.22\s*\r?\n(?<body>.*?)(?=^## |\z)').Groups['body'].Value
+    Assert-CcodTrue ($section-cmatch'(?i)candidate.*two distinct.*InternetDownload.*Defender receipts'-and$section-cmatch'\u5019\u9009.*InternetDownload.*Defender') 'changelog describes only the enforced candidate evidence contract'
 }
 
 Invoke-CcodTest '2.5.22 source metadata and documentation match the release contract' {
@@ -2722,8 +2988,13 @@ Invoke-CcodTest 'actual portable entrypoint rejects a post-Defender source mutat
         $manifest=[ordered]@{schemaVersion=1;product='CodexRemote-fix';version='2.5.22';gitCommit=('a'*40);buildTimestampUtc='2030-02-03T04:05:06.0000000Z';files=@($records)}
         [IO.File]::WriteAllText((Join-Path $root 'payload-manifest.json'),(($manifest|ConvertTo-Json -Depth 8)+[Environment]::NewLine),[Text.UTF8Encoding]::new($false))
         $attack=[pscustomobject]@{Ran=$false}
-        function Get-MpComputerStatus {[pscustomobject]@{AMProductVersion='fixture-platform';AntivirusSignatureVersion='fixture-signature';RealTimeProtectionEnabled=$true}}
+        function Get-MpComputerStatus {[pscustomobject]@{AMServiceEnabled=$true;AntivirusEnabled=$true;RealTimeProtectionEnabled=$true;AMProductVersion='fixture-platform';AMEngineVersion='fixture-engine';AntivirusSignatureVersion='fixture-signature';AntivirusSignatureLastUpdated=[datetime]::UtcNow.AddHours(-1)}}
         function Get-MpThreatDetection {param($ErrorAction)@()}
+        function Start-MpScan {param($ScanType,$ScanPath,$ErrorAction)throw 'fixture portable scan failure'}
+        $scanFailure=$null
+        try{&$entrypoint -DoNotStart|Out-Null}catch{$scanFailure=$_}
+        Assert-CcodTrue ($null-ne$scanFailure-and$scanFailure.FullyQualifiedErrorId-like'CCOD_PORTABLE_DEFENDER_SCAN_FAILED*') 'actual entrypoint preserves the portable scan failure code'
+        Assert-CcodTrue (-not(Test-Path -LiteralPath $childMarker)-and-not(Test-Path -LiteralPath $lifecycleRoot)) 'portable scan failure creates no child or lifecycle state'
         function Start-MpScan {param($ScanType,$ScanPath,$ErrorAction)$attack.Ran=$true;[IO.File]::WriteAllText($child,'raced-child-source',[Text.UTF8Encoding]::new($false))}
         $failure=$null
         try{&$entrypoint -DoNotStart|Out-Null}catch{$failure=$_}
@@ -2759,7 +3030,7 @@ Invoke-CcodTest 'actual portable entrypoint rejects the final File.Copy barrier 
         Assert-CcodEqual 'Install-CodexControlOtherDevices.ps1' ([string]$records[0].path) 'fixture child reaches the first production payload File.Copy barrier'
         $manifest=[ordered]@{schemaVersion=1;product='CodexRemote-fix';version='2.5.22';gitCommit=('a'*40);buildTimestampUtc='2030-02-03T04:05:06.0000000Z';files=@($records)}
         [IO.File]::WriteAllText((Join-Path $root 'payload-manifest.json'),(($manifest|ConvertTo-Json -Depth 8)+[Environment]::NewLine),[Text.UTF8Encoding]::new($false))
-        function Get-MpComputerStatus {[pscustomobject]@{AMProductVersion='fixture-platform';AntivirusSignatureVersion='fixture-signature';RealTimeProtectionEnabled=$true}}
+        function Get-MpComputerStatus {[pscustomobject]@{AMServiceEnabled=$true;AntivirusEnabled=$true;RealTimeProtectionEnabled=$true;AMProductVersion='fixture-platform';AMEngineVersion='fixture-engine';AntivirusSignatureVersion='fixture-signature';AntivirusSignatureLastUpdated=[datetime]::UtcNow.AddHours(-1)}}
         function Get-MpThreatDetection {param($ErrorAction)@()}
         function Start-MpScan {param($ScanType,$ScanPath,$ErrorAction)}
         $barrier=[pscustomobject]@{InstallerRootRedirected=$false;SourceMutated=$false}
