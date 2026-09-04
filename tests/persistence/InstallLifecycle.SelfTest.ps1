@@ -4151,7 +4151,10 @@ $results += Invoke-CcodTest 'README and release workflow publish current portabl
     $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot '.github\workflows\release.yml') -Raw -Encoding UTF8
     Assert-CcodTrue ($workflow -cmatch '(?m)^name: CodexRemote-fix release\r?$') 'release workflow uses public product branding'
     Assert-CcodTrue ($workflow -cmatch '(?m)^\s+name: CodexRemote-fix portable bundle\r?$') 'uploaded artifact uses public portable bundle branding'
-    Assert-CcodTrue ($workflow -cmatch '--title "CodexRemote-fix \$version"') 'GitHub release title uses public product branding'
+    $draftTool = Join-Path $repositoryRoot 'tools\Invoke-GitHubDraftRelease.ps1'
+    $draftToolContent = Get-Content -LiteralPath $draftTool -Raw -Encoding UTF8
+    Assert-CcodTrue ($draftToolContent -cmatch '(?s)release.*create.*--draft' -and $draftToolContent -cmatch 'CodexRemote-fix \$version') 'draft tool creates a private release with public product branding'
+    Assert-CcodTrue ($workflow -cmatch 'Invoke-CcodGitHubDraftRelease -Mode Stage') 'release workflow stages through the draft-only production tool'
     Assert-CcodTrue ($workflow -cmatch 'tools\\New-GitHubReleaseNotes\.ps1''\) -ChangelogPath .*? -Tag \$tag -OutputPath \$notesPath') 'GitHub release notes use the behavior-tested target-English extractor'
     Assert-CcodTrue ($workflow -cnotmatch 'englishSection\s*=\s*\[regex\]::Match') 'release workflow does not retain a second inline English extractor'
     $notesTool = Join-Path $repositoryRoot 'tools\New-GitHubReleaseNotes.ps1'

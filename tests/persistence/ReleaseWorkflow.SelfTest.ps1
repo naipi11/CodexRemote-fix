@@ -7,8 +7,9 @@ $releaseDefenderModulePath = Join-Path $repositoryRoot 'tools\ReleaseDefender.ps
 $assetContractPath = Join-Path $repositoryRoot 'tools\ReleaseAssetContract.psm1'
 
 $script:CcodReleaseBaseInvokeTest=${function:Invoke-CcodTest}
-function Invoke-CcodTest([string]$Name,[scriptblock]$Action){if(-not[string]::IsNullOrWhiteSpace($env:CCOD_TASK5_RED_CASE)){return};&$script:CcodReleaseBaseInvokeTest $Name $Action}
-function Invoke-CcodTask5Test([string]$Id,[string]$Name,[scriptblock]$Action){if(-not[string]::IsNullOrWhiteSpace($env:CCOD_TASK5_RED_CASE)-and$env:CCOD_TASK5_RED_CASE-cne$Id){return};&$script:CcodReleaseBaseInvokeTest $Name $Action}
+function Invoke-CcodTest([string]$Name,[scriptblock]$Action){if(-not[string]::IsNullOrWhiteSpace($env:CCOD_TASK5_RED_CASE)-or-not[string]::IsNullOrWhiteSpace($env:CCOD_TASK6_RED_CASE)){return};&$script:CcodReleaseBaseInvokeTest $Name $Action}
+function Invoke-CcodTask5Test([string]$Id,[string]$Name,[scriptblock]$Action){if(-not[string]::IsNullOrWhiteSpace($env:CCOD_TASK6_RED_CASE)){return};if(-not[string]::IsNullOrWhiteSpace($env:CCOD_TASK5_RED_CASE)-and$env:CCOD_TASK5_RED_CASE-cne$Id){return};&$script:CcodReleaseBaseInvokeTest $Name $Action}
+function Invoke-CcodTask6Test([string]$Id,[string]$Name,[scriptblock]$Action){if(-not[string]::IsNullOrWhiteSpace($env:CCOD_TASK5_RED_CASE)){return};if(-not[string]::IsNullOrWhiteSpace($env:CCOD_TASK6_RED_CASE)-and$env:CCOD_TASK6_RED_CASE-cne$Id){return};&$script:CcodReleaseBaseInvokeTest $Name $Action}
 
 function ConvertFrom-CcodWorkflowScalar {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
@@ -62,11 +63,11 @@ function Get-CcodWorkflowStructure {
         }
         if (-not $inSteps) { continue }
         if ($line -cmatch '^      -(?:\s+(?<key>[A-Za-z][A-Za-z0-9_-]*):\s*(?<value>.*))?\s*$') {
-            $currentStep = [pscustomobject]@{ Name = ''; Shell = ''; Run = ''; If = ''; ContinueOnError = '' }
+            $currentStep = [pscustomobject]@{ Name = ''; Shell = ''; Run = ''; If = ''; ContinueOnError = ''; Uses = '' }
             $currentJob.Steps.Add($currentStep)
             $key = [string]$Matches.key
             $value = [string]$Matches.value
-            if ($key -in @('name', 'shell', 'run', 'if', 'continue-on-error')) {
+            if ($key -in @('name', 'shell', 'run', 'if', 'continue-on-error', 'uses')) {
                 if ($key -ceq 'run' -and $value.Trim() -in @('|', '|-', '|+')) {
                     $runBlock = $true
                     $runLines.Clear()
@@ -77,6 +78,7 @@ function Get-CcodWorkflowStructure {
                         'run' { 'Run' }
                         'if' { 'If' }
                         'continue-on-error' { 'ContinueOnError' }
+                        'uses' { 'Uses' }
                     }
                     $currentStep.$property = ConvertFrom-CcodWorkflowScalar $value
                 }
@@ -84,7 +86,7 @@ function Get-CcodWorkflowStructure {
             continue
         }
         if ($null -eq $currentStep) { continue }
-        if ($line -cmatch '^        (?<key>name|shell|run|if|continue-on-error):\s*(?<value>.*)$') {
+        if ($line -cmatch '^        (?<key>name|shell|run|if|continue-on-error|uses):\s*(?<value>.*)$') {
             $key = $Matches.key
             $value = $Matches.value.Trim()
             if ($key -ceq 'run' -and $value -in @('|', '|-', '|+')) {
@@ -97,6 +99,7 @@ function Get-CcodWorkflowStructure {
                     'run' { 'Run' }
                     'if' { 'If' }
                     'continue-on-error' { 'ContinueOnError' }
+                    'uses' { 'Uses' }
                 }
                 $currentStep.$property = ConvertFrom-CcodWorkflowScalar $value
             }
@@ -2770,11 +2773,11 @@ Invoke-CcodTest 'package scripts build provenance and workflows retain the relea
     Assert-CcodTrue ($release -match 'test:release-contract') 'release promotion checks the release contract'
     Assert-CcodTrue ($release -match 'release-manifest') 'release promotion uploads the bound release manifest'
     Assert-CcodTrue ($release -match 'New-GitHubReleaseNotes\.ps1') 'release publication uses the behavior-tested English notes extractor'
-    Assert-CcodTrue ($release -match 'gh release download') 'existing release assets are downloaded before any publication decision'
+    Assert-CcodTrue ((Get-Content -LiteralPath (Join-Path $repositoryRoot 'tools\Invoke-GitHubDraftRelease.ps1') -Raw) -match 'gh release download') 'draft promoter reads back staged assets through gh adapters'
     Assert-CcodTrue (-not ($release -match 'gh release upload[^\r\n]*--clobber')) 'release publication never overwrites an existing asset'
-    Assert-CcodTrue ($release -match 'Read back published GitHub release assets') 'release publication re-downloads every uploaded asset for hash read-back'
+    Assert-CcodTrue ($release -match 'Invoke-CcodGitHubDraftRelease -Mode Verify') 'release publication re-downloads every uploaded asset for hash read-back'
     Assert-CcodTrue ($release -cmatch '(?ms)^permissions:\r?\n\s+contents: read\s*$') 'candidate build starts with read-only repository permission'
-    Assert-CcodTrue ($release -cmatch '(?ms)^  publish:\r?\n    needs: build\r?\n    runs-on: windows-latest\r?\n    permissions:\r?\n      contents: write\s*$') 'only the publish job receives release-write permission'
+    Assert-CcodTrue ($release -cmatch '(?ms)^  stage:\r?\n    needs: build\r?\n    runs-on: windows-latest\r?\n    permissions:\r?\n      contents: write\s*$') 'only the stage job receives release-write permission'
 }
 
 $iss = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw
@@ -3117,6 +3120,1060 @@ Invoke-CcodTest 'actual portable entrypoint rejects the final File.Copy barrier 
         if($null-ne$redirectBreakpoint){Remove-PSBreakpoint -Breakpoint $redirectBreakpoint -ErrorAction SilentlyContinue}
         if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue}
     }
+}
+
+function Import-CcodTask6ToolModule {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Name)
+    $existing = Get-Module -Name $Name -ErrorAction SilentlyContinue
+    if ($null -ne $existing) { Remove-Module -Name $Name -Force }
+    $text = [IO.File]::ReadAllText([IO.Path]::GetFullPath($Path), [Text.UTF8Encoding]::new($false))
+    $created = New-Module -Name $Name -ScriptBlock ([scriptblock]::Create($text))
+    Import-Module $created -Force -DisableNameChecking | Out-Null
+    $loaded = Get-Module -Name $Name
+    if ($null -eq $loaded) { throw "CCOD_TASK6_TOOL_MODULE_MISSING $Name" }
+    return $loaded
+}
+
+function Assert-CcodDraftReleaseWorkflowContract {
+    param(
+        [Parameter(Mandatory)][string]$CiPath,
+        [Parameter(Mandatory)][string]$ReleasePath
+    )
+    $errorId = 'CCOD_RELEASE_WORKFLOW_INVALID'
+    $pins = [ordered]@{
+        'actions/checkout' = '11d5960a326750d5838078e36cf38b85af677262'
+        'actions/setup-node' = '49933ea5288caeca8642d1e84afbd3f7d6820020'
+        'actions/upload-artifact' = 'ea165f8d65b6e75b540449e92b4886f43607fa02'
+        'actions/download-artifact' = 'd3f86a106a0bac45b974a628896c90dbdf5c8093'
+    }
+    foreach ($target in @($CiPath, $ReleasePath)) {
+        $raw = [IO.File]::ReadAllText($target, [Text.UTF8Encoding]::new($false))
+        if ($raw -cmatch 'uses:\s*actions/[A-Za-z0-9_.-]+@v\d') { throw $errorId }
+        if ($raw -cmatch '(?m)^\s*continue-on-error:') { throw $errorId }
+        foreach ($use in @([regex]::Matches($raw, '(?m)^\s+uses:\s*(?<ref>\S+)\s*$'))) {
+            if ($use.Groups['ref'].Value -cnotmatch '^actions/[A-Za-z0-9_.-]+@[0-9a-f]{40}$') { throw $errorId }
+            $action = ($use.Groups['ref'].Value -split '@')[0]
+            $sha = ($use.Groups['ref'].Value -split '@')[1]
+            if (-not $pins.Contains($action) -or $pins[$action] -cne $sha) { throw $errorId }
+        }
+    }
+    $ci = [IO.File]::ReadAllText($CiPath, [Text.UTF8Encoding]::new($false))
+    $release = [IO.File]::ReadAllText($ReleasePath, [Text.UTF8Encoding]::new($false))
+    foreach ($action in @('actions/checkout','actions/setup-node')) {
+        if (-not $ci.Contains($action + '@' + $pins[$action])) { throw $errorId }
+    }
+    foreach ($action in @($pins.Keys)) {
+        if (-not $release.Contains($action + '@' + $pins[$action])) { throw $errorId }
+    }
+    if ($release -cmatch 'build/dist/\*' -or $release -cmatch '\.Extension\s+-in' -or $release -cmatch 'Test-ReleaseDefender\.ps1[^\r\n]*-Library') { throw $errorId }
+    if ($release -cnotmatch 'ReleaseAssetContract\.psm1' -or $release -cnotmatch 'Get-CcodExpectedReleaseAssetNames' -or $release -cnotmatch 'Test-CcodCleanReleaseRunner' -or $release -cnotmatch 'Invoke-CcodGitHubDraftRelease') { throw $errorId }
+    if ($release -cmatch '(?m)gh release create\b(?![^\r\n]*--draft)') { throw $errorId }
+    if ($release -cnotmatch '(?m)^concurrency:' -or $release -cnotmatch 'cancel-in-progress:\s*false') { throw $errorId }
+    $workflow = Get-CcodWorkflowStructure -Path $ReleasePath
+    $jobNames = @($workflow.Jobs | ForEach-Object { $_.Name })
+    $preflightIndex = [array]::IndexOf($jobNames, 'preflight')
+    $buildIndex = [array]::IndexOf($jobNames, 'build')
+    if ($preflightIndex -lt 0 -or $buildIndex -lt 0 -or $preflightIndex -ge $buildIndex) { throw $errorId }
+    $cleanSteps = @($workflow.Jobs[$preflightIndex].Steps | Where-Object { [string]$_.Run -cmatch 'Test-CcodCleanReleaseRunner' })
+    if ($cleanSteps.Count -lt 1) { throw $errorId }
+    foreach ($job in @($workflow.Jobs)) {
+        foreach ($step in @($job.Steps)) {
+            if (-not [string]::IsNullOrEmpty([string]$step.ContinueOnError)) { throw $errorId }
+            if ($job.Name -cne 'build' -and (Test-CcodWorkflowStepInvokesBuild $step)) { throw $errorId }
+            if (([string]$step.Run -cmatch 'Test-CcodCleanReleaseRunner|Invoke-CcodGitHubDraftRelease|test:release-contract|build\.ps1') -and -not [string]::IsNullOrEmpty([string]$step.If)) { throw $errorId }
+        }
+    }
+}
+
+function New-CcodTask6CleanAdapterFixture {
+    param(
+        [string]$Version = '2.5.22',
+        [string]$Commit = ('c' * 40),
+        [string]$Porcelain = '',
+        [switch]$Installed,
+        [switch]$MutexOccupied,
+        [switch]$TaskPresent,
+        [switch]$SupervisorPresent,
+        [switch]$TrayHostPresent
+    )
+    $state = [pscustomobject]@{ Calls = [Collections.Generic.List[string]]::new(); Preflight = $null; Cleanup = [Collections.Generic.List[string]]::new() }
+    $adapters = @{
+        GetPackageVersion = { param($Root) $state.Calls.Add('GetPackageVersion'); $Version }.GetNewClosure()
+        GetGitPorcelain = { param($Root) $state.Calls.Add('GetGitPorcelain'); $Porcelain }.GetNewClosure()
+        GetGitCommit = { param($Root) $state.Calls.Add('GetGitCommit'); $Commit }.GetNewClosure()
+        GetProductState = { param($Root) $state.Calls.Add('GetProductState'); [pscustomobject]@{ InstallRootPresent = [bool]$Installed; ScheduledTaskPresent = [bool]$TaskPresent; SupervisorPresent = [bool]$SupervisorPresent; TrayHostPresent = [bool]$TrayHostPresent } }.GetNewClosure()
+        ProbeMutex = { param($Kind) $state.Calls.Add('ProbeMutex:' + $Kind); [bool]$MutexOccupied }.GetNewClosure()
+        WritePreflightEvidence = { param($Path, $Record) $state.Calls.Add('WritePreflightEvidence'); $state.Preflight = [pscustomobject]@{ Path = $Path; Record = $Record }; $Path }.GetNewClosure()
+        CleanupProduct = { param($Root) $state.Cleanup.Add('CleanupProduct'); throw 'cleanup forbidden' }.GetNewClosure()
+    }
+    [pscustomobject]@{ Adapters = $adapters; State = $state }
+}
+
+function New-CcodTask6DraftAdapterFixture {
+    param([string]$AssetDirectory, [switch]$UploadFails, [switch]$ConcurrentStage)
+    $state = [pscustomobject]@{
+        Calls = [Collections.Generic.List[string]]::new()
+        DraftPrivate = $true
+        Created = $false
+        Uploaded = [Collections.Generic.List[string]]::new()
+        Promoted = $false
+        Rebuilt = $false
+        Assets = @{}
+        SourceDirectory = $AssetDirectory
+    }
+    $hashFile = {
+        param($Path)
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $stream = [IO.File]::OpenRead([IO.Path]::GetFullPath($Path))
+            try { return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() } finally { $stream.Dispose() }
+        } finally { $sha.Dispose() }
+    }.GetNewClosure()
+    $adapters = @{
+        TryStageLock = { param($Tag) $state.Calls.Add('TryStageLock'); if ($ConcurrentStage) { $false } else { $true } }.GetNewClosure()
+        CreateDraft = { param($Tag, $Title, $Notes) $state.Calls.Add('CreateDraft'); $state.Created = $true; $state.DraftPrivate = $true; [pscustomobject]@{ Tag = $Tag; Draft = $true } }.GetNewClosure()
+        GetTagCommit = { param($Tag, [bool]$ActionsOnly) $state.Calls.Add('GetTagCommit'); 'c' * 40 }.GetNewClosure()
+        UploadAsset = { param($Tag, $Name, $Path)
+            $state.Calls.Add('UploadAsset:' + $Name)
+            if ($UploadFails) { throw 'upload failed' }
+            $state.Uploaded.Add($Name)
+            $state.Assets[$Name] = & $hashFile $Path
+        }.GetNewClosure()
+        DownloadAsset = { param($Tag, $Name, $Destination)
+            $state.Calls.Add('DownloadAsset:' + $Name)
+            $source = Join-Path $state.SourceDirectory $Name
+            [IO.File]::Copy($source, $Destination, $true)
+        }.GetNewClosure()
+        ViewRelease = { param($Tag) $state.Calls.Add('ViewRelease'); [pscustomobject]@{ Tag = $Tag; Draft = [bool]$state.DraftPrivate; AssetNames = @($state.Uploaded) } }.GetNewClosure()
+        SetReleaseDraftState = { param($Tag, [bool]$Draft) $state.Calls.Add('SetReleaseDraftState:' + $Draft); $state.DraftPrivate = [bool]$Draft; if (-not $Draft) { $state.Promoted = $true } }.GetNewClosure()
+        InvokeBuild = { param($Version) $state.Calls.Add('InvokeBuild'); $state.Rebuilt = $true }.GetNewClosure()
+        InvokeGh = { param($Arguments) $state.Calls.Add('InvokeGh'); throw 'raw gh forbidden' }.GetNewClosure()
+    }
+    [pscustomobject]@{ Adapters = $adapters; State = $state }
+}
+
+function Invoke-CcodTask6CleanCore {
+    param([Parameter(Mandatory)]$Module,[Parameter(Mandatory)][string]$RepositoryRoot,[Parameter(Mandatory)][string]$ExpectedVersion,[Parameter(Mandatory)][hashtable]$Adapters)
+    &$Module { param($RepositoryRoot,$ExpectedVersion,$Adapters) Test-CcodCleanReleaseRunnerCore -RepositoryRoot $RepositoryRoot -ExpectedVersion $ExpectedVersion -Adapters $Adapters } $RepositoryRoot $ExpectedVersion $Adapters
+}
+
+function Invoke-CcodTask6DraftCore {
+    param([Parameter(Mandatory)]$Module,[Parameter(Mandatory)][string]$Mode,[Parameter(Mandatory)][string]$Tag,[Parameter(Mandatory)][string]$AssetDirectory,[Parameter(Mandatory)][string]$EvidenceDirectory,[Parameter(Mandatory)][hashtable]$Adapters)
+    &$Module { param($Mode,$Tag,$AssetDirectory,$EvidenceDirectory,$Adapters) Invoke-CcodGitHubDraftReleaseCore -Mode $Mode -Tag $Tag -AssetDirectory $AssetDirectory -EvidenceDirectory $EvidenceDirectory -Adapters $Adapters } $Mode $Tag $AssetDirectory $EvidenceDirectory $Adapters
+}
+
+Invoke-CcodTask6Test 'runner' 'clean release runner is exported from the production tool' {
+    $path = Join-Path $repositoryRoot 'tools\Test-CleanReleaseRunner.ps1'
+    Assert-CcodTrue (Test-Path -LiteralPath $path -PathType Leaf) 'clean release runner script exists'
+    $module = Import-CcodTask6ToolModule -Path $path -Name 'CcodCleanReleaseRunnerPublic'
+    try {
+        $command = Get-Command Test-CcodCleanReleaseRunner -Module $module.Name -ErrorAction Stop
+        Assert-CcodTrue ($command.Parameters.ContainsKey('RepositoryRoot')) 'clean runner requires RepositoryRoot'
+        Assert-CcodTrue ($command.Parameters.ContainsKey('ExpectedVersion')) 'clean runner requires ExpectedVersion'
+        Assert-CcodTrue (-not $command.Parameters.ContainsKey('Adapters')) 'public clean runner exposes no adapter injection parameter'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Invoke-CcodTask6Test 'draft' 'draft release promoter is exported from the production tool' {
+    $path = Join-Path $repositoryRoot 'tools\Invoke-GitHubDraftRelease.ps1'
+    Assert-CcodTrue (Test-Path -LiteralPath $path -PathType Leaf) 'draft release promoter script exists'
+    $module = Import-CcodTask6ToolModule -Path $path -Name 'CcodGitHubDraftReleasePublic'
+    try {
+        $command = Get-Command Invoke-CcodGitHubDraftRelease -Module $module.Name -ErrorAction Stop
+        foreach ($name in @('Mode','Tag','AssetDirectory','EvidenceDirectory')) {
+            Assert-CcodTrue ($command.Parameters.ContainsKey($name)) "draft promoter requires $name"
+        }
+        Assert-CcodTrue (-not $command.Parameters.ContainsKey('Adapters')) 'public draft promoter exposes no adapter injection parameter'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Invoke-CcodTask6Test 'pin' 'CI and release workflows pin checkout to the reviewed commit SHA' {
+    $expected = 'actions/checkout@11d5960a326750d5838078e36cf38b85af677262'
+    foreach ($name in @('ci.yml','release.yml')) {
+        $raw = [IO.File]::ReadAllText((Join-Path $repositoryRoot ('.github\workflows\' + $name)), [Text.UTF8Encoding]::new($false))
+        Assert-CcodTrue ($raw.Contains($expected)) "$name pins actions/checkout to the reviewed SHA"
+        Assert-CcodTrue ($raw -cnotmatch 'actions/checkout@v') "$name does not use a floating checkout tag"
+    }
+}
+
+Invoke-CcodTask6Test 'glob' 'release workflow never uploads by dist glob or dotsources Defender library mode' {
+    $raw = [IO.File]::ReadAllText((Join-Path $repositoryRoot '.github\workflows\release.yml'), [Text.UTF8Encoding]::new($false))
+    Assert-CcodTrue ($raw -cnotmatch 'build/dist/\*') 'release workflow does not upload by dist glob'
+    Assert-CcodTrue ($raw -cnotmatch 'Test-ReleaseDefender\.ps1[^\r\n]*-Library') 'release workflow does not restore Defender library mode'
+    Assert-CcodTrue ($raw.Contains('ReleaseAssetContract.psm1')) 'release workflow imports the central asset contract'
+}
+
+Invoke-CcodTask6Test 'draft-create' 'release workflow never public-first creates a GitHub release' {
+    $raw = [IO.File]::ReadAllText((Join-Path $repositoryRoot '.github\workflows\release.yml'), [Text.UTF8Encoding]::new($false))
+    Assert-CcodTrue ($raw -cnotmatch '(?m)gh release create\b(?![^\r\n]*--draft)') 'gh release create is never invoked without --draft'
+}
+
+Invoke-CcodTask6Test 'workflow' 'CI and release workflows satisfy the draft-only pinned contract' {
+    Assert-CcodDraftReleaseWorkflowContract `
+        -CiPath (Join-Path $repositoryRoot '.github\workflows\ci.yml') `
+        -ReleasePath (Join-Path $repositoryRoot '.github\workflows\release.yml')
+}
+
+Invoke-CcodTask6Test 'workflow-bypass' 'draft workflow contract rejects unpinned actions continue-on-error if-bypass rebuild and missing concurrency' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-task6-workflow-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        $ciPath = Join-Path $root 'ci.yml'
+        $releasePath = Join-Path $root 'release.yml'
+        $pinnedCi = @'
+name: fixture CI
+jobs:
+  validate:
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+'@
+        $pinnedRelease = @'
+name: fixture release
+concurrency:
+  group: ccod-draft-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  preflight:
+    steps:
+      - name: Clean runner
+        shell: pwsh
+        run: Test-CcodCleanReleaseRunner -RepositoryRoot $PWD -ExpectedVersion 2.5.22
+  build:
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - name: Build
+        shell: pwsh
+        run: ./build/build.ps1 -Version 2.5.22
+      - name: Upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+  stage:
+    steps:
+      - name: Download
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - name: Stage draft
+        shell: pwsh
+        run: |
+          Import-Module ./tools/ReleaseAssetContract.psm1
+          Get-CcodExpectedReleaseAssetNames -Version 2.5.22
+          Invoke-CcodGitHubDraftRelease -Mode Stage -Tag v2.5.22 -AssetDirectory $PWD -EvidenceDirectory $PWD
+'@
+        [IO.File]::WriteAllText($ciPath, $pinnedCi, [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($releasePath, $pinnedRelease, [Text.UTF8Encoding]::new($false))
+        Assert-CcodDraftReleaseWorkflowContract -CiPath $ciPath -ReleasePath $releasePath
+        $invalid = @(
+            [pscustomobject]@{ Name = 'unpinned setup-node'; Release = $pinnedRelease.Replace('actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020','actions/setup-node@v4') },
+            [pscustomobject]@{ Name = 'continue-on-error'; Release = $pinnedRelease.Replace('      - name: Clean runner','      - name: Clean runner' + [Environment]::NewLine + '        continue-on-error: true') },
+            [pscustomobject]@{ Name = 'if bypass'; Release = $pinnedRelease.Replace('      - name: Clean runner','      - name: Clean runner' + [Environment]::NewLine + '        if: ${{ false }}') },
+            [pscustomobject]@{ Name = 'missing concurrency'; Release = $pinnedRelease.Replace(('concurrency:' + [Environment]::NewLine + '  group: ccod-draft-${{ github.ref }}' + [Environment]::NewLine + '  cancel-in-progress: false' + [Environment]::NewLine), '') },
+            [pscustomobject]@{ Name = 'rebuild in stage'; Release = $pinnedRelease + [Environment]::NewLine + "        run: ./build/build.ps1 -Version 2.5.22`n" },
+            [pscustomobject]@{ Name = 'extension glob'; Release = $pinnedRelease.Replace('Get-CcodExpectedReleaseAssetNames -Version 2.5.22','Get-ChildItem -File | Where-Object { $_.Extension -in @(''.exe'') }') }
+        )
+        foreach ($fixture in $invalid) {
+            [IO.File]::WriteAllText($releasePath, [string]$fixture.Release, [Text.UTF8Encoding]::new($false))
+            Assert-CcodThrows { Assert-CcodDraftReleaseWorkflowContract -CiPath $ciPath -ReleasePath $releasePath } 'CCOD_RELEASE_WORKFLOW_INVALID'
+        }
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Invoke-CcodTask6Test 'runner-core' 'clean runner core accepts module-scope adapters and public surface does not' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools\Test-CleanReleaseRunner.ps1') -Name 'CcodCleanReleaseRunner'
+    try {
+        $public = Get-Command Test-CcodCleanReleaseRunner -Module $module.Name -ErrorAction Stop
+        Assert-CcodTrue (-not $public.Parameters.ContainsKey('Adapters')) 'public clean runner exposes no adapter injection parameter'
+        $core = &$module { Get-Command Test-CcodCleanReleaseRunnerCore -ErrorAction SilentlyContinue }
+        Assert-CcodTrue ($null -ne $core) 'clean runner core exists for tests'
+        Assert-CcodTrue ($core.Parameters.ContainsKey('Adapters')) 'clean runner core accepts adapters'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Invoke-CcodTask6Test 'runner-reject' 'clean runner fail-closes contaminated dirty missing-preflight and version mismatches without cleanup' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools\Test-CleanReleaseRunner.ps1') -Name 'CcodCleanReleaseRunner'
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-task6-clean-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        foreach ($case in @(
+            [pscustomobject]@{ Id = 'installed'; Error = 'CCOD_CLEAN_RUNNER_CONTAMINATED'; Fixture = { New-CcodTask6CleanAdapterFixture -Installed } },
+            [pscustomobject]@{ Id = 'mutex'; Error = 'CCOD_CLEAN_RUNNER_CONTAMINATED'; Fixture = { New-CcodTask6CleanAdapterFixture -MutexOccupied } },
+            [pscustomobject]@{ Id = 'task'; Error = 'CCOD_CLEAN_RUNNER_CONTAMINATED'; Fixture = { New-CcodTask6CleanAdapterFixture -TaskPresent } },
+            [pscustomobject]@{ Id = 'supervisor'; Error = 'CCOD_CLEAN_RUNNER_CONTAMINATED'; Fixture = { New-CcodTask6CleanAdapterFixture -SupervisorPresent } },
+            [pscustomobject]@{ Id = 'trayhost'; Error = 'CCOD_CLEAN_RUNNER_CONTAMINATED'; Fixture = { New-CcodTask6CleanAdapterFixture -TrayHostPresent } },
+            [pscustomobject]@{ Id = 'dirty'; Error = 'CCOD_CLEAN_RUNNER_DIRTY'; Fixture = { New-CcodTask6CleanAdapterFixture -Porcelain ' M README.md' } },
+            [pscustomobject]@{ Id = 'version'; Error = 'CCOD_CLEAN_RUNNER_VERSION_INVALID'; Fixture = { New-CcodTask6CleanAdapterFixture -Version '2.5.21' } }
+        )) {
+            $fixture = & $case.Fixture
+            Assert-CcodThrows { Invoke-CcodTask6CleanCore -Module $module -RepositoryRoot $root -ExpectedVersion '2.5.22' -Adapters $fixture.Adapters | Out-Null } $case.Error
+            Assert-CcodEqual 0 $fixture.State.Cleanup.Count "clean runner does not cleanup after $($case.Id)"
+        }
+        $ok = New-CcodTask6CleanAdapterFixture
+        $result = Invoke-CcodTask6CleanCore -Module $module -RepositoryRoot $root -ExpectedVersion '2.5.22' -Adapters $ok.Adapters
+        Assert-CcodTrue ([bool]$result.Valid) 'clean runner accepts a clean checkout'
+        Assert-CcodEqual '2.5.22' ([string]$result.Version) 'clean runner returns the expected version'
+        Assert-CcodTrue ($ok.State.Calls -contains 'WritePreflightEvidence') 'clean runner writes preflight evidence'
+        Assert-CcodEqual 0 $ok.State.Cleanup.Count 'successful clean runner still performs no cleanup'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Invoke-CcodTask6Test 'draft-core' 'draft promoter core accepts module-scope adapters and public surface does not' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools\Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftRelease'
+    try {
+        $public = Get-Command Invoke-CcodGitHubDraftRelease -Module $module.Name -ErrorAction Stop
+        Assert-CcodTrue (-not $public.Parameters.ContainsKey('Adapters')) 'public draft promoter exposes no adapter injection parameter'
+        $core = &$module { Get-Command Invoke-CcodGitHubDraftReleaseCore -ErrorAction SilentlyContinue }
+        Assert-CcodTrue ($null -ne $core) 'draft promoter core exists for tests'
+        Assert-CcodTrue ($core.Parameters.ContainsKey('Adapters')) 'draft promoter core accepts adapters'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-public-module-boundary' 'release workflow imports only the public draft command and does not dot-source injectable internals' {
+    $releasePath = Join-Path $repositoryRoot '.github/workflows/release.yml'
+    $workflow = [IO.File]::ReadAllText($releasePath, [Text.UTF8Encoding]::new($false))
+    foreach ($spec in @(
+        [pscustomobject]@{ Name = 'draft'; Script = 'Invoke-GitHubDraftRelease.psm1'; Public = 'Invoke-CcodGitHubDraftRelease'; Private = 'Invoke-CcodGitHubDraftReleaseCore' },
+        [pscustomobject]@{ Name = 'clean runner'; Script = 'Test-CleanReleaseRunner.psm1'; Public = 'Test-CcodCleanReleaseRunner'; Private = 'Test-CcodCleanReleaseRunnerCore' }
+    )) {
+        $scriptPath = Join-Path $repositoryRoot ('tools/' + $spec.Script)
+        Assert-CcodTrue (Test-Path -LiteralPath $scriptPath -PathType Leaf) "$($spec.Name) tool has a real module wrapper"
+        Assert-CcodTrue ($workflow -cmatch ('Import-Module.*' + [regex]::Escape($spec.Script))) "$($spec.Name) workflow import uses the module wrapper"
+        Assert-CcodTrue ($workflow -cnotmatch ('(?m)^\s*\.\s+\.?/?\.?[/\\]tools[/\\]' + [regex]::Escape($spec.Script))) "$($spec.Name) workflow does not dot-source the module wrapper"
+        $module = Import-Module $scriptPath -Force -PassThru -DisableNameChecking
+        try {
+            Assert-CcodTrue ($null -ne (Get-Command $spec.Public -Module $module.Name -ErrorAction SilentlyContinue)) "$($spec.Name) public command is exported"
+            Assert-CcodTrue ($null -eq (Get-Command $spec.Private -Module $module.Name -ErrorAction SilentlyContinue)) "$($spec.Name) private core is not exported"
+        } finally {
+            Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Invoke-CcodTask6Test 'draft-stage' 'Stage fail-closes missing preflight extra assets upload failure concurrent stage and never promotes' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools\Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftRelease'
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-task6-draft-' + [guid]::NewGuid().ToString('N'))
+    $assetFixture = $null
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        $evidence = Join-Path $root 'evidence'
+        [IO.Directory]::CreateDirectory($evidence) | Out-Null
+        $emptyAssets = Join-Path $root 'assets'
+        [IO.Directory]::CreateDirectory($emptyAssets) | Out-Null
+        $fixture = New-CcodTask6DraftAdapterFixture -AssetDirectory $emptyAssets
+        Assert-CcodThrows { Invoke-CcodTask6DraftCore -Module $module -Mode Stage -Tag 'v2.5.22' -AssetDirectory $emptyAssets -EvidenceDirectory $evidence -Adapters $fixture.Adapters | Out-Null } 'CCOD_GITHUB_DRAFT_PREFLIGHT_MISSING'
+        Assert-CcodTrue (-not $fixture.State.Promoted) 'missing preflight never promotes'
+        Assert-CcodTrue (-not $fixture.State.Rebuilt) 'missing preflight never rebuilds'
+        [IO.File]::WriteAllText((Join-Path $evidence 'CodexRemote-fix-2.5.22-clean-preflight.json'), '{"valid":true}', [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $emptyAssets 'unexpected.txt'), 'x', [Text.UTF8Encoding]::new($false))
+        $extra = New-CcodTask6DraftAdapterFixture -AssetDirectory $emptyAssets
+        Assert-CcodThrows { Invoke-CcodTask6DraftCore -Module $module -Mode Stage -Tag 'v2.5.22' -AssetDirectory $emptyAssets -EvidenceDirectory $evidence -Adapters $extra.Adapters | Out-Null } 'CCOD_RELEASE_ASSET_SET_INVALID'
+        Assert-CcodTrue (-not $extra.State.Promoted) 'extra asset never promotes'
+        $assetFixture = New-CcodTask5ExactAssetFixture
+        $preflight = Join-Path $assetFixture.Outside 'CodexRemote-fix-2.5.22-clean-preflight.json'
+        $preflightRecord = [ordered]@{ schemaVersion = 1; valid = $true; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; repositoryRoot = [IO.Path]::GetFullPath($repositoryRoot) }
+        [IO.File]::WriteAllText($preflight, (($preflightRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        $upload = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root -UploadFails
+        Assert-CcodThrows { Invoke-CcodTask6DraftCore -Module $module -Mode Stage -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $assetFixture.Outside -Adapters $upload.Adapters | Out-Null } 'CCOD_GITHUB_DRAFT_UPLOAD_FAILED'
+        Assert-CcodTrue $upload.State.Created 'upload failure still created a draft'
+        Assert-CcodTrue $upload.State.DraftPrivate 'upload failure leaves the draft private'
+        Assert-CcodTrue (-not $upload.State.Promoted) 'upload failure never promotes'
+        $busy = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root -ConcurrentStage
+        Assert-CcodThrows { Invoke-CcodTask6DraftCore -Module $module -Mode Stage -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $assetFixture.Outside -Adapters $busy.Adapters | Out-Null } 'CCOD_GITHUB_DRAFT_CONCURRENT'
+        Assert-CcodTrue (-not $busy.State.Created) 'concurrent stage does not create a second draft'
+        Assert-CcodTrue (-not $busy.State.Promoted) 'concurrent stage never promotes'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if ($null -ne $assetFixture) { Remove-CcodTask5ExactAssetFixture $assetFixture }
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Invoke-CcodTask6Test 'draft-verify-promote' 'Verify and Promote cannot rebuild and Promote fail-closes missing dual receipt or acceptance' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools\Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftRelease'
+    $assetFixture = $null
+    $promotion = $null
+    try {
+        $assetFixture = New-CcodTask5ExactAssetFixture
+        $evidence = $assetFixture.Outside
+        $preflightRecord = [ordered]@{ schemaVersion = 1; valid = $true; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; repositoryRoot = [IO.Path]::GetFullPath($repositoryRoot) }
+        [IO.File]::WriteAllText((Join-Path $evidence 'CodexRemote-fix-2.5.22-clean-preflight.json'), (($preflightRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        $verify = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root
+        Assert-CcodThrows { Invoke-CcodTask6DraftCore -Module $module -Mode Verify -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $evidence -Adapters $verify.Adapters | Out-Null } 'CCOD_GITHUB_DRAFT_NOT_STAGED'
+        Assert-CcodTrue (-not $verify.State.Rebuilt) 'Verify never rebuilds'
+        Assert-CcodTrue (-not $verify.State.Created) 'Verify never creates a release'
+        Assert-CcodTrue (-not $verify.State.Promoted) 'Verify never promotes'
+        $promote = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root
+        Assert-CcodThrows { Invoke-CcodTask6DraftCore -Module $module -Mode Promote -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $evidence -Adapters $promote.Adapters | Out-Null } 'CCOD_RELEASE_PROMOTION_EVIDENCE_INVALID'
+        Assert-CcodTrue (-not $promote.State.Promoted) 'missing dual receipt never promotes'
+        Assert-CcodTrue (-not $promote.State.Rebuilt) 'Promote never rebuilds'
+        $promotion = New-CcodTask5PromotionFixture $assetFixture
+        $promoteEvidence = $promotion.Root
+        $defender = Join-Path $promoteEvidence 'defender'
+        [IO.Directory]::CreateDirectory($defender) | Out-Null
+        foreach ($name in @($promotion.Names)) { Move-Item -LiteralPath (Join-Path $promoteEvidence $name) -Destination (Join-Path $defender $name) }
+        $preflightRecord = [ordered]@{ schemaVersion = 1; valid = $true; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; repositoryRoot = [IO.Path]::GetFullPath($repositoryRoot) }
+        [IO.File]::WriteAllText((Join-Path $promoteEvidence 'CodexRemote-fix-2.5.22-clean-preflight.json'), (($preflightRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        $missingAcceptance = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root
+        Assert-CcodThrows { Invoke-CcodTask6DraftCore -Module $module -Mode Promote -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $promoteEvidence -Adapters $missingAcceptance.Adapters | Out-Null } 'CCOD_GITHUB_DRAFT_ACCEPTANCE_MISSING'
+        Assert-CcodTrue (-not $missingAcceptance.State.Promoted) 'missing acceptance never promotes'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if ($null -ne $promotion -and (Test-Path -LiteralPath $promotion.Root)) { Remove-Item -LiteralPath $promotion.Root -Recurse -Force }
+        if ($null -ne $assetFixture) { Remove-CcodTask5ExactAssetFixture $assetFixture }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-runner-inspection' 'clean runner converts inspection failures into stable fail-closed errors' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Test-CleanReleaseRunner.ps1') -Name 'CcodCleanReleaseRunnerFix1Inspection'
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-task6-runner-inspection-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        $fixture = New-CcodTask6CleanAdapterFixture
+        $fixture.Adapters.GetGitPorcelain = { param($Root) throw 'git inspection unavailable' }.GetNewClosure()
+        Assert-CcodThrows { Invoke-CcodTask6CleanCore -Module $module -RepositoryRoot $root -ExpectedVersion '2.5.22' -Adapters $fixture.Adapters | Out-Null } 'CCOD_CLEAN_RUNNER_INSPECTION_FAILED'
+        Assert-CcodEqual 0 $fixture.State.Cleanup.Count 'git inspection failure does not invoke cleanup'
+        $fixture = New-CcodTask6CleanAdapterFixture
+        $fixture.Adapters.GetProductState = { param($Root) throw 'product inspection denied' }.GetNewClosure()
+        Assert-CcodThrows { Invoke-CcodTask6CleanCore -Module $module -RepositoryRoot $root -ExpectedVersion '2.5.22' -Adapters $fixture.Adapters | Out-Null } 'CCOD_CLEAN_RUNNER_INSPECTION_FAILED'
+        Assert-CcodEqual 0 $fixture.State.Cleanup.Count 'product inspection failure does not invoke cleanup'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-preflight-binding' 'Stage rejects an unbound or malformed transferred clean preflight before creating a draft' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftReleaseFix1Preflight'
+    $assetFixture = $null
+    try {
+        $assetFixture = New-CcodTask5ExactAssetFixture
+        $evidence = $assetFixture.Outside
+        $preflight = Join-Path $evidence 'CodexRemote-fix-2.5.22-clean-preflight.json'
+        $record = [ordered]@{ schemaVersion = 1; valid = $true; version = '2.5.21'; gitCommit = [string]$assetFixture.GitCommit; repositoryRoot = [IO.Path]::GetFullPath($repositoryRoot) }
+        [IO.File]::WriteAllText($preflight, (($record | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        $fixture = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root
+        Assert-CcodThrows { Invoke-CcodTask6DraftCore -Module $module -Mode Stage -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $evidence -Adapters $fixture.Adapters | Out-Null } 'CCOD_GITHUB_DRAFT_PREFLIGHT_INVALID'
+        Assert-CcodTrue (-not $fixture.State.Created) 'invalid preflight does not create a draft'
+        Assert-CcodTrue (-not $fixture.State.Promoted) 'invalid preflight does not promote'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if ($null -ne $assetFixture) { Remove-CcodTask5ExactAssetFixture $assetFixture }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-preflight-all-modes' 'Verify and Promote require the transferred clean preflight before accepting or publishing evidence' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftReleaseFix1PreflightAllModes'
+    $assetFixture = $null
+    $promotion = $null
+    try {
+        $assetFixture = New-CcodTask5ExactAssetFixture
+        $evidence = Join-Path $assetFixture.Outside 'verify-without-preflight'
+        [IO.Directory]::CreateDirectory($evidence) | Out-Null
+        $expected = [string[]]$assetFixture.Names
+        $verify = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root
+        $verify.State.Uploaded.AddRange($expected)
+        Assert-CcodThrows {
+            Invoke-CcodTask6DraftCore -Module $module -Mode Verify -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $evidence -Adapters $verify.Adapters | Out-Null
+        } 'CCOD_GITHUB_DRAFT_PREFLIGHT_MISSING'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $evidence 'verification') -PathType Container)) 'Verify without preflight writes no verification evidence'
+
+        $promotion = New-CcodTask5PromotionFixture $assetFixture
+        $defender = Join-Path $promotion.Root 'defender'
+        $verificationDirectory = Join-Path $promotion.Root 'verification'
+        $acceptanceDirectory = Join-Path $promotion.Root 'acceptance'
+        [IO.Directory]::CreateDirectory($defender) | Out-Null
+        foreach ($name in @($promotion.Names)) { Move-Item -LiteralPath (Join-Path $promotion.Root $name) -Destination (Join-Path $defender $name) }
+        $preflightPath = Join-Path $promotion.Root 'CodexRemote-fix-2.5.22-clean-preflight.json'
+        $preflightRecord = [ordered]@{ schemaVersion = 1; valid = $true; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; repositoryRoot = [IO.Path]::GetFullPath($repositoryRoot) }
+        [IO.File]::WriteAllText($preflightPath, (($preflightRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        $promote = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root
+        $promote.State.Uploaded.AddRange($expected)
+        Invoke-CcodTask6DraftCore -Module $module -Mode Verify -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $promotion.Root -Adapters $promote.Adapters | Out-Null
+        Remove-Item -LiteralPath $preflightPath -Force
+        $acceptanceRecord = [ordered]@{ schemaVersion = 1; kind = 'official-draft-acceptance'; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; candidateManifestSha256 = Get-CcodTestFileSha256 (Join-Path $assetFixture.Root $assetFixture.Names[4]); phase = 'Complete'; completedAtUtc = '2030-02-03T04:05:07.0000000Z' }
+        [IO.Directory]::CreateDirectory($acceptanceDirectory) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $acceptanceDirectory 'CodexRemote-fix-2.5.22-official-draft.complete.json'), (($acceptanceRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows {
+            Invoke-CcodTask6DraftCore -Module $module -Mode Promote -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $promotion.Root -Adapters $promote.Adapters | Out-Null
+        } 'CCOD_GITHUB_DRAFT_PREFLIGHT_MISSING'
+        Assert-CcodTrue (-not $promote.State.Promoted) 'Promote without preflight never changes visibility'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if ($null -ne $promotion -and (Test-Path -LiteralPath $promotion.Root)) { Remove-Item -LiteralPath $promotion.Root -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($null -ne $assetFixture) { Remove-CcodTask5ExactAssetFixture $assetFixture }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-remote-contract' 'Verify rejects null, public, and non-exact remote draft responses' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftReleaseFix1Remote'
+    $assetFixture = $null
+    try {
+        $assetFixture = New-CcodTask5ExactAssetFixture
+        $evidence = $assetFixture.Outside
+        $preflightRecord = [ordered]@{ schemaVersion = 1; valid = $true; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; repositoryRoot = [IO.Path]::GetFullPath($repositoryRoot) }
+        [IO.File]::WriteAllText((Join-Path $evidence 'CodexRemote-fix-2.5.22-clean-preflight.json'), (($preflightRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        $expected = @(Get-CcodTask5ExpectedAssetNames '2.5.22')
+        $nullView = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root
+        $nullView.Adapters.ViewRelease = { param($Tag) $null }.GetNewClosure()
+        Assert-CcodThrows { Invoke-CcodTask6DraftCore -Module $module -Mode Verify -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $evidence -Adapters $nullView.Adapters | Out-Null } 'CCOD_GITHUB_DRAFT_NOT_STAGED'
+        $publicView = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root
+        $publicView.State.Uploaded.AddRange([string[]]$expected)
+        $publicView.State.DraftPrivate = $false
+        $publicView.Adapters.ViewRelease = { param($Tag) [pscustomobject]@{ Tag = $Tag; Draft = $false; AssetNames = @($expected) } }.GetNewClosure()
+        Assert-CcodThrows { Invoke-CcodTask6DraftCore -Module $module -Mode Verify -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $evidence -Adapters $publicView.Adapters | Out-Null } 'CCOD_GITHUB_DRAFT_NOT_STAGED'
+        $wrongNames = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root
+        $wrong = @($expected)
+        $wrong[0] = 'unexpected-release-asset.zip'
+        $wrongNames.State.Uploaded.AddRange([string[]]$wrong)
+        $wrongNames.Adapters.ViewRelease = { param($Tag) [pscustomobject]@{ Tag = $Tag; Draft = $true; AssetNames = @($wrong) } }.GetNewClosure()
+        Assert-CcodThrows { Invoke-CcodTask6DraftCore -Module $module -Mode Verify -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $evidence -Adapters $wrongNames.Adapters | Out-Null } 'CCOD_GITHUB_DRAFT_ASSET_SET_INVALID'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if ($null -ne $assetFixture) { Remove-CcodTask5ExactAssetFixture $assetFixture }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-github-boundary' 'draft release operations are bound to the official Actions repository without an environment bypass' {
+    $draftPath = Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1'
+    $releasePath = Join-Path $repositoryRoot '.github/workflows/release.yml'
+    $draftRaw = [IO.File]::ReadAllText($draftPath, [Text.UTF8Encoding]::new($false))
+    $releaseRaw = [IO.File]::ReadAllText($releasePath, [Text.UTF8Encoding]::new($false))
+    Assert-CcodTrue (-not ($draftRaw + $releaseRaw).Contains('CCOD_ALLOW_GITHUB_RELEASE')) 'live GitHub operations have no caller-controlled override'
+    Assert-CcodTrue ($draftRaw.Contains('naipi11/CodexRemote-fix')) 'GitHub target repository is explicit'
+    Assert-CcodTrue ($draftRaw.Contains('GITHUB_SERVER_URL') -and $draftRaw.Contains('GITHUB_RUN_ID') -and $draftRaw.Contains('GH_TOKEN')) 'default GitHub adapter checks the Actions context'
+    Assert-CcodTrue ($draftRaw.Contains('$value.isDraft -isnot [bool]')) 'default GitHub adapter rejects non-boolean draft state'
+    Assert-CcodTrue ($draftRaw.Contains('$json -join [Environment]::NewLine')) 'default GitHub adapter parses the complete multi-line JSON response'
+    $ghLines = @($draftRaw -split "`r?`n" | Where-Object { $_ -match '& gh ' })
+    Assert-CcodTrue ($ghLines.Count -gt 0) 'default adapter has explicit GitHub operations'
+    foreach ($line in $ghLines) {
+        if ($line -match '& gh api') {
+            Assert-CcodTrue ($draftRaw.Contains('repos/naipi11/CodexRemote-fix/')) 'GitHub API operation pins the repository in its endpoint'
+        } elseif ($line -notmatch '& gh auth status') {
+            Assert-CcodTrue ($line.Contains('--repo')) 'every GitHub release operation pins the repository'
+        }
+        if ($line -notmatch '\$json\s*=\s*& gh ' -and $line -notmatch '& gh api ') { Assert-CcodTrue ($line.Contains('| Out-Null')) 'non-query GitHub operations do not leak CLI output into the state result' }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-local-promote-context' 'authenticated local draft readback does not require the GitHub Actions environment' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftReleaseFix1LocalContext'
+    $fakeRoot = Join-Path ([IO.Path]::GetTempPath()) ('ccod-task6-local-gh-' + [guid]::NewGuid().ToString('N'))
+    $fakeGh = Join-Path $fakeRoot 'gh.cmd'
+    $saved = @{}
+    try {
+        [IO.Directory]::CreateDirectory($fakeRoot) | Out-Null
+        [IO.File]::WriteAllText($fakeGh, "@echo off`r`nif `"%1`"==`"release`" if `"%2`"==`"view`" (`r`n  echo {`"isDraft`":true,`"assets`":[]}`r`n)`r`nexit /b 0`r`n", [Text.UTF8Encoding]::new($false))
+        foreach ($name in @('GITHUB_ACTIONS','GITHUB_SERVER_URL','GITHUB_REPOSITORY','GITHUB_RUN_ID','GH_TOKEN','Path')) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+        Remove-Item Env:GITHUB_ACTIONS,Env:GITHUB_SERVER_URL,Env:GITHUB_REPOSITORY,Env:GITHUB_RUN_ID -ErrorAction SilentlyContinue
+        $env:GH_TOKEN = 'x'
+        $env:Path = $fakeRoot + ';' + $saved.Path
+        $view = &$module { $adapters = Get-CcodGitHubDraftReleaseDefaultAdapters; & $adapters.ViewRelease 'v2.5.22' }
+        Assert-CcodTrue ($view.Draft -is [bool] -and $view.Draft) 'local authenticated draft readback is allowed without Actions context'
+    } finally {
+        foreach ($name in @('GITHUB_ACTIONS','GITHUB_SERVER_URL','GITHUB_REPOSITORY','GITHUB_RUN_ID','GH_TOKEN','Path')) {
+            if ($null -eq $saved[$name]) { Remove-Item ("Env:" + $name) -ErrorAction SilentlyContinue } else { Set-Item ("Env:" + $name) $saved[$name] }
+        }
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $fakeRoot) { Remove-Item -LiteralPath $fakeRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-pwsh-schema-version' 'preflight schemaVersion accepts the Int64 representation emitted by PowerShell Core' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftReleaseFix1PwshSchema'
+    $path = Join-Path ([IO.Path]::GetTempPath()) ('ccod-task6-pwsh-schema-' + [guid]::NewGuid().ToString('N') + '.json')
+    try {
+        [IO.File]::WriteAllText($path, '{}', [Text.UTF8Encoding]::new($false))
+        $record = [pscustomobject][ordered]@{
+            schemaVersion = [int64]1
+            valid = $true
+            version = '2.5.22'
+            gitCommit = 'c' * 40
+            repositoryRoot = [IO.Path]::GetFullPath($repositoryRoot)
+        }
+        &$module { param($Value) Set-Item Function:Read-CcodGitHubDraftContractJson -Value { param($JsonPath,$ErrorId) [pscustomobject]@{ Raw = '{}'; Value = $Value } }.GetNewClosure() } $record
+        $result = &$module { param($Path,$Version,$Commit) Read-CcodGitHubDraftPreflight -Path $Path -Version $Version -GitCommit $Commit } $path '2.5.22' ('c' * 40)
+        Assert-CcodEqual 1 ([long]$result.schemaVersion) 'PowerShell Core Int64 schemaVersion is accepted'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-preflight-root-canonical' 'preflight rejects drive-relative repository roots' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftReleaseFix1PreflightRoot'
+    $path = Join-Path ([IO.Path]::GetTempPath()) ('ccod-task6-preflight-root-' + [guid]::NewGuid().ToString('N') + '.json')
+    try {
+        [IO.File]::WriteAllText($path, '{}', [Text.UTF8Encoding]::new($false))
+        $record = [pscustomobject][ordered]@{
+            schemaVersion = 1
+            valid = $true
+            version = '2.5.22'
+            gitCommit = 'c' * 40
+            repositoryRoot = 'C:relative-root'
+        }
+        &$module { param($Value) Set-Item Function:Read-CcodGitHubDraftContractJson -Value { param($JsonPath,$ErrorId) [pscustomobject]@{ Raw = '{}'; Value = $Value } }.GetNewClosure() } $record
+        Assert-CcodThrows {
+            &$module { param($Path,$Version,$Commit) Read-CcodGitHubDraftPreflight -Path $Path -Version $Version -GitCommit $Commit } $path '2.5.22' ('c' * 40)
+        } 'CCOD_GITHUB_DRAFT_PREFLIGHT_INVALID'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-install-root-probe' 'clean runner treats a file at the install root as product state and distinguishes absence' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Test-CleanReleaseRunner.ps1') -Name 'CcodCleanReleaseRunnerFix1InstallRoot'
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-task6-install-root-' + [guid]::NewGuid().ToString('N'))
+    $file = Join-Path $root 'malformed-install-root'
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        [IO.File]::WriteAllText($file, 'not-a-directory', [Text.UTF8Encoding]::new($false))
+        $present = &$module { param($Path) Get-CcodCleanReleaseRunnerInstallRootPresent -InstallRoot $Path } $file
+        $missing = &$module { param($Path) Get-CcodCleanReleaseRunnerInstallRootPresent -InstallRoot $Path } (Join-Path $root 'missing')
+        Assert-CcodTrue ([bool]$present) 'existing file at install root is treated as present'
+        Assert-CcodEqual $false ([bool]$missing) 'missing install root is treated as absent'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-ignored-clean-runner' 'clean runner includes ignored files in the contamination check' {
+    $raw = [IO.File]::ReadAllText((Join-Path $repositoryRoot 'tools/Test-CleanReleaseRunner.ps1'), [Text.UTF8Encoding]::new($false))
+    Assert-CcodTrue ($raw.Contains('--ignored=matching')) 'clean runner asks git status to report ignored contamination'
+}
+
+Invoke-CcodTask6Test 'fix1-mode-normalization' 'case-insensitive mode binding dispatches lowercase verify to Verify rather than Stage' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftReleaseFix1Mode'
+    $assetFixture = $null
+    try {
+        $assetFixture = New-CcodTask5ExactAssetFixture
+        $evidence = $assetFixture.Outside
+        $preflightRecord = [ordered]@{ schemaVersion = 1; valid = $true; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; repositoryRoot = [IO.Path]::GetFullPath($repositoryRoot) }
+        [IO.File]::WriteAllText((Join-Path $evidence 'CodexRemote-fix-2.5.22-clean-preflight.json'), (($preflightRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        $draft = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root
+        foreach ($name in @($assetFixture.Names)) { $draft.State.Uploaded.Add($name) }
+        $result = Invoke-CcodTask6DraftCore -Module $module -Mode 'verify' -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $evidence -Adapters $draft.Adapters
+        Assert-CcodEqual 'Verify' ([string]$result.Mode) 'lowercase verify dispatches to the Verify mode'
+        Assert-CcodEqual 0 (@($draft.State.Calls | Where-Object { $_ -eq 'CreateDraft' }).Count) 'lowercase verify does not create a release'
+        Assert-CcodEqual 0 (@($draft.State.Calls | Where-Object { [string]$_ -like 'UploadAsset:*' }).Count) 'lowercase verify does not upload assets'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if ($null -ne $assetFixture) { Remove-CcodTask5ExactAssetFixture $assetFixture }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-tag-commit-binding' 'release operations bind the remote tag to the immutable candidate commit' {
+    $draft = [IO.File]::ReadAllText((Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1'), [Text.UTF8Encoding]::new($false))
+    Assert-CcodTrue ($draft.Contains('GetTagCommit')) 'draft tool resolves the remote tag commit'
+    Assert-CcodTrue ($draft.Contains('repos/naipi11/CodexRemote-fix/commits/')) 'tag resolution is bound to the official repository'
+    Assert-CcodTrue ($draft.Contains("'--verify-tag'")) 'draft creation verifies the existing remote tag'
+}
+
+Invoke-CcodTask6Test 'fix1-create-private-readback' 'Stage confirms the newly created release is still private before uploading the first asset' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftReleaseFix1CreatePrivate'
+    $assetFixture = $null
+    try {
+        $assetFixture = New-CcodTask5ExactAssetFixture
+        $evidence = $assetFixture.Outside
+        $preflightRecord = [ordered]@{ schemaVersion = 1; valid = $true; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; repositoryRoot = [IO.Path]::GetFullPath($repositoryRoot) }
+        [IO.File]::WriteAllText((Join-Path $evidence 'CodexRemote-fix-2.5.22-clean-preflight.json'), (($preflightRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        $draft = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root
+        Invoke-CcodTask6DraftCore -Module $module -Mode Stage -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $evidence -Adapters $draft.Adapters | Out-Null
+        $firstUpload = @($draft.State.Calls | Where-Object { [string]$_ -like 'UploadAsset:*' })[0]
+        $firstUploadIndex = [array]::IndexOf([string[]]$draft.State.Calls, [string]$firstUpload)
+        $firstViewIndex = [array]::IndexOf([string[]]$draft.State.Calls, 'ViewRelease')
+        Assert-CcodTrue ($firstViewIndex -ge 0 -and $firstViewIndex -lt $firstUploadIndex) 'private release state is read before the first asset upload'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if ($null -ne $assetFixture) { Remove-CcodTask5ExactAssetFixture $assetFixture }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-post-promote-readback' 'Promote re-downloads and re-hashes public assets after changing draft visibility' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftReleaseFix1PostPromote'
+    $assetFixture = $null
+    $promotion = $null
+    $remoteRoot = $null
+    try {
+        $assetFixture = New-CcodTask5ExactAssetFixture
+        $promotion = New-CcodTask5PromotionFixture $assetFixture
+        $defender = Join-Path $promotion.Root 'defender'
+        $acceptanceDirectory = Join-Path $promotion.Root 'acceptance'
+        [IO.Directory]::CreateDirectory($defender) | Out-Null
+        foreach ($name in @($promotion.Names)) { Move-Item -LiteralPath (Join-Path $promotion.Root $name) -Destination (Join-Path $defender $name) }
+        $preflightRecord = [ordered]@{ schemaVersion = 1; valid = $true; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; repositoryRoot = [IO.Path]::GetFullPath($repositoryRoot) }
+        [IO.File]::WriteAllText((Join-Path $promotion.Root 'CodexRemote-fix-2.5.22-clean-preflight.json'), (($preflightRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        $expected = [string[]]$assetFixture.Names
+        $remoteRoot = Join-Path $assetFixture.Outside 'remote-assets'
+        [IO.Directory]::CreateDirectory($remoteRoot) | Out-Null
+        $draft = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root
+        $state = $draft.State
+        $draft.Adapters.UploadAsset = {
+            param($Tag, $Name, $Path)
+            [IO.File]::Copy($Path, (Join-Path $remoteRoot $Name), $true)
+            $state.Uploaded.Add($Name)
+        }.GetNewClosure()
+        $draft.Adapters.DownloadAsset = {
+            param($Tag, $Name, $Destination)
+            [IO.File]::Copy((Join-Path $remoteRoot $Name), $Destination, $true)
+        }.GetNewClosure()
+        Invoke-CcodTask6DraftCore -Module $module -Mode Stage -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $promotion.Root -Adapters $draft.Adapters | Out-Null
+        Invoke-CcodTask6DraftCore -Module $module -Mode Verify -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $promotion.Root -Adapters $draft.Adapters | Out-Null
+        $acceptanceRecord = [ordered]@{ schemaVersion = 1; kind = 'official-draft-acceptance'; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; candidateManifestSha256 = Get-CcodTestFileSha256 (Join-Path $assetFixture.Root $assetFixture.Names[4]); phase = 'Complete'; completedAtUtc = '2030-02-03T04:05:07.0000000Z' }
+        [IO.Directory]::CreateDirectory($acceptanceDirectory) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $acceptanceDirectory 'CodexRemote-fix-2.5.22-official-draft.complete.json'), (($acceptanceRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        $draft.Adapters.SetReleaseDraftState = {
+            param($Tag, [bool]$Draft)
+            $state.DraftPrivate = $Draft
+            $state.Promoted = -not $Draft
+            if (-not $Draft) { [IO.File]::WriteAllText((Join-Path $remoteRoot $expected[0]), 'post-promotion-mutated', [Text.UTF8Encoding]::new($false)) }
+        }.GetNewClosure()
+        Assert-CcodThrows {
+            Invoke-CcodTask6DraftCore -Module $module -Mode Promote -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $promotion.Root -Adapters $draft.Adapters | Out-Null
+        } 'CCOD_GITHUB_DRAFT_PROMOTE_READBACK_FAILED'
+        Assert-CcodTrue $state.Promoted 'post-promotion byte mismatch is detected after visibility changed'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if ($null -ne $promotion -and (Test-Path -LiteralPath $promotion.Root)) { Remove-Item -LiteralPath $promotion.Root -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($null -ne $assetFixture) { Remove-CcodTask5ExactAssetFixture $assetFixture }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-stage-lock' 'default Stage lock serializes same-tag processes and releases after the operation' {
+    $scriptPath = Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1'
+    $ready = Join-Path ([IO.Path]::GetTempPath()) ('ccod-task6-lock-ready-' + [guid]::NewGuid().ToString('N'))
+    $release = Join-Path ([IO.Path]::GetTempPath()) ('ccod-task6-lock-release-' + [guid]::NewGuid().ToString('N'))
+    $job = $null
+    $secondModule = $null
+    try {
+        $job = Start-Job -ArgumentList $scriptPath, $ready, $release -ScriptBlock {
+            param($Path, $ReadyPath, $ReleasePath)
+            $text = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false))
+            $module = New-Module -Name ('CcodLockHolder-' + [guid]::NewGuid().ToString('N')) -ScriptBlock ([scriptblock]::Create($text))
+            Import-Module $module -Force -DisableNameChecking | Out-Null
+            $held = [bool](&$module { $adapters = Get-CcodGitHubDraftReleaseDefaultAdapters; & $adapters.AcquireStageLock 'v2.5.22' })
+            if (-not $held) { throw 'CCOD_TEST_LOCK_HOLDER_FAILED' }
+            [IO.File]::WriteAllText($ReadyPath, 'held', [Text.UTF8Encoding]::new($false))
+            while (-not [IO.File]::Exists($ReleasePath)) { Start-Sleep -Milliseconds 25 }
+            &$module { $adapters = Get-CcodGitHubDraftReleaseDefaultAdapters; & $adapters.ReleaseStageLock 'v2.5.22' }
+            Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        }
+        $deadline = [DateTime]::UtcNow.AddSeconds(20)
+        while (-not [IO.File]::Exists($ready) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
+        Assert-CcodTrue ([IO.File]::Exists($ready)) 'separate lock-holder process acquired the same-tag lock'
+        $secondModule = Import-CcodTask6ToolModule -Path $scriptPath -Name 'CcodGitHubDraftReleaseFix1LockSecond'
+        $second = [bool](&$secondModule { $adapters = Get-CcodGitHubDraftReleaseDefaultAdapters; & $adapters.AcquireStageLock 'v2.5.22' })
+        Assert-CcodTrue (-not $second) 'second same-tag process is rejected by the default lock'
+        [IO.File]::WriteAllText($release, 'release', [Text.UTF8Encoding]::new($false))
+        $completed = Wait-Job -Job $job -Timeout 20
+        Assert-CcodTrue ($null -ne $completed) 'lock-holder process releases before timeout'
+        Receive-Job -Job $job -ErrorAction Stop | Out-Null
+        $afterModule = Import-CcodTask6ToolModule -Path $scriptPath -Name 'CcodGitHubDraftReleaseFix1LockAfter'
+        try {
+            $after = [bool](&$afterModule { $adapters = Get-CcodGitHubDraftReleaseDefaultAdapters; & $adapters.AcquireStageLock 'v2.5.22' })
+            Assert-CcodTrue $after 'same-tag lock can be reacquired after the holder releases'
+            &$afterModule { $adapters = Get-CcodGitHubDraftReleaseDefaultAdapters; & $adapters.ReleaseStageLock 'v2.5.22' }
+        } finally {
+            Remove-Module -Name $afterModule.Name -Force -ErrorAction SilentlyContinue
+        }
+    } finally {
+        if ($null -ne $secondModule) { Remove-Module -Name $secondModule.Name -Force -ErrorAction SilentlyContinue }
+        if ($null -ne $job) { Stop-Job -Job $job -ErrorAction SilentlyContinue | Out-Null; Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $ready) { Remove-Item -LiteralPath $ready -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $release) { Remove-Item -LiteralPath $release -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-evidence-layout' 'Promote accepts separate Defender receipts, verification, and acceptance evidence and reads the final draft state back' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftReleaseFix1Evidence'
+    $assetFixture = $null
+    $promotion = $null
+    try {
+        $assetFixture = New-CcodTask5ExactAssetFixture
+        $promotion = New-CcodTask5PromotionFixture $assetFixture
+        $defender = Join-Path $promotion.Root 'defender'
+        $verification = Join-Path $promotion.Root 'verification'
+        $acceptance = Join-Path $promotion.Root 'acceptance'
+        [IO.Directory]::CreateDirectory($defender) | Out-Null
+        [IO.Directory]::CreateDirectory($verification) | Out-Null
+        [IO.Directory]::CreateDirectory($acceptance) | Out-Null
+        foreach ($name in @($promotion.Names)) {
+            Move-Item -LiteralPath (Join-Path $promotion.Root $name) -Destination (Join-Path $defender $name)
+        }
+        $preflightRecord = [ordered]@{ schemaVersion = 1; valid = $true; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; repositoryRoot = [IO.Path]::GetFullPath($repositoryRoot) }
+        [IO.File]::WriteAllText((Join-Path $promotion.Root 'CodexRemote-fix-2.5.22-clean-preflight.json'), (($preflightRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        $draft = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root
+        Invoke-CcodTask6DraftCore -Module $module -Mode Stage -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $promotion.Root -Adapters $draft.Adapters | Out-Null
+        Invoke-CcodTask6DraftCore -Module $module -Mode Verify -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $promotion.Root -Adapters $draft.Adapters | Out-Null
+        $acceptanceRecord = [ordered]@{ schemaVersion = 1; kind = 'official-draft-acceptance'; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; candidateManifestSha256 = Get-CcodTestFileSha256 (Join-Path $assetFixture.Root $assetFixture.Names[4]); phase = 'Complete'; completedAtUtc = '2030-02-03T04:05:07.0000000Z' }
+        [IO.File]::WriteAllText((Join-Path $acceptance 'CodexRemote-fix-2.5.22-official-draft.complete.json'), (($acceptanceRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        $result = Invoke-CcodTask6DraftCore -Module $module -Mode Promote -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $promotion.Root -Adapters $draft.Adapters
+        Assert-CcodTrue ([bool]$result.Promoted) 'promotion succeeds with separated evidence planes'
+        Assert-CcodTrue (-not $draft.State.DraftPrivate) 'promotion changes the already verified draft to public'
+        Assert-CcodTrue (-not $draft.State.Rebuilt) 'promotion never rebuilds the candidate'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if ($null -ne $promotion -and (Test-Path -LiteralPath $promotion.Root)) { Remove-Item -LiteralPath $promotion.Root -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($null -ne $assetFixture) { Remove-CcodTask5ExactAssetFixture $assetFixture }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-workflow-transfer' 'release workflow transfers one immutable commit and the clean preflight as artifacts without rerunning the runner in Stage' {
+    $workflowPath = Join-Path $repositoryRoot '.github/workflows/release.yml'
+    $raw = [IO.File]::ReadAllText($workflowPath, [Text.UTF8Encoding]::new($false))
+    Assert-CcodTrue ($raw.Contains('commit:')) 'preflight publishes an immutable commit output'
+    Assert-CcodTrue ($raw.Contains('ref: ${{ needs.preflight.outputs.commit }}')) 'build and stage use the immutable preflight commit'
+    Assert-CcodTrue ($raw.Contains('-NotesPath $notesPath')) 'generated release notes are passed to draft creation'
+    Assert-CcodTrue ([regex]::Matches($raw, 'actions/upload-artifact@').Count -ge 2) 'preflight and candidate are transferred as separate artifacts'
+    Assert-CcodTrue ([regex]::Matches($raw, 'actions/download-artifact@').Count -ge 2) 'stage downloads both immutable artifacts'
+    Assert-CcodEqual 1 ([regex]::Matches($raw, 'Test-CcodCleanReleaseRunner').Count) 'Stage does not rerun clean runner as a substitute for transferred evidence'
+}
+
+Invoke-CcodTask6Test 'fix1-runner-defaults' 'default clean runner adapters fail closed on git failure and preflight evidence is create-only with readback' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Test-CleanReleaseRunner.ps1') -Name 'CcodCleanReleaseRunnerFix1Defaults'
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-task6-runner-defaults-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        $adapters = &$module { Get-CcodCleanReleaseRunnerDefaultAdapters }
+        Assert-CcodThrows { & $adapters.GetGitPorcelain $root | Out-Null } 'CCOD_CLEAN_RUNNER_INSPECTION_FAILED'
+        $evidence = Join-Path $root 'preflight.json'
+        $record = [ordered]@{ schemaVersion = 1; valid = $true; version = '2.5.22'; gitCommit = ('c' * 40); repositoryRoot = $root }
+        & $adapters.WritePreflightEvidence $evidence $record | Out-Null
+        Assert-CcodTrue (Test-Path -LiteralPath $evidence -PathType Leaf) 'default preflight writer creates its evidence file'
+        Assert-CcodThrows { & $adapters.WritePreflightEvidence $evidence $record | Out-Null } 'CCOD_CLEAN_RUNNER_PREFLIGHT_WRITE_FAILED'
+        $written = [IO.File]::ReadAllText($evidence, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+        Assert-CcodEqual $record.gitCommit ([string]$written.gitCommit) 'preflight writer readback retains the exact commit'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-evidence-types' 'persisted Verify and acceptance records reject scalar fields encoded as single-element arrays' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftReleaseFix1EvidenceTypes'
+    $assetFixture = $null
+    try {
+        $assetFixture = New-CcodTask5ExactAssetFixture
+        $evidence = Join-Path $assetFixture.Outside 'typed-evidence'
+        $acceptanceDirectory = Join-Path $evidence 'acceptance'
+        $verificationDirectory = Join-Path $evidence 'verification'
+        [IO.Directory]::CreateDirectory($acceptanceDirectory) | Out-Null
+        [IO.Directory]::CreateDirectory($verificationDirectory) | Out-Null
+        $manifestHash = Get-CcodTestFileSha256 (Join-Path $assetFixture.Root $assetFixture.Names[4])
+        $acceptanceRecord = [ordered]@{
+            schemaVersion = 1
+            kind = 'official-draft-acceptance'
+            version = @('2.5.22')
+            gitCommit = [string]$assetFixture.GitCommit
+            candidateManifestSha256 = $manifestHash
+            phase = 'Complete'
+            completedAtUtc = '2030-02-03T04:05:07.0000000Z'
+        }
+        [IO.File]::WriteAllText((Join-Path $acceptanceDirectory 'CodexRemote-fix-2.5.22-official-draft.complete.json'), (($acceptanceRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows {
+            &$module { param($Evidence,$Assets,$Version,$Commit) Read-CcodGitHubDraftAcceptance -EvidenceDirectory $Evidence -AssetDirectory $Assets -Version $Version -GitCommit $Commit } $evidence $assetFixture.Root '2.5.22' $assetFixture.GitCommit | Out-Null
+        } 'CCOD_GITHUB_DRAFT_ACCEPTANCE_INVALID'
+        $names = [string[]]$assetFixture.Names
+        $hashes = [Collections.Generic.List[string]]::new()
+        foreach ($name in $names) { $hashes.Add((Get-CcodTestFileSha256 (Join-Path $assetFixture.Root $name))) }
+        $verificationRecord = [ordered]@{
+            schemaVersion = 1
+            kind = 'github-draft-verification'
+            tag = @('v2.5.22')
+            version = '2.5.22'
+            gitCommit = [string]$assetFixture.GitCommit
+            draft = $true
+            verified = $true
+            assetNames = $names
+            assetSha256 = [string[]]$hashes
+            candidateManifestSha256 = $manifestHash
+        }
+        [IO.File]::WriteAllText((Join-Path $verificationDirectory 'CodexRemote-fix-2.5.22-draft-verified.json'), (($verificationRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows {
+            &$module { param($Evidence,$Assets,$Tag,$Version,$Commit) Read-CcodGitHubDraftVerification -EvidenceDirectory $Evidence -AssetDirectory $Assets -Tag $Tag -Version $Version -GitCommit $Commit } $evidence $assetFixture.Root 'v2.5.22' '2.5.22' $assetFixture.GitCommit | Out-Null
+        } 'CCOD_GITHUB_DRAFT_VERIFY_EVIDENCE_INVALID'
+        $verificationRecord.tag = 'v2.5.22'
+        $malformedNames = New-Object object[] $names.Count
+        $nestedName = New-Object object[] 1
+        $nestedName[0] = $names[0]
+        $malformedNames[0] = $nestedName
+        for ($index = 1; $index -lt $names.Count; $index++) { $malformedNames[$index] = $names[$index] }
+        $malformedRecord = [pscustomobject][ordered]@{
+            schemaVersion = 1
+            kind = 'github-draft-verification'
+            tag = 'v2.5.22'
+            version = '2.5.22'
+            gitCommit = [string]$assetFixture.GitCommit
+            draft = $true
+            verified = $true
+            assetNames = $malformedNames
+            assetSha256 = [string[]]$hashes
+            candidateManifestSha256 = $manifestHash
+        }
+        &$module { param($Value) Set-Item Function:Read-CcodGitHubDraftContractJson -Value { param($JsonPath,$ErrorId) [pscustomobject]@{ Raw = '{}'; Value = $Value } }.GetNewClosure() } $malformedRecord
+        Assert-CcodThrows {
+            &$module { param($Evidence,$Assets,$Tag,$Version,$Commit) Read-CcodGitHubDraftVerification -EvidenceDirectory $Evidence -AssetDirectory $Assets -Tag $Tag -Version $Version -GitCommit $Commit } $evidence $assetFixture.Root 'v2.5.22' '2.5.22' $assetFixture.GitCommit | Out-Null
+        } 'CCOD_GITHUB_DRAFT_VERIFY_EVIDENCE_INVALID'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if ($null -ne $assetFixture) { Remove-CcodTask5ExactAssetFixture $assetFixture }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-freeze-assets' 'Stage uploads the exact candidate bytes even when a source asset changes after validation' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftReleaseFix1FreezeAssets'
+    $assetFixture = $null
+    $uploadedRoot = $null
+    try {
+        $assetFixture = New-CcodTask5ExactAssetFixture
+        $evidence = Join-Path $assetFixture.Outside 'freeze-assets'
+        [IO.Directory]::CreateDirectory($evidence) | Out-Null
+        $expected = [string[]]$assetFixture.Names
+        $preflightRecord = [ordered]@{ schemaVersion = 1; valid = $true; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; repositoryRoot = [IO.Path]::GetFullPath($repositoryRoot) }
+        [IO.File]::WriteAllText((Join-Path $evidence 'CodexRemote-fix-2.5.22-clean-preflight.json'), (($preflightRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        $originalHash = Get-CcodTestFileSha256 (Join-Path $assetFixture.Root $expected[0])
+        $uploadedRoot = Join-Path $assetFixture.Outside 'uploaded'
+        [IO.Directory]::CreateDirectory($uploadedRoot) | Out-Null
+        $draft = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root
+        $state = $draft.State
+        $sourceRoot = $assetFixture.Root
+        $hashFile = {
+            param($Path)
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try {
+                $stream = [IO.File]::OpenRead($Path)
+                try { return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() } finally { $stream.Dispose() }
+            } finally { $sha.Dispose() }
+        }.GetNewClosure()
+        $draft.Adapters.CreateDraft = {
+            param($Tag, $Title, $Notes)
+            [IO.File]::WriteAllText((Join-Path $sourceRoot $expected[0]), 'mutated-after-exact-set', [Text.UTF8Encoding]::new($false))
+            $state.Created = $true
+            $state.DraftPrivate = $true
+            [pscustomobject]@{ Tag = $Tag; Draft = $true }
+        }.GetNewClosure()
+        $draft.Adapters.UploadAsset = {
+            param($Tag, $Name, $Path)
+            $destination = Join-Path $uploadedRoot $Name
+            [IO.File]::Copy($Path, $destination, $true)
+            $state.Uploaded.Add($Name)
+            $state.Assets[$Name] = & $hashFile $destination
+        }.GetNewClosure()
+        $draft.Adapters.DownloadAsset = {
+            param($Tag, $Name, $Destination)
+            [IO.File]::Copy((Join-Path $uploadedRoot $Name), $Destination, $true)
+        }.GetNewClosure()
+        Invoke-CcodTask6DraftCore -Module $module -Mode Stage -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $evidence -Adapters $draft.Adapters | Out-Null
+        Assert-CcodEqual $originalHash ([string]$state.Assets[$expected[0]]) 'Stage uploads the pre-validation bytes rather than the raced source bytes'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if ($null -ne $assetFixture) { Remove-CcodTask5ExactAssetFixture $assetFixture }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-promote-lock' 'Promote refuses an occupied same-tag lock before changing draft visibility' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftReleaseFix1PromoteLock'
+    $assetFixture = $null
+    $promotion = $null
+    try {
+        $assetFixture = New-CcodTask5ExactAssetFixture
+        $promotion = New-CcodTask5PromotionFixture $assetFixture
+        $defender = Join-Path $promotion.Root 'defender'
+        $acceptanceDirectory = Join-Path $promotion.Root 'acceptance'
+        [IO.Directory]::CreateDirectory($defender) | Out-Null
+        foreach ($name in @($promotion.Names)) { Move-Item -LiteralPath (Join-Path $promotion.Root $name) -Destination (Join-Path $defender $name) }
+        $preflightRecord = [ordered]@{ schemaVersion = 1; valid = $true; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; repositoryRoot = [IO.Path]::GetFullPath($repositoryRoot) }
+        [IO.File]::WriteAllText((Join-Path $promotion.Root 'CodexRemote-fix-2.5.22-clean-preflight.json'), (($preflightRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        $expected = [string[]]$assetFixture.Names
+        $draft = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root
+        $draft.State.Uploaded.AddRange($expected)
+        Invoke-CcodTask6DraftCore -Module $module -Mode Verify -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $promotion.Root -Adapters $draft.Adapters | Out-Null
+        $acceptanceRecord = [ordered]@{ schemaVersion = 1; kind = 'official-draft-acceptance'; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; candidateManifestSha256 = Get-CcodTestFileSha256 (Join-Path $assetFixture.Root $assetFixture.Names[4]); phase = 'Complete'; completedAtUtc = '2030-02-03T04:05:07.0000000Z' }
+        [IO.Directory]::CreateDirectory($acceptanceDirectory) | Out-Null
+        [IO.File]::WriteAllText((Join-Path $acceptanceDirectory 'CodexRemote-fix-2.5.22-official-draft.complete.json'), (($acceptanceRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        $draft.Adapters.TryStageLock = { param($Tag) $false }.GetNewClosure()
+        Assert-CcodThrows {
+            Invoke-CcodTask6DraftCore -Module $module -Mode Promote -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $promotion.Root -Adapters $draft.Adapters | Out-Null
+        } 'CCOD_GITHUB_DRAFT_CONCURRENT'
+        Assert-CcodTrue (-not $draft.State.Promoted) 'occupied Promote lock never changes visibility'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if ($null -ne $promotion -and (Test-Path -LiteralPath $promotion.Root)) { Remove-Item -LiteralPath $promotion.Root -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($null -ne $assetFixture) { Remove-CcodTask5ExactAssetFixture $assetFixture }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-evidence-paths' 'verification and acceptance evidence reject junction ancestry outside the evidence root' {
+    $module = Import-CcodTask6ToolModule -Path (Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1') -Name 'CcodGitHubDraftReleaseFix1EvidencePaths'
+    $assetFixture = $null
+    try {
+        $assetFixture = New-CcodTask5ExactAssetFixture
+        $evidence = Join-Path $assetFixture.Outside 'evidence-paths'
+        $verificationOutside = Join-Path $assetFixture.Outside 'verification-outside'
+        $acceptanceOutside = Join-Path $assetFixture.Outside 'acceptance-outside'
+        [IO.Directory]::CreateDirectory($evidence) | Out-Null
+        [IO.Directory]::CreateDirectory($verificationOutside) | Out-Null
+        [IO.Directory]::CreateDirectory($acceptanceOutside) | Out-Null
+        $verificationLink = Join-Path $evidence 'verification'
+        $acceptanceLink = Join-Path $evidence 'acceptance'
+        $previous = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            & cmd.exe /d /c mklink /J $verificationLink $verificationOutside 2>&1 | Out-Null
+            $verificationCode = $LASTEXITCODE
+            & cmd.exe /d /c mklink /J $acceptanceLink $acceptanceOutside 2>&1 | Out-Null
+            $acceptanceCode = $LASTEXITCODE
+        } finally { $ErrorActionPreference = $previous }
+        if ($verificationCode -ne 0 -or $acceptanceCode -ne 0) { throw 'evidence path junction fixture failed' }
+        $preflightRecord = [ordered]@{ schemaVersion = 1; valid = $true; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; repositoryRoot = [IO.Path]::GetFullPath($repositoryRoot) }
+        [IO.File]::WriteAllText((Join-Path $evidence 'CodexRemote-fix-2.5.22-clean-preflight.json'), (($preflightRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        $expected = [string[]]$assetFixture.Names
+        $verify = New-CcodTask6DraftAdapterFixture -AssetDirectory $assetFixture.Root
+        $verify.State.Uploaded.AddRange($expected)
+        Assert-CcodThrows {
+            Invoke-CcodTask6DraftCore -Module $module -Mode Verify -Tag 'v2.5.22' -AssetDirectory $assetFixture.Root -EvidenceDirectory $evidence -Adapters $verify.Adapters | Out-Null
+        } 'CCOD_GITHUB_DRAFT_EVIDENCE_PATH_INVALID'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $verificationOutside 'CodexRemote-fix-2.5.22-draft-verified.json') -PathType Leaf)) 'Verify does not write through an external verification junction'
+        $acceptanceRecord = [ordered]@{ schemaVersion = 1; kind = 'official-draft-acceptance'; version = '2.5.22'; gitCommit = [string]$assetFixture.GitCommit; candidateManifestSha256 = Get-CcodTestFileSha256 (Join-Path $assetFixture.Root $assetFixture.Names[4]); phase = 'Complete'; completedAtUtc = '2030-02-03T04:05:07.0000000Z' }
+        [IO.File]::WriteAllText((Join-Path $acceptanceOutside 'CodexRemote-fix-2.5.22-official-draft.complete.json'), (($acceptanceRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows {
+            &$module { param($Evidence,$Assets,$Version,$Commit) Read-CcodGitHubDraftAcceptance -EvidenceDirectory $Evidence -AssetDirectory $Assets -Version $Version -GitCommit $Commit } $evidence $assetFixture.Root '2.5.22' $assetFixture.GitCommit | Out-Null
+        } 'CCOD_GITHUB_DRAFT_EVIDENCE_PATH_INVALID'
+    } finally {
+        Remove-Module -Name $module.Name -Force -ErrorAction SilentlyContinue
+        if ($null -ne $assetFixture) { Remove-CcodTask5ExactAssetFixture $assetFixture }
+    }
+}
+
+Invoke-CcodTask6Test 'fix1-concurrency-canonical' 'workflow dispatch rejects whitespace tag variants instead of normalizing them after concurrency grouping' {
+    $releasePath = Join-Path $repositoryRoot '.github/workflows/release.yml'
+    $raw = [IO.File]::ReadAllText($releasePath, [Text.UTF8Encoding]::new($false))
+    Assert-CcodTrue ($raw -cnotmatch '\$tag\s*=\s*\$tag\.Trim\(\)') 'dispatch tag is validated without post-group normalization'
+}
+
+Invoke-CcodTask6Test 'fix1-absolute-tag-anchor' 'release tag and version validators reject trailing newline variants' {
+    $release = [IO.File]::ReadAllText((Join-Path $repositoryRoot '.github/workflows/release.yml'), [Text.UTF8Encoding]::new($false))
+    $draft = [IO.File]::ReadAllText((Join-Path $repositoryRoot 'tools/Invoke-GitHubDraftRelease.ps1'), [Text.UTF8Encoding]::new($false))
+    $clean = [IO.File]::ReadAllText((Join-Path $repositoryRoot 'tools/Test-CleanReleaseRunner.ps1'), [Text.UTF8Encoding]::new($false))
+    Assert-CcodTrue ($release.Contains('^v\d+\.\d+\.\d+\z')) 'release workflow uses an absolute tag end anchor'
+    Assert-CcodTrue ($draft.Contains('^v\d+\.\d+\.\d+\z')) 'draft command uses an absolute tag end anchor'
+    Assert-CcodTrue ($clean.Contains('^\d+\.\d+\.\d+\z')) 'clean runner uses an absolute version end anchor'
 }
 
 Write-Host 'Release workflow self-tests passed.'

@@ -737,5 +737,13 @@ $results += Invoke-CcodTest 'prelaunch evaluates safe-exit policy before lease a
     Assert-CcodExactEqual $null $suppressed.LaunchLease 'suppressed startup owns no launch lease'
 }
 
+$results += Invoke-CcodTest 'clean release runner fail-closes contaminated product state without invoking bootstrap' {
+    $path = Join-Path $repositoryRoot 'tools\Test-CleanReleaseRunner.ps1'
+    Assert-CcodTrue (Test-Path -LiteralPath $path -PathType Leaf) 'clean release runner script exists'
+    $source = [IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false))
+    Assert-CcodTrue ($source -cnotmatch 'bootstrap\.ps1') 'clean runner does not invoke bootstrap'
+    Assert-CcodTrue ($source -cmatch 'CCOD_CLEAN_RUNNER_CONTAMINATED') 'clean runner fail-closes contaminated product state'
+}
+
 $results | Format-Table -AutoSize
 Write-Host ("Bootstrap self-test passed: {0}" -f $results.Count)
