@@ -4,6 +4,7 @@ Date: 2026-09-04
 Worktree: `C:\Users\33384\Documents\Codex-Control-other-devices-Windows\.worktrees\codex-v2522-install-runtime-reliability`
 Branch: `codex/v2522-install-runtime-reliability`
 Implementation commit: `6d9bafa96c252ece692e8aff35e420285479b7b6`
+Corrective module-boundary commit: `325985d9a56bc222be1eb6a73dfb60b6326706da`
 
 ## Scope
 
@@ -35,7 +36,7 @@ Observed result: exit code `0`; the focused case reported `True` and `Release wo
 
 All commands were run from the exact worktree above.
 
-- `powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tests/persistence/ReleaseWorkflow.SelfTest.ps1` — exit `0`.
+- `powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tests/persistence/ReleaseWorkflow.SelfTest.ps1` — exit `0`, including the public-module-boundary and strict evidence-type cases after the corrective module-boundary commit.
 - `powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tests/persistence/Bootstrap.SelfTest.ps1` — exit `0`, `27/27`.
 - `powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File tests/persistence/InstallLifecycle.SelfTest.ps1` — exit `0`, `151` passed.
 - `npm test` — exit `0`; `Validation passed: PowerShell, JavaScript, clean-room runtime, package checker, persistence tests, repository files, and package preflight.`
@@ -57,8 +58,8 @@ The reviewer reported no file modifications and no external operations. Earlier 
 
 ## Commit separation
 
-- Implementation commit: `6d9bafa96c252ece692e8aff35e420285479b7b6`.
-- This report and the progress ledger are evidence only and are committed separately after the implementation commit.
+- Implementation commits: `6d9bafa96c252ece692e8aff35e420285479b7b6` and corrective module-boundary commit `325985d9a56bc222be1eb6a73dfb60b6326706da`.
+- This report and the progress ledger are evidence only and are committed separately after the implementation commits.
 
 ## Remaining gates
 

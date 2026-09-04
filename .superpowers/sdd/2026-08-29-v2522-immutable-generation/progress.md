@@ -409,5 +409,5 @@ installation, or reboot action was performed.
 Focused Task 6 slices, full ReleaseWorkflow, Bootstrap 27/27, PowerShell/YAML parsing,
 static security checks, and the formal `npm test` validation all passed. The old
 InstallLifecycle branding assertion was updated to the new draft-tool ownership and
-its standalone suite passed 151. A constrained independent re-review inspected the exact staged Task 6 diff and returned PASS with no findings. The implementation was committed as `6d9bafa96c252ece692e8aff35e420285479b7b6`; the verification report is committed separately. No live GitHub, Defender, network, publication, installation, or reboot action was performed.
+its standalone suite passed 151. A constrained independent re-review inspected the exact staged Task 6 diff and returned PASS with no findings. The implementation was committed as `6d9bafa96c252ece692e8aff35e420285479b7b6`, and the required public module wrappers were restored and verified in corrective commit `325985d9a56bc222be1eb6a73dfb60b6326706da`; the verification report is committed separately. No live GitHub, Defender, network, publication, installation, or reboot action was performed.
 Task 6 fix-round implementation and independent acceptance are complete. Task 7/8 official draft acceptance remains blocked until its own gates are implemented.
