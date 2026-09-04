@@ -393,4 +393,21 @@ identities through the decision; and receipts require production write/read-back
 Frozen verification passed ReleaseWorkflow 63 declared cases, PortableRelease
 5/5, InstallLifecycle 151/151, parser 104/104, diff check, and all 39 aggregate
 suites. No real Defender/build/install/network/release action was performed.
-Task 5 scoped re-review of `fb163b7..9f8a9e7` is required. Tasks 6–8 remain blocked.
+Task 5 scoped re-review of `fb163b7..9f8a9e7` is PASS (Spec Compliance PASS,
+Task Quality PASS, 0 Critical, 0 Important). Original findings 1-4 are closed.
+Task 5 is complete. Task 6 is in progress; Tasks 7-8 remain blocked.
+
+Task 6 fix round is implemented in the current worktree after the first scoped review
+returned 4 Critical and 7 Important findings. The fix adds fail-closed clean-runner
+inspection and create-only preflight evidence; binds prepare/preflight/build/stage to
+one resolved 40-hex commit and transfers preflight as a pinned artifact; removes the
+GitHub environment bypass and pins every gh call to `naipi11/CodexRemote-fix`; uses a
+real same-tag named mutex; separates `defender/`, `verification/`, and `acceptance/`
+evidence; persists and revalidates Verify hashes; and requires exact remote asset/state
+read-back before and after promotion. No live GitHub, Defender, network, publication,
+installation, or reboot action was performed.
+Focused Task 6 slices, full ReleaseWorkflow, Bootstrap 27/27, PowerShell/YAML parsing,
+static security checks, and the formal `npm test` validation all passed. The old
+InstallLifecycle branding assertion was updated to the new draft-tool ownership and
+its standalone suite passed 151. A constrained independent re-review inspected the exact staged Task 6 diff and returned PASS with no findings. The implementation was committed as `6d9bafa96c252ece692e8aff35e420285479b7b6`; the verification report is committed separately. No live GitHub, Defender, network, publication, installation, or reboot action was performed.
+Task 6 fix-round implementation and independent acceptance are complete. Task 7/8 official draft acceptance remains blocked until its own gates are implemented.
