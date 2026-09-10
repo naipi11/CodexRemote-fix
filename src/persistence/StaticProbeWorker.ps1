@@ -432,7 +432,7 @@ function Test-CcodStaticManifestPath {
 function Get-CcodStaticRuntimeIdFromRecords {
     param([string]$ProjectVersion,[object[]]$Files,[string]$ExpectedRuntimeId)
     $lines=[Collections.Generic.List[string]]::new()
-    foreach($file in $Files){$lines.Add(('{0}`t{1}`t{2}' -f [string]$file.path,[int64]$file.length,[string]$file.sha256))}
+    foreach($file in $Files){$lines.Add(("{0}`t{1}`t{2}" -f [string]$file.path,[int64]$file.length,[string]$file.sha256))}
     $canonical=$lines -join "`n";$sha=[Security.Cryptography.SHA256]::Create()
     try{$digest=[BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
     $match=[regex]::Match($ExpectedRuntimeId,'^(?<version>[A-Za-z0-9][A-Za-z0-9._-]{0,45})-(?<digest>[0-9a-f]{16})-(?<nonce>[0-9a-f]{32})$');if(-not$match.Success-or$match.Groups['version'].Value-cne$ProjectVersion){Throw-CcodStaticProbeError 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Runtime identity format is invalid' $ExpectedRuntimeId}

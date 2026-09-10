@@ -27,7 +27,7 @@ function Get-CcodErrorId {
 function Assert-CcodRuntimeId {
     param([Parameter(Mandatory)][string]$RuntimeId)
 
-    if ($RuntimeId -notmatch '^[A-Za-z0-9._-]{1,96}$') {
+    if ($RuntimeId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}\z') {
         Throw-CcodRuntimeError 'CCOD_RUNTIME_ID_INVALID' 'Runtime ID must be a safe relative directory name' $RuntimeId
     }
     return $RuntimeId
@@ -68,16 +68,16 @@ function Get-CcodRuntimeAdapters {
 }
 
 function ConvertTo-CcodRuntimeGeneration {
-    param([Parameter(Mandatory)]$Value, [Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)]$Value, [Parameter(Mandatory)][string]$Path, [switch]$AllowZero)
 
     if ($Value -is [decimal]) {
-        if ($Value -lt 1 -or [decimal]::Truncate($Value) -ne $Value) {
+        if ($Value -lt $(if ($AllowZero) { 0 } else { 1 }) -or [decimal]::Truncate($Value) -ne $Value) {
             Throw-CcodRuntimeError 'CCOD_RUNTIME_GENERATION_INVALID' 'Active runtime generation must be a positive unsigned integer' $Path
         }
         try { return [UInt64]$Value } catch { Throw-CcodRuntimeError 'CCOD_RUNTIME_GENERATION_INVALID' 'Active runtime generation is outside the unsigned 64-bit range' $Path }
     }
     if ($Value -isnot [byte] -and $Value -isnot [uint16] -and $Value -isnot [uint32] -and $Value -isnot [uint64] -and
-        $Value -isnot [int16] -and $Value -isnot [int32] -and $Value -isnot [int64] -or $Value -lt 1) {
+        $Value -isnot [int16] -and $Value -isnot [int32] -and $Value -isnot [int64] -or $Value -lt $(if ($AllowZero) { 0 } else { 1 })) {
         Throw-CcodRuntimeError 'CCOD_RUNTIME_GENERATION_INVALID' 'Active runtime generation must be a positive unsigned integer' $Path
     }
     return [UInt64]$Value
@@ -87,13 +87,33 @@ function Get-CcodRuntimeRoot {
     param([Parameter(Mandatory)][string]$RuntimeDirectory)
 
     $root = [IO.Path]::GetFullPath($RuntimeDirectory)
-    if (-not [IO.Directory]::Exists($root)) {
+    if (-not [string]::Equals($root, $RuntimeDirectory, [StringComparison]::OrdinalIgnoreCase)) {
+        Throw-CcodRuntimeError 'CCOD_RUNTIME_PATH_INVALID' 'Runtime directory must use a canonical absolute path' $RuntimeDirectory
+    }
+    try {
+        $item = Get-Item -LiteralPath $root -Force -ErrorAction Stop
+    } catch [Management.Automation.ItemNotFoundException] {
+        return $null
+    } catch [IO.FileNotFoundException] {
+        return $null
+    } catch [IO.DirectoryNotFoundException] {
         return $null
     }
-
-    $item = Get-Item -LiteralPath $root -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer) {
+        return $null
+    }
     if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         Throw-CcodRuntimeError 'CCOD_REPARSE_PATH' 'Runtime root is a reparse point' $root
+    }
+    $current = [IO.Directory]::GetParent($root)
+    while ($null -ne $current) {
+        $ancestor = Get-Item -LiteralPath $current.FullName -Force -ErrorAction Stop
+        if (($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Throw-CcodRuntimeError 'CCOD_REPARSE_PATH' 'Runtime root has a reparse-point ancestor' $current.FullName
+        }
+        $pathRoot = [IO.Path]::GetPathRoot($current.FullName)
+        if ($current.FullName.TrimEnd('\\') -ceq $pathRoot.TrimEnd('\\')) { break }
+        $current = [IO.Directory]::GetParent($current.FullName)
     }
     return $root
 }
@@ -156,7 +176,7 @@ function Get-CcodRuntimeFileRecords {
         if (-not $item.PSIsContainer) {
             $relative = ConvertTo-CcodRuntimeRelativePath -Root $root -FullName $item.FullName
             if (-not $relative.Equals('manifest.json', [StringComparison]::OrdinalIgnoreCase)) {
-                $records.Add([pscustomobject]@{
+                $records.Add([pscustomobject][ordered]@{
                     path = $relative
                     length = [int64]$item.Length
                     sha256 = Get-CcodRuntimeFileSha256 -Path $item.FullName
@@ -181,13 +201,13 @@ function Get-CcodRuntimeId {
         [string]$Nonce = ([guid]::NewGuid().ToString('N'))
     )
 
-    if($ProjectVersion-cnotmatch'^[A-Za-z0-9][A-Za-z0-9._-]{0,45}$'-or$Nonce-cnotmatch'^[0-9a-f]{32}$'){
+    if($ProjectVersion-cnotmatch'^[A-Za-z0-9][A-Za-z0-9._-]{0,45}\z'-or$Nonce-cnotmatch'^[0-9a-f]{32}\z'){
         Throw-CcodRuntimeError 'CCOD_RUNTIME_ID_INVALID' 'Runtime identity components are invalid' $ProjectVersion
     }
 
     $lines = [System.Collections.Generic.List[string]]::new()
     foreach ($file in $Files) {
-        $lines.Add(('{0}`t{1}`t{2}' -f [string]$file.path, [int64]$file.length, [string]$file.sha256))
+        $lines.Add(("{0}`t{1}`t{2}" -f [string]$file.path, [int64]$file.length, [string]$file.sha256))
     }
     $canonical = $lines -join "`n"
     $sha256 = [Security.Cryptography.SHA256]::Create()
@@ -201,7 +221,7 @@ function Get-CcodRuntimeId {
 
 function Test-CcodRuntimeIdBinding {
     param([Parameter(Mandatory)][string]$RuntimeId,[Parameter(Mandatory)][string]$ProjectVersion,[Parameter(Mandatory)][object[]]$Files)
-    if($RuntimeId-cnotmatch'^(?<version>[A-Za-z0-9][A-Za-z0-9._-]{0,45})-(?<digest>[0-9a-f]{16})-(?<nonce>[0-9a-f]{32})$'-or$Matches.version-cne$ProjectVersion){return $false}
+    if($RuntimeId-cnotmatch'^(?<version>[A-Za-z0-9][A-Za-z0-9._-]{0,45})-(?<digest>[0-9a-f]{16})-(?<nonce>[0-9a-f]{32})\z'-or$Matches.version-cne$ProjectVersion){return $false}
     return (Get-CcodRuntimeId -ProjectVersion $ProjectVersion -Files $Files -Nonce $Matches.nonce)-ceq$RuntimeId
 }
 
@@ -253,11 +273,23 @@ function Test-CcodRuntimeManifest {
     }
 
     $manifestPath = Resolve-CcodContainedPath -Root $root -RelativePath 'manifest.json' -AllowMissingLeaf
-    if (-not [IO.File]::Exists($manifestPath)) {
+    $manifestItem = $null
+    try {
+        $manifestItem = Get-Item -LiteralPath $manifestPath -Force -ErrorAction Stop
+    } catch [Management.Automation.ItemNotFoundException] {
         return New-CcodRuntimeValidationResult -Valid $false -Code 'CCOD_RUNTIME_MANIFEST_MISSING' -RuntimeId $ExpectedRuntimeId -Manifest $null
+    } catch [IO.FileNotFoundException] {
+        return New-CcodRuntimeValidationResult -Valid $false -Code 'CCOD_RUNTIME_MANIFEST_MISSING' -RuntimeId $ExpectedRuntimeId -Manifest $null
+    } catch [IO.DirectoryNotFoundException] {
+        return New-CcodRuntimeValidationResult -Valid $false -Code 'CCOD_RUNTIME_MANIFEST_MISSING' -RuntimeId $ExpectedRuntimeId -Manifest $null
+    } catch {
+        return New-CcodRuntimeValidationResult -Valid $false -Code 'CCOD_RUNTIME_MANIFEST_UNAVAILABLE' -RuntimeId $ExpectedRuntimeId -Manifest $null
+    }
+    if ($null -eq $manifestItem -or $manifestItem.PSIsContainer -or (($manifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        return New-CcodRuntimeValidationResult -Valid $false -Code 'CCOD_RUNTIME_MANIFEST_INVALID' -RuntimeId $ExpectedRuntimeId -Manifest $null
     }
     if(-not[string]::IsNullOrWhiteSpace($ExpectedManifestSha256)){
-        if($ExpectedManifestSha256-cnotmatch'^[0-9a-f]{64}$'-or(Get-CcodRuntimeFileSha256 -Path $manifestPath)-cne$ExpectedManifestSha256){return New-CcodRuntimeValidationResult -Valid $false -Code 'CCOD_RUNTIME_MANIFEST_HASH_MISMATCH' -RuntimeId $ExpectedRuntimeId -Manifest $null}
+        if($ExpectedManifestSha256-cnotmatch'^[0-9a-f]{64}\z'-or(Get-CcodRuntimeFileSha256 -Path $manifestPath)-cne$ExpectedManifestSha256){return New-CcodRuntimeValidationResult -Valid $false -Code 'CCOD_RUNTIME_MANIFEST_HASH_MISMATCH' -RuntimeId $ExpectedRuntimeId -Manifest $null}
     }
 
     try {
@@ -266,43 +298,51 @@ function Test-CcodRuntimeManifest {
         return New-CcodRuntimeValidationResult -Valid $false -Code (Get-CcodErrorId -ErrorRecord $_) -RuntimeId $ExpectedRuntimeId -Manifest $null
     }
 
+    $schemaVersionProperty = $manifest.PSObject.Properties['schemaVersion']
+    $schemaIntegerTypes = @([byte],[uint16],[uint32],[uint64],[sbyte],[int16],[int32],[int64])
+    $schemaVersionIsInteger = $false
+    foreach ($type in $schemaIntegerTypes) { if ($null -ne $schemaVersionProperty -and $schemaVersionProperty.Value -is $type) { $schemaVersionIsInteger = $true; break } }
     $runtimeIdProperty = $manifest.PSObject.Properties['runtimeId']
     $projectVersionProperty = $manifest.PSObject.Properties['projectVersion']
     $filesProperty = $manifest.PSObject.Properties['files']
-    if ($null -eq $runtimeIdProperty -or $null -eq $projectVersionProperty -or $null -eq $filesProperty -or
-        $runtimeIdProperty.Value -isnot [string] -or $projectVersionProperty.Value -isnot [string] -or $null -eq $filesProperty.Value) {
+    $propertyNames = (@($manifest.PSObject.Properties.Name) -join ',')
+    $filesIsArray = $false
+    if ($null -ne $filesProperty -and $null -ne $filesProperty.Value) { $filesIsArray = $filesProperty.Value.GetType().IsArray }
+    if ($propertyNames -cne 'schemaVersion,projectVersion,runtimeId,files' -or
+        -not $schemaVersionIsInteger -or $null -eq $schemaVersionProperty -or $schemaVersionProperty.Value -ne 1 -or
+        $null -eq $runtimeIdProperty -or $null -eq $projectVersionProperty -or $null -eq $filesProperty -or
+        $runtimeIdProperty.Value -isnot [string] -or $projectVersionProperty.Value -isnot [string] -or -not $filesIsArray) {
         return New-CcodRuntimeValidationResult -Valid $false -Code 'CCOD_RUNTIME_MANIFEST_INVALID' -RuntimeId $ExpectedRuntimeId -Manifest $manifest
     }
 
     $manifestRuntimeId = [string]$runtimeIdProperty.Value
-    if ($manifestRuntimeId -notmatch '^[A-Za-z0-9._-]{1,96}$' -or $manifestRuntimeId -cne $ExpectedRuntimeId) {
+    if ($manifestRuntimeId -notmatch '^[A-Za-z0-9._-]{1,96}\z' -or $manifestRuntimeId -cne $ExpectedRuntimeId) {
         return New-CcodRuntimeValidationResult -Valid $false -Code 'CCOD_RUNTIME_ID_MISMATCH' -RuntimeId $manifestRuntimeId -Manifest $manifest
     }
 
-    $manifestFiles = @($filesProperty.Value)
     $previousPath = $null
+    $seenPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $integerTypes = @([byte],[uint16],[uint32],[uint64],[sbyte],[int16],[int32],[int64])
     $manifestRecords = [System.Collections.Generic.List[object]]::new()
-    foreach ($file in $manifestFiles) {
-        if ($file -isnot [pscustomobject] -or
-            $null -eq $file.PSObject.Properties['path'] -or
-            $null -eq $file.PSObject.Properties['length'] -or
-            $null -eq $file.PSObject.Properties['sha256'] -or
-            $file.path -isnot [string] -or
-            $file.sha256 -isnot [string]) {
+    foreach ($file in @($filesProperty.Value)) {
+        if ($file -isnot [pscustomobject] -or (@($file.PSObject.Properties.Name) -join ',' -cne 'path,length,sha256')) {
             return New-CcodRuntimeValidationResult -Valid $false -Code 'CCOD_RUNTIME_MANIFEST_INVALID' -RuntimeId $manifestRuntimeId -Manifest $manifest
         }
-
+        $lengthTypeIsValid = $false
+        foreach ($type in $integerTypes) { if ($file.length -is $type) { $lengthTypeIsValid = $true; break } }
+        if (-not $lengthTypeIsValid -or $file.length -is [bool] -or
+            $file.path -isnot [string] -or [string]::IsNullOrWhiteSpace($file.path) -or
+            $file.sha256 -isnot [string] -or $file.sha256 -cnotmatch '^[0-9a-f]{64}\z') {
+            return New-CcodRuntimeValidationResult -Valid $false -Code 'CCOD_RUNTIME_MANIFEST_INVALID' -RuntimeId $manifestRuntimeId -Manifest $manifest
+        }
         Assert-CcodManifestRelativePath -Path $file.path | Out-Null
-        if ($file.path.Equals('manifest.json', [StringComparison]::OrdinalIgnoreCase) -or
-            $file.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        try { $length = [int64]$file.length } catch {
             return New-CcodRuntimeValidationResult -Valid $false -Code 'CCOD_RUNTIME_MANIFEST_INVALID' -RuntimeId $manifestRuntimeId -Manifest $manifest
         }
-        try {
-            $length = [Convert]::ToInt64($file.length, [Globalization.CultureInfo]::InvariantCulture)
-        } catch {
-            return New-CcodRuntimeValidationResult -Valid $false -Code 'CCOD_RUNTIME_MANIFEST_INVALID' -RuntimeId $manifestRuntimeId -Manifest $manifest
-        }
-        if ($length -lt 0 -or ($null -ne $previousPath -and [StringComparer]::Ordinal.Compare($previousPath, [string]$file.path) -ge 0)) {
+        if ($length -lt 0 -or [IO.Path]::IsPathRooted($file.path) -or $file.path.Contains(':') -or
+            $file.path.Equals('manifest.json', [StringComparison]::OrdinalIgnoreCase) -or
+            -not $seenPaths.Add([string]$file.path) -or
+            ($null -ne $previousPath -and [StringComparer]::Ordinal.Compare($previousPath, [string]$file.path) -ge 0)) {
             return New-CcodRuntimeValidationResult -Valid $false -Code 'CCOD_RUNTIME_MANIFEST_INVALID' -RuntimeId $manifestRuntimeId -Manifest $manifest
         }
         $previousPath = [string]$file.path
@@ -343,6 +383,20 @@ function Get-CcodRuntimeDirectoryForId {
     return Resolve-CcodContainedPath -Root $InstallRoot -RelativePath (Join-Path 'runtime' $RuntimeId) -AllowMissingLeaf
 }
 
+function Test-CcodRuntimeSchemaVersion {
+    param($Value,[Parameter(Mandatory)][int]$Expected)
+    $integerTypes=@([byte],[uint16],[uint32],[uint64],[sbyte],[int16],[int32],[int64])
+    $typed=$false
+    foreach($type in $integerTypes){if($Value-is$type){$typed=$true;break}}
+    return $typed -and [int64]$Value -eq [int64]$Expected
+}
+
+function Test-CcodRuntimeCanonicalUtcTimestamp {
+    param($Value)
+    if($Value-isnot[string]-or$Value-cnotmatch'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z\z'){return $false}
+    try{$parsed=[DateTime]::ParseExact($Value,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind);return $parsed.Kind-eq[DateTimeKind]::Utc}catch{return $false}
+}
+
 function Assert-CcodRuntimePointerFile {
     param([Parameter(Mandatory)][string]$Path)
     try{
@@ -357,7 +411,7 @@ public static class CcodRuntimePointerIdentity { [StructLayout(LayoutKind.Sequen
     }catch{Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation selector is not a plain single-link file' $Path}
 }
 
-function Read-CcodActiveRuntime {
+function Read-CcodActiveRuntimeCore {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$InstallRoot,[hashtable]$Adapters)
 
@@ -373,13 +427,12 @@ function Read-CcodActiveRuntime {
         if($entries.Count-eq 0){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation store is empty' $pointerRoot}
         $records=[Collections.Generic.List[object]]::new()
         foreach($entry in $entries){
-            if($entry.PSIsContainer-or($entry.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0-or$entry.Name-cnotmatch'^\d{20}\.json$'){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation store contains an unknown object' $entry.FullName}
+            if($entry.PSIsContainer-or($entry.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0-or$entry.Name-cnotmatch'^\d{20}\.json\z'){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation store contains an unknown object' $entry.FullName}
             Assert-CcodRuntimePointerFile -Path $entry.FullName
             $record=Read-CcodStrictJson -Path $entry.FullName -ExpectedSchema 1 -Kind 'active generation'
-            $names=@($record.PSObject.Properties.Name);if(($names-join',')-cne'schemaVersion,generation,activeRuntime,previousGeneration'-or$record.activeRuntime-isnot[string]){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation record fields are invalid' $entry.FullName}
+            $names=@($record.PSObject.Properties.Name);if(($names-join',')-cne'schemaVersion,generation,activeRuntime,previousGeneration'-or$record.activeRuntime-isnot[string]-or-not(Test-CcodRuntimeSchemaVersion $record.schemaVersion 1)){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation record fields are invalid' $entry.FullName}
             $generation=ConvertTo-CcodRuntimeGeneration $record.generation $entry.FullName
-            $integerTypes=@([byte],[uint16],[uint32],[uint64],[int16],[int32],[int64]);$typed=$false;foreach($t in $integerTypes){if($record.previousGeneration-is$t){$typed=$true;break}};if(-not$typed){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Previous generation is not an integer' $entry.FullName}
-            [uint64]$previous=$record.previousGeneration;if($generation-ne($previous+1)-or$entry.Name-cne('{0:D20}.json'-f$generation)){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation record is not canonical' $entry.FullName}
+            try{$previous=ConvertTo-CcodRuntimeGeneration -Value $record.previousGeneration -Path $entry.FullName -AllowZero}catch{Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Previous generation is not a nonnegative integer' $entry.FullName};if($generation-ne($previous+1)-or$entry.Name-cne('{0:D20}.json'-f$generation)){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation record is not canonical' $entry.FullName}
             Assert-CcodRuntimeId $record.activeRuntime|Out-Null;$records.Add([pscustomobject]@{generation=$generation;previousGeneration=$previous;activeRuntime=[string]$record.activeRuntime})
         }
         $ordered=@($records|Sort-Object generation);for($i=0;$i-lt$ordered.Count;$i++){if([uint64]$ordered[$i].generation-ne[uint64]($i+1)-or[uint64]$ordered[$i].previousGeneration-ne[uint64]$i){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active generation chain has a gap' $pointerRoot}}
@@ -389,6 +442,10 @@ function Read-CcodActiveRuntime {
     $path = Resolve-CcodContainedPath -Root $InstallRoot -RelativePath 'active.json' -AllowMissingLeaf
     $active = $null
     $legacy = $false
+    $legacyItem = $null
+    try { $legacyItem = Get-Item -LiteralPath $path -Force -ErrorAction Stop } catch { if ($_.CategoryInfo.Category -eq 'ObjectNotFound' -or $_.Exception -is [IO.FileNotFoundException] -or $_.Exception -is [IO.DirectoryNotFoundException] -or $_.Exception -is [Management.Automation.ItemNotFoundException]) { Throw-CcodRuntimeError 'CCOD_PATH_MISSING' 'Active runtime pointer is not present' $path }; throw }
+    if ($null -eq $legacyItem) { Throw-CcodRuntimeError 'CCOD_PATH_MISSING' 'Active runtime pointer is not present' $path }
+    Assert-CcodRuntimePointerFile -Path $legacyItem.FullName
     try {
         $active = Read-CcodStrictJson -Path $path -ExpectedSchema 2 -Kind 'active runtime'
     } catch {
@@ -410,6 +467,10 @@ function Read-CcodActiveRuntime {
         Throw-CcodRuntimeError 'CCOD_RUNTIME_ID_INVALID' 'Active runtime ID must be a string' $path
     }
     Assert-CcodRuntimeId -RuntimeId $active.activeRuntime | Out-Null
+    $expectedSchemaVersion = if ($legacy) { 1 } else { 2 }
+    if (-not (Test-CcodRuntimeSchemaVersion $active.schemaVersion $expectedSchemaVersion) -or -not (Test-CcodRuntimeCanonicalUtcTimestamp $active.updatedAtUtc)) {
+        Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Active runtime pointer schema or UTC timestamp is invalid' $path
+    }
     if ($null -ne $active.previousRuntime) {
         if ($active.previousRuntime -isnot [string]) {
             Throw-CcodRuntimeError 'CCOD_RUNTIME_ID_INVALID' 'Previous runtime ID must be null or a string' $path
@@ -456,7 +517,7 @@ function Resolve-CcodActiveRuntimeContext {
     }
 }
 
-function Set-CcodActiveRuntime {
+function Set-CcodActiveRuntimeCore {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$InstallRoot,
@@ -474,7 +535,7 @@ function Set-CcodActiveRuntime {
     if($null-ne$FileTransaction-or$null-ne$TargetGeneration){
         if($null-eq(Get-Command Commit-CcodInstallActivePointer -ErrorAction SilentlyContinue)){Import-Module (Join-Path $PSScriptRoot 'InstallFileTransaction.psm1') -ErrorAction Stop}
         if($null-eq$FileTransaction-or$null-eq$TargetGeneration){Throw-CcodRuntimeError 'CCOD_RUNTIME_POINTER_INVALID' 'Pointer commit requires target and transaction' $InstallRoot}
-        $current=$null;try{$current=Read-CcodActiveRuntime -InstallRoot $InstallRoot -Adapters @{GetSelectorRootItem=$Adapters.GetSelectorRootItem}}catch{if((Get-CcodErrorId $_)-notin@('CCOD_STATE_MISSING','CCOD_PATH_MISSING')){throw}}
+        $current=$null;try{$current=Read-CcodActiveRuntimeCore -InstallRoot $InstallRoot -Adapters @{GetSelectorRootItem=$Adapters.GetSelectorRootItem}}catch{if((Get-CcodErrorId $_)-notin@('CCOD_STATE_MISSING','CCOD_PATH_MISSING')){throw}}
         [uint64]$previous=if($null-eq$current){0}else{$current.generation}
         try{[void](& $Adapters.AssertLifecycleFence $InstallRoot $Ownership ($null-ne$current) $NewRuntimeId)}catch{Throw-CcodRuntimeError 'CCOD_RUNTIME_FENCE_STALE' 'Active runtime mutation lifecycle fence is stale' $InstallRoot}
         $committed=Commit-CcodInstallActivePointer -InstallRoot $InstallRoot -TargetGeneration $TargetGeneration -ExpectedPreviousGeneration $previous -FileTransaction $FileTransaction
@@ -516,6 +577,24 @@ function Set-CcodActiveRuntime {
     }
     Write-CcodAtomicJson -Path $activePath -Value $pointer
     return [pscustomobject]$pointer
+}
+
+function Set-CcodActiveRuntime {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [string]$NewRuntimeId,
+        $TargetGeneration,
+        $FileTransaction,
+        $Ownership
+    )
+    return Set-CcodActiveRuntimeCore -InstallRoot $InstallRoot -NewRuntimeId $NewRuntimeId -TargetGeneration $TargetGeneration -FileTransaction $FileTransaction -Ownership $Ownership
+}
+
+function Read-CcodActiveRuntime {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$InstallRoot)
+    return Read-CcodActiveRuntimeCore -InstallRoot $InstallRoot
 }
 
 Export-ModuleMember -Function Get-CcodRuntimeId, New-CcodRuntimeManifest, Test-CcodRuntimeManifest, Read-CcodActiveRuntime, Resolve-CcodActiveRuntimeContext, Set-CcodActiveRuntime

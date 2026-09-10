@@ -380,6 +380,16 @@ $results += Invoke-CcodTest 'bootstrap legacy fallback rejects a state ancestor 
     }finally{if(Test-Path $root){Remove-Item $root -Recurse -Force}}
 }
 
+$results += Invoke-CcodTest 'bootstrap runtime IDs use canonical TAB delimiters' {
+    $files = @(
+        [pscustomobject]@{ path = 'a.txt'; length = [int64]5; sha256 = ('a' * 64) }
+        [pscustomobject]@{ path = 'b.txt'; length = [int64]4; sha256 = ('b' * 64) }
+    )
+    $nonce = '0123456789abcdef0123456789abcdef'
+    $expected = '2.5.22-e71f4818a0f8e98f-0123456789abcdef0123456789abcdef'
+    Assert-CcodExactEqual $expected (Get-CcodBootstrapRuntimeId -ProjectVersion '2.5.22' -Files $files -Nonce $nonce) 'bootstrap runtime ID digest input must use literal TAB delimiters'
+}
+
 $results += Invoke-CcodTest 'generation bootstrap launches the append-only selected runtime without root active json' {
     $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-bootstrap-generation-'+[guid]::NewGuid().ToString('N'))
     try{

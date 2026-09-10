@@ -180,7 +180,7 @@ function New-CcodWorkerSuccessResult {
 
 function Get-CcodTestRuntimeId {
     param([string]$ProjectVersion, [object[]]$Files)
-    $lines = foreach ($file in $Files) { '{0}`t{1}`t{2}' -f $file.path,[int64]$file.length,$file.sha256 }
+    $lines = foreach ($file in $Files) { "{0}`t{1}`t{2}" -f $file.path,[int64]$file.length,$file.sha256 }
     $canonical = $lines -join "`n"
     $sha = [Security.Cryptography.SHA256]::Create()
     try { $digest = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))).Replace('-','').ToLowerInvariant() }
@@ -1378,6 +1378,16 @@ try {
         Assert-CcodTrue ($identity.CreationTimeUtc -is [string] -and -not [string]::IsNullOrWhiteSpace($identity.CreationTimeUtc)) 'identity creation time is present'
         Assert-CcodTrue ($identity.UserSid -is [string] -and $identity.UserSid -ceq ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)) 'identity owner SID is exact'
         Assert-CcodEqual ([int](Get-Process -Id $PID).SessionId) $identity.SessionId 'identity session is exact'
+    }
+
+    Invoke-CcodTest 'static probe runtime IDs use canonical TAB delimiters' {
+        $files = @(
+            [pscustomobject]@{ path = 'a.txt'; length = [int64]5; sha256 = ('a' * 64) }
+            [pscustomobject]@{ path = 'b.txt'; length = [int64]4; sha256 = ('b' * 64) }
+        )
+        $nonce = '0123456789abcdef0123456789abcdef'
+        $expected = '2.0.0-e71f4818a0f8e98f-0123456789abcdef0123456789abcdef'
+        Assert-CcodEqual $expected (Get-CcodStaticRuntimeIdFromRecords -ProjectVersion '2.0.0' -Files $files -ExpectedRuntimeId $expected) 'static probe runtime ID digest input must use literal TAB delimiters'
     }
 } catch {
     Write-Error $_

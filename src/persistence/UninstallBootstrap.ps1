@@ -271,7 +271,7 @@ function Get-CcodUninstallBootstrapRuntimeId {
         Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The runtime manifest version is invalid' $ProjectVersion
     }
     $lines = [Collections.Generic.List[string]]::new()
-    foreach ($record in $Records) { $lines.Add(('{0}`t{1}`t{2}' -f $record.path,[int64]$record.length,$record.sha256)) }
+    foreach ($record in $Records) { $lines.Add(("{0}`t{1}`t{2}" -f $record.path,[int64]$record.length,$record.sha256)) }
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
         $digest = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($lines -join "`n")))).Replace('-','').ToLowerInvariant()
@@ -974,6 +974,100 @@ function Assert-CcodUninstallBootstrapTransactionMatchesContext {
     }
 }
 
+function Initialize-CcodUninstallPayloadAuthority {
+    if ($null -ne ('CcodUninstallPayloadAuthorityV1' -as [type])) { return }
+    Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public sealed class CcodUninstallPayloadAuthorityV1 : IDisposable
+{
+    [StructLayout(LayoutKind.Sequential)] private struct Info
+    {
+        public uint Attributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME Creation, Access, Write;
+        public uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern SafeFileHandle CreateFileW(string path,uint access,uint share,IntPtr security,uint creation,uint flags,IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle handle,out Info info);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle,StringBuilder value,uint length,uint flags);
+    private readonly List<SafeFileHandle> handles = new List<SafeFileHandle>();
+    private readonly HashSet<string> paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private bool disposed;
+    public void Add(string path)
+    {
+        if(disposed)throw new ObjectDisposedException("uninstall payload authority");
+        if(String.IsNullOrWhiteSpace(path)||!Path.IsPathRooted(path)||path.StartsWith(@"\\?\")||path.StartsWith(@"\\.\"))throw new IOException("Payload path");
+        string full=Path.GetFullPath(path),root=Path.GetPathRoot(full);
+        if(!String.Equals(full,path,StringComparison.OrdinalIgnoreCase)||full.Substring(root.Length).IndexOf(':')>=0)throw new IOException("Payload canonical path");
+        var parents=new List<string>();
+        for(DirectoryInfo parent=Directory.GetParent(full);parent!=null;parent=parent.Parent)parents.Add(parent.FullName);
+        parents.Reverse();
+        foreach(string parent in parents)Open(parent,true);
+        Open(full,false);
+    }
+    private void Open(string path,bool directory)
+    {
+        if(paths.Contains(path))return;
+        uint access=directory?0x00100081U:0x80100080U;
+        uint flags=0x00200000U|(directory?0x02000000U:0U);
+        SafeFileHandle handle=CreateFileW(path,access,1U,IntPtr.Zero,3U,flags,IntPtr.Zero);
+        if(handle.IsInvalid){int error=Marshal.GetLastWin32Error();handle.Dispose();throw new Win32Exception(error);}
+        try{
+            Info info;if(!GetFileInformationByHandle(handle,out info))throw new Win32Exception(Marshal.GetLastWin32Error());
+            if((info.Attributes&0x400U)!=0||((info.Attributes&0x10U)!=0)!=directory||(!directory&&info.Links!=1))throw new IOException("Payload file kind");
+            var value=new StringBuilder(512);uint length=GetFinalPathNameByHandleW(handle,value,(uint)value.Capacity,0);
+            if(length>=value.Capacity){value.Capacity=checked((int)length+1);length=GetFinalPathNameByHandleW(handle,value,(uint)value.Capacity,0);}
+            if(length==0||length>=value.Capacity)throw new IOException("Payload final path unavailable");
+            string final=value.ToString();
+            if(final.StartsWith(@"\\?\UNC\",StringComparison.OrdinalIgnoreCase))final=@"\\"+final.Substring(8);
+            else if(final.StartsWith(@"\\?\",StringComparison.OrdinalIgnoreCase))final=final.Substring(4);
+            if(!String.Equals(final.TrimEnd('\\'),path.TrimEnd('\\'),StringComparison.OrdinalIgnoreCase))throw new IOException("Payload final path mismatch");
+            handles.Add(handle);paths.Add(path);
+        }catch{handle.Dispose();throw;}
+    }
+    public void Dispose()
+    {
+        if(disposed)return;disposed=true;
+        for(int index=handles.Count-1;index>=0;index--)handles[index].Dispose();
+        handles.Clear();paths.Clear();
+    }
+}
+'@
+}
+
+function Open-CcodUninstallBootstrapPayloadAuthority {
+    param([Parameter(Mandatory)][string]$PayloadRoot,[Parameter(Mandatory)][object[]]$Records)
+    $lease=$null
+    try {
+        Initialize-CcodUninstallPayloadAuthority
+        $lease=[CcodUninstallPayloadAuthorityV1]::new()
+        if ($Records.Count -lt 1) { throw 'payload records missing' }
+        $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($record in $Records) {
+            [void](Assert-CcodUninstallBootstrapManifestRecord $record)
+            if (-not $seen.Add($record.path)) { throw 'duplicate payload path' }
+            $path=Resolve-CcodUninstallBootstrapChildPath -Root $PayloadRoot -RelativePath $record.path -RequireLeafFile
+            $lease.Add($path)
+            $streams=@(Get-Item -LiteralPath $path -Stream * -ErrorAction Stop)
+            $fingerprint=Get-CcodUninstallBootstrapFileFingerprint $path
+            if ($streams.Count -ne 1 -or $streams[0].Stream -cne ':$DATA' -or
+                $fingerprint.length -ne $record.length -or $fingerprint.sha256 -cne $record.sha256) { throw 'staged payload changed' }
+        }
+        return $lease
+    } catch {
+        if ($null -ne $lease) { $lease.Dispose() }
+        Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PAYLOAD_HASH_MISMATCH' 'Staged cleanup authority could not be acquired before consumption.' $PayloadRoot
+    }
+}
+
 function Get-CcodUninstallBootstrapAdapters {
     param([hashtable]$Adapters)
     $defaults = @{
@@ -1030,8 +1124,11 @@ function Get-CcodUninstallBootstrapAdapters {
             Read-CcodUninstallBootstrapStoredReceipt -TransactionDirectory $TransactionRoot
         }
         RunCleanup = {
-            param($InstallerRoot,$InstallRoot,$TransactionRoot,$Transaction,$WriteTransaction,$Mode)
+            param($InstallerRoot,$InstallRoot,$TransactionRoot,$Transaction,$WriteTransaction,$Mode,$PayloadRecords)
             $payloadRoot = Resolve-CcodUninstallBootstrapChildPath -Root $TransactionRoot -RelativePath 'payload'
+            $records=if($null-ne$Transaction.installedBinding){@($Transaction.installedBinding.payloadRecords)}else{@($PayloadRecords)}
+            $payloadAuthority=Open-CcodUninstallBootstrapPayloadAuthority -PayloadRoot $payloadRoot -Records $records
+            try {
             $modulePath = Resolve-CcodUninstallBootstrapChildPath -Root $payloadRoot -RelativePath 'src\persistence\modules\InstallLifecycle.psm1' -RequireLeafFile
             $module = Import-Module -Name $modulePath -Force -PassThru -ErrorAction Stop
             $writer = {
@@ -1042,6 +1139,7 @@ function Get-CcodUninstallBootstrapAdapters {
                 param($Root,$Value,$Writer,$DeferRemoval)
                 Invoke-CcodUninstallCleanup -InstallRoot $Root -Transaction $Value -WriteTransaction $Writer -StopAfterTaskRemoval:([bool]$DeferRemoval)
             } $InstallRoot $Transaction $writer ($Mode -ceq 'PrepareInstalled'))
+            } finally { $payloadAuthority.Dispose() }
         }
         RemoveProductRegistration = {
             param($Context)
@@ -1236,7 +1334,7 @@ function Invoke-CcodUninstallBootstrap {
         }
         if ($stagePayload) { & $adapter.StagePayload $InstallerRoot $InstallRoot $context $stageRoot }
         if($returnExistingInstalledTaskRemoved){&$adapter.WriteReceipt $stageRoot $transaction;$receipt=&$adapter.ReadReceipt $stageRoot;if(-not(Test-CcodUninstallBootstrapReceiptMatchesTransaction -Receipt $receipt -Transaction $transaction)){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_WRITE_FAILED' 'Replacement wrapper receipt read-back did not match.' $transaction.transactionId};return $transaction}
-        $result = & $adapter.RunCleanup $InstallerRoot $InstallRoot $stageRoot $transaction $adapter.WriteTransaction $Mode
+        $result = & $adapter.RunCleanup $InstallerRoot $InstallRoot $stageRoot $transaction $adapter.WriteTransaction $Mode $context.payloadRecords
         if ($null -eq $result) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PREPARE_FAILED' 'The staged cleanup returned no transaction receipt' $stageRoot }
         Assert-CcodUninstallBootstrapTransactionMatchesContext $result $context $InstallRoot
         $expectedPhase=if($Mode-ceq'PrepareInstalled'){'TaskRemoved'}else{'ReadyForInno'}

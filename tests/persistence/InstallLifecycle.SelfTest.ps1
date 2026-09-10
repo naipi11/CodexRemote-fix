@@ -12,6 +12,12 @@ Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\UiPreferences.
 Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\RuntimeManifest.psm1') -Force
 Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\LifecycleEpoch.psm1') -Force
 
+function Invoke-CcodRuntimeCoreSetForTest {
+    param([Parameter(Mandatory)][string]$InstallRoot,[string]$NewRuntimeId,$TargetGeneration,$FileTransaction,$Ownership,[hashtable]$Adapters)
+    $module = Get-Module -Name RuntimeManifest
+    return & $module { param($Root,$Runtime,$Generation,$Transaction,$Lease,$Injected) Set-CcodActiveRuntimeCore -InstallRoot $Root -NewRuntimeId $Runtime -TargetGeneration $Generation -FileTransaction $Transaction -Ownership $Lease -Adapters $Injected } $InstallRoot $NewRuntimeId $TargetGeneration $FileTransaction $Ownership $Adapters
+}
+
 $v2521LifecycleShortcutNames=@(
     'Programs\CodexRemote-fix\CodexRemote-fix.lnk',
     'Programs\CodexRemote-fix\CodexRemote-fix compatibility check.lnk',
@@ -395,7 +401,7 @@ function New-CcodLifecycleFake {
         param($InstallRoot, $RuntimeId, $Ownership, $TargetGeneration, $FileTransaction)
         if ($null -ne $world.SetActiveFailure) { & $world.SetActiveFailure $InstallRoot $RuntimeId $Ownership $TargetGeneration $FileTransaction }
         $assertFence = { param($Root, $Receipt, $ExpectActivePointer,$TargetRuntimeId) if ($Receipt.released) { throw 'released lifecycle owner' }; $true }
-        Set-CcodActiveRuntime -InstallRoot $InstallRoot -NewRuntimeId $RuntimeId -TargetGeneration $TargetGeneration -FileTransaction $FileTransaction -Ownership $Ownership -Adapters @{ AssertLifecycleFence=$assertFence }
+        Invoke-CcodRuntimeCoreSetForTest -InstallRoot $InstallRoot -NewRuntimeId $RuntimeId -TargetGeneration $TargetGeneration -FileTransaction $FileTransaction -Ownership $Ownership -Adapters @{ AssertLifecycleFence=$assertFence }
     }.GetNewClosure()
     $adapters.ExitLifecycleOwnership = {
         param($Ownership)
@@ -1297,7 +1303,7 @@ $results += Invoke-CcodTest 'real v2.5.21 selector commit with a missing Pointer
             if($gate.Remaining-gt0){
                 $gate.Remaining--
                 $fence={param($InstallRoot,$Receipt,$ExpectActivePointer)$true}
-                Set-CcodActiveRuntime -InstallRoot $Root -TargetGeneration $TargetGeneration -FileTransaction $FileTransaction -Ownership $Ownership -Adapters @{AssertLifecycleFence=$fence}|Out-Null
+                Invoke-CcodRuntimeCoreSetForTest -InstallRoot $Root -TargetGeneration $TargetGeneration -FileTransaction $FileTransaction -Ownership $Ownership -Adapters @{AssertLifecycleFence=$fence}|Out-Null
                 throw 'PRIVATE_AFTER_SELECTOR_COMMIT_BEFORE_JOURNAL'
             }
         }.GetNewClosure()
@@ -1473,7 +1479,7 @@ $results += Invoke-CcodTest 'unique immutable runtime ids bind project and manif
     $second=&$module {param($Files)New-CcodUniqueRuntimeId -ProjectVersion '2.5.22' -Files $Files -NewNonce { '2'*32 }} $filesA
     $differentContent=&$module {param($Files)New-CcodUniqueRuntimeId -ProjectVersion '2.5.22' -Files $Files -NewNonce { '1'*32 }} $filesB
     $differentVersion=&$module {param($Files)New-CcodUniqueRuntimeId -ProjectVersion '2.5.23' -Files $Files -NewNonce { '1'*32 }} $filesA
-    Assert-CcodEqual '2.5.22-a1c6387570c23404-11111111111111111111111111111111' $first 'runtime id contains project version, manifest file digest, and canonical nonce'
+    Assert-CcodEqual '2.5.22-4b2146780452e12e-11111111111111111111111111111111' $first 'runtime id contains project version, manifest file digest, and canonical nonce'
     Assert-CcodTrue ($first.Length-le96) 'runtime id remains within the manifest identity bound'
     Assert-CcodTrue ($first-cne$second) 'identical package content receives a unique generation id per attempt'
     Assert-CcodTrue ($first-cne$differentContent) 'manifest file content changes the deterministic runtime identity'
@@ -2438,7 +2444,7 @@ $results += Invoke-CcodTest 'upgrade boundaries fail closed with phase receipts 
         [pscustomobject]@{ Name='old task still running';Code='CCOD_INSTALL_SUPERVISOR_TASK_BUSY';Committed=$false;Configure={param($Fake)$Fake.World.TaskIdle=$false} },
         [pscustomobject]@{ Name='stale lifecycle generation';Code='CCOD_LIFECYCLE_FENCE_STALE';Committed=$false;Configure={param($Fake)$Fake.World.SetActiveFailure={throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('stale'), 'CCOD_LIFECYCLE_FENCE_STALE', [Management.Automation.ErrorCategory]::InvalidData, $null)}} },
         [pscustomobject]@{ Name='active pointer write failure';Code='CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN';Committed=$false;Configure={param($Fake)$Fake.World.SetActiveFailure={throw 'PRIVATE_POINTER_SECRET'}} },
-        [pscustomobject]@{ Name='crash after generation commit';Code='CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN';Committed=$true;Configure={param($Fake,$OldRuntime)$gate=[pscustomobject]@{Remaining=1};$Fake.World.SetActiveFailure={param($Root,$RuntimeId,$Ownership,$TargetGeneration,$FileTransaction)if($gate.Remaining-gt0){$gate.Remaining--;$fence={param($InstallRoot,$Receipt,$ExpectActivePointer)$true};Set-CcodActiveRuntime -InstallRoot $Root -TargetGeneration $TargetGeneration -FileTransaction $FileTransaction -Ownership $Ownership -Adapters @{AssertLifecycleFence=$fence}|Out-Null;throw 'PRIVATE_AFTER_COMMIT_SECRET'}}.GetNewClosure()} },
+        [pscustomobject]@{ Name='crash after generation commit';Code='CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN';Committed=$true;Configure={param($Fake,$OldRuntime)$gate=[pscustomobject]@{Remaining=1};$Fake.World.SetActiveFailure={param($Root,$RuntimeId,$Ownership,$TargetGeneration,$FileTransaction)if($gate.Remaining-gt0){$gate.Remaining--;$fence={param($InstallRoot,$Receipt,$ExpectActivePointer)$true};Invoke-CcodRuntimeCoreSetForTest -InstallRoot $Root -TargetGeneration $TargetGeneration -FileTransaction $FileTransaction -Ownership $Ownership -Adapters @{AssertLifecycleFence=$fence}|Out-Null;throw 'PRIVATE_AFTER_COMMIT_SECRET'}}.GetNewClosure()} },
         [pscustomobject]@{ Name='new task start failure';Code='CCOD_INSTALL_SUPERVISOR_START_FAILED';Committed=$true;Configure={param($Fake,$OldRuntime)$gate=[pscustomobject]@{Remaining=1};$Fake.Adapters.StartSupervisorTask={if($gate.Remaining-gt0){$gate.Remaining--;throw 'PRIVATE_TASK_START_SECRET'};$Fake.World.TaskStarted++}.GetNewClosure()} },
         [pscustomobject]@{ Name='Supervisor ready timeout';Code='CCOD_INSTALL_NEW_RUNTIME_NOT_READY';Committed=$true;Configure={param($Fake,$OldRuntime)$Fake.Adapters.WaitNewRuntimeReady={param($Root,$RuntimeId,$Generation,$Identity,$Started,$Timeout)[pscustomobject]@{SupervisorReady=([string]$RuntimeId-ceq[string]$OldRuntime);TrayReady=$true}}.GetNewClosure()} },
         [pscustomobject]@{ Name='TrayHost ready timeout';Code='CCOD_INSTALL_NEW_RUNTIME_NOT_READY';Committed=$true;Configure={param($Fake,$OldRuntime)$Fake.Adapters.WaitNewRuntimeReady={param($Root,$RuntimeId,$Generation,$Identity,$Started,$Timeout)[pscustomobject]@{SupervisorReady=$true;TrayReady=([string]$RuntimeId-ceq[string]$OldRuntime)}}.GetNewClosure()} },
@@ -3508,7 +3514,7 @@ $results += Invoke-CcodTest 'portable release keeps the fail-closed bootstrap ha
     Assert-CcodTrue ($inno -notmatch 'BackupDeviceKeyStore|RemoveDeviceKeyStore|KeepCurrentSpecialSession') 'Inno exposes no key or special-session uninstall options'
     Assert-CcodTrue (Test-Path -LiteralPath $finalizerPath -PathType Leaf) 'portable release includes an external finalizer'
     Assert-CcodTrue (Test-Path -LiteralPath $portableModulePath -PathType Leaf) 'portable release includes a marker-bound removal module'
-    Assert-CcodTrue ($wrapper -match 'PortableUninstallFinalizer\.ps1' -and $wrapper -match '-Mode\s+Prepare') 'public wrapper prepares protected cleanup before launching the external portable finalizer'
+    Assert-CcodTrue ($wrapper -match 'PortableUninstallFinalizer\.ps1' -and $wrapper -match 'Invoke-CcodPublicUninstallPrepare[^\r\n]+-PrepareMode\s+Prepare\s+-Identity\s+\$null') 'public wrapper prepares protected cleanup before launching the external portable finalizer'
     Assert-CcodTrue ($wrapper -match 'Start-Process' -and $wrapper -match 'portable-finalizer\.stderr\.log') 'public wrapper delegates final deletion to a detached external process with auditable output'
     Assert-CcodTrue ($wrapper -notmatch 'Remove-Item') 'public wrapper cannot delete the portable installer root directly'
     Assert-CcodTrue ((Get-Content -LiteralPath $finalizerPath -Raw) -match 'Remove-CcodPortableInstallerRoot') 'external finalizer owns the bound portable root deletion'

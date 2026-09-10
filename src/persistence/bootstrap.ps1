@@ -299,7 +299,7 @@ function Get-CcodBootstrapRuntimeId {
 
     $lines = [Collections.Generic.List[string]]::new()
     foreach ($file in $Files) {
-        $lines.Add(('{0}`t{1}`t{2}' -f [string]$file.path, [int64]$file.length, [string]$file.sha256))
+        $lines.Add(("{0}`t{1}`t{2}" -f [string]$file.path, [int64]$file.length, [string]$file.sha256))
     }
     $canonical = $lines -join "`n"
     $sha256 = [Security.Cryptography.SHA256]::Create()

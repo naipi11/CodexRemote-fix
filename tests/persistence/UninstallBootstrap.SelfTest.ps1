@@ -15,6 +15,17 @@ if (-not (Test-Path -LiteralPath $installedFinalizerScript -PathType Leaf)) { th
 Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\RuntimeManifest.psm1') -Force
 $canonicalTaskTarget=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'schtasks.exe'))
 
+$results=@()
+
+$results+=Invoke-CcodTest 'uninstall bootstrap runtime IDs use canonical TAB delimiters' {
+    $records=@(
+        [pscustomobject]@{ path='a.txt'; length=[int64]5; sha256=('a'*64) }
+        [pscustomobject]@{ path='b.txt'; length=[int64]4; sha256=('b'*64) }
+    )
+    $expected='2.5.22-e71f4818a0f8e98f-0123456789abcdef0123456789abcdef'
+    Assert-CcodEqual $expected (Get-CcodUninstallBootstrapRuntimeId -ProjectVersion '2.5.22' -Records $records -Nonce '0123456789abcdef0123456789abcdef') 'uninstall runtime ID digest input must use literal TAB delimiters'
+}
+
 function New-CcodUninstallBootstrapTestPayloadRecords {
     $records=@(New-CcodUninstallBootstrapPayloadRecords -ResumeOnly);foreach($record in $records){$record.length=[int64]1;$record.sha256=('d'*64)};$resume=@($records|Where-Object{$_.path-ceq'src/persistence/InstalledUninstallFinalizer.ps1'})[0];$resume.length=[int64]123;$resume.sha256=('e'*64);return $records
 }
@@ -225,8 +236,6 @@ function New-CcodVerifiedUninstallRuntimeFixture {
     return [pscustomobject][ordered]@{RuntimeRoot=$finalRuntime;RuntimeId=$manifest.runtimeId}
 }
 
-$results = @()
-
 $results += Invoke-CcodTest 'Prepare stages only the manifest-bound cleanup payload and reaches the Inno boundary' {
     $world = [pscustomobject]@{
         Calls = [Collections.Generic.List[string]]::new()
@@ -305,6 +314,7 @@ function New-CcodInstalledFinalizerMemoryAdapters {
         ReclaimSelectedGeneration={param($Runtime,$Transaction)$World.Calls.Add('Reclaim');$World.EntryPresentAtReclaim=[bool]$World.PublicEntry;$World.RootPresent=$false;[pscustomobject]@{phase='Completed';result='Reclaimed';runtimeId=$Transaction.runtimeId}}.GetNewClosure()
         WriteReadyForInno={param($Transaction)$World.Calls.Add('Write:ReadyForInno');if($World.Failure-ceq'PhaseWrite'-and-not$World.FailureInjected){$World.FailureInjected=$true;throw [Management.Automation.ErrorRecord]::new([IO.IOException]::new('durable phase write failed after reclaim'),'CCOD_UNINSTALL_TRANSACTION_WRITE_FAILED',[Management.Automation.ErrorCategory]::WriteError,$Transaction.transactionId)};$Transaction.phase='ReadyForInno';$Transaction.resumePhase='ReadyForInno';$World.Transaction=$Transaction;$Transaction}.GetNewClosure()
         RemoveMatchedProductShortcuts={param($Transaction)$World.Calls.Add('ProductShortcuts');if($World.Failure-ceq'ProductShortcuts'-and-not$World.FailureInjected){$World.FailureInjected=$true;throw [IO.IOException]::new('shortcut cleanup failed')};$World.ShortcutsPresent=$false}.GetNewClosure()
+        CleanupProductResidue={param($Transaction)$World.Calls.Add('ProductResidue');[pscustomobject]@{phase='Completed';result='Removed'}}.GetNewClosure()
         FinalizeReceipt={param($Transaction)$World.Calls.Add('FinalizeReceipt');$Transaction.phase='Completed';$Transaction.resumePhase='Completed';$World.Transaction=$Transaction;if($World.Failure-ceq'FinalReceipt'-and-not$World.FailureInjected){$World.FailureInjected=$true;$World.CompletedReceipt=$false;throw [IO.IOException]::new('receipt write failed after Completed transaction')};$World.CompletedReceipt=$true;$Transaction}.GetNewClosure()
         TestCompletedReceipt={param($Transaction)$World.Calls.Add('TestReceipt');[bool]$World.CompletedReceipt}.GetNewClosure()
         RemoveResumeProductRegistration={param($Transaction)$World.Calls.Add('RemoveRegistry');if($World.Failure-ceq'FinalRegistry'-and-not$World.FailureInjected){$World.FailureInjected=$true;throw [IO.IOException]::new('final recovery registry delete failed')};$World.PublicEntry=$false;$World.PublicCommand=$null;$true}.GetNewClosure()
@@ -913,16 +923,39 @@ $results += Invoke-CcodTest 'fresh and stored Ready evidence require one exact c
     }
 }
 
-$results += Invoke-CcodTest 'default installed finalizer validates and removes only the exact selected generation fixture' {
+function Invoke-CcodDefaultInstalledProductCleanupCase {
+    param([switch]$PartialFailure)
     $local=Join-Path ([IO.Path]::GetTempPath()) ('ccod-installed-finalizer-'+[guid]::NewGuid().ToString('N'));$previous=[Environment]::GetEnvironmentVariable('LOCALAPPDATA','Process')
     try{
-        [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$local,'Process');$install=Join-Path $local 'CodexControlOtherDevices';$fixture=New-CcodVerifiedUninstallRuntimeFixture -InstallRoot $install -AppendOnly;$identity=Get-CcodUninstallBootstrapCurrentIdentity;$transactionRoot=Get-CcodUninstallBootstrapDefaultTransactionRoot;$id='11111111-2222-3333-4444-555555555555';$directory=New-CcodUninstallBootstrapTransactionDirectory -TransactionRoot $transactionRoot -TransactionId $id -UserSid $identity.userSid
+        [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$local,'Process');$install=Join-Path $local 'CodexControlOtherDevices';$fixture=New-CcodVerifiedUninstallRuntimeFixture -InstallRoot $install -AppendOnly -ProjectVersion '2.5.22';$identity=Get-CcodUninstallBootstrapCurrentIdentity;$transactionRoot=Get-CcodUninstallBootstrapDefaultTransactionRoot;$id='11111111-2222-3333-4444-555555555555';$directory=New-CcodUninstallBootstrapTransactionDirectory -TransactionRoot $transactionRoot -TransactionId $id -UserSid $identity.userSid
         $payload=Join-Path $directory 'payload';$recordMap=@{};foreach($relative in $script:CcodUninstallPayloadEntries){$source=Join-Path $fixture.RuntimeRoot $relative.Replace('/','\');$destination=Join-Path $payload $relative.Replace('/','\');[IO.Directory]::CreateDirectory((Split-Path $destination -Parent))|Out-Null;[IO.File]::Copy($source,$destination,$true);$recordMap[$relative]=Get-CcodUninstallBootstrapFileFingerprint $source};$payloadRecords=New-CcodUninstallBootstrapPayloadRecords -RecordMap $recordMap
         $tx=New-CcodUninstallBootstrapTestTransaction -Phase 'TaskRemoved';$tx.runtimeId=$fixture.RuntimeId;$tx.runtimeGeneration=[uint64]7;$tx.userSid=$identity.userSid;$tx.sessionId=$identity.sessionId;$tx.readyEvidence.runtimeId=$fixture.RuntimeId;$tx.readyEvidence.runtimeGeneration=[uint64]7;$tx.readyEvidence.installRoot=$install;$manifest=(Get-FileHash (Join-Path $fixture.RuntimeRoot 'manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant();$tx.readyEvidence.manifestSha256=$manifest;$tx.installedBinding=New-CcodUninstallBootstrapTestInstalledBinding -TransactionId $id -RuntimeRoot $fixture.RuntimeRoot -InstallRoot $install -UserSid $identity.userSid -SessionId $identity.sessionId -PayloadRecords $payloadRecords -TransactionDirectory $directory -RuntimeManifestSha256 $manifest;$timestamp=[DateTime]::UtcNow.AddMinutes(-1).ToString('o',[Globalization.CultureInfo]::InvariantCulture);$tx.startedAtUtc=$timestamp;$tx.updatedAtUtc=$timestamp;Write-CcodUninstallBootstrapStoredTransaction -TransactionDirectory $directory -Transaction $tx;Publish-CcodUninstallBootstrapCurrentTransaction -TransactionRoot $transactionRoot -TransactionId $id -UserSid $identity.userSid
         $resume=[pscustomobject]@{Present=$false};$overrides=@{WaitWrapperExit={param($I,$T)[pscustomobject]@{verifiedAtStart=$true;exited=$true}};InstallResumeProductRegistration={param($T)$resume.Present=$true}.GetNewClosure();GetResumeProductRegistrationState={param($T)if($resume.Present){'Exact'}else{'Absent'}}.GetNewClosure();RemoveMatchedProductShortcuts={param($T)};RemoveResumeProductRegistration={param($T)$resume.Present=$false;$true}.GetNewClosure()};$adapters=Get-CcodInstalledFinalizerAdapters -Adapters $overrides -TransactionRoot $transactionRoot -PayloadRoot $payload -RuntimeRoot $fixture.RuntimeRoot -InstallRoot $install
-        $receipt=Invoke-CcodInstalledUninstallFinalizer -TransactionId $id -RuntimeRoot $fixture.RuntimeRoot -InstallRoot $install -WrapperIdentity ([pscustomobject]@{pid=42;creationTimeUtc='2030-02-03T03:04:05.0000000Z';sessionId=$identity.sessionId;userSid=$identity.userSid}) -Adapters $adapters;Assert-CcodEqual 'Completed' $receipt.phase 'default finalizer reaches completion';Assert-CcodTrue (-not(Test-Path $fixture.RuntimeRoot)) 'default finalizer deletes exact selected runtime';Assert-CcodTrue (Test-Path (Join-Path $install 'state')) 'default finalizer preserves sibling install state';Assert-CcodTrue (-not$resume.Present) 'default finalizer removes the public anchor last'
+        $wrapper=[pscustomobject]@{pid=42;creationTimeUtc='2030-02-03T03:04:05.0000000Z';sessionId=$identity.sessionId;userSid=$identity.userSid}
+        if($PartialFailure){
+            $defaultCleanup=$adapters.CleanupProductResidue
+            $adapters.CleanupProductResidue={param($Transaction)
+                $path=Join-Path $payload 'src/persistence/modules/GenerationReclamation.psm1'
+                $reclamation=Import-Module $path -Force -PassThru -DisableNameChecking
+                &$reclamation {$script:CcodProductResidueFailCommitAtForTest=18}
+                try {&$reclamation {param($Root,$Tx,$Directory)Remove-CcodVerifiedProductResidue -InstallRoot $Root -SelectedRuntimeId $Tx.runtimeId -ExpectedEpoch ([uint64]$Tx.leaseEpoch) -TransactionDirectory $Directory -TransactionId $Tx.transactionId} $install $Transaction $directory}
+                finally {&$reclamation {$script:CcodProductResidueFailCommitAtForTest=-1}}
+            }.GetNewClosure()
+            Assert-CcodThrows {Invoke-CcodInstalledUninstallFinalizer -TransactionId $id -RuntimeRoot $fixture.RuntimeRoot -InstallRoot $install -WrapperIdentity $wrapper -Adapters $adapters|Out-Null} 'CCOD_PRODUCT_RESIDUE_INVALID'
+            Assert-CcodTrue $resume.Present 'actual cleanup failure retains the public resume entry'
+            Assert-CcodTrue (-not(Test-Path (Join-Path $install 'state/lifecycle-epoch.json'))) 'failure occurs after the live epoch file was deleted'
+            $adapters.CleanupProductResidue=$defaultCleanup
+            $receipt=Invoke-CcodInstalledUninstallFinalizer -TransactionId $id -RuntimeRoot $fixture.RuntimeRoot -InstallRoot $install -Resume -Adapters $adapters
+        }else{$receipt=Invoke-CcodInstalledUninstallFinalizer -TransactionId $id -RuntimeRoot $fixture.RuntimeRoot -InstallRoot $install -WrapperIdentity $wrapper -Adapters $adapters}
+        Assert-CcodEqual 'Completed' $receipt.phase 'default finalizer reaches completion'
+        Assert-CcodTrue (-not(Test-Path $fixture.RuntimeRoot)) 'default finalizer deletes exact selected runtime'
+        Assert-CcodTrue (-not(Test-Path $install)) 'completion receipt requires the product root and state to be absent'
+        Assert-CcodTrue (-not$resume.Present) 'default finalizer removes the public anchor last'
     }finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if(Test-Path $local){Remove-Item $local -Recurse -Force}}
 }
+
+$results += Invoke-CcodTest 'default installed finalizer completes bounded product cleanup before its completion receipt' {Invoke-CcodDefaultInstalledProductCleanupCase}
+$results += Invoke-CcodTest 'default installed finalizer resumes after product cleanup removed the live epoch file' {Invoke-CcodDefaultInstalledProductCleanupCase -PartialFailure}
 
 function Invoke-CcodInstalledReclamationMutationCase {
     param([Parameter(Mandatory)][ValidateSet('UnexpectedFile','UnexpectedDirectory','Reparse','Hardlink','Ads','OpenChild')][string]$Mutation)

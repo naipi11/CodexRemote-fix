@@ -44,14 +44,65 @@ function Set-CcodTestActiveRuntime {
         $current = if ([IO.File]::Exists((Join-Path $InstallRoot 'active.json'))) { Read-CcodActiveRuntime -InstallRoot $InstallRoot } else { $null }
         $owner = [pscustomobject][ordered]@{ pid=[int]$process.Id; creationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o') }
         $ownership = Enter-CcodLifecycleOwnership -InstallRoot $InstallRoot -RuntimeId $(if ($null -eq $current) { $NewRuntimeId } else { $current.activeRuntime }) -RuntimeGeneration $(if ($null -eq $current) { [UInt64]1 } else { [UInt64]$current.generation }) -OwnerIdentity $owner -UserSid $identity.User.Value -SessionId ([int]$process.SessionId)
-        return Set-CcodActiveRuntime -InstallRoot $InstallRoot -NewRuntimeId $NewRuntimeId -Ownership $ownership -Adapters $Adapters
+        return Invoke-CcodRuntimeCoreSet -InstallRoot $InstallRoot -NewRuntimeId $NewRuntimeId -Ownership $ownership -Adapters $Adapters
     } finally {
         if ($null -ne $ownership -and -not $ownership.released) { Exit-CcodLifecycleOwnership -Ownership $ownership | Out-Null }
         $process.Dispose(); $identity.Dispose()
     }
 }
 
+function Invoke-CcodRuntimeCoreSet {
+    param([Parameter(Mandatory)][string]$InstallRoot,[string]$NewRuntimeId,$TargetGeneration,$FileTransaction,$Ownership,[hashtable]$Adapters)
+    $module = Get-Module -Name RuntimeManifest
+    return & $module { param($Root,$Runtime,$Generation,$Transaction,$Lease,$Injected) Set-CcodActiveRuntimeCore -InstallRoot $Root -NewRuntimeId $Runtime -TargetGeneration $Generation -FileTransaction $Transaction -Ownership $Lease -Adapters $Injected } $InstallRoot $NewRuntimeId $TargetGeneration $FileTransaction $Ownership $Adapters
+}
+
 try {
+    Invoke-CcodTest 'runtime manifest file records preserve strict property order' {
+        $source = [IO.File]::ReadAllText((Join-Path $repositoryRoot 'src/persistence/modules/RuntimeManifest.psm1'), [Text.UTF8Encoding]::new($false))
+        Assert-CcodTrue ($source.Contains('$records.Add([pscustomobject][ordered]@{')) 'runtime file records use deterministic property order'
+    }
+
+    Invoke-CcodTest 'runtime root existence probe preserves lookup failures' {
+        $source = [IO.File]::ReadAllText((Join-Path $repositoryRoot 'src/persistence/modules/RuntimeManifest.psm1'), [Text.UTF8Encoding]::new($false))
+        $start = $source.IndexOf('function Get-CcodRuntimeRoot')
+        $end = $source.IndexOf('function Get-CcodRuntimeFileSha256')
+        Assert-CcodTrue ($start -ge 0 -and $end -gt $start) 'runtime root helper is present as one inspectable definition'
+        $body = $source.Substring($start, $end - $start)
+        Assert-CcodTrue (-not $body.Contains('[IO.Directory]::Exists($root)')) 'runtime root does not collapse access failures through Directory.Exists'
+        Assert-CcodTrue ($body.Contains('catch [Management.Automation.ItemNotFoundException]')) 'runtime root handles only an explicit missing-item exception as absence'
+        $manifestStart = $source.IndexOf('function Test-CcodRuntimeManifest')
+        $manifestEnd = $source.IndexOf('function Get-CcodRuntimeDirectoryForId')
+        Assert-CcodTrue ($manifestStart -ge 0 -and $manifestEnd -gt $manifestStart) 'runtime manifest validator is present as one inspectable definition'
+        Assert-CcodTrue (-not $source.Substring($manifestStart, $manifestEnd - $manifestStart).Contains("'^[0-9a-f]{64}$'")) 'runtime manifest hash validation uses an absolute end anchor'
+        }
+
+    Invoke-CcodTest 'runtime root propagates an injected access failure instead of treating it as missing' {
+        $module = Get-Module -Name RuntimeManifest
+        Assert-CcodTrue ($null -ne $module) 'RuntimeManifest module is loaded for the behavioral probe'
+        try {
+            $error = & $module {
+                function Get-Item { throw [UnauthorizedAccessException]::new('fixture access denied') }
+                try {
+                    Get-CcodRuntimeRoot -RuntimeDirectory ([IO.Path]::GetFullPath((Join-Path $root 'access-denied')))
+                    return $null
+                } catch {
+                    return $_
+                } finally {
+                    Remove-Item -LiteralPath Function:\Get-Item -Force -ErrorAction SilentlyContinue
+                }
+            }
+            Assert-CcodTrue ($null -ne $error -and $error.Exception -is [UnauthorizedAccessException]) 'access failures escape the runtime-root probe'
+        } finally {
+            Remove-Item -LiteralPath Function:\Get-Item -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Invoke-CcodTest 'public active runtime setter does not expose adapter injection' {
+        $command = Get-Command Set-CcodActiveRuntime -Module RuntimeManifest
+        Assert-CcodTrue (-not $command.Parameters.ContainsKey('Adapters')) 'public active runtime mutation cannot replace lifecycle fence adapters'
+    }
+
     Invoke-CcodTest 'includes the External renderer integration module in the staged runtime manifest input' {
         $sourceFiles = @(& $installLifecycleModule { param($sourceRoot) Get-CcodLifecycleSourceFiles -SourceRoot $sourceRoot } $repositoryRoot)
         $rendererModule = @($sourceFiles | Where-Object { $_.Relative -ceq 'src\persistence\modules\RendererIntegration.psm1' })
@@ -77,6 +128,26 @@ try {
         Assert-CcodEqual 'b.txt' $first.files[1].path 'files must sort ordinally'
         Assert-CcodEqual 2 $first.files.Count 'manifest must exclude manifest.json itself'
         Assert-CcodTrue ($first.files[0].sha256 -cmatch '^[0-9a-f]{64}$') 'file hash must be lowercase SHA-256'
+    }
+
+    Invoke-CcodTest 'runtime IDs use canonical TAB delimiters' {
+        $files = @(
+            [pscustomobject]@{ path = 'a.txt'; length = [int64]5; sha256 = ('a' * 64) }
+            [pscustomobject]@{ path = 'b.txt'; length = [int64]4; sha256 = ('b' * 64) }
+        )
+        $nonce = '0123456789abcdef0123456789abcdef'
+        $expected = '2.5.22-e71f4818a0f8e98f-0123456789abcdef0123456789abcdef'
+        Assert-CcodEqual $expected (Get-CcodRuntimeId -ProjectVersion '2.5.22' -Files $files -Nonce $nonce) 'runtime ID digest input must use literal TAB delimiters'
+    }
+
+    Invoke-CcodTest 'runtime manifest producer and validator agree on filenames containing consecutive dots' {
+        $runtime = Join-Path $root 'consecutive-dots'
+        New-Item -ItemType Directory -Path $runtime | Out-Null
+        [IO.File]::WriteAllText((Join-Path $runtime 'foo..bar'), 'dot filename', [Text.UTF8Encoding]::new($false))
+        $manifest = New-CcodRuntimeManifest -RuntimeDirectory $runtime -ProjectVersion '2.5.22'
+        Write-CcodAtomicJson -Path (Join-Path $runtime 'manifest.json') -Value $manifest
+        $validation = Test-CcodRuntimeManifest -RuntimeDirectory $runtime -ExpectedRuntimeId $manifest.runtimeId
+        Assert-CcodTrue $validation.Valid 'a safe filename with consecutive dots must validate after production'
     }
 
     Invoke-CcodTest 'verifies exact runtime bytes and rejects tampering' {
@@ -119,6 +190,49 @@ try {
             files = @([ordered]@{ path = '../ccod-runtime-outside/outside.txt'; length = 7; sha256 = ('0' * 64) })
         })
         Assert-CcodThrows { Test-CcodRuntimeManifest -RuntimeDirectory $runtime -ExpectedRuntimeId '2.0.0-safe' } 'CCOD_PATH_OUTSIDE_ROOT'
+    }
+
+    Invoke-CcodTest 'rejects a runtime directory reached through a reparse ancestor' {
+        $outsideRuntime = Join-Path $outside 'reparse-runtime'
+        $junctionParent = Join-Path $root 'reparse-runtime-parent'
+        New-Item -ItemType Directory -Path $outsideRuntime | Out-Null
+        [IO.File]::WriteAllText((Join-Path $outsideRuntime 'payload.txt'), 'outside runtime', [Text.UTF8Encoding]::new($false))
+        $outsideManifest = New-CcodRuntimeManifest -RuntimeDirectory $outsideRuntime -ProjectVersion '2.0.0'
+        Write-CcodAtomicJson -Path (Join-Path $outsideRuntime 'manifest.json') -Value $outsideManifest
+        New-Item -ItemType Junction -Path $junctionParent -Target $outside | Out-Null
+        $runtime = Join-Path $junctionParent 'reparse-runtime'
+        Assert-CcodThrows { New-CcodRuntimeManifest -RuntimeDirectory $runtime -ProjectVersion '2.0.0' } 'CCOD_REPARSE_PATH'
+        Assert-CcodThrows { Test-CcodRuntimeManifest -RuntimeDirectory $runtime -ExpectedRuntimeId $outsideManifest.runtimeId } 'CCOD_REPARSE_PATH'
+    }
+
+    Invoke-CcodTest 'runtime manifest rejects a noncanonical runtime directory' {
+        $fixture = New-CcodRuntimeFixture -InstallRoot $root -ProjectVersion '2.0.0' -AContent 'a' -BContent 'b'
+        $noncanonical = [string]$fixture.Runtime + '\.'
+        Assert-CcodThrows { Test-CcodRuntimeManifest -RuntimeDirectory $noncanonical -ExpectedRuntimeId $fixture.Manifest.runtimeId } 'CCOD_RUNTIME_PATH_INVALID'
+    }
+
+    Invoke-CcodTest 'runtime manifest rejects a directory at its manifest leaf instead of treating it as missing' {
+        $runtime = Join-Path $root 'manifest-leaf-directory'
+        New-Item -ItemType Directory -Path $runtime | Out-Null
+        [IO.File]::WriteAllText((Join-Path $runtime 'payload.txt'), 'payload', [Text.UTF8Encoding]::new($false))
+        $manifest = New-CcodRuntimeManifest -RuntimeDirectory $runtime -ProjectVersion '2.0.0'
+        New-Item -ItemType Directory -Path (Join-Path $runtime 'manifest.json') | Out-Null
+        $result = Test-CcodRuntimeManifest -RuntimeDirectory $runtime -ExpectedRuntimeId $manifest.runtimeId
+        Assert-CcodEqual 'CCOD_RUNTIME_MANIFEST_INVALID' $result.Code 'manifest directory is invalid state rather than missing file'
+    }
+
+    Invoke-CcodTest 'active pointer rejects a noninteger schema version' {
+        $runtime = New-CcodRuntimeFixture -InstallRoot $root -ProjectVersion '2.5.0' -AContent 'a' -BContent 'b'
+        $pointer = '{"schemaVersion":2.0,"activeRuntime":"' + $runtime.Manifest.runtimeId + '","previousRuntime":null,"generation":1,"updatedAtUtc":"2030-02-03T04:05:06.0000000Z"}'
+        [IO.File]::WriteAllText((Join-Path $root 'active.json'), $pointer, [Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows { Read-CcodActiveRuntime -InstallRoot $root } 'CCOD_RUNTIME_POINTER_INVALID'
+    }
+
+    Invoke-CcodTest 'active pointer rejects a noncanonical UTC timestamp' {
+        $runtime = New-CcodRuntimeFixture -InstallRoot $root -ProjectVersion '2.5.0' -AContent 'a' -BContent 'b'
+        $pointer = [ordered]@{ schemaVersion = 2; activeRuntime = $runtime.Manifest.runtimeId; previousRuntime = $null; generation = [UInt64]1; updatedAtUtc = 123 }
+        [IO.File]::WriteAllText((Join-Path $root 'active.json'), ($pointer | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows { Read-CcodActiveRuntime -InstallRoot $root } 'CCOD_RUNTIME_POINTER_INVALID'
     }
 
     Invoke-CcodTest 'rotates an active pointer only to a verified runtime' {
@@ -177,6 +291,21 @@ try {
         Assert-CcodThrows { Read-CcodActiveRuntime -InstallRoot $installRoot } 'CCOD_RUNTIME_ID_INVALID'
     }
 
+    Invoke-CcodTest 'rejects dot-only runtime IDs before resolving active runtime paths' {
+        foreach ($runtimeId in @('.', '..')) {
+            $installRoot = Join-Path $root ('dot-runtime-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $installRoot | Out-Null
+            Write-CcodAtomicJson -Path (Join-Path $installRoot 'active.json') -Value ([ordered]@{
+                schemaVersion = 1
+                activeRuntime = $runtimeId
+                previousRuntime = $null
+                updatedAtUtc = '2030-02-03T04:05:06.0000000Z'
+            })
+            Assert-CcodThrows { Read-CcodActiveRuntime -InstallRoot $installRoot } 'CCOD_RUNTIME_ID_INVALID'
+            if (Test-Path -LiteralPath $installRoot) { Remove-Item -LiteralPath $installRoot -Recurse -Force }
+        }
+    }
+
     Invoke-CcodTest 'default immutable pointer fence commits fresh and append-only upgrade with real ownership' {
         $installRoot=Join-Path $root 'default-immutable-fence';[IO.Directory]::CreateDirectory($installRoot)|Out-Null;$identity=[Security.Principal.WindowsIdentity]::GetCurrent();$process=[Diagnostics.Process]::GetCurrentProcess();$firstTx=$null;$secondTx=$null;$ownership=$null
         $makeGeneration={param($Root,$Content,$Nonce)$source=Join-Path $Root ("source-$Nonce.txt");[IO.File]::WriteAllText($source,$Content,[Text.UTF8Encoding]::new($false));$sha=(Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant();$records=@([pscustomobject]@{path='payload.txt';length=[int64](Get-Item $source).Length;sha256=$sha});$id=Get-CcodRuntimeId -ProjectVersion '2.5.22' -Files $records -Nonce $Nonce;$tx=Open-CcodInstallGeneration -InstallRoot $Root -RuntimeId $id;Copy-CcodInstallSealedSource -Generation $tx -SourcePath $source -Leaf 'payload.txt' -ExpectedLength $records[0].length -ExpectedSha256 $sha|Out-Null;$runtime=Join-Path $Root "runtime\$id";$manifest=New-CcodRuntimeManifest -RuntimeDirectory $runtime -ProjectVersion '2.5.22' -RuntimeId $id;Write-CcodInstallGenerationManifest -Generation $tx -Manifest $manifest|Out-Null;[pscustomobject]@{Id=$id;Transaction=$tx;Generation=$tx}}
@@ -216,7 +345,7 @@ try {
                 $pointerRoot=Join-Path $installRoot 'state\active-generation';if($kind-ceq'root-file'){[IO.Directory]::CreateDirectory((Split-Path $pointerRoot -Parent))|Out-Null;[IO.File]::WriteAllText($pointerRoot,'not-a-directory',[Text.UTF8Encoding]::new($false))}
                 $owner=[pscustomobject][ordered]@{pid=[int]$process.Id;creationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o')};$ownership=Enter-CcodLifecycleOwnership -InstallRoot $installRoot -RuntimeId $runtimeId -RuntimeGeneration 1 -OwnerIdentity $owner -UserSid $identity.User.Value -SessionId ([int]$process.SessionId)
                 $adapters=if($kind-ceq'lookup-error'){@{GetSelectorRootItem={param($Path)throw [UnauthorizedAccessException]::new('selector lookup denied')}}}else{$null}
-                Assert-CcodThrows {Set-CcodActiveRuntime -InstallRoot $installRoot -NewRuntimeId $runtimeId -TargetGeneration $transaction -FileTransaction $transaction -Ownership $ownership -Adapters $adapters|Out-Null} 'CCOD_RUNTIME_POINTER_INVALID'
+                Assert-CcodThrows { Invoke-CcodRuntimeCoreSet -InstallRoot $installRoot -NewRuntimeId $runtimeId -TargetGeneration $transaction -FileTransaction $transaction -Ownership $ownership -Adapters $adapters | Out-Null } 'CCOD_RUNTIME_POINTER_INVALID'
                 Assert-CcodEqual $false ([IO.File]::Exists((Join-Path $pointerRoot '00000000000000000001.json'))) "$kind failure publishes no active generation"
             }finally{if($null-ne$ownership-and-not$ownership.released){Exit-CcodLifecycleOwnership $ownership|Out-Null};if($null-ne$transaction){Close-CcodInstallFileTransaction $transaction Failed};$process.Dispose();$identity.Dispose()}
         }
@@ -351,7 +480,7 @@ try {
                 }
                 return $true
             }.GetNewClosure()
-            Assert-CcodThrows { Set-CcodActiveRuntime -InstallRoot $installRoot -NewRuntimeId $second.Manifest.runtimeId -Ownership $ownership -Adapters @{ AssertLifecycleFence=$raceFence } } 'CCOD_RUNTIME_FENCE_STALE'
+            Assert-CcodThrows { Invoke-CcodRuntimeCoreSet -InstallRoot $installRoot -NewRuntimeId $second.Manifest.runtimeId -Ownership $ownership -Adapters @{ AssertLifecycleFence=$raceFence } } 'CCOD_RUNTIME_FENCE_STALE'
             $unchanged = Read-CcodActiveRuntime -InstallRoot $installRoot
             Assert-CcodEqual 2 ([UInt64]$unchanged.generation) 'concurrent generation remains committed instead of being reused'
             Assert-CcodEqual $first.Manifest.runtimeId $unchanged.activeRuntime 'stale owner cannot replace the concurrent active runtime'
@@ -373,6 +502,55 @@ try {
         Assert-CcodThrows { Read-CcodActiveRuntime -InstallRoot $installRoot } 'CCOD_RUNTIME_GENERATION_INVALID'
         [IO.File]::WriteAllText((Join-Path $installRoot 'active.json'), '{"schemaVersion":2,"activeRuntime":"2.5.0-a","previousRuntime":null,"generation":18446744073709551616,"updatedAtUtc":"2030-02-03T04:05:06.0000000Z"}', [Text.UTF8Encoding]::new($false))
         Assert-CcodThrows { Read-CcodActiveRuntime -InstallRoot $installRoot } 'CCOD_RUNTIME_GENERATION_INVALID'
+    }
+
+    Invoke-CcodTest 'accepts Decimal previousGeneration values in active-generation records' {
+        $installRoot = Join-Path $root 'decimal-previous-generation'
+        $pointerRoot = Join-Path $installRoot 'state\active-generation'
+        New-Item -ItemType Directory -Path $pointerRoot -Force | Out-Null
+        $record = [ordered]@{ schemaVersion = 1; generation = [decimal]2; activeRuntime = '2.5.22-a'; previousGeneration = [decimal]1 }
+        [IO.File]::WriteAllText((Join-Path $pointerRoot '00000000000000000002.json'), ($record | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+        $first = [ordered]@{ schemaVersion = 1; generation = 1; activeRuntime = '2.5.22-b'; previousGeneration = 0 }
+        [IO.File]::WriteAllText((Join-Path $pointerRoot '00000000000000000001.json'), ($first | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+        $actual = Read-CcodActiveRuntime -InstallRoot $installRoot
+        Assert-CcodTrue ([UInt64]$actual.generation -eq [UInt64]2) 'Decimal previousGeneration must not invalidate an otherwise canonical selector chain'
+    }
+
+    Invoke-CcodTest 'rejects legacy active pointer files with alternate data streams' {
+        $installRoot = Join-Path $root 'legacy-pointer-stream'
+        New-Item -ItemType Directory -Path $installRoot | Out-Null
+        $runtime = New-CcodRuntimeFixture -InstallRoot $installRoot -ProjectVersion '2.3.0' -AContent 'ads alpha' -BContent 'ads beta'
+        Write-CcodAtomicJson -Path (Join-Path $installRoot 'active.json') -Value ([ordered]@{ schemaVersion = 1; activeRuntime = $runtime.Manifest.runtimeId; previousRuntime = $null; updatedAtUtc = '2030-02-03T04:05:06.0000000Z' })
+        Add-Content -LiteralPath (Join-Path $installRoot 'active.json') -Stream 'unexpected' -Value 'tampered'
+        Assert-CcodThrows { Read-CcodActiveRuntime -InstallRoot $installRoot } 'CCOD_RUNTIME_POINTER_INVALID'
+    }
+
+    Invoke-CcodTest 'runtime manifest rejects scalar files and noninteger lengths' {
+        $installRoot = Join-Path $root 'manifest-strict-shape'
+        New-Item -ItemType Directory -Path $installRoot | Out-Null
+        $fixture = New-CcodRuntimeFixture -InstallRoot $installRoot -ProjectVersion '2.3.1' -AContent 'shape alpha' -BContent 'shape beta'
+        $path = Join-Path $fixture.Runtime 'manifest.json'
+        $valid = $fixture.Manifest
+        $scalar = [ordered]@{ schemaVersion = 1; projectVersion = '2.3.1'; runtimeId = $valid.runtimeId; files = [ordered]@{ path = 'a.txt'; length = 1; sha256 = ('0' * 64) } }
+        Write-CcodAtomicJson -Path $path -Value $scalar
+        Assert-CcodEqual 'CCOD_RUNTIME_MANIFEST_INVALID' (Test-CcodRuntimeManifest -RuntimeDirectory $fixture.Runtime -ExpectedRuntimeId $valid.runtimeId).Code 'scalar files are rejected by shape'
+        $fraction = [ordered]@{ schemaVersion = 1; projectVersion = '2.3.1'; runtimeId = $valid.runtimeId; files = @([ordered]@{ path = 'a.txt'; length = 1.5; sha256 = ('0' * 64) }) }
+        Write-CcodAtomicJson -Path $path -Value $fraction
+        Assert-CcodEqual 'CCOD_RUNTIME_MANIFEST_INVALID' (Test-CcodRuntimeManifest -RuntimeDirectory $fixture.Runtime -ExpectedRuntimeId $valid.runtimeId).Code 'fractional lengths are rejected by shape'
+    }
+
+    Invoke-CcodTest 'runtime manifest rejects extra properties and string schema versions' {
+        $installRoot = Join-Path $root 'manifest-strict-extra'
+        New-Item -ItemType Directory -Path $installRoot | Out-Null
+        $fixture = New-CcodRuntimeFixture -InstallRoot $installRoot -ProjectVersion '2.3.2' -AContent 'extra alpha' -BContent 'extra beta'
+        $path = Join-Path $fixture.Runtime 'manifest.json'
+        $valid = $fixture.Manifest
+        $extra = [ordered]@{ schemaVersion = 1; projectVersion = '2.3.2'; runtimeId = $valid.runtimeId; files = @(); unexpected = 'x' }
+        Write-CcodAtomicJson -Path $path -Value $extra
+        Assert-CcodEqual 'CCOD_RUNTIME_MANIFEST_INVALID' (Test-CcodRuntimeManifest -RuntimeDirectory $fixture.Runtime -ExpectedRuntimeId $valid.runtimeId).Code 'extra manifest fields are rejected'
+        $stringSchema = [ordered]@{ schemaVersion = '1'; projectVersion = '2.3.2'; runtimeId = $valid.runtimeId; files = @() }
+        Write-CcodAtomicJson -Path $path -Value $stringSchema
+        Assert-CcodEqual 'CCOD_RUNTIME_MANIFEST_INVALID' (Test-CcodRuntimeManifest -RuntimeDirectory $fixture.Runtime -ExpectedRuntimeId $valid.runtimeId).Code 'string schema version is rejected'
     }
 } finally {
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }

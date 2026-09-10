@@ -25,6 +25,7 @@ $cleanRoomSelfTest = Join-Path $PSScriptRoot 'CleanroomSelfTest.js'
 $packageCheckerSelfTest = Join-Path $PSScriptRoot 'PackageCheckerSelfTest.mjs'
 $persistenceSelfTest = Join-Path $PSScriptRoot 'PersistenceSelfTest.ps1'
 $installFileTransactionSelfTest = Join-Path $PSScriptRoot 'persistence\InstallFileTransaction.SelfTest.ps1'
+$officialDraftAcceptanceSelfTest = Join-Path $PSScriptRoot 'persistence\OfficialDraftAcceptanceHarness.SelfTest.ps1'
 
 function Get-CcodValidationSafeChildMarkers {
     param($Output)
@@ -117,6 +118,30 @@ if ($failures.Count -eq 0) {
     }
 }
 
+if (-not (Test-Path -LiteralPath $officialDraftAcceptanceSelfTest -PathType Leaf)) {
+    $failures.Add("Official draft acceptance self-test is missing: $officialDraftAcceptanceSelfTest")
+} elseif ($failures.Count -eq 0) {
+    $powershellExecutable = (Get-Command powershell.exe -ErrorAction Stop).Source
+    $previousErrorActionPreference = $ErrorActionPreference
+    $hadChildExecutionPolicy = Test-Path -LiteralPath 'Env:PSExecutionPolicyPreference'
+    $previousChildExecutionPolicy = $env:PSExecutionPolicyPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        Remove-Item -LiteralPath 'Env:PSExecutionPolicyPreference' -ErrorAction SilentlyContinue
+        # Omit the policy switch: Windows PowerShell 5.1 maps an explicit
+        # Undefined argument to Restricted instead of inheriting normal policy.
+        $officialDraftAcceptanceOutput = & $powershellExecutable -NoProfile -File $officialDraftAcceptanceSelfTest 2>&1
+        $officialDraftAcceptanceExitCode = $LASTEXITCODE
+    } finally {
+        if ($hadChildExecutionPolicy) { $env:PSExecutionPolicyPreference = $previousChildExecutionPolicy }
+        else { Remove-Item -LiteralPath 'Env:PSExecutionPolicyPreference' -ErrorAction SilentlyContinue }
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($officialDraftAcceptanceExitCode -ne 0) {
+        $failures.Add("Official draft acceptance self-test failed with exit code $officialDraftAcceptanceExitCode; $(Get-CcodValidationSafeChildMarkers $officialDraftAcceptanceOutput)")
+    }
+}
+
 foreach ($required in @(
     'README.md',
     'README.zh-CN.md',
@@ -148,6 +173,10 @@ foreach ($required in @(
     'tests\persistence\UninstallBootstrap.SelfTest.ps1',
     'tests\persistence\InstalledLifecycleHarness.SelfTest.ps1',
     'tests\persistence\ReleaseWorkflow.SelfTest.ps1',
+    'tests\persistence\TrustedModuleImport.SelfTest.ps1',
+    'tests\installed\OfficialDraftAcceptance.psm1',
+    'tests\installed\Invoke-OfficialDraftAcceptance.ps1',
+    'tests\persistence\OfficialDraftAcceptanceHarness.SelfTest.ps1',
     'tools\ReleaseAssetContract.psm1',
     'tools\ReleaseDefender.psm1',
     'tools\Test-ReleaseDefender.ps1',

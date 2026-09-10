@@ -10,19 +10,19 @@ No unreleased changes.
 
 ### English
 
-- Bound Setup activation to the exact verified manifest, installer, and module bytes across child launch, then revalidated the selected runtime before reporting Ready.
-- Rejected hard-linked install leaves before writes and added independent Setup PE/provenance validation for version, commit, and the activation payload-manifest hash.
+- Bound Setup activation and Ready reporting to verified manifest, installer, and module bytes; rejected hard-linked install leaves and independently checked Setup PE/provenance against the version, commit, and payload-manifest hash.
 - Added bounded same-root process-tree rereads while preserving strict root and per-process identity checks during close and remote rebind.
 - Correlated native tray actions with the acknowledged presentation revision and durable, bounded terminal diagnostics; stale actions now produce a sanitized support code.
 - Made v2.5.22 candidate promotion require two distinct InternetDownload Defender receipts for the exact Setup and portable ZIP identities; workflow-artifact evidence cannot substitute.
+- Added manifest- and state-verified uninstall residue cleanup with durable retry after partial deletion; unknown files, protected user data, and unavailable process observations block completion instead of being silently ignored.
 
 ### 简体中文
 
-- 将 Setup 激活绑定到跨子进程启动仍保持不变的 manifest、installer 与 module 精确字节，并在报告 Ready 前重新校验所选 runtime。
-- 在写入前拒绝安装目录中的硬链接叶子，并独立校验 Setup PE/构建 provenance 所绑定的版本、commit 与激活 payload-manifest 哈希。
+- 将 Setup 激活与 Ready 报告绑定到已验证的 manifest、installer 和 module 字节；写入前拒绝硬链接叶子，并独立核对 Setup PE/构建 provenance 的版本、commit 与 payload-manifest 哈希。
 - 为同一根进程加入有界 process-tree 重读，同时在关闭和远程重绑定时继续严格校验根进程与每个成员的身份。
 - 将原生托盘操作绑定到已确认的 presentation revision 和持久、有界的终态诊断；过期操作会记录清理后的支持代码。
 - v2.5.22 候选版本只有在精确 Setup 与便携 ZIP 分别具备不同的 InternetDownload Defender 收据后才能提升；工作流产物证据不能替代它们。
+- 新增基于清单与状态核验的卸载残留清理，部分删除后可持久化重试；遇到未知文件、受保护用户数据或无法确认的进程状态时停止，不再静默忽略并报告完成。
 
 ## v2.5.21
 

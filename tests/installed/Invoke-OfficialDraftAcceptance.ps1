@@ -1,3 +1,20 @@
+[CmdletBinding()]
+param(
+    [string]$Phase,
+    [string]$AssetDirectory,
+    [string]$PreviousAssetDirectory,
+    [string]$EvidenceRoot,
+    [string]$DraftId,
+    [switch]$AllowMachineMutation,
+    [switch]$AllowCodexRestart,
+    [switch]$AllowWindowsReboot,
+    [string]$TrayOperation,
+    [string]$RemoteOperation,
+    [string]$ScreenshotPath,
+    [string]$RedactedLogPath,
+    [string]$ReviewState
+)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -147,12 +164,64 @@ function Open-CcodTrustedImportLease {
     }
 }
 # END CCOD TRUSTED IMPORT BOOTSTRAP
-
-$entryPath = Join-Path $PSScriptRoot 'Invoke-GitHubDraftRelease.ps1'
-$entryLease = Open-CcodTrustedImportLease -Path $entryPath -ErrorId 'CCOD_GITHUB_DRAFT_CONTRACT_MISSING'
+$modulePath = Join-Path $PSScriptRoot 'OfficialDraftAcceptance.psm1'
+function Throw-CcodOfficialDraftWrapperError {
+    param([Parameter(Mandatory)][string]$ErrorId,[Parameter(Mandatory)][string]$Message)
+    throw [Management.Automation.ErrorRecord]::new(
+        [InvalidOperationException]::new($Message),
+        $ErrorId,
+        [Management.Automation.ErrorCategory]::InvalidArgument,
+        $null
+    )
+}
 try {
-    $entryLease.Revalidate()
-    . $entryPath
-    $entryLease.Revalidate()
-} finally { $entryLease.Dispose() }
-Export-ModuleMember -Function Invoke-CcodGitHubDraftRelease
+    $phaseNames = [string[]]@('Preflight','LegacyUpgrade','Uninstall','FreshInstall','PreReboot','PostReboot','ReadyForManualEvidence','TrayEvidence','RemoteEvidence','Complete')
+    $phaseMatch = @($phaseNames | Where-Object { $_ -ieq [string]$Phase })
+    if ($phaseMatch.Count -ne 1) { Throw-CcodOfficialDraftWrapperError 'CCOD_ACCEPTANCE_PHASE_INVALID' 'The official-draft acceptance phase is unsupported.' }
+    $Phase = [string]$phaseMatch[0]
+    if ([string]::IsNullOrWhiteSpace($AssetDirectory) -or [string]::IsNullOrWhiteSpace($PreviousAssetDirectory) -or [string]::IsNullOrWhiteSpace($EvidenceRoot)) {
+        Throw-CcodOfficialDraftWrapperError 'CCOD_ACCEPTANCE_ARGUMENT_INVALID' 'Required acceptance paths are missing.'
+    }
+    $trayNames = [string[]]@('About','Language','OpenLogs','Repair')
+    if (-not [string]::IsNullOrWhiteSpace($TrayOperation)) {
+        $trayMatch = @($trayNames | Where-Object { $_ -ieq [string]$TrayOperation })
+        if ($trayMatch.Count -ne 1) { Throw-CcodOfficialDraftWrapperError 'CCOD_ACCEPTANCE_TRAY_OPERATION_INVALID' 'The tray operation is unsupported.' }
+        $TrayOperation = [string]$trayMatch[0]
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RemoteOperation)) {
+        if ($RemoteOperation -ine 'SecondDeviceControl') { Throw-CcodOfficialDraftWrapperError 'CCOD_ACCEPTANCE_REMOTE_OPERATION_INVALID' 'The remote operation is unsupported.' }
+        $RemoteOperation = 'SecondDeviceControl'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ReviewState)) {
+        if ($ReviewState -ine 'Reviewed') { Throw-CcodOfficialDraftWrapperError 'CCOD_ACCEPTANCE_REVIEW_STATE_INVALID' 'The manual evidence review state is unsupported.' }
+        $ReviewState = 'Reviewed'
+    }
+    $moduleLease = Open-CcodTrustedImportLease -Path $modulePath -ErrorId 'CCOD_ACCEPTANCE_MODULE_MISSING'
+    try {
+        $moduleLease.Revalidate()
+        Import-Module $modulePath -Force -ErrorAction Stop
+        $moduleLease.Revalidate()
+    } finally { $moduleLease.Dispose() }
+    $invokeParameters = @{
+        Phase = $Phase
+        AssetDirectory = $AssetDirectory
+        PreviousAssetDirectory = $PreviousAssetDirectory
+        EvidenceRoot = $EvidenceRoot
+        DraftId = $DraftId
+        AllowMachineMutation = [bool]$AllowMachineMutation
+        AllowCodexRestart = [bool]$AllowCodexRestart
+        AllowWindowsReboot = [bool]$AllowWindowsReboot
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TrayOperation)) { $invokeParameters.TrayOperation = $TrayOperation }
+    if (-not [string]::IsNullOrWhiteSpace($RemoteOperation)) { $invokeParameters.RemoteOperation = $RemoteOperation }
+    if (-not [string]::IsNullOrWhiteSpace($ScreenshotPath)) { $invokeParameters.ScreenshotPath = $ScreenshotPath }
+    if (-not [string]::IsNullOrWhiteSpace($RedactedLogPath)) { $invokeParameters.RedactedLogPath = $RedactedLogPath }
+    if (-not [string]::IsNullOrWhiteSpace($ReviewState)) { $invokeParameters.ReviewState = $ReviewState }
+    Invoke-CcodOfficialDraftAcceptance @invokeParameters |
+        ConvertTo-Json -Depth 16
+} catch {
+    $errorId = [string]$_.FullyQualifiedErrorId
+    if ($errorId -notmatch '^CCOD_ACCEPTANCE_[A-Z0-9_]+\z') { $errorId = 'CCOD_ACCEPTANCE_WRAPPER_FAILED' }
+    [Console]::Error.WriteLine($errorId)
+    exit 1
+}

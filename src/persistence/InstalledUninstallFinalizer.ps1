@@ -6,12 +6,82 @@ param(
     [Parameter(ParameterSetName='Initial')][Parameter(ParameterSetName='WrapperResume')][int]$WrapperProcessId,
     [Parameter(ParameterSetName='Initial')][Parameter(ParameterSetName='WrapperResume')][string]$WrapperCreationTimeUtc,
     [Parameter(ParameterSetName='WrapperResume')][switch]$WrapperResume,
-    [Parameter(ParameterSetName='Resume')][switch]$Resume
+    [Parameter(ParameterSetName='Resume')][switch]$Resume,
+    [Parameter(ParameterSetName='Initial')][Parameter(ParameterSetName='WrapperResume')][string]$AuthorityReadyHandle
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $script:CcodInstalledFinalizerPayloadEntries=@('src/persistence/UninstallBootstrap.ps1','src/persistence/PortableUninstallFinalizer.ps1','src/persistence/InstalledUninstallFinalizer.ps1','src/persistence/modules/GenerationReclamation.psm1','src/persistence/modules/InstallLifecycle.psm1','src/persistence/modules/ProductRegistration.psm1','src/persistence/modules/PortableRelease.psm1','src/persistence/modules/PersistenceIO.psm1','src/persistence/modules/RuntimeManifest.psm1','src/persistence/modules/LifecycleEpoch.psm1','src/persistence/modules/StateStore.psm1','src/persistence/modules/TrustedLogonIdentity.psm1','src/persistence/modules/ScheduledTask.psm1','src/persistence/modules/KernelObjects.psm1','src/persistence/modules/CompatibilityProbe.psm1','src/persistence/modules/UiPreferences.psm1','src/persistence/modules/LifecycleTransaction.psm1')
+
+function Initialize-CcodUninstallPayloadAuthority {
+    if ($null -ne ('CcodUninstallPayloadAuthorityV1' -as [type])) { return }
+    Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public sealed class CcodUninstallPayloadAuthorityV1 : IDisposable
+{
+    [StructLayout(LayoutKind.Sequential)] private struct Info
+    {
+        public uint Attributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME Creation, Access, Write;
+        public uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern SafeFileHandle CreateFileW(string path,uint access,uint share,IntPtr security,uint creation,uint flags,IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle handle,out Info info);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle,StringBuilder value,uint length,uint flags);
+    private readonly List<SafeFileHandle> handles = new List<SafeFileHandle>();
+    private readonly HashSet<string> paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private bool disposed;
+    public void Add(string path)
+    {
+        if(disposed)throw new ObjectDisposedException("uninstall payload authority");
+        if(String.IsNullOrWhiteSpace(path)||!Path.IsPathRooted(path)||path.StartsWith(@"\\?\")||path.StartsWith(@"\\.\"))throw new IOException("Payload path");
+        string full=Path.GetFullPath(path),root=Path.GetPathRoot(full);
+        if(!String.Equals(full,path,StringComparison.OrdinalIgnoreCase)||full.Substring(root.Length).IndexOf(':')>=0)throw new IOException("Payload canonical path");
+        var parents=new List<string>();
+        for(DirectoryInfo parent=Directory.GetParent(full);parent!=null;parent=parent.Parent)parents.Add(parent.FullName);
+        parents.Reverse();
+        foreach(string parent in parents)Open(parent,true);
+        Open(full,false);
+    }
+    private void Open(string path,bool directory)
+    {
+        if(paths.Contains(path))return;
+        uint access=directory?0x00100081U:0x80100080U;
+        uint flags=0x00200000U|(directory?0x02000000U:0U);
+        SafeFileHandle handle=CreateFileW(path,access,1U,IntPtr.Zero,3U,flags,IntPtr.Zero);
+        if(handle.IsInvalid){int error=Marshal.GetLastWin32Error();handle.Dispose();throw new Win32Exception(error);}
+        try{
+            Info info;if(!GetFileInformationByHandle(handle,out info))throw new Win32Exception(Marshal.GetLastWin32Error());
+            if((info.Attributes&0x400U)!=0||((info.Attributes&0x10U)!=0)!=directory||(!directory&&info.Links!=1))throw new IOException("Payload file kind");
+            var value=new StringBuilder(512);uint length=GetFinalPathNameByHandleW(handle,value,(uint)value.Capacity,0);
+            if(length>=value.Capacity){value.Capacity=checked((int)length+1);length=GetFinalPathNameByHandleW(handle,value,(uint)value.Capacity,0);}
+            if(length==0||length>=value.Capacity)throw new IOException("Payload final path unavailable");
+            string final=value.ToString();
+            if(final.StartsWith(@"\\?\UNC\",StringComparison.OrdinalIgnoreCase))final=@"\\"+final.Substring(8);
+            else if(final.StartsWith(@"\\?\",StringComparison.OrdinalIgnoreCase))final=final.Substring(4);
+            if(!String.Equals(final.TrimEnd('\\'),path.TrimEnd('\\'),StringComparison.OrdinalIgnoreCase))throw new IOException("Payload final path mismatch");
+            handles.Add(handle);paths.Add(path);
+        }catch{handle.Dispose();throw;}
+    }
+    public void Dispose()
+    {
+        if(disposed)return;disposed=true;
+        for(int index=handles.Count-1;index>=0;index--)handles[index].Dispose();
+        handles.Clear();paths.Clear();
+    }
+}
+'@
+}
 
 function Throw-CcodInstalledFinalizerError {
     param([string]$Id,[string]$Message,$Target)
@@ -83,18 +153,51 @@ function Get-CcodInstalledFinalizerAdapters {
         ExitAccountTransition={param($Lease)Import-Module $kernelModule -Force -DisableNameChecking -ErrorAction Stop;[void](Exit-CcodMutex -Lease $Lease)}.GetNewClosure()
         EnterTransactionLock={param($UserSid);. $bootstrap;Enter-CcodUninstallBootstrapTransactionLock -UserSid $UserSid}.GetNewClosure()
         ExitTransactionLock={param($Lock);. $bootstrap;Exit-CcodUninstallBootstrapTransactionLock -Lock $Lock}.GetNewClosure()
-        WaitWrapperExit={param($Identity,$Timeout);$process=Get-Process -Id $Identity.pid -ErrorAction SilentlyContinue;if($null-eq$process){return [pscustomobject]@{verifiedAtStart=$true;exited=$true}};try{if($process.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)-cne$Identity.creationTimeUtc-or[int]$process.SessionId-ne[int]$Identity.sessionId){return [pscustomobject]@{verifiedAtStart=$true;exited=$true}}}finally{$process.Dispose()};$owner=$null;try{$owner=(Get-CimInstance Win32_Process -Filter ('ProcessId='+$Identity.pid)-ErrorAction Stop|Invoke-CimMethod -MethodName GetOwnerSid -ErrorAction Stop)}catch{};if($null-eq$owner-or[int]$owner.ReturnValue-ne0-or[string]$owner.Sid-cne[string]$Identity.userSid){return [pscustomobject]@{verifiedAtStart=$false;exited=$false}};$stopwatch=[Diagnostics.Stopwatch]::StartNew();while($stopwatch.ElapsedMilliseconds-lt$Timeout){$current=Get-Process -Id $Identity.pid -ErrorAction SilentlyContinue;if($null-eq$current){return [pscustomobject]@{verifiedAtStart=$true;exited=$true}};try{if($current.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)-cne$Identity.creationTimeUtc){return [pscustomobject]@{verifiedAtStart=$true;exited=$true}}}finally{$current.Dispose()};Start-Sleep -Milliseconds 100};[pscustomobject]@{verifiedAtStart=$true;exited=$false}}
+        WaitWrapperExit={
+            param($Identity,$Timeout)
+            $observeProcess={
+                param([int]$ProcessId)
+                try {
+                    $observed=@(Get-Process -Id $ProcessId -ErrorAction Stop)
+                } catch {
+                    if($_.CategoryInfo.Category-eq[Management.Automation.ErrorCategory]::ObjectNotFound-and
+                       ([string]$_.FullyQualifiedErrorId-split',')[0]-ceq'NoProcessFoundForGivenId'){return $null}
+                    throw
+                }
+                if($observed.Count-ne1-or$observed[0]-isnot[Diagnostics.Process]){throw 'wrapper process observation is unavailable'}
+                return $observed[0]
+            }
+            $process=&$observeProcess $Identity.pid
+            if($null-eq$process){return [pscustomobject]@{verifiedAtStart=$true;exited=$true}}
+            try {
+                if($process.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)-cne$Identity.creationTimeUtc-or[int]$process.SessionId-ne[int]$Identity.sessionId){return [pscustomobject]@{verifiedAtStart=$true;exited=$true}}
+            } finally {$process.Dispose()}
+            $owner=$null
+            try {$owner=Get-CimInstance Win32_Process -Filter ('ProcessId='+$Identity.pid) -ErrorAction Stop|Invoke-CimMethod -MethodName GetOwnerSid -ErrorAction Stop} catch {}
+            if($null-eq$owner-or[int]$owner.ReturnValue-ne0-or[string]$owner.Sid-cne[string]$Identity.userSid){return [pscustomobject]@{verifiedAtStart=$false;exited=$false}}
+            $stopwatch=[Diagnostics.Stopwatch]::StartNew()
+            while($stopwatch.ElapsedMilliseconds-lt$Timeout){
+                $current=&$observeProcess $Identity.pid
+                if($null-eq$current){return [pscustomobject]@{verifiedAtStart=$true;exited=$true}}
+                try {
+                    if($current.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)-cne$Identity.creationTimeUtc){return [pscustomobject]@{verifiedAtStart=$true;exited=$true}}
+                } finally {$current.Dispose()}
+                Start-Sleep -Milliseconds 100
+            }
+            [pscustomobject]@{verifiedAtStart=$true;exited=$false}
+        }
         ReadPreparedTransaction={param($Id,$ExpectedInstallRoot);. $bootstrap;$identity=Get-CcodUninstallBootstrapCurrentIdentity;$value=Read-CcodUninstallBootstrapStoredTransaction -TransactionRoot $TransactionRoot -ExpectedUserSid $identity.userSid -IncludeCompleted -ExpectedInstallRoot $ExpectedInstallRoot;if($null-eq$value-or$value.transactionId-cne$Id){return $null};$value}.GetNewClosure()
         ValidateStagedPayload={param($Transaction,$Root)Test-CcodInstalledFinalizerStagedPayload -Transaction $Transaction -PayloadRoot $Root}
         ValidateSelectedGeneration={param($SelectedRuntime,$Root,$Transaction);. $bootstrap;$context=Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $SelectedRuntime -InstallRoot $Root -InvocationPath (Join-Path $SelectedRuntime 'src\persistence\UninstallBootstrap.ps1');$manifest=Get-CcodUninstallBootstrapFileFingerprint -Path (Join-Path $SelectedRuntime 'manifest.json');$context.runtimeId-ceq$Transaction.runtimeId-and[uint64]$context.runtimeGeneration-eq[uint64]$Transaction.runtimeGeneration-and$manifest.sha256-ceq$Transaction.installedBinding.runtimeManifestSha256}.GetNewClosure()
-        ReadCurrentEpoch={param($Root);. $bootstrap;$record=Read-CcodUninstallBootstrapJson -Path (Join-Path $Root 'state\lifecycle-epoch.json') -Kind 'Lifecycle epoch';[uint64]$record.epoch}.GetNewClosure()
+        ReadCurrentEpoch={param($Root);$epochPath=Join-Path $Root 'state\lifecycle-epoch.json';try{Get-Item -LiteralPath $epochPath -Force -ErrorAction Stop|Out-Null}catch [Management.Automation.ItemNotFoundException]{return $null};. $bootstrap;$record=Read-CcodUninstallBootstrapJson -Path $epochPath -Kind 'Lifecycle epoch';[uint64]$record.epoch}.GetNewClosure()
         GetSelectedRootState={param($Root)try{$item=Get-Item -LiteralPath $Root -Force -ErrorAction Stop;if($item.PSIsContainer-and($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-eq0){'Present'}else{'Invalid'}}catch [Management.Automation.ItemNotFoundException]{'Absent'}catch{throw}}
         InstallResumeProductRegistration={param($Transaction)Import-Module $productModule -Force -DisableNameChecking -ErrorAction Stop;Set-CcodInstalledUninstallResumeRegistration -Transaction $Transaction|Out-Null}.GetNewClosure()
         GetResumeProductRegistrationState={param($Transaction)Import-Module $productModule -Force -DisableNameChecking -ErrorAction Stop;Get-CcodInstalledUninstallResumeRegistrationState -Transaction $Transaction}.GetNewClosure()
         ReclaimSelectedGeneration={param($SelectedRuntime,$Transaction);$expected=[IO.Path]::GetFullPath([string]$Transaction.installedBinding.selectedRuntimeRoot);if([IO.Path]::GetFullPath($SelectedRuntime)-cne$expected){throw 'selected root changed'};$modulePath=Join-Path $PayloadRoot 'src\persistence\modules\GenerationReclamation.psm1';if(-not[IO.File]::Exists($modulePath)){throw 'generation reclamation module missing'};Import-Module $modulePath -Force -DisableNameChecking -ErrorAction Stop;$reclaimed=Remove-CcodVerifiedGenerationTree -InstallRoot $Transaction.readyEvidence.installRoot -RuntimeRoot $expected -RuntimeId $Transaction.runtimeId -ExpectedManifestSha256 $Transaction.installedBinding.runtimeManifestSha256;if($null-eq$reclaimed-or$reclaimed.phase-cne'Completed'-or$reclaimed.result-cne'Reclaimed'-or$reclaimed.runtimeId-cne$Transaction.runtimeId){throw 'generation reclamation proof invalid'};$reclaimed}.GetNewClosure()
         WriteReadyForInno={param($Transaction);. $bootstrap;$Transaction.phase='ReadyForInno';$Transaction.resumePhase='ReadyForInno';$Transaction.updatedAtUtc=[DateTime]::UtcNow.ToString('o',[Globalization.CultureInfo]::InvariantCulture);$Transaction.errorCode=$null;Write-CcodUninstallBootstrapStoredTransaction -TransactionDirectory (Join-Path $TransactionRoot $Transaction.transactionId) -Transaction $Transaction;$Transaction}.GetNewClosure()
         RemoveMatchedProductShortcuts={param($Transaction)Import-Module $productModule -Force -DisableNameChecking -ErrorAction Stop;Remove-CcodInstalledUninstallProductShortcuts -Transaction $Transaction|Out-Null}.GetNewClosure()
-        FinalizeReceipt={param($Transaction);$runtimeForReceipt=$finalizerRuntimeRoot;$installForReceipt=$finalizerInstallRoot;$bootstrapForReceipt=$stagedBootstrapPath;. $bootstrapForReceipt;$validation={param($Root,$Value,$Identity)Assert-CcodUninstallBootstrapFinalizationInvocation -TransactionRoot $Root -Transaction $Value -Identity $Identity -InvocationPath $bootstrapForReceipt};$absence={param($Root)try{$item=Get-Item -LiteralPath $Root -Force -ErrorAction Stop;return $false}catch [Management.Automation.ItemNotFoundException]{return $true}catch{throw}};Invoke-CcodUninstallBootstrap -InstallerRoot $runtimeForReceipt -InstallRoot $installForReceipt -Mode FinalizeReceipt -Adapters @{ValidateFinalizationInvocation=$validation;TestInstallRootAbsent=$absence}}.GetNewClosure()
+        CleanupProductResidue={param($Transaction);Import-Module (Join-Path $PayloadRoot 'src\persistence\modules\GenerationReclamation.psm1') -Force -DisableNameChecking -ErrorAction Stop;Remove-CcodVerifiedProductResidue -InstallRoot $finalizerInstallRoot -SelectedRuntimeId $Transaction.runtimeId -ExpectedEpoch ([uint64]$Transaction.leaseEpoch) -TransactionDirectory (Join-Path $TransactionRoot $Transaction.transactionId) -TransactionId $Transaction.transactionId}.GetNewClosure()
+        FinalizeReceipt={param($Transaction);$installForReceipt=$finalizerInstallRoot;$bootstrapForReceipt=$stagedBootstrapPath;. $bootstrapForReceipt;$validation={param($Root,$Value,$Identity)Assert-CcodUninstallBootstrapFinalizationInvocation -TransactionRoot $Root -Transaction $Value -Identity $Identity -InvocationPath $bootstrapForReceipt};$absence={param($Root)try{Get-Item -LiteralPath $Root -Force -ErrorAction Stop|Out-Null;return $false}catch [Management.Automation.ItemNotFoundException]{return $true}catch{throw}};Invoke-CcodUninstallBootstrap -InstallerRoot $installForReceipt -InstallRoot $installForReceipt -Mode FinalizeReceipt -Adapters @{ValidateFinalizationInvocation=$validation;TestInstallRootAbsent=$absence}}.GetNewClosure()
         TestCompletedReceipt={param($Transaction);. $bootstrap;$identity=Get-CcodUninstallBootstrapCurrentIdentity;Test-CcodUninstallBootstrapStoredCompletedReceipt -TransactionRoot $TransactionRoot -Transaction $Transaction -ExpectedUserSid $identity.userSid}.GetNewClosure()
         RemoveResumeProductRegistration={param($Transaction)Import-Module $productModule -Force -DisableNameChecking -ErrorAction Stop;Remove-CcodInstalledUninstallResumeRegistration -Transaction $Transaction -CompletedReceiptProven}.GetNewClosure()
     }
@@ -120,10 +223,28 @@ function Assert-CcodInstalledFinalizerTransactionBinding {
 }
 
 function Invoke-CcodInstalledUninstallFinalizer {
-    param([Parameter(Mandatory)][string]$TransactionId,[Parameter(Mandatory)][string]$RuntimeRoot,[Parameter(Mandatory)][string]$InstallRoot,[AllowNull()]$WrapperIdentity,[switch]$Resume,[switch]$WrapperResume,[hashtable]$Adapters)
+    param([Parameter(Mandatory)][string]$TransactionId,[Parameter(Mandatory)][string]$RuntimeRoot,[Parameter(Mandatory)][string]$InstallRoot,[AllowNull()]$WrapperIdentity,[switch]$Resume,[switch]$WrapperResume,[hashtable]$Adapters,[string]$AuthorityReadyHandle)
     if(($Resume-and$WrapperResume)-or$TransactionId-cnotmatch'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'-or-not[IO.Path]::IsPathRooted($RuntimeRoot)-or-not[IO.Path]::IsPathRooted($InstallRoot)-or(-not$Resume-and-not(Test-CcodInstalledFinalizerIdentity $WrapperIdentity))){Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Installed finalizer inputs are invalid' $TransactionId}
     $runtime=[IO.Path]::GetFullPath($RuntimeRoot);$install=[IO.Path]::GetFullPath($InstallRoot);$local=Get-CcodInstalledFinalizerLocalAppData;$transactionRoot=[IO.Path]::GetFullPath((Join-Path $local 'CodexRemote-fix-uninstall'));$payloadRoot=[IO.Path]::GetFullPath((Join-Path (Join-Path $transactionRoot $TransactionId) 'payload'))
-    if($null-eq$Adapters){$expectedSelf=[IO.Path]::GetFullPath((Join-Path $payloadRoot 'src\persistence\InstalledUninstallFinalizer.ps1'));if([string]::IsNullOrWhiteSpace($PSCommandPath)-or[IO.Path]::GetFullPath($PSCommandPath)-cne$expectedSelf){Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Installed finalizer is outside the durable staged payload' $PSCommandPath};[void](Read-CcodInstalledFinalizerEnvelope -TransactionRoot $transactionRoot -TransactionId $TransactionId -PayloadRoot $payloadRoot -RuntimeRoot $runtime -InstallRoot $install)}
+    $payloadAuthority=$null
+    try {
+    if($null-eq$Adapters){
+        $expectedSelf=[IO.Path]::GetFullPath((Join-Path $payloadRoot 'src\persistence\InstalledUninstallFinalizer.ps1'))
+        if([string]::IsNullOrWhiteSpace($PSCommandPath)-or[IO.Path]::GetFullPath($PSCommandPath)-cne$expectedSelf){Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Installed finalizer is outside the durable staged payload' $PSCommandPath}
+        # Bootstrap independently: no pathname-loaded dependency may establish
+        # its own authority. Retain the complete external closure through cleanup.
+        try {
+            Initialize-CcodUninstallPayloadAuthority
+            $payloadAuthority=[CcodUninstallPayloadAuthorityV1]::new()
+            foreach($relative in $script:CcodInstalledFinalizerPayloadEntries){$payloadAuthority.Add([IO.Path]::GetFullPath((Join-Path $payloadRoot $relative)))}
+        } catch { Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Staged finalizer payload could not be pinned before validation.' $null }
+        [void](Read-CcodInstalledFinalizerEnvelope -TransactionRoot $transactionRoot -TransactionId $TransactionId -PayloadRoot $payloadRoot -RuntimeRoot $runtime -InstallRoot $install)
+        if(-not[string]::IsNullOrEmpty($AuthorityReadyHandle)){
+            if($Resume-or$AuthorityReadyHandle-cnotmatch'^[1-9][0-9]{0,18}\z'){Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Finalizer authority handle is invalid.' $null}
+            $readyPipe=[IO.Pipes.AnonymousPipeClientStream]::new([IO.Pipes.PipeDirection]::Out,$AuthorityReadyHandle)
+            try{$bytes=[BitConverter]::GetBytes([int]$PID);$readyPipe.Write($bytes,0,$bytes.Length);$readyPipe.Flush()}finally{$readyPipe.Dispose()}
+        }
+    }
     $adapter=Get-CcodInstalledFinalizerAdapters -Adapters $Adapters -TransactionRoot $transactionRoot -PayloadRoot $payloadRoot -RuntimeRoot $runtime -InstallRoot $install;$caller=&$adapter.GetCurrentIdentity
     if($null-eq$caller-or$caller.userSid-isnot[string]-or$caller.userSid-cnotmatch'^S-1-'){Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Current resume caller identity is invalid' $caller}
     $accountLease=$null;$lock=$null
@@ -135,7 +256,8 @@ function Invoke-CcodInstalledUninstallFinalizer {
         $transaction=&$adapter.ReadPreparedTransaction $TransactionId $install
         $phase=Assert-CcodInstalledFinalizerTransactionBinding -Transaction $transaction -TransactionId $TransactionId -RuntimeRoot $runtime -InstallRoot $install -CallerIdentity $caller -WrapperIdentity $WrapperIdentity -IsResume ([bool]$Resume) -IsWrapperResume ([bool]$WrapperResume) -PayloadRoot $payloadRoot
         if(-not(&$adapter.ValidateStagedPayload $transaction $payloadRoot)){Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Durable staged uninstall payload is invalid' $payloadRoot}
-        if([uint64](&$adapter.ReadCurrentEpoch $install)-ne[uint64]$transaction.leaseEpoch){Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Lifecycle epoch no longer matches the uninstall transaction' $install}
+        $observedEpoch=&$adapter.ReadCurrentEpoch $install
+        if(($null-eq$observedEpoch-and$phase-ceq'TaskRemoved')-or($null-ne$observedEpoch-and[uint64]$observedEpoch-ne[uint64]$transaction.leaseEpoch)){Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Lifecycle epoch no longer matches the uninstall transaction' $install}
 
         if(-not$Resume){$wrapperExit=&$adapter.WaitWrapperExit $WrapperIdentity 15000;if($null-eq$wrapperExit-or$wrapperExit.verifiedAtStart-isnot[bool]-or-not$wrapperExit.verifiedAtStart-or$wrapperExit.exited-isnot[bool]-or-not$wrapperExit.exited){Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Installed wrapper was not verified before its exact exit' $WrapperIdentity}}
         $resumeAnchorState=if($Resume){[string](&$adapter.GetResumeProductRegistrationState $transaction)}else{'Invalid'}
@@ -157,6 +279,8 @@ function Invoke-CcodInstalledUninstallFinalizer {
         }
         if($phase-ceq'ReadyForInno'){
             if([string](&$adapter.GetResumeProductRegistrationState $transaction)-cne'Exact'){Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Product tail lacks its durable public resume entry' $TransactionId}
+            $cleanup=&$adapter.CleanupProductResidue $transaction
+            if($null-eq$cleanup-or$cleanup.phase-cne'Completed'-or$cleanup.result-cne'Removed'){Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Bounded product residue cleanup was not proven' $TransactionId}
             &$adapter.RemoveMatchedProductShortcuts $transaction
             if([string](&$adapter.GetResumeProductRegistrationState $transaction)-cne'Exact'){Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Public resume entry disappeared before completion receipt' $TransactionId}
             [void](&$adapter.FinalizeReceipt $transaction)
@@ -164,14 +288,17 @@ function Invoke-CcodInstalledUninstallFinalizer {
             $phase=Assert-CcodInstalledFinalizerTransactionBinding -Transaction $transaction -TransactionId $TransactionId -RuntimeRoot $runtime -InstallRoot $install -CallerIdentity $caller -WrapperIdentity $WrapperIdentity -IsResume $true -IsWrapperResume $false -PayloadRoot $payloadRoot
         }
         if($phase-cne'Completed'){Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Installed uninstall tail did not reach Completed' $TransactionId}
+        $cleanup=&$adapter.CleanupProductResidue $transaction
+        if($null-eq$cleanup-or$cleanup.phase-cne'Completed'-or$cleanup.result-cne'Removed'){Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Completed uninstall product root is not absent' $TransactionId}
         if(-not(&$adapter.TestCompletedReceipt $transaction)){[void](&$adapter.FinalizeReceipt $transaction);$transaction=&$adapter.ReadPreparedTransaction $TransactionId $install;if(-not(&$adapter.TestCompletedReceipt $transaction)){Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Completed receipt is not durable' $TransactionId}}
         $completedAnchor=[string](&$adapter.GetResumeProductRegistrationState $transaction);if($completedAnchor-ceq'Exact'){[void](&$adapter.RemoveResumeProductRegistration $transaction)}elseif($completedAnchor-cne'Absent'){Throw-CcodInstalledFinalizerError 'CCOD_INSTALLED_FINALIZER_INVALID' 'Completed uninstall has an invalid final public anchor' $TransactionId}
         return $transaction
     }finally{if($null-ne$accountLease){&$adapter.ExitAccountTransition $accountLease};if($null-ne$lock){&$adapter.ExitTransactionLock $lock}}
+    } finally { if($null-ne$payloadAuthority){$payloadAuthority.Dispose()} }
 }
 
 if($MyInvocation.InvocationName-ne'.'){
     $identity=$null
     if(-not$Resume){$currentIdentity=[Security.Principal.WindowsIdentity]::GetCurrent();$process=[Diagnostics.Process]::GetCurrentProcess();try{$identity=[pscustomobject]@{pid=[int]$WrapperProcessId;creationTimeUtc=$WrapperCreationTimeUtc;sessionId=[int]$process.SessionId;userSid=[string]$currentIdentity.User.Value}}finally{$process.Dispose();$currentIdentity.Dispose()}}
-    try{Invoke-CcodInstalledUninstallFinalizer -TransactionId $TransactionId -RuntimeRoot $RuntimeRoot -InstallRoot $InstallRoot -WrapperIdentity $identity -Resume:$Resume -WrapperResume:$WrapperResume|Out-Null;exit 0}catch{[Console]::Error.WriteLine([string]$_.FullyQualifiedErrorId);exit 3}
+    try{Invoke-CcodInstalledUninstallFinalizer -TransactionId $TransactionId -RuntimeRoot $RuntimeRoot -InstallRoot $InstallRoot -WrapperIdentity $identity -Resume:$Resume -WrapperResume:$WrapperResume -AuthorityReadyHandle $AuthorityReadyHandle|Out-Null;exit 0}catch{[Console]::Error.WriteLine([string]$_.FullyQualifiedErrorId);exit 3}
 }
