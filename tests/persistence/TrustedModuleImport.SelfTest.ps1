@@ -283,12 +283,86 @@ try {
     } finally { Remove-Item -LiteralPath $fixture.Root -Recurse -Force }
 }
 
+function Move-CcodImportDirectoryWithRetry {
+    param([Parameter(Mandatory)][string]$Source,[Parameter(Mandatory)][string]$Destination,[Parameter(Mandatory)][scriptblock]$Move)
+    $lastFailure = $null
+    for ($attempt = 1; $attempt -le 8; $attempt++) {
+        try { & $Move $Source $Destination; return }
+        catch {
+            $lastFailure = $_
+            if ($attempt -ge 8 -or -not (Test-CcodTransientImportMoveFailure -ErrorRecord $_)) { throw }
+            Start-Sleep -Milliseconds ([Math]::Min(200, 10 * $attempt))
+        }
+    }
+    throw $lastFailure
+}
+
+function Test-CcodTransientImportMoveFailure {
+    param([Parameter(Mandatory)]$ErrorRecord)
+    $transientHresults = @(-2146232800,-2147024891,-2147024864,-2147024863,-2147024726)
+    foreach ($exception in @($ErrorRecord.Exception, $ErrorRecord.Exception.InnerException)) {
+        if ($null -eq $exception) { continue }
+        if (($exception -is [IO.IOException] -or $exception -is [UnauthorizedAccessException]) -and [int64]$exception.HResult -in $transientHresults) { return $true }
+    }
+    return $false
+}
+
+Invoke-CcodImportTest 'Lease' 'fixture directory move retries transient access failures' {
+    $fixture = New-CcodImportFixture
+    $source = Join-Path $fixture.Root 'retry-source'
+    $destination = Join-Path $fixture.Root 'retry-destination'
+    try {
+        [IO.Directory]::CreateDirectory($source) | Out-Null
+        $state = [pscustomobject]@{ Calls = 0 }
+        $move = {
+            param($From,$To)
+            $state.Calls++
+            if ($state.Calls -lt 3) { throw [IO.IOException]::new('transient fixture access failure') }
+            [IO.Directory]::Move($From,$To)
+        }.GetNewClosure()
+        Move-CcodImportDirectoryWithRetry -Source $source -Destination $destination -Move $move
+        Assert-CcodEqual 3 $state.Calls 'fixture move retries transient access failures before succeeding'
+        Assert-CcodTrue ([IO.Directory]::Exists($destination)) 'fixture move publishes the destination after retry'
+        Assert-CcodTrue (-not [IO.Directory]::Exists($source)) 'fixture move leaves no source directory after retry'
+    } finally {
+        if ([IO.Directory]::Exists($source)) { [IO.Directory]::Delete($source, $true) }
+        if ([IO.Directory]::Exists($destination)) { [IO.Directory]::Delete($destination, $true) }
+        if ([IO.Directory]::Exists($fixture.Root)) { [IO.Directory]::Delete($fixture.Root, $true) }
+    }
+}
+
+Invoke-CcodImportTest 'Lease' 'fixture directory move does not retry a non-I/O exception with an I/O HResult' {
+    $fixture = New-CcodImportFixture
+    $source = Join-Path $fixture.Root 'nonio-source'
+    $destination = Join-Path $fixture.Root 'nonio-destination'
+    try {
+        [IO.Directory]::CreateDirectory($source) | Out-Null
+        $state = [pscustomobject]@{ Calls = 0 }
+        $failure = $null
+        $move = {
+            param($From,$To)
+            $state.Calls++
+            $exception = [Exception]::new('non-I/O fixture failure')
+            $field = [Exception].GetField('_HResult', [Reflection.BindingFlags]'NonPublic,Instance')
+            $field.SetValue($exception, [int32]-2146232800)
+            throw $exception
+        }.GetNewClosure()
+        try { Move-CcodImportDirectoryWithRetry -Source $source -Destination $destination -Move $move } catch { $failure = $_ }
+        Assert-CcodEqual 1 $state.Calls 'non-I/O exceptions are not retried from a coincidental I/O HResult'
+        Assert-CcodEqual 'non-I/O fixture failure' $failure.Exception.Message 'the original non-I/O failure is preserved'
+    } finally {
+        if ([IO.Directory]::Exists($source)) { [IO.Directory]::Delete($source, $true) }
+        if ([IO.Directory]::Exists($destination)) { [IO.Directory]::Delete($destination, $true) }
+        if ([IO.Directory]::Exists($fixture.Root)) { [IO.Directory]::Delete($fixture.Root, $true) }
+    }
+}
+
 function Assert-CcodImportFixtureReleased {
     param($Fixture,[string]$Target)
     [IO.File]::WriteAllText($Target, '# lease released')
     foreach ($directory in @($Fixture.Tools, (Split-Path $Fixture.Tools -Parent), $Fixture.Root)) {
-        [IO.Directory]::Move($directory, $directory + '-released')
-        [IO.Directory]::Move($directory + '-released', $directory)
+        Move-CcodImportDirectoryWithRetry -Source $directory -Destination ($directory + '-released') -Move { param($From,$To) [IO.Directory]::Move($From,$To) }
+        Move-CcodImportDirectoryWithRetry -Source ($directory + '-released') -Destination $directory -Move { param($From,$To) [IO.Directory]::Move($From,$To) }
     }
 }
 

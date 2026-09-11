@@ -202,6 +202,76 @@ function Get-CcodTestRuntimeRecords {
     return $records.ToArray()
 }
 
+function Test-CcodTransientFixtureMoveFailure {
+    param([Parameter(Mandatory)]$ErrorRecord)
+    $transientHresults = @(-2146232800,-2147024891,-2147024864,-2147024863,-2147024726)
+    foreach ($exception in @($ErrorRecord.Exception, $ErrorRecord.Exception.InnerException)) {
+        if ($null -eq $exception) { continue }
+        if (($exception -is [IO.IOException] -or $exception -is [UnauthorizedAccessException]) -and [int64]$exception.HResult -in $transientHresults) { return $true }
+    }
+    return $false
+}
+
+function Move-CcodTestFixtureDirectory {
+    param([Parameter(Mandatory)][string]$Source,[Parameter(Mandatory)][string]$Destination,[Parameter(Mandatory)][scriptblock]$Move)
+    $lastFailure = $null
+    for ($attempt = 1; $attempt -le 8; $attempt++) {
+        try { & $Move $Source $Destination; return }
+        catch {
+            $lastFailure = $_
+            if ($attempt -ge 8 -or -not (Test-CcodTransientFixtureMoveFailure -ErrorRecord $_)) { throw }
+            Start-Sleep -Milliseconds ([Math]::Min(200, 10 * $attempt))
+        }
+    }
+    throw $lastFailure
+}
+
+Invoke-CcodTest 'fixture directory move retries a transient Windows file-system failure' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-static-move-retry-' + [guid]::NewGuid().ToString('N'))
+    $source = Join-Path $root 'source'
+    $destination = Join-Path $root 'destination'
+    try {
+        [IO.Directory]::CreateDirectory($source) | Out-Null
+        $state = [pscustomobject]@{ Calls = 0 }
+        $move = {
+            param($From,$To)
+            $state.Calls++
+            if ($state.Calls -lt 3) { throw [IO.IOException]::new('transient fixture sharing violation') }
+            [IO.Directory]::Move($From,$To)
+        }.GetNewClosure()
+        Move-CcodTestFixtureDirectory -Source $source -Destination $destination -Move $move
+        Assert-CcodEqual 3 $state.Calls 'fixture move retries transient failures before succeeding'
+        Assert-CcodTrue ([IO.Directory]::Exists($destination)) 'fixture move publishes the destination after retry'
+        Assert-CcodTrue (-not [IO.Directory]::Exists($source)) 'fixture move leaves no source directory after retry'
+    } finally {
+        if ([IO.Directory]::Exists($root)) { [IO.Directory]::Delete($root,$true) }
+    }
+}
+
+Invoke-CcodTest 'fixture directory move does not retry a non-I/O exception with an I/O HResult' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-static-move-nonio-' + [guid]::NewGuid().ToString('N'))
+    $source = Join-Path $root 'source'
+    $destination = Join-Path $root 'destination'
+    try {
+        [IO.Directory]::CreateDirectory($source) | Out-Null
+        $state = [pscustomobject]@{ Calls = 0 }
+        $failure = $null
+        $move = {
+            param($From,$To)
+            $state.Calls++
+            $exception = [Exception]::new('non-I/O fixture failure')
+            $field = [Exception].GetField('_HResult', [Reflection.BindingFlags]'NonPublic,Instance')
+            $field.SetValue($exception, [int32]-2146232800)
+            throw $exception
+        }.GetNewClosure()
+        try { Move-CcodTestFixtureDirectory -Source $source -Destination $destination -Move $move } catch { $failure = $_ }
+        Assert-CcodEqual 1 $state.Calls 'non-I/O exceptions are not retried from a coincidental I/O HResult'
+        Assert-CcodEqual 'non-I/O fixture failure' $failure.Exception.Message 'the original non-I/O failure is preserved'
+    } finally {
+        if ([IO.Directory]::Exists($root)) { [IO.Directory]::Delete($root,$true) }
+    }
+}
+
 function New-CcodAuthorizedRuntimeFixture {
     param([string]$Root,[string]$ReadStrictJsonMarker,[switch]$AppendOnly)
     $install = Join-Path $Root 'install'
@@ -232,7 +302,7 @@ function New-CcodAuthorizedRuntimeFixture {
     $runtimeId = Get-CcodTestRuntimeId -ProjectVersion '2.0.0' -Files $records
     $runtime = Join-Path (Join-Path $install 'runtime') $runtimeId
     [IO.Directory]::CreateDirectory((Split-Path $runtime -Parent)) | Out-Null
-    [IO.Directory]::Move($staging,$runtime)
+    Move-CcodTestFixtureDirectory -Source $staging -Destination $runtime -Move { param($Source,$Destination) [IO.Directory]::Move($Source,$Destination) }
     $manifest = [pscustomobject][ordered]@{schemaVersion=1;projectVersion='2.0.0';runtimeId=$runtimeId;files=$records}
     [IO.File]::WriteAllText((Join-Path $runtime 'manifest.json'),($manifest|ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($false))
     if($AppendOnly){$pointerRoot=Join-Path $install 'state\active-generation';[IO.Directory]::CreateDirectory($pointerRoot)|Out-Null;$active=[pscustomobject][ordered]@{schemaVersion=1;generation=[uint64]1;activeRuntime=$runtimeId;previousGeneration=[uint64]0};[IO.File]::WriteAllText((Join-Path $pointerRoot '00000000000000000001.json'),($active|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))}
@@ -509,6 +579,23 @@ try {
         Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $fixture.InstallRoot 'active.json')) 'append-only fixture has no legacy selector'
         $context=Get-CcodStaticProbeRuntimeAuthorization -ScriptPath $fixture.WorkerPath
         Assert-CcodEqual $fixture.RuntimeId $context.RuntimeId 'static worker binds the append-only selected runtime'
+    }
+
+    Invoke-CcodTest 'append-only authorization accepts integral Decimal generation records' {
+        $large=[decimal]::Parse('9223372036854775808',[Globalization.CultureInfo]::InvariantCulture)
+        $maximum=[decimal]::Parse('18446744073709551615',[Globalization.CultureInfo]::InvariantCulture)
+        Assert-CcodEqual '9223372036854775808' ([string](ConvertTo-CcodStaticRuntimeGeneration -Value $large -Path 'fixture')) 'static worker accepts integral Decimal generations above Int64'
+        Assert-CcodEqual '18446744073709551615' ([string](ConvertTo-CcodStaticRuntimeGeneration -Value $maximum -Path 'fixture')) 'static worker accepts the maximum UInt64 generation represented as Decimal'
+        Assert-CcodEqual '0' ([string](ConvertTo-CcodStaticRuntimeGeneration -Value ([decimal]0) -Path 'fixture' -AllowZero)) 'static worker accepts Decimal zero for previousGeneration'
+        Assert-CcodThrows { ConvertTo-CcodStaticRuntimeGeneration -Value ([decimal]1.5) -Path 'fixture' } 'CCOD_STATIC_RUNTIME_UNAUTHORIZED'
+        Assert-CcodThrows { ConvertTo-CcodStaticRuntimeGeneration -Value ([decimal]-1) -Path 'fixture' } 'CCOD_STATIC_RUNTIME_UNAUTHORIZED'
+        Assert-CcodThrows { ConvertTo-CcodStaticRuntimeGeneration -Value ([decimal]::Parse('18446744073709551616',[Globalization.CultureInfo]::InvariantCulture)) -Path 'fixture' } 'CCOD_STATIC_RUNTIME_UNAUTHORIZED'
+        $fixture=New-CcodAuthorizedRuntimeFixture -Root (Join-Path $root 'append-decimal-generations') -AppendOnly
+        $pointerRoot=Join-Path $fixture.InstallRoot 'state\active-generation'
+        $json='{"schemaVersion":1,"generation":1.0,"activeRuntime":"'+$fixture.RuntimeId+'","previousGeneration":0.0}'
+        [IO.File]::WriteAllText((Join-Path $pointerRoot '00000000000000000001.json'),$json,[Text.UTF8Encoding]::new($false))
+        $authorization=Get-CcodStaticProbeRuntimeAuthorization -ScriptPath $fixture.WorkerPath
+        Assert-CcodEqual $fixture.RuntimeId $authorization.RuntimeId 'static worker accepts integral Decimal append-only generations'
     }
 
     Invoke-CcodTest 'append-only authorization rejects unsafe roots leaves JSON and generations' {

@@ -134,6 +134,56 @@ function Get-CcodRuntimeFileSha256 {
     }
 }
 
+function Get-CcodRuntimeFileLinkCount {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if ($null -eq ('CcodRuntimeFileIdentity' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class CcodRuntimeFileIdentity
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILETIME_NATIVE { public uint Low; public uint High; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILE_INFO
+    {
+        public uint FileAttributes;
+        public FILETIME_NATIVE CreationTime;
+        public FILETIME_NATIVE LastAccessTime;
+        public FILETIME_NATIVE LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FILE_INFO info);
+
+    public static uint Links(string path)
+    {
+        using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            FILE_INFO info;
+            if (!GetFileInformationByHandle(stream.SafeFileHandle, out info))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return info.NumberOfLinks;
+        }
+    }
+}
+'@
+    }
+    return [CcodRuntimeFileIdentity]::Links($Path)
+}
+
 function ConvertTo-CcodRuntimeRelativePath {
     param(
         [Parameter(Mandatory)][string]$Root,
@@ -144,15 +194,23 @@ function ConvertTo-CcodRuntimeRelativePath {
     if (-not $FullName.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
         Throw-CcodRuntimeError 'CCOD_PATH_OUTSIDE_ROOT' 'Runtime file is outside its runtime root' $FullName
     }
-    return $FullName.Substring($rootPrefix.Length).Replace('\', '/')
+    $relative = $FullName.Substring($rootPrefix.Length).Replace('\', '/')
+    return Assert-CcodManifestRelativePath -Path $relative
 }
 
 function Assert-CcodManifestRelativePath {
     param([Parameter(Mandatory)][string]$Path)
 
+    foreach ($character in $Path.ToCharArray()) {
+        if ([char]::IsControl($character) -or
+            [Globalization.CharUnicodeInfo]::GetUnicodeCategory($character) -eq [Globalization.UnicodeCategory]::Format) {
+            Throw-CcodRuntimeError 'CCOD_PATH_OUTSIDE_ROOT' 'Manifest file path contains a control or format character' $Path
+        }
+    }
     if ([IO.Path]::IsPathRooted($Path) -or
         $Path.StartsWith('/') -or
         $Path.IndexOf('\') -ge 0 -or
+        $Path.IndexOf(':') -ge 0 -or
         $Path -match '(^|/)(\.|\.\.)(/|$)' -or
         $Path.Contains('//')) {
         Throw-CcodRuntimeError 'CCOD_PATH_OUTSIDE_ROOT' 'Manifest file path is not a safe relative path' $Path
@@ -176,6 +234,9 @@ function Get-CcodRuntimeFileRecords {
         if (-not $item.PSIsContainer) {
             $relative = ConvertTo-CcodRuntimeRelativePath -Root $root -FullName $item.FullName
             if (-not $relative.Equals('manifest.json', [StringComparison]::OrdinalIgnoreCase)) {
+                if ((Get-CcodRuntimeFileLinkCount -Path $item.FullName) -ne 1) {
+                    Throw-CcodRuntimeError 'CCOD_RUNTIME_FILE_INVALID' 'Runtime payload file must be a single-link regular file' $item.FullName
+                }
                 $records.Add([pscustomobject][ordered]@{
                     path = $relative
                     length = [int64]$item.Length

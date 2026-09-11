@@ -150,6 +150,15 @@ try {
         Assert-CcodTrue $validation.Valid 'a safe filename with consecutive dots must validate after production'
     }
 
+    Invoke-CcodTest 'runtime manifest rejects control and format characters in relative paths' {
+        $module = Get-Module -Name RuntimeManifest
+        foreach ($control in @("`t", "`n", "`r", [char]1, [char]0x7f, [char]0x200b)) {
+            Assert-CcodThrows { & $module { param($Path) Assert-CcodManifestRelativePath -Path $Path | Out-Null } ('safe' + $control + 'name.txt') } 'CCOD_PATH_OUTSIDE_ROOT'
+            $fullName = Join-Path $root ('safe' + $control + 'name.txt')
+            Assert-CcodThrows { & $module { param($Root, $FullName) ConvertTo-CcodRuntimeRelativePath -Root $Root -FullName $FullName | Out-Null } $root $fullName } 'CCOD_PATH_OUTSIDE_ROOT'
+        }
+    }
+
     Invoke-CcodTest 'verifies exact runtime bytes and rejects tampering' {
         $runtime = Join-Path $root 'verify'
         New-Item -ItemType Directory -Path $runtime | Out-Null
@@ -203,6 +212,15 @@ try {
         $runtime = Join-Path $junctionParent 'reparse-runtime'
         Assert-CcodThrows { New-CcodRuntimeManifest -RuntimeDirectory $runtime -ProjectVersion '2.0.0' } 'CCOD_REPARSE_PATH'
         Assert-CcodThrows { Test-CcodRuntimeManifest -RuntimeDirectory $runtime -ExpectedRuntimeId $outsideManifest.runtimeId } 'CCOD_REPARSE_PATH'
+    }
+
+    Invoke-CcodTest 'runtime manifest rejects hardlinked payload files' {
+        $runtime = Join-Path $root 'hardlink-payload'
+        $outsidePayload = Join-Path $outside 'hardlink-payload.txt'
+        New-Item -ItemType Directory -Path $runtime | Out-Null
+        [IO.File]::WriteAllText($outsidePayload, 'hardlinked payload', [Text.UTF8Encoding]::new($false))
+        New-Item -ItemType HardLink -Path (Join-Path $runtime 'payload.txt') -Target $outsidePayload | Out-Null
+        Assert-CcodThrows { New-CcodRuntimeManifest -RuntimeDirectory $runtime -ProjectVersion '2.0.0' } 'CCOD_RUNTIME_FILE_INVALID'
     }
 
     Invoke-CcodTest 'runtime manifest rejects a noncanonical runtime directory' {

@@ -114,6 +114,19 @@ function Test-CcodStaticRuntimeId {
     return $Value -is [string] -and $Value -cmatch '^[A-Za-z0-9._-]{1,96}$'
 }
 
+function ConvertTo-CcodStaticRuntimeGeneration {
+    param([Parameter(Mandatory)]$Value,[Parameter(Mandatory)][string]$Path,[switch]$AllowZero)
+    $minimum=if($AllowZero){[decimal]0}else{[decimal]1}
+    $integerTypes=@([byte],[uint16],[uint32],[uint64],[int16],[int32],[int64])
+    $typed=$Value -is [decimal]
+    if(-not$typed){foreach($type in $integerTypes){if($Value -is $type){$typed=$true;break}}}
+    if(-not$typed){Throw-CcodStaticProbeError 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active generation is not an unsigned integer' $Path}
+    try{
+        if([decimal]$Value -lt $minimum -or ($Value -is [decimal] -and [decimal]::Truncate($Value)-ne$Value)){throw 'range'}
+        return [uint64]$Value
+    }catch{Throw-CcodStaticProbeError 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active generation is outside UInt64' $Path}
+}
+
 function Test-CcodStaticCanonicalSid {
     param($Value)
     if ($Value -isnot [string]) { return $false }
@@ -490,7 +503,7 @@ function Get-CcodStaticProbeRuntimeAuthorization {
         if($null-ne$pointerRootItem-and-not$pointerRootItem.PSIsContainer){throw 'selector root type'}
         if($null-ne$pointerRootItem){
             Assert-CcodStaticProbeNoReparse $installRoot $pointerRoot -Adapters $Adapters;$entries=@(Get-ChildItem -LiteralPath $pointerRoot -Force -ErrorAction Stop);if($entries.Count-eq0){throw 'empty active chain'};$records=[Collections.Generic.List[object]]::new()
-            foreach($entry in $entries){if($entry.PSIsContainer-or$entry.Name-cnotmatch'^\d{20}\.json$'){throw 'active entry'};Assert-CcodStaticSelectorFile $installRoot $entry.FullName $Adapters;$record=Read-CcodStaticProbeLocalJson $entry.FullName;Assert-CcodStaticExactObject $record @('schemaVersion','generation','activeRuntime','previousGeneration') 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active generation'|Out-Null;if($record.schemaVersion -isnot [int] -or $record.schemaVersion -ne 1){throw 'active generation schema'};if($record.generation-isnot[long]-and$record.generation-isnot[int]-or$record.previousGeneration-isnot[long]-and$record.previousGeneration-isnot[int]-or-not(Test-CcodStaticRuntimeId $record.activeRuntime)){throw 'active generation'};try{[uint64]$generation=$record.generation;[uint64]$previousGeneration=$record.previousGeneration}catch{throw 'active generation range'};if($generation-eq0-or$previousGeneration-eq[uint64]::MaxValue-or$generation-ne($previousGeneration+1)-or$entry.Name-cne('{0:D20}.json'-f$generation)){throw 'active generation canonical'};$records.Add([pscustomobject]@{generation=$generation;previousGeneration=$previousGeneration;activeRuntime=[string]$record.activeRuntime;path=$entry.FullName})}
+            foreach($entry in $entries){if($entry.PSIsContainer-or$entry.Name-cnotmatch'^\d{20}\.json$'){throw 'active entry'};Assert-CcodStaticSelectorFile $installRoot $entry.FullName $Adapters;$record=Read-CcodStaticProbeLocalJson $entry.FullName;Assert-CcodStaticExactObject $record @('schemaVersion','generation','activeRuntime','previousGeneration') 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active generation'|Out-Null;if($record.schemaVersion -isnot [int] -or $record.schemaVersion -ne 1){throw 'active generation schema'};if(-not(Test-CcodStaticRuntimeId $record.activeRuntime)){throw 'active generation'};$generation=ConvertTo-CcodStaticRuntimeGeneration -Value $record.generation -Path $entry.FullName;$previousGeneration=ConvertTo-CcodStaticRuntimeGeneration -Value $record.previousGeneration -Path $entry.FullName -AllowZero;if($generation-eq0-or$previousGeneration-eq[uint64]::MaxValue-or$generation-ne($previousGeneration+1)-or$entry.Name-cne('{0:D20}.json'-f$generation)){throw 'active generation canonical'};$records.Add([pscustomobject]@{generation=$generation;previousGeneration=$previousGeneration;activeRuntime=[string]$record.activeRuntime;path=$entry.FullName})}
             $ordered=@($records|Sort-Object generation);for($i=0;$i-lt$ordered.Count;$i++){if([uint64]$ordered[$i].generation-ne[uint64]($i+1)-or[uint64]$ordered[$i].previousGeneration-ne[uint64]$i){throw 'active chain'}};$latest=$ordered[-1];$active=[pscustomobject]@{activeRuntime=$latest.activeRuntime};$activePath=$latest.path
         }else{$activePath=[IO.Path]::GetFullPath((Join-Path $installRoot 'active.json'));Assert-CcodStaticProbeNoReparse $installRoot $activePath -Adapters $Adapters;$active=Read-CcodStaticProbeLocalJson $activePath;Assert-CcodStaticExactObject $active @('schemaVersion','activeRuntime','previousRuntime','updatedAtUtc') 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active pointer'|Out-Null;if($active.schemaVersion -isnot [int] -or $active.schemaVersion -ne 1 -or -not(Test-CcodStaticRuntimeId $active.activeRuntime) -or($null -ne $active.previousRuntime -and (-not(Test-CcodStaticRuntimeId $active.previousRuntime) -or $active.previousRuntime -ceq $active.activeRuntime)) -or-not(Test-CcodStaticCanonicalUtc $active.updatedAtUtc)){throw 'active pointer'}}
         if($active.activeRuntime-cne$runtimeId){throw 'active runtime'}
