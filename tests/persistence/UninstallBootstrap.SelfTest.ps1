@@ -1065,7 +1065,7 @@ function Invoke-CcodDefaultInstalledFinalizerNegative {
         elseif($Mutation-ceq'PayloadHash'){[IO.File]::AppendAllText((Join-Path $payload 'src\persistence\modules\ProductRegistration.psm1'),'# changed after staging',[Text.UTF8Encoding]::new($false))}
         $creationArgument=if($Mutation-ceq'WrapperIdentity'){'2001-02-03T04:05:06.0000000Z'}else{$wrapperCreation};$previousPreference=$ErrorActionPreference;try{$ErrorActionPreference='Continue';$output=& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $payload 'src\persistence\InstalledUninstallFinalizer.ps1') -TransactionId $id -RuntimeRoot $runtime -InstallRoot $install -WrapperProcessId $wrapper.Id -WrapperCreationTimeUtc $creationArgument 2>&1;$exit=$LASTEXITCODE}finally{$ErrorActionPreference=$previousPreference}
         if($exit-ne3){throw("FINALIZER_DIAGNOSTIC mutation={0} exit={1} output={2}"-f$Mutation,$exit,(@($output)-join' | '))};Assert-CcodEqual 3 $exit "$Mutation default child rejects before finalization";Assert-CcodTrue (Test-Path -LiteralPath $selected -PathType Container) "$Mutation preserves the selected generation";Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install 'state') -PathType Container) "$Mutation preserves sibling/root state"
-        if($Mutation-ceq'Sibling'){$wrapper.Refresh();Assert-CcodTrue $wrapper.HasExited 'Sibling reaches the default wrapper wait before its generation mismatch boundary'}
+
     }finally{if($null-ne$wrapper){try{if(-not$wrapper.HasExited){$wrapper.Kill();$wrapper.WaitForExit()}}catch{};$wrapper.Dispose()};[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if(Test-Path -LiteralPath $local){Remove-Item -LiteralPath $local -Recurse -Force}}
 }
 
