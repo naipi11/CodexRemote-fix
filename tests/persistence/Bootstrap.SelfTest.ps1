@@ -157,7 +157,7 @@ function Exit-CcodLifecycleOwnership {
             [IO.File]::AppendAllText((Join-Path $kernelDirectory 'LifecycleEpoch.psm1'), $releaseFailureInjection.Replace('__CCOD_RELEASE_MARKER_BASE64__',$releaseMarkerBase64), [Text.UTF8Encoding]::new($false))
         }
     }
-    $manifest = New-CcodRuntimeManifest -RuntimeDirectory $runtimeDirectory -ProjectVersion '0.0.0-bootstrap-test'
+    $manifest = New-CcodRuntimeManifest -RuntimeDirectory $runtimeDirectory -ProjectVersion '0.0.0-b'
     if ([string]::IsNullOrWhiteSpace($RuntimeId)) {
         $RuntimeId = $manifest.runtimeId
         $targetDirectory = Join-Path $Root "runtime\$RuntimeId"

@@ -26,7 +26,11 @@ $v2521LifecycleShortcutNames=@(
 )
 
 function New-CcodLifecycleTempRoot {
-    return (Join-Path ([IO.Path]::GetTempPath()) ("ccod-lifecycle-" + [guid]::NewGuid().ToString('N')))
+    $tempPath = [IO.Path]::GetFullPath(([IO.Path]::GetTempPath()).TrimEnd('\'))
+    $tempLeaf = Split-Path $tempPath -Leaf
+    $parent = Split-Path $tempPath -Parent
+    $base = if ($tempLeaf.Length -gt 8 -and -not [string]::IsNullOrWhiteSpace($parent) -and [IO.Directory]::Exists($parent)) { $parent } else { $tempPath }
+    return (Join-Path $base ('c-' + [guid]::NewGuid().ToString('N').Substring(0,8)))
 }
 
 function New-CcodLifecycleSourceFixture {
@@ -2455,7 +2459,7 @@ $results += Invoke-CcodTest 'upgrade boundaries fail closed with phase receipts 
         $install = New-CcodLifecycleTempRoot
         $nodeRoot = New-CcodLifecycleTempRoot
         try {
-            New-CcodLifecycleSourceFixture -Root $source -Version ('2.5.0-boundary-' + ($case.Name -replace '[^A-Za-z0-9]','-')) | Out-Null
+            New-CcodLifecycleSourceFixture -Root $source -Version '2.5.0-b' | Out-Null
             $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
             $first = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
             Set-CcodLifecycleTestStatus -InstallRoot $install -RuntimeId $first.RuntimeId
@@ -4238,6 +4242,35 @@ $results += Invoke-CcodTest 'product registration runs exactly once only after t
         Assert-CcodTrue $fake.World.ProductRegistrationReadyObserved 'registration adapter receives only the durable Ready transaction'
         Assert-CcodTrue $result.ProductRegistrationVerified 'install result reports verified post-Ready registration'
     }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
+}
+
+# Production mutation caught: an AlreadyInstalled return must not strand the
+# temporary shortcut candidates prepared before the idempotence check.
+$results += Invoke-CcodTest 'AlreadyInstalled product reconciliation removes temporary shortcut candidates before returning' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot;$temporaryRoot=$null
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$first=New-CcodLifecycleFake -NodePath $node
+        $firstResult=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters $first.Adapters
+        Assert-CcodEqual 'Installed' $firstResult.Outcome 'fixture reaches a Ready install before idempotent reconciliation'
+        $second=New-CcodLifecycleFake -NodePath $node
+        $preparedState=@{Calls=0;TemporaryRoot=$null}
+        $second.Adapters.AddProductShortcutCandidates={
+            param($Files)
+            $preparedState.Calls++
+            $temporaryRoot=Join-Path ([IO.Path]::GetTempPath()) ('ccod-lifecycle-same-identity-'+[guid]::NewGuid().ToString('N'))
+            [IO.Directory]::CreateDirectory($temporaryRoot)|Out-Null
+            [IO.File]::WriteAllText((Join-Path $temporaryRoot 'candidate.tmp'),'fixture',[Text.UTF8Encoding]::new($false))
+            $preparedState.TemporaryRoot=$temporaryRoot
+            [pscustomobject]@{Files=@($Files);TemporaryRoot=$temporaryRoot}
+        }.GetNewClosure()
+        $secondResult=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters $second.Adapters
+        Assert-CcodEqual 'AlreadyInstalled' $secondResult.Outcome 'same package takes the idempotent reconciliation path'
+        Assert-CcodEqual 0 $preparedState.Calls 'idempotent reconciliation checks package identity before preparing product candidates'
+        Assert-CcodTrue ([string]::IsNullOrWhiteSpace([string]$preparedState.TemporaryRoot)) 'idempotent reconciliation creates no temporary product candidates'
+    }finally{
+        foreach($path in @($source,$install,$nodeRoot,$temporaryRoot)){if(-not[string]::IsNullOrWhiteSpace([string]$path)-and(Test-Path -LiteralPath $path)){Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue}}
+    }
 }
 
 # Production mutation caught: treating post-Ready registration failure as an install rollback or Failed lifecycle snapshot.

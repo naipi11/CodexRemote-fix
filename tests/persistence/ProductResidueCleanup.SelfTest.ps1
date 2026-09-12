@@ -120,7 +120,7 @@ $results+=Invoke-CcodTest 'bounded cleanup accepts the actual installer state-pl
 
 function Invoke-CcodFullInstallerResidueCase {
     param([switch]$LegacyUpgrade)
-    $root=Join-Path $env:TEMP ('ccod-product-real-writers-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path $env:TEMP ('c-'+[guid]::NewGuid().ToString('N').Substring(0,8))
     $install=Join-Path $root 'CodexControlOtherDevices';$source=Join-Path $root 'source';$nodeRoot=Join-Path $root 'node'
     try {
         Import-Module (Join-Path $repositoryRoot 'src/persistence/modules/InstallLifecycle.psm1') -Force -DisableNameChecking

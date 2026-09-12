@@ -3317,13 +3317,6 @@ function Invoke-CcodInstall {
     }
     $nodeCandidates = @(Get-CcodLifecycleNodeCandidates -Adapters $adapters)
     if (-not $payloadBound) { $files = @(Get-CcodLifecycleSourceFiles -SourceRoot $sourceRoot -RequireTrayHost) }
-    $productShortcutTemporaryRoot=$null
-    if([string]$projectVersion-ceq$script:CcodProductVersion){
-        $preparedProductFiles=&$adapters.AddProductShortcutCandidates $files
-        if($null-eq$preparedProductFiles-or$null-eq$preparedProductFiles.Files){Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product shortcut candidate preparation returned no files' $null}
-        $files=@($preparedProductFiles.Files);$productShortcutTemporaryRoot=[string]$preparedProductFiles.TemporaryRoot
-    }
-
     $oldManifestSha256=$null;$activeValidation=$null;$upgradeCompatibility=$null
     if($null-ne$existingPointer){
         $activeRuntimeRoot=[IO.Path]::GetFullPath((Join-Path (Join-Path $root 'runtime') ([string]$existingPointer.activeRuntime)))
@@ -3345,6 +3338,12 @@ function Invoke-CcodInstall {
                 return [pscustomobject][ordered]@{Outcome='AlreadyInstalled';Installed=$true;RuntimeId=[string]$existingPointer.activeRuntime;PreviousRuntimeId=$existingPointer.previousRuntime;RepairCompleted=$false;ProductRegistrationVerified=$true}
             }
         }
+    }
+    $productShortcutTemporaryRoot=$null
+    if([string]$projectVersion-ceq$script:CcodProductVersion){
+        $preparedProductFiles=&$adapters.AddProductShortcutCandidates $files
+        if($null-eq$preparedProductFiles-or$null-eq$preparedProductFiles.Files){Throw-CcodLifecycleError 'CCOD_PRODUCT_REGISTRATION_FAILED' 'Product shortcut candidate preparation returned no files' $null}
+        $files=@($preparedProductFiles.Files);$productShortcutTemporaryRoot=[string]$preparedProductFiles.TemporaryRoot
     }
     if($null-ne$upgradeCompatibility-and$upgradeCompatibility.Kind-ceq'LegacyMigrationRetry'){
         [void](Assert-CcodLegacyMigrationRetryPackage -CompatibilityContext $upgradeCompatibility -ProjectVersion ([string]$projectVersion) -SealedPackageSha256 $SealedPackageSha256 -Files $files)

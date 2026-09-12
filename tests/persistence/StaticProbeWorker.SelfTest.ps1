@@ -372,7 +372,7 @@ function New-CcodWorkerHarness {
     [pscustomobject][ordered]@{RequestPath=$requestPath;ResultPath=$resultPath;Context=$context;Adapters=$adapters;Events=$events;Stdout=$stdout;Written=$written;ProbeCalls=$probeCalls}
 }
 
-$root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-static-worker-'+[guid]::NewGuid().ToString('N'))
+$root = Join-Path ([IO.Path]::GetTempPath()) 's'
 try {
     Invoke-CcodTest 'strictly rejects every request shape, order, type, case, and correlation mutation' {
         $base=New-CcodWorkerRequest
@@ -717,7 +717,7 @@ try {
             Assert-CcodEqual $(if($boundary -ceq 'ImportRuntime'){'CCOD_STATIC_MODULE_LOAD_FAILED'}else{'CCOD_STATIC_RUNTIME_UNAUTHORIZED'}) $harness.Written[0].error.code "$boundary failure keeps its fixed code"
         }
 
-        $fixture=New-CcodAuthorizedRuntimeFixture -Root (Join-Path $root 'production-module-failure-publication')
+        $fixture=New-CcodAuthorizedRuntimeFixture -Root (Join-Path $root 'mod-fail-pub')
         $request=New-CcodWorkerRequest;$request.runtimeId=$fixture.RuntimeId
         $requestPath=[IO.Path]::GetFullPath((Join-Path $fixture.WorkersRoot ("static-probe-$($request.requestId).request.json")))
         $resultPath=[IO.Path]::GetFullPath((Join-Path $fixture.WorkersRoot ("static-probe-$($request.requestId).result.json")))
@@ -738,7 +738,7 @@ try {
         Assert-CcodEqual 1 $stdout.Count 'successful fallback atomic publication emits one stdout frame'
         Assert-CcodEqual 0 $stderr.Count 'successful fallback atomic publication emits no stderr frame'
 
-        $raceFixture=New-CcodAuthorizedRuntimeFixture -Root (Join-Path $root 'production-module-failure-result-race')
+        $raceFixture=New-CcodAuthorizedRuntimeFixture -Root (Join-Path $root 'mod-fail-race')
         $raceRequest=New-CcodWorkerRequest;$raceRequest.runtimeId=$raceFixture.RuntimeId
         $raceRequestPath=[IO.Path]::GetFullPath((Join-Path $raceFixture.WorkersRoot ("static-probe-$($raceRequest.requestId).request.json")))
         $raceResultPath=[IO.Path]::GetFullPath((Join-Path $raceFixture.WorkersRoot ("static-probe-$($raceRequest.requestId).result.json")))

@@ -1232,7 +1232,7 @@ try {
 }
 
 Invoke-CcodTest 'default finalizer pins its staged closure before validating the envelope' {
-    $root=Join-Path $env:TEMP ('ccod-finalizer-consumer-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path $env:TEMP ('ccod-finalizer-c-'+[guid]::NewGuid().ToString('N'))
     $previous=[Environment]::GetEnvironmentVariable('LOCALAPPDATA','Process');$module=$null
     try {
         [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$root,'Process')
