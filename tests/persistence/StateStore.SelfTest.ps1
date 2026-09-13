@@ -124,7 +124,7 @@ function Assert-CcodFailedAttemptClearReceipt {
     Assert-CcodEqual $Outcome $Receipt.Outcome "$Message receipt outcome"
 }
 
-$root = Join-Path ([IO.Path]::GetTempPath()) ('c-s-' + [Guid]::NewGuid().ToString('N'))
+$root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-state-store-' + [Guid]::NewGuid().ToString('N'))
 try {
     Invoke-CcodTest 'exposes trusted safe-exit persistence with the state-store contract' {
         $commands = @('Get-CcodTrustedLogonIdentity', 'Read-CcodSafeExitIntent', 'Write-CcodSafeExitIntent', 'Test-CcodSafeExitIntentForCurrentLogon', 'Clear-CcodSafeExitIntent')
@@ -841,5 +841,5 @@ try {
     Write-Error $_
     exit 1
 } finally {
-    if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    if (Test-Path -LiteralPath $root) { Remove-CcodTestOwnedTree -Path $root }
 }
