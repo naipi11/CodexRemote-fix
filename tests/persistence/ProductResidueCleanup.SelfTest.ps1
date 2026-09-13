@@ -1,4 +1,4 @@
-$ErrorActionPreference='Stop'
+﻿$ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'TestSupport.ps1')
 $repositoryRoot=Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $module=Import-Module (Join-Path $repositoryRoot 'src/persistence/modules/GenerationReclamation.psm1') -Force -PassThru
@@ -36,7 +36,7 @@ $results+=Invoke-CcodTest 'bounded product residue cleanup removes only the veri
         Assert-CcodEqual 'Removed' $result.result 'product cleanup returns exact terminal result'
         Assert-CcodTrue (-not(Test-Path -LiteralPath $install)) 'complete uninstall removes the product root'
         Assert-CcodEqual $outsideHash (Get-CcodTestFileSha256 $outside) 'sibling project is unchanged'
-    } finally {if(Test-Path $root){Remove-Item $root -Recurse -Force}}
+    } finally {if(Test-Path $root){Remove-CcodTestOwnedTree -Path $root}}
 }
 $results+=Invoke-CcodTest 'bounded product residue cleanup accepts real initialized state and retained manifest files' {
     $root=Join-Path $env:TEMP ('ccod-product-state-'+[guid]::NewGuid().ToString('N'))
@@ -63,7 +63,7 @@ $results+=Invoke-CcodTest 'bounded product residue cleanup accepts real initiali
         $result=&$module {param($Install,$Runtime)Remove-CcodVerifiedProductResidue -InstallRoot $Install -SelectedRuntimeId $Runtime -ExpectedEpoch ([uint64]11)} $install $runtimeId
         Assert-CcodEqual 'Removed' $result.result 'actual producers are accepted without loosening unknown-file handling'
         Assert-CcodTrue (-not(Test-Path -LiteralPath $install)) 'known state and verified retained product files are removed'
-    } finally {foreach($imported in $modules){Remove-Module $imported -Force -ErrorAction SilentlyContinue};if(Test-Path $root){Remove-Item $root -Recurse -Force}}
+    } finally {foreach($imported in $modules){Remove-Module $imported -Force -ErrorAction SilentlyContinue};if(Test-Path $root){Remove-CcodTestOwnedTree -Path $root}}
 }
 
 foreach($mutation in @('UnknownFile','UnknownDirectory','DeviceKey','Reparse','Hardlink','Ads','OpenFile','EpochDrift')){
@@ -94,7 +94,7 @@ foreach($mutation in @('UnknownFile','UnknownDirectory','DeviceKey','Reparse','H
             Assert-CcodTrue (Test-Path $pointer) "$mutation leaves the product selector untouched"
             Assert-CcodTrue (Test-Path $epoch) "$mutation leaves the epoch untouched"
             Assert-CcodEqual $outsideHash (Get-CcodTestFileSha256 $outside) "$mutation leaves outside data untouched"
-        } finally {if($null-ne$held){$held.Dispose()};if(Test-Path (Join-Path $install 'projects') -PathType Container){$item=Get-Item (Join-Path $install 'projects') -Force;if($item.Attributes-band[IO.FileAttributes]::ReparsePoint){[IO.Directory]::Delete($item.FullName)}};if(Test-Path $root){Remove-Item $root -Recurse -Force}}
+        } finally {if($null-ne$held){$held.Dispose()};if(Test-Path (Join-Path $install 'projects') -PathType Container){$item=Get-Item (Join-Path $install 'projects') -Force;if($item.Attributes-band[IO.FileAttributes]::ReparsePoint){[IO.Directory]::Delete($item.FullName)}};if(Test-Path $root){Remove-CcodTestOwnedTree -Path $root}}
     }
 }
 
@@ -115,7 +115,7 @@ $results+=Invoke-CcodTest 'bounded cleanup accepts the actual installer state-pl
         [IO.File]::WriteAllText((Join-Path $install 'state/active-generation/00000000000000000001.json'),('{"schemaVersion":1,"generation":1,"activeRuntime":"'+$runtimeId+'","previousGeneration":0}'))
         $result=&$module {param($Install,$Runtime)Remove-CcodVerifiedProductResidue -InstallRoot $Install -SelectedRuntimeId $Runtime -ExpectedEpoch ([uint64]11)} $install $runtimeId
         Assert-CcodEqual 'Removed' $result.result 'actual installer initialization records are recognized'
-    } finally {if($null-ne$fileTransaction){Close-CcodInstallFileTransaction -Transaction $fileTransaction -Disposition Failed|Out-Null};foreach($m in @($installModule,$fileModule)){if($null-ne$m){Remove-Module $m -Force -ErrorAction SilentlyContinue}};if(Test-Path $root){Remove-Item $root -Recurse -Force}}
+    } finally {if($null-ne$fileTransaction){Close-CcodInstallFileTransaction -Transaction $fileTransaction -Disposition Failed|Out-Null};foreach($m in @($installModule,$fileModule)){if($null-ne$m){Remove-Module $m -Force -ErrorAction SilentlyContinue}};if(Test-Path $root){Remove-CcodTestOwnedTree -Path $root}}
 }
 
 function Invoke-CcodFullInstallerResidueCase {
@@ -150,7 +150,7 @@ function Invoke-CcodFullInstallerResidueCase {
         [IO.File]::WriteAllText((Join-Path $install 'state/lifecycle-epoch.json'),'{"schemaVersion":1,"epoch":11}')
         $result=&$module {param($Root,$Id)Remove-CcodVerifiedProductResidue -InstallRoot $Root -SelectedRuntimeId $Id -ExpectedEpoch ([uint64]11)} $install $active.activeRuntime
         Assert-CcodEqual 'Removed' $result.result 'full installer output is recognized without a fabricated state layout'
-    } finally {if(Test-Path $root){Remove-Item $root -Recurse -Force}}
+    } finally {if(Test-Path $root){Remove-CcodTestOwnedTree -Path $root}}
 }
 
 $results+=Invoke-CcodTest 'bounded cleanup consumes the full actual installer output with isolated machine adapters' {Invoke-CcodFullInstallerResidueCase}
@@ -176,7 +176,7 @@ $results+=Invoke-CcodTest 'an existing cleanup journal cannot authorize an unkno
         [IO.File]::WriteAllText((Join-Path $directory 'product-residue-plan.json'),($plan|ConvertTo-Json -Depth 8 -Compress))
         Assert-CcodThrows {&$module {param($Root,$Runtime,$Directory,$Id)Remove-CcodVerifiedProductResidue -InstallRoot $Root -SelectedRuntimeId $Runtime -ExpectedEpoch ([uint64]11) -TransactionDirectory $Directory -TransactionId $Id} $install $runtimeId $directory $id|Out-Null} 'CCOD_PRODUCT_RESIDUE_INVALID'
         Assert-CcodEqual $originalHash (Get-CcodTestFileSha256 $userFile) 'forged journal cannot expand the approved deletion inventory'
-    } finally {if($null-ne$native){$native.Dispose()};if(Test-Path $root){Remove-Item $root -Recurse -Force}}
+    } finally {if($null-ne$native){$native.Dispose()};if(Test-Path $root){Remove-CcodTestOwnedTree -Path $root}}
 }
 
 function Invoke-CcodResiduePartialRetryCase {
@@ -210,7 +210,7 @@ function Invoke-CcodResiduePartialRetryCase {
         $result=&$module {param($Root,$Runtime,$Directory,$Id)Remove-CcodVerifiedProductResidue -InstallRoot $Root -SelectedRuntimeId $Runtime -ExpectedEpoch ([uint64]11) -TransactionDirectory $Directory -TransactionId $Id} $install $runtimeId $directory $id
         Assert-CcodEqual 'Removed' $result.result 'same-root retry validates the saved inventory and completes'
         Assert-CcodTrue (-not(Test-Path $install)) 'retried cleanup removes the exact residual root'
-    } finally {&$module {$script:CcodProductResidueFailCommitAtForTest=-1};if(Test-Path $root){Remove-Item $root -Recurse -Force}}
+    } finally {&$module {$script:CcodProductResidueFailCommitAtForTest=-1};if(Test-Path $root){Remove-CcodTestOwnedTree -Path $root}}
 }
 
 $results+=Invoke-CcodTest 'bounded cleanup resumes the exact residual tree after a native partial commit failure' {Invoke-CcodResiduePartialRetryCase}
@@ -239,7 +239,7 @@ $results+=Invoke-CcodTest 'bounded cleanup accepts real epoch initialization and
         Assert-CcodEqual 0 $hostState.RuntimeCleanupCodes.Count 'log writing itself succeeded'
         $result=&$module {param($Root,$Id)Remove-CcodVerifiedProductResidue -InstallRoot $Root -SelectedRuntimeId $Id -ExpectedEpoch ([uint64]11)} $install $runtimeId
         Assert-CcodEqual 'Removed' $result.result 'product diagnostics and epoch initializer are recognized'
-    } finally {if(Test-Path $root){Remove-Item $root -Recurse -Force}}
+    } finally {if(Test-Path $root){Remove-CcodTestOwnedTree -Path $root}}
 }
 
 $results+=Invoke-CcodTest 'protected user data is rejected before opening or hashing its contents' {
@@ -252,7 +252,7 @@ $results+=Invoke-CcodTest 'protected user data is rejected before opening or has
         $failure=$null
         try {&$module {param($Root)Remove-CcodVerifiedProductResidue -InstallRoot $Root -SelectedRuntimeId ('2.5.22-'+('a'*16)+'-'+('b'*32)) -ExpectedEpoch ([uint64]11)} $install|Out-Null}catch{$failure=$_}
         Assert-CcodTrue ($null-ne$failure-and$failure.Exception.Message.Contains('protected user data')) 'policy rejects the directory name before the exclusive file can cause a read error'
-    } finally {if($null-ne$held){$held.Dispose()};if(Test-Path $root){Remove-Item $root -Recurse -Force}}
+    } finally {if($null-ne$held){$held.Dispose()};if(Test-Path $root){Remove-CcodTestOwnedTree -Path $root}}
 }
 
 $results+=Invoke-CcodTest 'bounded cleanup accepts actual terminal lifecycle receipts and transaction archive output' {
@@ -286,7 +286,7 @@ $results+=Invoke-CcodTest 'bounded cleanup accepts actual terminal lifecycle rec
         &$io {param($Root,$Archive,$Completion)Write-CcodRotatingLog -Path (Join-Path $Root 'logs/transactions.log') -Message ($Archive|ConvertTo-Json -Depth 8 -Compress);Write-CcodAtomicJson -Path (Join-Path $Root 'state/transaction-completion.receipt.json') -Value $Completion -Compress} $install $archive $completion
         $result=&$module {param($Root,$Runtime)Remove-CcodVerifiedProductResidue -InstallRoot $Root -SelectedRuntimeId $Runtime -ExpectedEpoch ([uint64]11)} $install $runtimeId
         Assert-CcodEqual 'Removed' $result.result 'actual completed lifecycle evidence is disposable product state'
-    } finally {if(Test-Path $root){Remove-Item $root -Recurse -Force}}
+    } finally {if(Test-Path $root){Remove-CcodTestOwnedTree -Path $root}}
 }
 
 $results+=Invoke-CcodTest 'bounded cleanup accepts real session and legacy install diagnostic writers' {
@@ -309,7 +309,7 @@ $results+=Invoke-CcodTest 'bounded cleanup accepts real session and legacy insta
         &$lifecycle {param($Root)$adapter=Get-CcodLifecycleAdapters;Write-CcodLifecycleLog -InstallRoot $Root -Adapters $adapter -Stage Install -Code CCOD_INSTALL_COMPLETED -Outcome Installed -ThrowOnFailure} $install
         $result=&$module {param($Root,$Id)Remove-CcodVerifiedProductResidue -InstallRoot $Root -SelectedRuntimeId $Id -ExpectedEpoch ([uint64]11)} $install $runtimeId
         Assert-CcodEqual 'Removed' $result.result 'actual session and legacy install diagnostics are recognized'
-    } finally {if(Test-Path $root){Remove-Item $root -Recurse -Force}}
+    } finally {if(Test-Path $root){Remove-CcodTestOwnedTree -Path $root}}
 }
 
 $results+=Invoke-CcodTest 'bounded cleanup accepts the exact abandoned-lease warning produced by Supervisor' {
@@ -341,7 +341,7 @@ $results+=Invoke-CcodTest 'bounded cleanup accepts the exact abandoned-lease war
         &$io {param($Root,$Value)Write-CcodRotatingLog -Path (Join-Path $Root 'logs/supervisor.log') -Message ($Value|ConvertTo-Json -Compress)} $install $record
         $result=&$module {param($Root,$Runtime)Remove-CcodVerifiedProductResidue -InstallRoot $Root -SelectedRuntimeId $Runtime -ExpectedEpoch ([uint64]11)} $install $runtimeId
         Assert-CcodEqual 'Removed' $result.result 'real abandoned-lease diagnostic does not block uninstall'
-    } finally {if(Test-Path $root){Remove-Item $root -Recurse -Force}}
+    } finally {if(Test-Path $root){Remove-CcodTestOwnedTree -Path $root}}
 }
 
 $results|ForEach-Object {"PASS $($_.Name)"}

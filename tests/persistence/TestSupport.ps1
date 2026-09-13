@@ -1,4 +1,4 @@
-function Assert-CcodTrue([bool]$Condition, [string]$Message) {
+﻿function Assert-CcodTrue([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw "ASSERT_TRUE: $Message" }
 }
 
@@ -38,4 +38,44 @@ function Get-CcodTestFileSha256 {
     } finally {
         $sha.Dispose()
     }
+}
+
+function Remove-CcodTestOwnedTree {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    $full = [IO.Path]::GetFullPath($Path)
+    $temp = [IO.Path]::GetFullPath(([IO.Path]::GetTempPath()).TrimEnd('\'))
+    if ($full -eq $temp -or -not $full.StartsWith($temp + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Refusing to remove a non-temporary test tree.'
+    }
+    $leaf = [IO.Path]::GetFileName($full)
+    if ($leaf -notmatch '^(?:ccod-[A-Za-z0-9_.-]+|c-[0-9a-f]{8})$') {
+        throw 'Refusing to remove an unnamed test tree.'
+    }
+    if (-not [IO.Directory]::Exists($full)) { return }
+
+    $root = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+    if ($root.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw 'Refusing to remove a reparse-point test root.'
+    }
+    $items = @(Get-ChildItem -LiteralPath $full -Force -Recurse -ErrorAction Stop |
+        Sort-Object { $_.FullName.Length } -Descending)
+    foreach ($item in $items) {
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw ('Refusing to remove a reparse-point test child: ' + $item.FullName)
+        }
+        try {
+            if ($item.PSIsContainer) {
+                [IO.Directory]::Delete($item.FullName, $false)
+            } else {
+                [IO.File]::SetAttributes($item.FullName, [IO.FileAttributes]::Normal)
+                [IO.File]::Delete($item.FullName)
+            }
+        } catch [IO.FileNotFoundException] { }
+          catch [IO.DirectoryNotFoundException] { }
+    }
+    try { [IO.Directory]::Delete($full, $false) }
+    catch [IO.DirectoryNotFoundException] { }
+    if ([IO.Directory]::Exists($full)) { throw ('Test-owned cleanup left residue: ' + $full) }
 }
