@@ -372,7 +372,7 @@ function New-CcodWorkerHarness {
     [pscustomobject][ordered]@{RequestPath=$requestPath;ResultPath=$resultPath;Context=$context;Adapters=$adapters;Events=$events;Stdout=$stdout;Written=$written;ProbeCalls=$probeCalls}
 }
 
-$root = Join-Path ([IO.Path]::GetTempPath()) 's'
+$root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-static-worker-' + [guid]::NewGuid().ToString('N'))
 try {
     Invoke-CcodTest 'strictly rejects every request shape, order, type, case, and correlation mutation' {
         $base=New-CcodWorkerRequest
@@ -1480,5 +1480,5 @@ try {
     Write-Error $_
     exit 1
 } finally {
-    if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    if ([IO.Directory]::Exists($root)) { Remove-CcodTestOwnedTree -Path $root }
 }

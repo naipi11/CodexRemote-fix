@@ -50,7 +50,7 @@ function Remove-CcodTestOwnedTree {
         throw 'Refusing to remove a non-temporary test tree.'
     }
     $leaf = [IO.Path]::GetFileName($full)
-    if ($leaf -notmatch '^(?:ccod-[A-Za-z0-9_.-]+|c-[0-9a-f]{8})$') {
+    if ($leaf -notmatch '^ccod-[A-Za-z0-9_.-]+$') {
         throw 'Refusing to remove an unnamed test tree.'
     }
     if (-not [IO.Directory]::Exists($full)) { return }
@@ -63,7 +63,15 @@ function Remove-CcodTestOwnedTree {
         Sort-Object { $_.FullName.Length } -Descending)
     foreach ($item in $items) {
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-            throw ('Refusing to remove a reparse-point test child: ' + $item.FullName)
+            if ($item.PSIsContainer) {
+                try { [IO.Directory]::Delete($item.FullName, $false) }
+                catch [IO.DirectoryNotFoundException] { }
+            } else {
+                try { [IO.File]::SetAttributes($item.FullName, [IO.FileAttributes]::Normal); [IO.File]::Delete($item.FullName) }
+                catch [IO.FileNotFoundException] { }
+                catch [IO.DirectoryNotFoundException] { }
+            }
+            continue
         }
         try {
             if ($item.PSIsContainer) {
