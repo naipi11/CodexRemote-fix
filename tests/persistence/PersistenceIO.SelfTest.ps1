@@ -49,6 +49,12 @@ try {
         Assert-CcodEqual 1 (Read-CcodStrictJson -Path $path -ExpectedSchema 1 -Kind 'settings').schemaVersion 'schema round-trip'
     }
 
+    Invoke-CcodTest 'bounded strict JSON reader rejects oversized complete records before parsing' {
+        $path = Join-Path $root 'state\oversized-record.json'
+        [IO.File]::WriteAllText($path,('{"schemaVersion":1,"padding":"'+('x'*4096)+'"}'),[Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows { Read-CcodStrictJson -Path $path -ExpectedSchema 1 -Kind 'bounded record' -MaxBytes 1024 | Out-Null } 'CCOD_STATE_TOO_LARGE'
+    }
+
     Invoke-CcodTest 'preserves ISO timestamp fields as JSON strings under Windows PowerShell' {
         $path = Join-Path $root 'state\timestamp-string.json'
         $timestamp = '2030-02-03T04:05:06.0000000Z'

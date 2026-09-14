@@ -1,0 +1,342 @@
+# v2.5.22 Install and Runtime Reliability Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Ship v2.5.22 so a fresh or legacy upgrade can only activate the
+payload supplied by that setup, while stable Codex roots survive transient
+Electron child churn and tray action failures remain diagnosable.
+
+**Architecture:** Setup uses a versioned immutable payload directory and a
+hash manifest as the lifecycle source allowlist.  Lifecycle close/recovery
+retries only indeterminate child-tree reads while retaining the exact top-level
+root identity boundary.  Tray actions retain the authenticated protocol but
+produce a sanitized local diagnostic result and receive end-to-end coverage.
+
+**Tech Stack:** Windows PowerShell 5.1, Inno Setup, C# TrayHost, Node.js 22,
+existing PowerShell persistence self-tests.
+
+**Spec:** `docs/superpowers/specs/2026-08-28-v2522-install-runtime-reliability-design.md`
+
+## Global Constraints
+
+- Release version is exactly `2.5.22`; setup, portable ZIP, runtime manifests,
+  README, and release contracts must agree.
+- Never modify Codex binaries or `WindowsApps`; preserve the current-user DPAPI
+  device-key file.
+- A changed PID, creation time, session, user SID, package family, executable
+  path, mode, or debug-port identity is fail-closed and must not be retried as
+  success.
+- Every implementation change begins with a failing behavioral test, then the
+  smallest production change, then focused and full validation.
+- Keep the primary checkout untouched; all work occurs in this worktree.
+
+---
+
+### Task 1: Bind setup activation to an immutable payload
+
+**Files:**
+- Modify: `build/build.ps1`
+- Modify: `build/CodexControlOtherDevices.iss`
+- Modify: `Activate-CcodRemoteFix.ps1`
+- Modify: `Install-CodexControlOtherDevices.ps1`
+- Modify: `src/persistence/modules/InstallLifecycle.psm1`
+- Test: `tests/persistence/InstallLifecycle.SelfTest.ps1`
+- Test: `tests/persistence/ReleaseWorkflow.SelfTest.ps1`
+
+**Interfaces:**
+- Build writes `installer-payload.manifest.json` with ordered
+  `{schemaVersion,projectVersion,files}` records in the setup payload root.
+- `Activate-CcodRemoteFix.ps1` receives `-ExpectedVersion` and validates the
+  payload before activation and the active runtime after `Ready`.
+- `Invoke-CcodInstall` receives `-ExpectedVersion` and `-PayloadManifestPath`.
+
+- [ ] **Step 1: Write failing lifecycle tests**
+
+```powershell
+$oldPayload = New-CcodLifecycleSourceFixture -Root $source -Version '2.5.13'
+Assert-CcodThrows {
+    Invoke-CcodInstall -SourceRoot $source -InstallRoot $install `
+      -ExpectedVersion '2.5.22' -PayloadManifestPath $manifestPath -Adapters $fake.Adapters
+} 'CCOD_INSTALL_PAYLOAD_VERSION_MISMATCH'
+Assert-CcodEqual $oldRuntime $pointer.activeRuntime 'old payload cannot replace the active runtime'
+```
+
+Add a second test whose matching manifest has an extra stale source file.  It
+must prove the staged runtime contains only manifest-listed records.
+
+- [ ] **Step 2: Run the focused test and confirm RED**
+
+Run: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/InstallLifecycle.SelfTest.ps1`
+
+Expected: the new test fails because `Invoke-CcodInstall` does not accept or
+enforce the expected version/manifest yet.
+
+- [ ] **Step 3: Implement the smallest payload-binding path**
+
+Generate the ordered manifest during build, copy the release payload into
+`{app}\payload\{#ProjectVersion}`, and pass that directory plus
+`-ExpectedVersion {#ProjectVersion}` to activation.  Validate each source file
+against the manifest before staging, reject an unexpected project version, and
+reread `active.json` plus the selected runtime manifest after readiness before
+writing `Ready`.
+
+- [ ] **Step 4: Run focused tests and prove GREEN**
+
+Run the lifecycle test, release workflow test, and Inno compile contract test.
+Expected: matching new/upgrade fixtures are Ready; mismatched and stale payload
+fixtures fail before active-pointer mutation.
+
+- [ ] **Step 5: Commit**
+
+```text
+fix: bind setup activation to immutable payload
+```
+
+### Task 2: Compile an include-free generated setup script
+
+**Files:**
+- Modify: `build/build.ps1`
+- Modify: `build/CodexControlOtherDevices.iss`
+- Modify: `tools/New-InstallerDestinationInventory.ps1`
+- Test: `tests/persistence/ReleaseWorkflow.SelfTest.ps1`
+
+**Interfaces:**
+- The checked-in `.iss` contains exactly one inventory marker comment.
+- Build writes a temporary generated `.iss` by replacing that marker with the
+  verified inventory procedure and invokes ISCC only on the generated file.
+- The template accepts only the required literal build directives and rejects
+  all external/line-spanned/pragma/generated-code preprocessor directives.
+
+- [ ] **Step 1: Write failing behavior tests**
+
+```powershell
+$template = @'
+[Setup]
+AppName=fixture
+[Files]
+Source: "first.txt"; DestDir: "{app}\first"
+# \
++ "extra.iss"
+'@
+Assert-CcodThrows {
+  & $generator -RepositoryRoot $root -PayloadRoot $payload -ProjectVersion '2.5.22' `
+    -InnoScriptPath $templatePath -OutputPath $inventoryPath
+} 'include'
+Assert-CcodFalse (Test-Path -LiteralPath $inventoryPath) 'include bypass produces no partial inventory'
+```
+
+Add actual ISCC tests showing that the generated script compiles with its
+injected inventory, while templates with literal or line-spanned include,
+pragma, emit, and unknown preprocessor directives are rejected before ISCC is
+launched.
+
+- [ ] **Step 2: Run the focused test and confirm RED**
+
+Run: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/ReleaseWorkflow.SelfTest.ps1`
+
+Expected: the line-spanned include-alias fixture is accepted before the new
+template boundary exists.
+
+- [ ] **Step 3: Implement the generated include-free compiler input**
+
+Build reads the checked-in template, verifies every literal preprocessor line
+is one of the fixed required directives, rejects continuation characters and
+all other directives, substitutes the generated inventory text once, writes a
+GUID-named temporary `.iss`, validates that the result has no marker or unsafe
+preprocessor directive, and passes that generated path to ISCC. Clean the
+temporary script in `finally`, including when the compiler returns nonzero.
+
+- [ ] **Step 4: Run focused tests and prove GREEN**
+
+Run ReleaseWorkflow and the real ISCC fixture. Confirm the compiled setup
+source contains the expected injected procedure; literal and line-spanned
+include aliases plus other code-generating directives leave neither setup nor
+inventory output; a nonzero compiler also leaves no generated `.iss`.
+
+- [ ] **Step 5: Commit**
+
+```text
+fix: compile include-free setup inventory
+```
+
+### Task 3: Retry only transient Electron tree reads
+
+**Files:**
+- Modify: `src/persistence/modules/ProcessControl.psm1`
+- Modify: `src/persistence/modules/SessionEngine.psm1`
+- Modify: `src/persistence/Supervisor.ps1`
+- Test: `tests/persistence/ProcessControl.SelfTest.ps1`
+- Test: `tests/persistence/SessionEngine.SelfTest.ps1`
+- Test: `tests/persistence/Supervisor.SelfTest.ps1`
+
+**Interfaces:**
+- Add `Get-CcodStableVerifiedProcessTree` that accepts a root snapshot,
+  `StatusEvidence`, a fixed retry budget, and adapters.
+- It returns a verified tree only if every successful attempt preserves the
+  original root identity; otherwise it returns no tree.
+- `Confirm-CcodSupervisorLifecycleProofCandidate` uses the same bounded
+  candidate-root rebind rule and records a stable failure reason without
+  granting a changed root any authority.
+
+- [ ] **Step 1: Write failing process-tree tests**
+
+```powershell
+$attempt = 0
+$tree = Get-CcodStableVerifiedProcessTree -Root $root -Adapters @{
+  GetVerifiedTree = { $attempt++; if ($attempt -eq 1) { @() } else { @($root,$child) } }
+  GetProcess = { param($pid,$status) if ($pid -eq $root.Pid) { $root } else { $child } }
+  Delay = { param($milliseconds) }
+}
+Assert-CcodEqual 2 $tree.Count 'one transient empty tree is retried without relaxing root identity'
+```
+
+Add a companion test where the second root snapshot has a different creation
+time; it must return no tree and perform no close mutation.
+
+Add a Supervisor test where the first post-worker rebind sees no special root
+but the second sees the same candidate root; it must publish `RemoteVerified`.
+Add its counterpart where the second root has a different creation time; it
+must remain `CCOD_REMOTE_PROOF_REBIND_FAILED`.
+
+- [ ] **Step 2: Run focused tests and confirm RED**
+
+Run: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/ProcessControl.SelfTest.ps1`
+
+Expected: the new helper is unavailable and the tests fail for that missing
+behavior.
+
+- [ ] **Step 3: Implement bounded stable acquisition**
+
+Use a fixed small retry count and condition-based delay only around a failed
+tree acquisition.  On each retry reread the root and require
+`Test-CcodProcessMatch` against the original root.  Replace pre-mutation
+`GetTree` calls in close and recovery paths with this helper; leave per-member
+pre-stop/post-stop/final proofs unchanged.
+
+- [ ] **Step 4: Run focused tests and prove GREEN**
+
+Run ProcessControl, SessionEngine, and Supervisor self-tests.  Confirm child
+churn retries successfully, a transient same-identity rebind succeeds, root
+drift remains fail-closed, and ordinary close tests still prove every stopped
+member.
+
+- [ ] **Step 5: Commit**
+
+```text
+fix: stabilize verified Electron process trees
+```
+
+### Task 4: Make tray action correlation testable and diagnosable
+
+> **Superseded for execution:** Task 4 reached an approved architectural
+> correction after three reviewed fix rounds.  Execute
+> `docs/superpowers/plans/2026-08-28-v2522-async-tray-receipts.md` before this
+> plan's Task 5.  Its receipt sink preserves this task's authenticated
+> correlation and generic-dialog constraints while making persistence bounded
+> and non-blocking.
+
+**Files:**
+- Modify: `src/persistence/modules/TrayHostClient.psm1`
+- Modify: `src/persistence/Supervisor.ps1`
+- Modify: `src/trayhost/HostTransport.cs`
+- Modify: `src/trayhost/TrayWindow.cs`
+- Test: `tests/persistence/TrayHostClient.SelfTest.ps1`
+- Test: `tests/persistence/Supervisor.SelfTest.ps1`
+- Test: `tests/trayhost/TrayHostTransportSelfTest.cs`
+
+**Interfaces:**
+- A terminal tray action record carries `command`, `revision`, `status`, and a
+  stable `CCOD_*` code to the local diagnostic log.
+- A current acknowledged presentation revision reaches its command handler;
+  an unacknowledged revision is rejected as `CCOD_TRAY_ACTION_STALE`.
+
+- [ ] **Step 1: Write failing end-to-end action tests**
+
+```powershell
+$action = [pscustomobject]@{ ActionId=[guid]::NewGuid(); Command='OpenLogs'; Revision=[UInt64]7 }
+$hostState.Tray.AcknowledgedPresentations['7'] = $enabledPresentation
+$result = Invoke-CcodSupervisorCommand $hostState $adapters $action
+Assert-CcodEqual 'Completed' $result.Status 'acknowledged revision reaches OpenLogs'
+```
+
+Add the same command with revision `8` and no ACK map entry; assert
+`Rejected` plus `CCOD_TRAY_ACTION_STALE` and one sanitized diagnostic record.
+
+- [ ] **Step 2: Run focused tests and confirm RED**
+
+Run the TrayHost client, Supervisor, and transport tests.  Expected failure:
+the diagnostic record and full correlation behavior are absent.
+
+- [ ] **Step 3: Implement only the action correlation record and tests**
+
+Record terminal action outcomes after Supervisor authorization and before the
+host collapses them into the generic dialog.  Keep the generic dialog wording
+and authenticated pipe protocol unchanged.  Do not add external control or a
+new unauthenticated command channel.
+
+- [ ] **Step 4: Run focused tests and prove GREEN**
+
+Run all three focused suites and the native TrayHost self-test.  Confirm a
+stale revision cannot perform any action and a current revision carries the
+exact terminal code into local diagnostics.
+
+- [ ] **Step 5: Commit**
+
+```text
+test: cover tray action revision correlation
+```
+
+### Task 5: Version, documentation, and release acceptance
+
+**Files:**
+- Modify: `package.json`
+- Modify: `src/trayhost/AssemblyInfo.cs`
+- Modify: `src/portable/AssemblyInfo.cs`
+- Modify: `README.md`
+- Modify: `README.zh-CN.md`
+- Modify: `CHANGELOG.md`
+- Test: `tests/persistence/ReleaseWorkflow.SelfTest.ps1`
+
+- [ ] **Step 1: Write failing version-contract assertions**
+
+Add release contract coverage requiring version `2.5.22`, the versioned setup
+payload route, and both setup/portable manifests to expose the same version.
+
+- [ ] **Step 2: Run the release contract test and confirm RED**
+
+Run: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/persistence/ReleaseWorkflow.SelfTest.ps1`
+
+Expected: it fails while the product metadata is still `2.5.21`.
+
+- [ ] **Step 3: Update metadata and concise user documentation**
+
+Set every product version to `2.5.22`.  Keep the README stable-release section
+concise; put technical repair detail in `CHANGELOG.md` and the GitHub release
+body.
+
+- [ ] **Step 4: Run focused and full validation**
+
+Run `npm.cmd test`, release contract tests, native TrayHost tests, and a clean
+release build.  Review setup and portable manifests byte-for-byte against the
+generated assets.
+
+- [ ] **Step 5: Commit**
+
+```text
+release: prepare CodexRemote-fix v2.5.22
+```
+
+## Plan self-review
+
+- Task 1 produces the immutable source/expected-version contract consumed by
+  the new setup flow and release contract.
+- Task 2 removes the preprocessor include ambiguity from the Task 1 setup
+  source before any release compiler invocation.
+- Task 3 changes only pre-mutation tree acquisition and explicitly leaves all
+  identity and post-stop checks strict.
+- Task 4 has no dependency on Task 3 and can be reviewed independently; its
+  diagnostics make future live failures actionable without weakening protocol
+  authentication.
+- Task 5 consumes the completed behavior and performs no release publication;
+  publishing, installation, and reboot remain a separately authorized final
+  acceptance step.

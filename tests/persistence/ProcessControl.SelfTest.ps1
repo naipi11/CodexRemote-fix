@@ -892,6 +892,53 @@ try {
         Assert-CcodTrue ($seen.RootEvidenceCount -ge 2) 'Special root proof is supplied on initial and final rereads'
     }
 
+    Invoke-CcodTest 'retries one transient verified tree miss while the exact root identity remains stable' {
+        $status = New-CcodSpecialStatus
+        $root = New-CcodSnapshot -Mode Special -RendererPort 41001 -MainPort 41002 -CommandLine 'special'
+        $child = New-CcodSnapshot -ProcessId 101 -CreationTimeUtc '2026-08-02T00:00:01.0000000Z' -ParentPid 100 -IsTopLevel $false -Mode Unrelated
+        $calls = [pscustomobject]@{ Tree = 0; Root = 0; Delay = 0 }
+        $tree = @(Get-CcodStableVerifiedProcessTree -Root $root -StatusEvidence $status -RetryBudget 1 -Adapters @{
+            GetVerifiedTree = {
+                param($ExpectedRoot, $StatusEvidence)
+                $calls.Tree++
+                if ($calls.Tree -eq 1) { return @() }
+                return @($root, $child)
+            }.GetNewClosure()
+            GetProcess = {
+                param($ProcessId, $StatusEvidence)
+                $calls.Root++
+                Assert-CcodEqual $status $StatusEvidence 'stable retry preserves root status evidence'
+                return $root
+            }.GetNewClosure()
+            Delay = { param($Milliseconds) $calls.Delay++ }.GetNewClosure()
+        })
+        Assert-CcodEqual 2 $tree.Count 'one transient empty tree is retried without relaxing root identity'
+        Assert-CcodEqual '100,101' (($tree.Pid | Sort-Object) -join ',') 'successful retry returns the complete verified tree'
+        Assert-CcodEqual 2 $calls.Tree 'the fixed one-retry budget performs exactly two tree attempts'
+        Assert-CcodEqual 1 $calls.Root 'the root is reread exactly once before the retry'
+        Assert-CcodEqual 1 $calls.Delay 'delay is entered only after an empty tree and a stable root reread'
+    }
+
+    Invoke-CcodTest 'rejects a retry when the exact root creation time changes' {
+        $root = New-CcodSnapshot
+        $changed = New-CcodSnapshot -CreationTimeUtc '2026-08-02T00:00:05.0000000Z'
+        $calls = [pscustomobject]@{ Tree = 0; Root = 0; Delay = 0 }
+        $tree = @(Get-CcodStableVerifiedProcessTree -Root $root -RetryBudget 1 -Adapters @{
+            GetVerifiedTree = {
+                param($ExpectedRoot, $StatusEvidence)
+                $calls.Tree++
+                if ($calls.Tree -eq 1) { return @() }
+                return @($changed)
+            }.GetNewClosure()
+            GetProcess = { param($ProcessId, $StatusEvidence) $calls.Root++; $changed }.GetNewClosure()
+            Delay = { param($Milliseconds) $calls.Delay++ }.GetNewClosure()
+        })
+        Assert-CcodEqual 0 $tree.Count 'creation-time drift returns no verified tree'
+        Assert-CcodEqual 1 $calls.Tree 'root drift is not retried'
+        Assert-CcodEqual 1 $calls.Root 'drift is detected by the mandatory root reread'
+        Assert-CcodEqual 0 $calls.Delay 'root drift never enters the retry delay'
+    }
+
     Invoke-CcodTest 'adopts exactly one special transaction candidate' {
         $command = '"C:\Codex\ChatGPT.exe" --remote-debugging-address=127.0.0.1 --remote-debugging-port=41001 --inspect=127.0.0.1:41002'
         $validArgv = @('C:\Codex\ChatGPT.exe','--remote-debugging-address=127.0.0.1','--remote-debugging-port=41001','--inspect=127.0.0.1:41002')

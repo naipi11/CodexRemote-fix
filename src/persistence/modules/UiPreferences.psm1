@@ -100,9 +100,14 @@ function Get-CcodUiPreferenceTimestamp {
 
 function Initialize-CcodUiPreference {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$StateRoot)
+    param([Parameter(Mandatory)][string]$StateRoot,[switch]$AllowExisting)
 
     $path = Resolve-CcodContainedPath -Root $StateRoot -RelativePath 'ui-preferences.json' -AllowMissingLeaf
+    if([IO.File]::Exists($path)){
+        if(-not$AllowExisting){Throw-CcodUiPreferenceError 'CCOD_UI_PREFERENCES_EXISTS' 'UI preferences already exist.' $path}
+        $existing=Read-CcodStrictJson -Path $path -ExpectedSchema 1 -Kind 'UI preferences';Assert-CcodUiPreferenceStore -Store $existing
+        return $existing
+    }
     $store = New-CcodUiPreferenceStore -LanguageMode 'System' -UpdatedAtUtc (Get-CcodUiPreferenceTimestamp -Adapters (Get-CcodUiPreferenceAdapters))
     Assert-CcodUiPreferenceStore -Store $store
     try {
@@ -113,6 +118,7 @@ function Initialize-CcodUiPreference {
         }
         throw
     }
+    return $store
 }
 
 function Read-CcodUiPreference {

@@ -457,9 +457,18 @@ function Get-CcodTreeDepth {
     return $depth
 }
 
+function Get-CcodStableSessionProcessTree {
+    param($Root,$StatusEvidence,[hashtable]$Adapter)
+    return @(Get-CcodStableVerifiedProcessTree -Root $Root -StatusEvidence $StatusEvidence -RetryBudget 1 -Adapters @{
+        GetVerifiedTree=$Adapter.GetTree
+        GetProcess=$Adapter.GetProcess
+        Delay=$Adapter.Delay
+    })
+}
+
 function Get-CcodChildFirstVerifiedTree {
     param($Root,$StatusEvidence,[hashtable]$Adapter)
-    $tree=@(& $Adapter.GetTree $Root $StatusEvidence)
+    $tree=@(Get-CcodStableSessionProcessTree $Root $StatusEvidence $Adapter)
     if($tree.Count -lt 1){Throw-CcodSessionError 'CCOD_RECOVERY_UNPROVEN' 'Recorded special tree could not be verified' $Root}
     $byPid=@{};foreach($member in $tree){$byPid[[int]$member.Pid]=$member}
     if(-not $byPid.ContainsKey([int]$Root.Pid)){Throw-CcodSessionError 'CCOD_RECOVERY_UNPROVEN' 'Verified tree omitted the recorded root' $Root}
@@ -1366,7 +1375,7 @@ function Invoke-CcodCloseSession {
             if($null -eq $target -or -not (& $adapter.ProcessMatch $Request.source $target)){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Requested close source is not the one verified current root' $Request.source}
         }
         if($null -eq $target){$result.ok=$true;$result.outcome='Closed';$result.safeState='Closed';$result.stage='Closed';return $result}
-        $tree=@(& $adapter.GetTree $target $state.Status)
+        $tree=@(Get-CcodStableSessionProcessTree $target $state.Status $adapter)
         if($tree.Count -lt 1){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Current close target tree is not exact and verified' $target}
         $renderer=$null;$main=$null;$source=$target
         if($isSpecial){if($null -ne $statusCodex){$renderer=$statusCodex.rendererPort;$main=$statusCodex.mainPort}else{$renderer=$target.RendererPort;$main=$target.MainPort};$source=$null;$result.special=ConvertTo-CcodSessionSpecial $target}else{$result.source=ConvertTo-CcodSessionSource $target}
@@ -1449,7 +1458,7 @@ function Invoke-CcodRecoverSession {
             }
         }
         if($null -eq $target){$result.ok=$true;$result.outcome='Closed';$result.safeState='Closed';$result.stage='Closed';return $result}
-        $tree=@(& $adapter.GetTree $target $state.Status)
+        $tree=@(Get-CcodStableSessionProcessTree $target $state.Status $adapter)
         if($tree.Count -lt 1){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Current close target tree is not exact and verified' $target}
         $renderer=$null;$main=$null;$source=$target
         if($isSpecial){if($null -ne $statusCodex){$renderer=$statusCodex.rendererPort;$main=$statusCodex.mainPort}else{$renderer=$target.RendererPort;$main=$target.MainPort};$source=$null;$result.special=ConvertTo-CcodSessionSpecial $target}else{$result.source=ConvertTo-CcodSessionSource $target}
@@ -1531,7 +1540,7 @@ function Invoke-CcodReplayTransition {
                 $decision=Get-CcodReplayDecision -Transition $Transition -Observed $cold
                 Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Cold close replay cannot prove absence of the complete recorded tree' $decision
             }
-            $tree=@(& $adapter.GetTree $current $state.Status)
+            $tree=@(Get-CcodStableSessionProcessTree $current $state.Status $adapter)
             if($tree.Count -lt 1){Throw-CcodSessionError 'CCOD_CLOSE_UNPROVEN' 'Recorded close root does not yield a verified tree' $current}
             if($null -ne $Transition.specialPid){
                 $fact=[pscustomobject][ordered]@{Process=$current;Evidence='PersistedIdentity';Validation='Indeterminate'}
