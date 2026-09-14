@@ -23,7 +23,7 @@ function New-CcodUninstallBootstrapTestRoot {
     $tempLeaf=Split-Path $tempPath -Leaf
     $parent=Split-Path $tempPath -Parent
     $base=if($tempLeaf.Length -gt 8 -and -not [string]::IsNullOrWhiteSpace($parent) -and [IO.Directory]::Exists($parent)){$parent}else{$tempPath}
-    return Join-Path $base ('u-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+    return Join-Path $base ('ccod-uninstall-' + [guid]::NewGuid().ToString('N').Substring(0,8))
 }
 
 $results+=Invoke-CcodTest 'uninstall bootstrap runtime IDs use canonical TAB delimiters' {
@@ -282,7 +282,7 @@ $results += Invoke-CcodTest 'production runtime verification binds the installed
         Assert-CcodThrows { Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $repositoryRoot -InstallRoot $installRoot | Out-Null } 'CCOD_UNINSTALL_RUNTIME_INVALID'
     } finally {
         [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previousLocalAppData,'Process')
-        if (Test-Path -LiteralPath $localAppData) { Remove-Item -LiteralPath $localAppData -Recurse -Force }
+        if ([IO.Directory]::Exists($localAppData)) { Remove-CcodTestOwnedTree -Path $localAppData }
     }
 }
 
@@ -339,7 +339,7 @@ function Invoke-CcodInstalledFinalizerPublicResume {
 
 $results += Invoke-CcodTest 'production uninstall authorization consumes append-only selector before legacy active json' {
     $localAppData=New-CcodUninstallBootstrapTestRoot ('u-a-'+[guid]::NewGuid().ToString('N').Substring(0,12));$installRoot=Join-Path $localAppData 'CodexControlOtherDevices';$previous=[Environment]::GetEnvironmentVariable('LOCALAPPDATA','Process')
-    try{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$localAppData,'Process');$fixture=New-CcodVerifiedUninstallRuntimeFixture -InstallRoot $installRoot -AppendOnly;$context=Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $repositoryRoot -InstallRoot $installRoot;Assert-CcodEqual $fixture.RuntimeId $context.runtimeId 'uninstall context binds append-only active runtime';Assert-CcodEqual 7 ([uint64]$context.runtimeGeneration) 'uninstall context binds latest append-only generation';Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $installRoot 'active.json')) 'append-only uninstall authorization needs no legacy pointer'}finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if(Test-Path $localAppData){Remove-Item $localAppData -Recurse -Force}}
+    try{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$localAppData,'Process');$fixture=New-CcodVerifiedUninstallRuntimeFixture -InstallRoot $installRoot -AppendOnly;$context=Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $repositoryRoot -InstallRoot $installRoot;Assert-CcodEqual $fixture.RuntimeId $context.runtimeId 'uninstall context binds append-only active runtime';Assert-CcodEqual 7 ([uint64]$context.runtimeGeneration) 'uninstall context binds latest append-only generation';Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $installRoot 'active.json')) 'append-only uninstall authorization needs no legacy pointer'}finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if([IO.Directory]::Exists($localAppData)){Remove-CcodTestOwnedTree -Path $localAppData}}
 }
 
 $results += Invoke-CcodTest 'uninstall legacy fallback accepts a valid pointer when the entire state plane is absent' {
@@ -358,17 +358,17 @@ $results += Invoke-CcodTest 'uninstall legacy fallback accepts a valid pointer w
         $failure=$null;try{Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $repositoryRoot -InstallRoot $install|Out-Null}catch{$failure=$_}
         Assert-CcodTrue ($null-ne$failure-and$failure.FullyQualifiedErrorId-like'CCOD_UNINSTALL_REPARSE_OR_PATH_INVALID*') 'missing lifecycle epoch still fails closed after legacy authorization'
         Assert-CcodEqual ([IO.Path]::GetFullPath($state)) ([string]$failure.TargetObject) 'valid legacy selector fallback reaches the later lifecycle epoch validation'
-    }finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if(Test-Path $local){Remove-Item $local -Recurse -Force}}
+    }finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if([IO.Directory]::Exists($local)){Remove-CcodTestOwnedTree -Path $local}}
 }
 
 $results += Invoke-CcodTest 'uninstall append-only authorization rejects unsafe roots leaves JSON and generations' {
     $previous=[Environment]::GetEnvironmentVariable('LOCALAPPDATA','Process')
-    try{foreach($kind in @('root-file','root-reparse','leaf-reparse','ads','multilink','malformed','schema','duplicate','fractional','noncanonical')){$local=New-CcodUninstallBootstrapTestRoot $kind;$install=Join-Path $local 'CodexControlOtherDevices';[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$local,'Process');$fixture=New-CcodVerifiedUninstallRuntimeFixture -InstallRoot $install -AppendOnly;$pointerRoot=Join-Path $install 'state\active-generation';$leaf=Join-Path $pointerRoot '00000000000000000007.json';$target=Join-Path $install ("target-$kind");if($kind-ceq'root-file'){Remove-Item $pointerRoot -Recurse -Force;[IO.File]::WriteAllText($pointerRoot,'x',[Text.UTF8Encoding]::new($false))}elseif($kind-ceq'root-reparse'){Remove-Item $pointerRoot -Recurse -Force;[IO.Directory]::CreateDirectory($target)|Out-Null;New-Item -ItemType Junction -Path $pointerRoot -Target $target|Out-Null}elseif($kind-ceq'leaf-reparse'){[IO.File]::Delete($leaf);[IO.Directory]::CreateDirectory($target)|Out-Null;New-Item -ItemType Junction -Path $leaf -Target $target|Out-Null}elseif($kind-ceq'ads'){Set-Content -LiteralPath $leaf -Stream evidence -Value x -NoNewline}elseif($kind-ceq'multilink'){$text=[IO.File]::ReadAllText($leaf);[IO.File]::Delete($leaf);$outside=Join-Path $install 'outside-pointer.json';[IO.File]::WriteAllText($outside,$text,[Text.UTF8Encoding]::new($false));New-Item -ItemType HardLink -Path $leaf -Target $outside|Out-Null}elseif($kind-ceq'malformed'){[IO.File]::WriteAllText($leaf,'{',[Text.UTF8Encoding]::new($false))}elseif($kind-ceq'schema'){$id=$fixture.RuntimeId;[IO.File]::WriteAllText($leaf,('{"schemaVersion":2,"generation":7,"activeRuntime":"'+$id+'","previousGeneration":6}'),[Text.UTF8Encoding]::new($false))}elseif($kind-ceq'duplicate'){$id=$fixture.RuntimeId;[IO.File]::WriteAllText($leaf,('{"schemaVersion":1,"schemaVersion":1,"generation":7,"activeRuntime":"'+$id+'","previousGeneration":6}'),[Text.UTF8Encoding]::new($false))}elseif($kind-ceq'fractional'){$id=$fixture.RuntimeId;[IO.File]::WriteAllText($leaf,('{"schemaVersion":1,"generation":7.5,"activeRuntime":"'+$id+'","previousGeneration":6}'),[Text.UTF8Encoding]::new($false))}else{Move-Item $leaf (Join-Path $pointerRoot '00000000000000000008.json')};Assert-CcodThrows {Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $repositoryRoot -InstallRoot $install|Out-Null} 'CCOD_UNINSTALL_RUNTIME_INVALID';if(Test-Path $local){Remove-Item $local -Recurse -Force}}}finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process')}
+    try{foreach($kind in @('root-file','root-reparse','leaf-reparse','ads','multilink','malformed','schema','duplicate','fractional','noncanonical')){$local=New-CcodUninstallBootstrapTestRoot $kind;$install=Join-Path $local 'CodexControlOtherDevices';[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$local,'Process');$fixture=New-CcodVerifiedUninstallRuntimeFixture -InstallRoot $install -AppendOnly;$pointerRoot=Join-Path $install 'state\active-generation';$leaf=Join-Path $pointerRoot '00000000000000000007.json';$target=Join-Path $install ("target-$kind");if($kind-ceq'root-file'){Remove-Item $pointerRoot -Recurse -Force;[IO.File]::WriteAllText($pointerRoot,'x',[Text.UTF8Encoding]::new($false))}elseif($kind-ceq'root-reparse'){Remove-Item $pointerRoot -Recurse -Force;[IO.Directory]::CreateDirectory($target)|Out-Null;New-Item -ItemType Junction -Path $pointerRoot -Target $target|Out-Null}elseif($kind-ceq'leaf-reparse'){[IO.File]::Delete($leaf);[IO.Directory]::CreateDirectory($target)|Out-Null;New-Item -ItemType Junction -Path $leaf -Target $target|Out-Null}elseif($kind-ceq'ads'){Set-Content -LiteralPath $leaf -Stream evidence -Value x -NoNewline}elseif($kind-ceq'multilink'){$text=[IO.File]::ReadAllText($leaf);[IO.File]::Delete($leaf);$outside=Join-Path $install 'outside-pointer.json';[IO.File]::WriteAllText($outside,$text,[Text.UTF8Encoding]::new($false));New-Item -ItemType HardLink -Path $leaf -Target $outside|Out-Null}elseif($kind-ceq'malformed'){[IO.File]::WriteAllText($leaf,'{',[Text.UTF8Encoding]::new($false))}elseif($kind-ceq'schema'){$id=$fixture.RuntimeId;[IO.File]::WriteAllText($leaf,('{"schemaVersion":2,"generation":7,"activeRuntime":"'+$id+'","previousGeneration":6}'),[Text.UTF8Encoding]::new($false))}elseif($kind-ceq'duplicate'){$id=$fixture.RuntimeId;[IO.File]::WriteAllText($leaf,('{"schemaVersion":1,"schemaVersion":1,"generation":7,"activeRuntime":"'+$id+'","previousGeneration":6}'),[Text.UTF8Encoding]::new($false))}elseif($kind-ceq'fractional'){$id=$fixture.RuntimeId;[IO.File]::WriteAllText($leaf,('{"schemaVersion":1,"generation":7.5,"activeRuntime":"'+$id+'","previousGeneration":6}'),[Text.UTF8Encoding]::new($false))}else{Move-Item $leaf (Join-Path $pointerRoot '00000000000000000008.json')};Assert-CcodThrows {Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $repositoryRoot -InstallRoot $install|Out-Null} 'CCOD_UNINSTALL_RUNTIME_INVALID';if([IO.Directory]::Exists($local)){Remove-CcodTestOwnedTree -Path $local}}}finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process')}
 }
 
 $results += Invoke-CcodTest 'uninstall selector fallback requires proven ItemNotFound instead of a lookup error' {
     $local=New-CcodUninstallBootstrapTestRoot ('ccod-uninstall-lookup-'+[guid]::NewGuid().ToString('N'));$install=Join-Path $local 'CodexControlOtherDevices';$previous=[Environment]::GetEnvironmentVariable('LOCALAPPDATA','Process')
-    try{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$local,'Process');New-CcodVerifiedUninstallRuntimeFixture -InstallRoot $install|Out-Null;Assert-CcodThrows {Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $repositoryRoot -InstallRoot $install -SelectorAdapters @{GetSelectorRootItem={param($Path)throw [UnauthorizedAccessException]::new('selector lookup denied')}}|Out-Null} 'CCOD_UNINSTALL_RUNTIME_INVALID'}finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if(Test-Path $local){Remove-Item $local -Recurse -Force}}
+    try{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$local,'Process');New-CcodVerifiedUninstallRuntimeFixture -InstallRoot $install|Out-Null;Assert-CcodThrows {Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $repositoryRoot -InstallRoot $install -SelectorAdapters @{GetSelectorRootItem={param($Path)throw [UnauthorizedAccessException]::new('selector lookup denied')}}|Out-Null} 'CCOD_UNINSTALL_RUNTIME_INVALID'}finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if([IO.Directory]::Exists($local)){Remove-CcodTestOwnedTree -Path $local}}
 }
 
 $results += Invoke-CcodTest 'uninstall legacy fallback rejects a state ancestor file at the selector boundary' {
@@ -379,7 +379,7 @@ $results += Invoke-CcodTest 'uninstall legacy fallback rejects a state ancestor 
         $failure=$null;try{Get-CcodUninstallBootstrapVerifiedRuntimeContext -InstallerRoot $repositoryRoot -InstallRoot $install|Out-Null}catch{$failure=$_}
         Assert-CcodTrue ($null-ne$failure-and$failure.FullyQualifiedErrorId-like'CCOD_UNINSTALL_RUNTIME_INVALID*') 'state ancestor file fails uninstall authorization'
         Assert-CcodTrue ($failure.Exception.Message-like'*selector*') 'state ancestor file is rejected at the selector boundary'
-    }finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if(Test-Path $local){Remove-Item $local -Recurse -Force}}
+    }finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if([IO.Directory]::Exists($local)){Remove-CcodTestOwnedTree -Path $local}}
 }
 
 $results += Invoke-CcodTest 'external staging refuses a cleanup source changed after runtime verification' {
@@ -400,7 +400,7 @@ $results += Invoke-CcodTest 'external staging refuses a cleanup source changed a
         Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $payloadRoot 'src\persistence\PortableUninstallFinalizer.ps1'))) 'the changed cleanup source is never staged'
     } finally {
         [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previousLocalAppData,'Process')
-        if (Test-Path -LiteralPath $localAppData) { Remove-Item -LiteralPath $localAppData -Recurse -Force }
+        if ([IO.Directory]::Exists($localAppData)) { Remove-CcodTestOwnedTree -Path $localAppData }
     }
 }
 
@@ -475,7 +475,7 @@ $results += Invoke-CcodTest 'real external staging uses a protected current-user
         Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $transactionDirectory 'receipt.json') -PathType Leaf) 'staged finalization writes a separate durable receipt'
     } finally {
         [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previousLocalAppData,'Process')
-        if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }
+        if ([IO.Directory]::Exists($testRoot)) { Remove-CcodTestOwnedTree -Path $testRoot }
     }
 }
 
@@ -538,7 +538,7 @@ $results += Invoke-CcodTest 'Prepare resumes a TaskRemoved transaction even afte
         Assert-CcodEqual 'Validate,GetRoot,Read,Cleanup,Write:ReadyForInno,RemoveProduct,Receipt:ReadyForInno' ($world.Calls -join ',') 'partial deletion resume neither creates another transaction nor restages payload'
     } finally {
         [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previousLocalAppData,'Process')
-        if (Test-Path -LiteralPath $localAppData) { Remove-Item -LiteralPath $localAppData -Recurse -Force }
+        if ([IO.Directory]::Exists($localAppData)) { Remove-CcodTestOwnedTree -Path $localAppData }
     }
 }
 
@@ -565,7 +565,7 @@ $results += Invoke-CcodTest 'Prepare rejects a partial-deletion transaction from
         Assert-CcodEqual 'Validate,GetRoot,Read' ($world.Calls -join ',') 'another user cannot cause cleanup of a partial transaction'
     } finally {
         [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previousLocalAppData,'Process')
-        if (Test-Path -LiteralPath $localAppData) { Remove-Item -LiteralPath $localAppData -Recurse -Force }
+        if ([IO.Directory]::Exists($localAppData)) { Remove-CcodTestOwnedTree -Path $localAppData }
     }
 }
 
@@ -700,7 +700,7 @@ $results += Invoke-CcodTest 'disk-backed new-session replacement uses real verif
         Assert-CcodTrue (Test-CcodUninstallBootstrapReceiptMatchesTransaction -Receipt $receipt -Transaction $disk) 'disk receipt binds the fresh replacement timestamp'
         Assert-CcodEqual $freshSession $disk.installedBinding.resumeWrapperSessionId 'disk transaction persists only the new wrapper session seam'
         Assert-CcodEqual 0 $cleanup.Count 'real disk-backed TaskRemoved recovery never enters RunCleanup'
-    }finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if(Test-Path -LiteralPath $local){Remove-Item -LiteralPath $local -Recurse -Force}}
+    }finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if([IO.Directory]::Exists($local)){Remove-CcodTestOwnedTree -Path $local}}
 }
 
 $results += Invoke-CcodTest 'Failed resume TaskRemoved recovers in same and new sessions without RunCleanup' {
@@ -960,7 +960,7 @@ function Invoke-CcodDefaultInstalledProductCleanupCase {
         Assert-CcodTrue (-not(Test-Path $fixture.RuntimeRoot)) 'default finalizer deletes exact selected runtime'
         Assert-CcodTrue (-not(Test-Path $install)) 'completion receipt requires the product root and state to be absent'
         Assert-CcodTrue (-not$resume.Present) 'default finalizer removes the public anchor last'
-    }finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if(Test-Path $local){Remove-Item $local -Recurse -Force}}
+    }finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if([IO.Directory]::Exists($local)){Remove-CcodTestOwnedTree -Path $local}}
 }
 
 $results += Invoke-CcodTest 'default installed finalizer completes bounded product cleanup before its completion receipt' {Invoke-CcodDefaultInstalledProductCleanupCase}
@@ -986,7 +986,8 @@ function Invoke-CcodInstalledReclamationMutationCase {
         if(([string]$failure.FullyQualifiedErrorId-split',')[0]-cne'CCOD_GENERATION_RECLAMATION_INVALID'){throw $failure}
         Assert-CcodEqual $outsideHash (Get-CcodTestFileSha256 $outsideSentinel) "$Mutation preserves outside bytes";Assert-CcodEqual $siblingHash (Get-CcodTestFileSha256 $siblingSentinel) "$Mutation preserves sibling generation bytes";Assert-CcodEqual $deviceKeyHash (Get-CcodTestFileSha256 $deviceKey) "$Mutation preserves device-key bytes"
         if($Mutation-ceq'Ads'){Assert-CcodTrue ($null-ne(Get-Item -LiteralPath $attackState.Path -Stream 'ccod-evidence' -ErrorAction SilentlyContinue)) 'ADS hostile object remains after zero deletion'}else{Assert-CcodTrue (Test-Path -LiteralPath $attackState.Path) "$Mutation hostile object remains after zero deletion"}
-    }finally{if($null-ne$attackState.OpenHandle){$attackState.OpenHandle.Dispose()};[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if(Test-Path -LiteralPath $local){Remove-Item -LiteralPath $local -Recurse -Force}}
+        if($null-ne$attackState.OpenHandle){$attackState.OpenHandle.Dispose();$attackState.OpenHandle=$null}
+    }finally{[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if([IO.Directory]::Exists($local)){Remove-CcodTestOwnedTree -Path $local}}
 }
 
 # Production mutation caught: validation and deletion must remain bound across every hostile
@@ -1024,7 +1025,7 @@ if([string]::IsNullOrWhiteSpace($env:CCOD_RECLAMATION_RED_CASE)-or$env:CCOD_RECL
             &$module {param($Value)$script:CcodGenerationReclamationBeforeArmForTest=$Value} $hook
             try{Assert-CcodThrows {Remove-CcodVerifiedGenerationTree -InstallRoot $install -RuntimeRoot $fixture.RuntimeRoot -RuntimeId $fixture.RuntimeId -ExpectedManifestSha256 $manifest|Out-Null} 'CCOD_GENERATION_RECLAMATION_INVALID'}finally{&$module {$script:CcodGenerationReclamationBeforeArmForTest=$null}}
             Assert-CcodEqual 'blocked' $attack.Result 'pinned selected root rejects identity replacement';Assert-CcodGenerationReclamationTreeProof $proof 'identity replacement failure preserves selected tree';Assert-CcodGenerationReclamationTreeProof $replacementProof 'identity replacement failure preserves outside replacement tree';Assert-CcodTrue (-not(Test-Path -LiteralPath $parked)) 'identity replacement creates no renamed selected alias'
-        }finally{if(Test-Path -LiteralPath $local){Remove-Item -LiteralPath $local -Recurse -Force}}
+        }finally{if([IO.Directory]::Exists($local)){Remove-CcodTestOwnedTree -Path $local}}
     }
 }
 
@@ -1038,7 +1039,7 @@ if([string]::IsNullOrWhiteSpace($env:CCOD_RECLAMATION_RED_CASE)-or$env:CCOD_RECL
             try{Assert-CcodThrows {Remove-CcodVerifiedGenerationTree -InstallRoot $install -RuntimeRoot $fixture.RuntimeRoot -RuntimeId $fixture.RuntimeId -ExpectedManifestSha256 $manifest|Out-Null} 'CCOD_GENERATION_RECLAMATION_INVALID'}finally{&$module {$script:CcodGenerationReclamationFailFileArmAtForTest=-1}}
             Assert-CcodGenerationReclamationTreeProof $proof 'file-arm rollback preserves the complete selected tree';Assert-CcodEqual $siblingHash (Get-CcodTestFileSha256 $siblingFile) 'file-arm rollback preserves sibling';Assert-CcodEqual $deviceKeyHash (Get-CcodTestFileSha256 $deviceKey) 'file-arm rollback preserves device-key state'
             $result=Remove-CcodVerifiedGenerationTree -InstallRoot $install -RuntimeRoot $fixture.RuntimeRoot -RuntimeId $fixture.RuntimeId -ExpectedManifestSha256 $manifest;Assert-CcodEqual 'Completed' $result.phase 'successful retry reaches terminal reclamation phase';Assert-CcodEqual 'Reclaimed' $result.result 'successful retry reports exact reclamation';Assert-CcodTrue (-not(Test-Path -LiteralPath $fixture.RuntimeRoot)) 'successful retry removes only selected generation';Assert-CcodEqual $siblingHash (Get-CcodTestFileSha256 $siblingFile) 'successful retry preserves sibling';Assert-CcodEqual $deviceKeyHash (Get-CcodTestFileSha256 $deviceKey) 'successful retry preserves device-key state';Assert-CcodTrue (Test-Path -LiteralPath $install -PathType Container) 'successful retry preserves install root'
-        }finally{if(Test-Path -LiteralPath $local){Remove-Item -LiteralPath $local -Recurse -Force}}
+        }finally{if([IO.Directory]::Exists($local)){Remove-CcodTestOwnedTree -Path $local}}
     }
 }
 
@@ -1050,7 +1051,7 @@ if([string]::IsNullOrWhiteSpace($env:CCOD_RECLAMATION_RED_CASE)-or$env:CCOD_RECL
             &$module {param($Index)$script:CcodGenerationReclamationFailCommitAtForTest=$Index} ($proof.Files.Count+1)
             try{Assert-CcodThrows {Remove-CcodVerifiedGenerationTree -InstallRoot $install -RuntimeRoot $fixture.RuntimeRoot -RuntimeId $fixture.RuntimeId -ExpectedManifestSha256 $manifest|Out-Null} 'CCOD_GENERATION_RECLAMATION_COMMIT_FAILED'}finally{&$module {$script:CcodGenerationReclamationFailCommitAtForTest=-1}}
             Assert-CcodTrue (Test-Path -LiteralPath $fixture.RuntimeRoot -PathType Container) 'CommitStarted failure retains a selected-root failure boundary';Assert-CcodEqual $outsideHash (Get-CcodTestFileSha256 $outsideFile) 'CommitStarted failure preserves outside';Assert-CcodEqual $siblingHash (Get-CcodTestFileSha256 $siblingFile) 'CommitStarted failure preserves sibling';Assert-CcodEqual $deviceKeyHash (Get-CcodTestFileSha256 $deviceKey) 'CommitStarted failure preserves lifecycle/device-key state';Assert-CcodTrue (Test-Path -LiteralPath $install -PathType Container) 'CommitStarted failure preserves install root'
-        }finally{if(Test-Path -LiteralPath $local){Remove-Item -LiteralPath $local -Recurse -Force}}
+        }finally{if([IO.Directory]::Exists($local)){Remove-CcodTestOwnedTree -Path $local}}
 
         $tx=New-CcodUninstallBootstrapTestTransaction -Phase 'TaskRemoved';$tx.installedBinding=New-CcodUninstallBootstrapTestInstalledBinding;$world=[pscustomobject]@{Calls=[Collections.Generic.List[string]]::new();Transaction=$tx;RootPresent=$true;PublicEntry=$false;PublicCommand=$null;ShortcutsPresent=$true;CompletedReceipt=$false;Failure=$null;FailureInjected=$false;EntryPresentAtReclaim=$false};$adapters=New-CcodInstalledFinalizerMemoryAdapters $world;$adapters.ReclaimSelectedGeneration={param($Runtime,$Transaction)$world.Calls.Add('Reclaim');throw [Management.Automation.ErrorRecord]::new([IO.IOException]::new('commit failed'),'CCOD_GENERATION_RECLAMATION_COMMIT_FAILED',[Management.Automation.ErrorCategory]::WriteError,$Runtime)}.GetNewClosure()
         Assert-CcodThrows {Invoke-CcodInstalledUninstallFinalizer -TransactionId $tx.transactionId -RuntimeRoot $tx.installedBinding.selectedRuntimeRoot -InstallRoot 'C:\install' -WrapperIdentity ([pscustomobject]@{pid=42;creationTimeUtc='2030-02-03T03:04:05.0000000Z';sessionId=1;userSid='S-1-5-21-111-222-333-1001'}) -Adapters $adapters|Out-Null} 'CCOD_GENERATION_RECLAMATION_COMMIT_FAILED';Assert-CcodEqual 0 @($world.Calls|Where-Object{$_-in@('Write:ReadyForInno','ProductShortcuts','FinalizeReceipt','RemoveRegistry')}).Count 'CommitStarted failure reaches no phase write product removal or completion receipt'
@@ -1075,7 +1076,7 @@ function Invoke-CcodDefaultInstalledFinalizerNegative {
         $creationArgument=if($Mutation-ceq'WrapperIdentity'){'2001-02-03T04:05:06.0000000Z'}else{$wrapperCreation};$previousPreference=$ErrorActionPreference;try{$ErrorActionPreference='Continue';$output=& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $payload 'src\persistence\InstalledUninstallFinalizer.ps1') -TransactionId $id -RuntimeRoot $runtime -InstallRoot $install -WrapperProcessId $wrapper.Id -WrapperCreationTimeUtc $creationArgument 2>&1;$exit=$LASTEXITCODE}finally{$ErrorActionPreference=$previousPreference}
         if($exit-ne3){throw("FINALIZER_DIAGNOSTIC mutation={0} exit={1} output={2}"-f$Mutation,$exit,(@($output)-join' | '))};Assert-CcodEqual 3 $exit "$Mutation default child rejects before finalization";Assert-CcodTrue (Test-Path -LiteralPath $selected -PathType Container) "$Mutation preserves the selected generation";Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install 'state') -PathType Container) "$Mutation preserves sibling/root state"
 
-    }finally{if($null-ne$wrapper){try{if(-not$wrapper.HasExited){$wrapper.Kill();$wrapper.WaitForExit()}}catch{};$wrapper.Dispose()};[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if(Test-Path -LiteralPath $local){Remove-Item -LiteralPath $local -Recurse -Force}}
+    }finally{if($null-ne$wrapper){try{if(-not$wrapper.HasExited){$wrapper.Kill();$wrapper.WaitForExit()}}catch{};$wrapper.Dispose()};[Environment]::SetEnvironmentVariable('LOCALAPPDATA',$previous,'Process');if([IO.Directory]::Exists($local)){Remove-CcodTestOwnedTree -Path $local}}
 }
 
 $results += Invoke-CcodTest 'default staged installed finalizer child rejects the full negative authorization matrix without deletion' {
