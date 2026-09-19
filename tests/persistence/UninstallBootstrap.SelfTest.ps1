@@ -1,5 +1,6 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+Restore-CcodTestDesktopModulePath
 
 $repositoryRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $bootstrapScript = Join-Path $repositoryRoot 'src\persistence\UninstallBootstrap.ps1'

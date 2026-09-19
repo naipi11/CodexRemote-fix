@@ -1,5 +1,6 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+Restore-CcodTestDesktopModulePath
 . (Join-Path $PSScriptRoot 'LegacyReleaseFixture.ps1')
 
 $repositoryRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent

@@ -3,6 +3,7 @@ param([string]$FocusedCase)
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'TestSupport.ps1')
+Restore-CcodTestDesktopModulePath
 
 $repositoryRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $defenderPath = Join-Path $repositoryRoot 'tools\Test-ReleaseDefender.ps1'
@@ -1022,6 +1023,10 @@ Invoke-CcodTest 'sealed installer package rejects entry and identity changes bef
 # Production mutation caught: restoring any legacy recursive {app} copy or executing a writable app bootstrap before Ready.
 Invoke-CcodTest 'Setup contains only sealed temporary inputs and no pre-Ready app product write' {
     $source = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
+    # This text asset is not line-ending pinned, so a Windows checkout with
+    # core.autocrlf produces CRLF while a Unix checkout produces LF. Normalize so
+    # the line-anchored assertions below assert content rather than line endings.
+    $source = $source -replace "`r`n", "`n"
     Assert-CcodTrue ($source -cmatch '(?m)^CreateAppDir=no\s*$') 'Setup never creates app before Ready'
     Assert-CcodTrue ($source -cmatch '(?m)^Uninstallable=no\s*$') 'Setup never creates an Inno uninstaller before Ready'
     Assert-CcodTrue ($source -cmatch 'InstallerPackageSha256' -and $source -cmatch 'InstallerPackageManifestSha256' -and $source -cmatch 'ActivationBootstrapSha256') 'Setup binds package manifest and bootstrap hashes'

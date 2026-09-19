@@ -76,6 +76,27 @@ function Read-CcodTestStandardInputLine {
     try { return $reader.ReadLine() } finally { $reader.Dispose() }
 }
 
+function Restore-CcodTestDesktopModulePath {
+    # npm and GitHub Actions launch these Windows PowerShell 5.1 entry points from a
+    # PowerShell 7 shell. The inherited PSModulePath then contains only the
+    # PowerShell 7 module layout, so a 5.1 child process cannot resolve inbox
+    # cmdlets such as Get-ExecutionPolicy or Get-FileHash. The repository already
+    # normalizes this in tests/Validate.ps1 and tests/PersistenceSelfTest.ps1; do the
+    # same for any suite that CI starts directly from a PowerShell 7 shell.
+    [CmdletBinding()]
+    param()
+    if ($PSVersionTable.PSEdition -ne 'Desktop') { return }
+    $current = [Environment]::GetEnvironmentVariable('PSModulePath', 'Process')
+    if ([string]::IsNullOrWhiteSpace($current) -or $current -notmatch 'PowerShell\\7(\\|$|;)') { return }
+    $desktopModulePaths = @(
+        [Environment]::GetEnvironmentVariable('PSModulePath', 'User'),
+        [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    if ($desktopModulePaths.Count -gt 0) {
+        $env:PSModulePath = $desktopModulePaths -join ';'
+    }
+}
+
 function Get-CcodTestCanonicalTempRoot {
     # $env:TEMP can be a Windows 8.3 short-name alias such as
     # C:\Users\RUNNER~1\AppData\Local\Temp on hosted runners. Fixture roots

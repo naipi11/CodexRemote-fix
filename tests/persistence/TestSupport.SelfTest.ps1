@@ -84,6 +84,27 @@ if ($line -cne 'continue') { [Console]::Error.WriteLine('handshake failed'); exi
         if ([IO.Directory]::Exists($root)) { Remove-CcodTestOwnedTree -Path $root }
     }
 
+
+    # npm and Actions start these suites from a PowerShell 7 shell, which leaks a
+    # PowerShell 7 PSModulePath into the Windows PowerShell 5.1 child processes.
+    $previousModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Process')
+    try {
+        if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            [Environment]::SetEnvironmentVariable('PSModulePath', 'C:\Program Files\PowerShell\7\Modules', 'Process')
+            Restore-CcodTestDesktopModulePath
+            $restored = [Environment]::GetEnvironmentVariable('PSModulePath', 'Process')
+            if ($restored -match 'PowerShell\\7(\\|$|;)') { throw 'ASSERT_TRUE: a leaked PowerShell 7 module path was not replaced' }
+            if ([string]::IsNullOrWhiteSpace($restored)) { throw 'ASSERT_TRUE: the restored module path is empty' }
+            [Environment]::SetEnvironmentVariable('PSModulePath', 'C:\custom-desktop-modules', 'Process')
+            Restore-CcodTestDesktopModulePath
+            if ([Environment]::GetEnvironmentVariable('PSModulePath', 'Process') -cne 'C:\custom-desktop-modules') {
+                throw 'ASSERT_EQUAL: a Desktop-only module path was overwritten'
+            }
+        }
+    } finally {
+        [Environment]::SetEnvironmentVariable('PSModulePath', $previousModulePath, 'Process')
+    }
+
     Write-Output 'TestSupport self-tests passed.'
 } finally {
     if ([IO.Directory]::Exists($sentinel)) { [IO.Directory]::Delete($sentinel, $true) }

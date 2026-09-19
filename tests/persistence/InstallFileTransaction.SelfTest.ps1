@@ -352,6 +352,20 @@ Invoke-CcodTask2Fix1Test 'unsafe-recovery' 'empty-directory recovery rejects non
             Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed;$product=$null;&$lifecycleModule {param($Fence)Complete-CcodLifecycleProductCleanupFence -Fence $Fence -Outcome Completed|Out-Null} $fence
         }finally{if($null-ne$product){try{Close-CcodInstallFileTransaction -Transaction $product -Disposition Failed}catch{}};if($null-ne$outer){try{&$lifecycleModule {param($Context)Exit-CcodLifecycleProductCleanupLease -Context $Context|Out-Null} $outer}catch{}};Remove-CcodInstallFileFixture $fixture}
     }
+    # A hosted runner runs the suite as an elevated administrator whose inherited
+    # directory owner is the Administrators group (S-1-5-32-544) rather than the
+    # token user, so the recovery predicate must accept the token's default owner
+    # for inherited evidence while still rejecting a foreign owner.
+    $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+    try{
+        $defaultOwner=$identity.Owner
+        if($null-ne$defaultOwner){
+            $sddl='O:{0}D:AI(A;OICIID;FA;;;{1})(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)'-f$defaultOwner.Value,$identity.User.Value
+            $descriptor=[Security.AccessControl.RawSecurityDescriptor]::new($sddl);$bytes=[byte[]]::new($descriptor.BinaryLength);$descriptor.GetBinaryForm($bytes,0)
+            $sameDefaultOwner=&$module {param([byte[]]$Value)[bool](Invoke-CcodRuntimeStatic IsRecoverableLegacyPlanDirectorySecurity @((,$Value)))} $bytes
+            Assert-CcodEqual $true $sameDefaultOwner 'a directory owned by the token default owner is recoverable inherited evidence'
+        }
+    }finally{$identity.Dispose()}
     $identity=[Security.Principal.WindowsIdentity]::GetCurrent();try{$sddl='O:WDG:{0}D:AI(A;OICIID;FA;;;{0})(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)'-f$identity.User.Value;$descriptor=[Security.AccessControl.RawSecurityDescriptor]::new($sddl);$bytes=[byte[]]::new($descriptor.BinaryLength);$descriptor.GetBinaryForm($bytes,0);$recoverable=&$module {param([byte[]]$Value)[bool](Invoke-CcodRuntimeStatic IsRecoverableLegacyPlanDirectorySecurity @((,$Value)))} $bytes;Assert-CcodEqual $false $recoverable 'foreign owner is rejected by the same native recovery predicate'}finally{$identity.Dispose()}
 }
 
