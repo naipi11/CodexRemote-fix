@@ -2,7 +2,8 @@
 param(
     [string]$Version,
     [switch]$UseExistingTrayHost,
-    [string]$TrayHostArtifactDirectory
+    [string]$TrayHostArtifactDirectory,
+    [switch]$Library
 )
 
 Set-StrictMode -Version Latest
@@ -104,6 +105,230 @@ function Write-CcodBuildUtf8 {
     [IO.File]::WriteAllText($Path,$Text,[Text.UTF8Encoding]::new($false))
 }
 
+function Assert-CcodBuildInstallerDestinationInventory {
+    param([Parameter(Mandatory)][string]$Path)
+    $inventoryPath = Assert-CcodBuildRegularFile -Path $Path -Kind 'Installer destination inventory'
+    foreach ($line in [IO.File]::ReadAllLines($inventoryPath,[Text.UTF8Encoding]::new($false))) {
+        if ($line -match '^\s*\[[^\[\]\r\n]+\]\s*(?:;.*)?$') {
+            throw "Installer destination inventory contains an Inno section header: $line"
+        }
+    }
+    return $inventoryPath
+}
+
+function Assert-CcodBuildInnoPreprocessorLines {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines,
+        [Parameter(Mandatory)][string]$Kind
+    )
+    $allowedSimpleDirectives = @(
+        '#ifndef TrayHostArtifactDirectory',
+        '#define TrayHostArtifactDirectory SourcePath + "\generated\trayhost"',
+        '#ifndef PortableArtifactDirectory',
+        '#define PortableArtifactDirectory SourcePath + "\generated\portable"',
+        '#ifndef InstallerPayloadDirectory',
+        '#error InstallerPayloadDirectory must be supplied by the release builder',
+        '#ifndef InstallerPayloadManifestSha256',
+        '#error InstallerPayloadManifestSha256 must be supplied by the release builder',
+        '#ifndef ProjectVersion',
+        '#error ProjectVersion must be supplied by the release builder',
+        '#ifndef InstallerPackagePath',
+        '#error InstallerPackagePath must be supplied by the release builder',
+        '#ifndef InstallerPackageManifestPath',
+        '#error InstallerPackageManifestPath must be supplied by the release builder',
+        '#ifndef InstallerPackageSha256',
+        '#error InstallerPackageSha256 must be supplied by the release builder',
+        '#ifndef InstallerPackageManifestSha256',
+        '#error InstallerPackageManifestSha256 must be supplied by the release builder',
+        '#define InstallerPackageManifestSha256First Copy(InstallerPackageManifestSha256, 1, 32)',
+        '#define InstallerPackageManifestSha256Last Copy(InstallerPackageManifestSha256, 33, 32)',
+        '#ifndef ActivationBootstrapPath',
+        '#error ActivationBootstrapPath must be supplied by the release builder',
+        '#ifndef ActivationBootstrapSha256',
+        '#error ActivationBootstrapSha256 must be supplied by the release builder',
+        '#define ActivationBootstrapSha256First Copy(ActivationBootstrapSha256, 1, 32)',
+        '#define ActivationBootstrapSha256Last Copy(ActivationBootstrapSha256, 33, 32)',
+        '#ifndef SetupGitCommit',
+        '#error SetupGitCommit must be supplied by the release builder',
+        '#ifndef SetupProvenancePath',
+        '#error SetupProvenancePath must be supplied by the release builder',
+        '#endif'
+    )
+    $allowedInlineConstructs = @(
+        '{#ProjectVersion}',
+        '{#TrayHostArtifactDirectory}',
+        '{#PortableArtifactDirectory}',
+        '{#InstallerPayloadDirectory}',
+        '{#InstallerPayloadManifestSha256}',
+        '{#InstallerPackagePath}',
+        '{#InstallerPackageManifestPath}',
+        '{#InstallerPackageSha256}',
+        '{#InstallerPackageManifestSha256}',
+        '{#InstallerPackageManifestSha256First}',
+        '{#InstallerPackageManifestSha256Last}',
+        '{#ActivationBootstrapPath}',
+        '{#ActivationBootstrapSha256}',
+        '{#ActivationBootstrapSha256First}',
+        '{#ActivationBootstrapSha256Last}',
+        '{#SetupGitCommit}',
+        '{#SetupProvenancePath}'
+    )
+    for ($lineIndex = 0; $lineIndex -lt $Lines.Count; $lineIndex++) {
+        $line = [string]$Lines[$lineIndex]
+        $lineNumber = $lineIndex + 1
+        if ($line -match '\\\s*$') {
+            throw "$Kind requires an include-free simple preprocessor source; line continuation is not permitted at line $lineNumber."
+        }
+        if ($line -match '^\s*#' -and $allowedSimpleDirectives -cnotcontains $line) {
+            throw "$Kind requires an include-free exact preprocessor source; unsafe simple directive at line ${lineNumber}: $line"
+        }
+        $inlineStart = $line.IndexOf('{#',[StringComparison]::Ordinal)
+        while ($inlineStart -ge 0) {
+            $inlineEnd = $line.IndexOf('}',$inlineStart + 2)
+            if ($inlineEnd -lt 0) {
+                throw "$Kind contains an unterminated inline preprocessor construct at line $lineNumber."
+            }
+            $inlineConstruct = $line.Substring($inlineStart,$inlineEnd - $inlineStart + 1)
+            if ($allowedInlineConstructs -cnotcontains $inlineConstruct) {
+                throw "$Kind contains an unsafe inline preprocessor construct at line ${lineNumber}: $inlineConstruct"
+            }
+            $inlineStart = $line.IndexOf('{#',$inlineEnd + 1,[StringComparison]::Ordinal)
+        }
+    }
+}
+
+function New-CcodBuildGeneratedInnoScript {
+    param(
+        [Parameter(Mandatory)][string]$TemplatePath,
+        [Parameter(Mandatory)][string]$InventoryPath,
+        [Parameter(Mandatory)][string]$OutputPath
+    )
+    $template = Assert-CcodBuildRegularFile -Path $TemplatePath -Kind 'Inno Setup template'
+    $inventory = Assert-CcodBuildInstallerDestinationInventory -Path $InventoryPath
+    $output = [IO.Path]::GetFullPath($OutputPath)
+    if ([IO.File]::Exists($output) -or [IO.Directory]::Exists($output)) {
+        throw "Refusing to overwrite generated Inno Setup script: $output"
+    }
+    $templateDirectory = [IO.Path]::GetFullPath((Split-Path $template -Parent)).TrimEnd('\')
+    $outputDirectory = [IO.Path]::GetFullPath((Split-Path $output -Parent)).TrimEnd('\')
+    if (-not $outputDirectory.Equals($templateDirectory,[StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetExtension($output) -cne '.iss') {
+        throw 'The generated Inno Setup script must be a sibling .iss file of its template.'
+    }
+
+    $marker = '// CCOD_INSTALLER_DESTINATION_INVENTORY'
+    $templateSource = [IO.File]::ReadAllText($template,[Text.UTF8Encoding]::new($false))
+    Assert-CcodBuildInnoPreprocessorLines -Lines ([IO.File]::ReadAllLines($template,[Text.UTF8Encoding]::new($false))) -Kind 'The Inno Setup template'
+    $markerCount = [regex]::Matches($templateSource,[regex]::Escape($marker)).Count
+    $markerLineCount = [regex]::Matches($templateSource,'(?m)^\s*// CCOD_INSTALLER_DESTINATION_INVENTORY\s*$').Count
+    if ($markerCount -ne 1 -or $markerLineCount -ne 1) {
+        throw "The Inno Setup template must contain exactly one inventory marker comment; found $markerCount."
+    }
+
+    $inventorySource = [IO.File]::ReadAllText($inventory,[Text.UTF8Encoding]::new($false)).TrimEnd("`r","`n")
+    $generatedSource = $templateSource.Replace($marker,$inventorySource)
+    if ($generatedSource.Contains($marker)) {
+        throw 'The generated Inno Setup script contains an unresolved inventory marker.'
+    }
+    Assert-CcodBuildInnoPreprocessorLines -Lines ([regex]::Split($generatedSource,'\r\n|\n|\r')) -Kind 'The generated Inno Setup script'
+
+    try {
+        Write-CcodBuildUtf8 -Path $output -Text $generatedSource
+        $writtenSource = [IO.File]::ReadAllText((Assert-CcodBuildRegularFile -Path $output -Kind 'Generated Inno Setup script'),[Text.UTF8Encoding]::new($false))
+        if (-not $writtenSource.Equals($generatedSource,[StringComparison]::Ordinal)) {
+            throw 'The generated Inno Setup script changed during write verification.'
+        }
+        return $output
+    } catch {
+        if ([IO.File]::Exists($output)) { Remove-Item -LiteralPath $output -Force -ErrorAction SilentlyContinue }
+        throw
+    }
+}
+
+function Invoke-CcodBuildInnoCompiler {
+    param(
+        [Parameter(Mandatory)][string]$TemplatePath,
+        [Parameter(Mandatory)][string]$InventoryPath,
+        [Parameter(Mandatory)][string]$IsccPath,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments,
+        [Parameter(Mandatory)][string]$SetupPath
+    )
+    $template = Assert-CcodBuildRegularFile -Path $TemplatePath -Kind 'Inno Setup template'
+    $compiler = Assert-CcodBuildRegularFile -Path $IsccPath -Kind 'Inno Setup compiler'
+    $setup = [IO.Path]::GetFullPath($SetupPath)
+    if ([IO.File]::Exists($setup) -or [IO.Directory]::Exists($setup)) {
+        throw "Refusing to compile over an existing setup output: $setup"
+    }
+    $generatedScriptPath = Join-Path (Split-Path $template -Parent) ('.ccod-generated-setup-' + [guid]::NewGuid().ToString('N') + '.iss')
+    try {
+        $generatedScript = New-CcodBuildGeneratedInnoScript -TemplatePath $template -InventoryPath $InventoryPath -OutputPath $generatedScriptPath
+        $compilerArguments = @($Arguments) + @($generatedScript)
+        & $compiler @compilerArguments
+        $compilerExitCode = $LASTEXITCODE
+        if ($compilerExitCode -ne 0 -or -not (Test-Path -LiteralPath $setup -PathType Leaf)) {
+            throw "Inno Setup compilation failed with exit code $compilerExitCode"
+        }
+    } finally {
+        if ([IO.File]::Exists($generatedScriptPath)) {
+            $generatedFull = [IO.Path]::GetFullPath($generatedScriptPath)
+            $templateDirectory = [IO.Path]::GetFullPath((Split-Path $template -Parent)).TrimEnd('\') + '\'
+            $generatedItem = Get-Item -LiteralPath $generatedFull -Force -ErrorAction Stop
+            if (-not $generatedFull.StartsWith($templateDirectory,[StringComparison]::OrdinalIgnoreCase) -or
+                [IO.Path]::GetFileName($generatedFull) -cnotmatch '^\.ccod-generated-setup-[0-9a-f]{32}\.iss$' -or
+                (($generatedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                throw "Refusing to clean an unexpected generated Inno Setup path: $generatedFull"
+            }
+            Remove-Item -LiteralPath $generatedFull -Force -ErrorAction Stop
+        }
+    }
+}
+
+function Remove-CcodBuildTemporarySetupInput {
+    param(
+        [Parameter(Mandatory)][string]$BuildRoot,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('PayloadDirectory','DestinationInventory')][string]$Kind
+    )
+    $root = [IO.Path]::GetFullPath($BuildRoot).TrimEnd('\')
+    $candidate = [IO.Path]::GetFullPath($Path)
+    $parent = [IO.Path]::GetFullPath((Split-Path $candidate -Parent)).TrimEnd('\')
+    $leaf = [IO.Path]::GetFileName($candidate)
+    $expectedPattern = if ($Kind -ceq 'PayloadDirectory') { '^\.installer-payload-stage-[0-9a-f]{32}$' } else { '^\.installer-destination-inventory-[0-9a-f]{32}\.iss$' }
+    if (-not $parent.Equals($root,[StringComparison]::OrdinalIgnoreCase) -or $leaf -cnotmatch $expectedPattern) {
+        throw "Refusing to clean an unexpected temporary Setup input: $candidate"
+    }
+    if ($Kind -ceq 'PayloadDirectory') {
+        if (-not [IO.Directory]::Exists($candidate)) { return }
+        $rootItem = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+        if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Refusing to clean a reparse Setup payload stage: $candidate" }
+        foreach ($item in @(Get-ChildItem -LiteralPath $candidate -Force -Recurse -ErrorAction Stop)) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Refusing to clean a Setup payload stage containing a reparse point: $($item.FullName)" }
+        }
+        Remove-Item -LiteralPath $candidate -Recurse -Force -ErrorAction Stop
+        return
+    }
+    if (-not [IO.File]::Exists($candidate)) { return }
+    $inventory = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+    if ($inventory.PSIsContainer -or ($inventory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Refusing to clean an unsafe Setup destination inventory: $candidate" }
+    Remove-Item -LiteralPath $candidate -Force -ErrorAction Stop
+}
+
+function Invoke-CcodBuildTemporarySetupScope {
+    param(
+        [Parameter(Mandatory)][string]$BuildRoot,
+        [Parameter(Mandatory)][string]$InstallerPayloadDirectory,
+        [Parameter(Mandatory)][string]$DestinationInventoryPath,
+        [Parameter(Mandatory)][scriptblock]$Action
+    )
+    try { & $Action $InstallerPayloadDirectory $DestinationInventoryPath }
+    finally {
+        Remove-CcodBuildTemporarySetupInput -BuildRoot $BuildRoot -Path $InstallerPayloadDirectory -Kind PayloadDirectory
+        Remove-CcodBuildTemporarySetupInput -BuildRoot $BuildRoot -Path $DestinationInventoryPath -Kind DestinationInventory
+    }
+}
+
+if ($Library) { return }
+
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $package = Get-Content -LiteralPath (Join-Path $repoRoot 'package.json') -Raw | ConvertFrom-Json
 $packageVersion = ([string]$package.version).TrimStart('v')
@@ -113,6 +338,11 @@ $Version = $Version.TrimStart('v')
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid project version for the portable bundle: $Version" }
 if ($Version -cne $packageVersion) { throw "Requested release version $Version does not match package.json version $packageVersion" }
 Assert-CcodBuildCleanCheckout -RepositoryRoot $repoRoot
+$releaseAssetContractPath = Join-Path $repoRoot 'tools\ReleaseAssetContract.psm1'
+if (-not [IO.File]::Exists($releaseAssetContractPath)) { throw "Release asset contract is missing: $releaseAssetContractPath" }
+Import-Module $releaseAssetContractPath -Force -ErrorAction Stop
+$releaseAssetNames = @(Get-CcodExpectedReleaseAssetNames -Version $Version)
+if ($releaseAssetNames.Count -ne 11) { throw 'Release asset contract did not return exactly eleven ordered names.' }
 $gitCommit = Get-CcodBuildGitCommit -RepositoryRoot $repoRoot
 $buildTimestampUtc = [DateTime]::UtcNow.ToString('o',[Globalization.CultureInfo]::InvariantCulture)
 
@@ -126,18 +356,25 @@ if ($UseExistingTrayHost) {
 
 $dist = Join-Path $PSScriptRoot 'dist'
 [IO.Directory]::CreateDirectory($dist) | Out-Null
-$bundle = Join-Path $dist "CodexRemote-fix-$Version-windows-x64.zip"
-$checksum = "$bundle.sha256.txt"
-$provenance = Join-Path $dist "CodexRemote-fix-$Version-trayhost-provenance.json"
-$payloadManifestAsset = Join-Path $dist "CodexRemote-fix-$Version-payload-manifest.json"
-$releaseManifest = Join-Path $dist "CodexRemote-fix-$Version-release-manifest.json"
-$setupExe = Join-Path $dist "CodexRemote-fix-$Version-setup.exe"
-$setupChecksum = "$setupExe.sha256.txt"
-foreach ($path in @($bundle,$checksum,$provenance,$payloadManifestAsset,$releaseManifest,$setupExe,$setupChecksum)) {
+$bundle = Join-Path $dist $releaseAssetNames[0]
+$checksum = Join-Path $dist $releaseAssetNames[1]
+$provenance = Join-Path $dist $releaseAssetNames[2]
+$payloadManifestAsset = Join-Path $dist $releaseAssetNames[3]
+$releaseManifest = Join-Path $dist $releaseAssetNames[4]
+$setupExe = Join-Path $dist $releaseAssetNames[5]
+$setupChecksum = Join-Path $dist $releaseAssetNames[6]
+$setupProvenance = Join-Path $dist $releaseAssetNames[7]
+$setupPayloadInput = Join-Path $dist $releaseAssetNames[8]
+$setupInventoryInput = Join-Path $dist $releaseAssetNames[9]
+$setupReleaseManifest = Join-Path $dist $releaseAssetNames[10]
+foreach ($path in @($bundle,$checksum,$provenance,$payloadManifestAsset,$releaseManifest,$setupExe,$setupChecksum,$setupProvenance,$setupPayloadInput,$setupInventoryInput,$setupReleaseManifest)) {
     if ([IO.File]::Exists($path) -or [IO.Directory]::Exists($path)) { throw "Refusing to overwrite immutable release output: $path" }
 }
 
 $stageRoot = Join-Path $PSScriptRoot ('.portable-stage-' + [guid]::NewGuid().ToString('N'))
+$installerPayloadDirectory = Join-Path $PSScriptRoot ('.installer-payload-stage-' + [guid]::NewGuid().ToString('N'))
+$installerDestinationInventoryPath = Join-Path $PSScriptRoot ('.installer-destination-inventory-' + [guid]::NewGuid().ToString('N') + '.iss')
+Invoke-CcodBuildTemporarySetupScope -BuildRoot $PSScriptRoot -InstallerPayloadDirectory $installerPayloadDirectory -DestinationInventoryPath $installerDestinationInventoryPath -Action ({
 try {
     [IO.Directory]::CreateDirectory($stageRoot) | Out-Null
     $payloadRoot = Join-Path $stageRoot 'payload'
@@ -157,7 +394,8 @@ try {
         'src/persistence/LifecycleWorker.ps1',
         'src/persistence/bootstrap.ps1',
         'src/persistence/UninstallBootstrap.ps1',
-        'src/persistence/PortableUninstallFinalizer.ps1'
+        'src/persistence/PortableUninstallFinalizer.ps1',
+        'src/persistence/InstalledUninstallFinalizer.ps1'
     )) {
         Copy-CcodBuildPayloadFile -Source (Join-Path $repoRoot ($relative.Replace('/','\'))) -PayloadRoot $payloadRoot -Relative $relative
     }
@@ -172,7 +410,9 @@ try {
         $relative = $runtimeFile.FullName.Substring($runtimeRoot.TrimEnd('\').Length + 1).Replace('\','/')
         Copy-CcodBuildPayloadFile -Source $runtimeFile.FullName -PayloadRoot $payloadRoot -Relative ('src/runtime/' + $relative)
     }
-    Invoke-CcodPortableLauncherBuild -RepositoryRoot $repoRoot -Version $Version -OutputDirectory (Join-Path $PSScriptRoot 'generated\portable') -GitCommit $gitCommit -BuildTimestampUtc $buildTimestampUtc | Out-Null
+    $portableArtifact = Join-Path $PSScriptRoot 'generated\portable'
+    Invoke-CcodPortableLauncherBuild -RepositoryRoot $repoRoot -Version $Version -OutputDirectory $portableArtifact -GitCommit $gitCommit -BuildTimestampUtc $buildTimestampUtc | Out-Null
+    Test-CcodPortableLauncherArtifact -RepositoryRoot $repoRoot -Version $Version -ArtifactDirectory $portableArtifact -ExpectedGitCommit $gitCommit | Out-Null
     foreach ($trayHostFile in @('CodexRemote.TrayHost.exe','CodexRemote.TrayHost.exe.config','trayhost-build-provenance.json')) {
         Copy-CcodBuildPayloadFile -Source (Join-Path $trayHostArtifact $trayHostFile) -PayloadRoot $payloadRoot -Relative ('bin/' + $trayHostFile)
     }
@@ -186,6 +426,33 @@ try {
         Remove-Module -Name $lifecycleModule.Name -Force -ErrorAction SilentlyContinue
     }
     $payloadRecords = Get-CcodBuildPayloadRecords -PayloadRoot $payloadRoot
+    [IO.Directory]::CreateDirectory($installerPayloadDirectory) | Out-Null
+    foreach ($record in $payloadRecords) {
+        Copy-CcodBuildPayloadFile -Source (Join-Path $payloadRoot ([string]$record.path).Replace('/','\')) -PayloadRoot $installerPayloadDirectory -Relative ([string]$record.path)
+    }
+    $installerPayloadManifestPath = Join-Path $installerPayloadDirectory 'installer-payload.manifest.json'
+    $installerPayloadGenerator = Join-Path $repoRoot 'tools\New-InstallerPayloadManifest.ps1'
+    if (-not [IO.File]::Exists($installerPayloadGenerator)) { throw "Installer payload manifest generator is missing: $installerPayloadGenerator" }
+    $installerPayloadManifest = & $installerPayloadGenerator -PayloadRoot $installerPayloadDirectory -ProjectVersion $Version -OutputPath $installerPayloadManifestPath
+    if (@($installerPayloadManifest.files).Count -ne $payloadRecords.Count) { throw 'Installer payload generator record count differs from the verified portable payload.' }
+    for ($recordIndex = 0; $recordIndex -lt $payloadRecords.Count; $recordIndex++) {
+        if ([string]$installerPayloadManifest.files[$recordIndex].path -cne [string]$payloadRecords[$recordIndex].path -or
+            [int64]$installerPayloadManifest.files[$recordIndex].length -ne [int64]$payloadRecords[$recordIndex].length -or
+            [string]$installerPayloadManifest.files[$recordIndex].sha256 -cne [string]$payloadRecords[$recordIndex].sha256) {
+            throw 'Installer payload generator records differ from the verified portable payload.'
+        }
+    }
+    $installerPayloadManifestSha256 = Get-CcodBuildFileSha256 -Path $installerPayloadManifestPath
+    $installerPackagePath = Join-Path $installerPayloadDirectory 'installer-package.zip'
+    $installerPackageManifestPath = Join-Path $installerPayloadDirectory 'installer-package.manifest.json'
+    Import-Module (Join-Path $PSScriptRoot 'InstallerPackage.psm1') -Force
+    $installerPackage = New-CcodInstallerPackage -PayloadRoot $installerPayloadDirectory -PayloadManifestPath $installerPayloadManifestPath -Version $Version -GitCommit $gitCommit -OutputPath $installerPackagePath -ManifestOutputPath $installerPackageManifestPath
+    Test-CcodInstallerPackage -PackagePath $installerPackagePath -ManifestPath $installerPackageManifestPath -ExpectedPackageSha256 $installerPackage.PackageSha256 -ExpectedManifestSha256 $installerPackage.ManifestSha256 -ExpectedVersion $Version -ExpectedGitCommit $gitCommit | Out-Null
+    $activationBootstrapPath = Assert-CcodBuildRegularFile -Path (Join-Path $repoRoot 'Activate-CcodRemoteFix.ps1') -Kind 'Activation bootstrap'
+    $activationBootstrapSha256 = Get-CcodBuildFileSha256 -Path $activationBootstrapPath
+    $destinationInventoryGenerator = Join-Path $repoRoot 'tools\New-InstallerDestinationInventory.ps1'
+    if (-not [IO.File]::Exists($destinationInventoryGenerator)) { throw "Installer destination inventory generator is missing: $destinationInventoryGenerator" }
+    & $destinationInventoryGenerator -RepositoryRoot $repoRoot -PayloadRoot $installerPayloadDirectory -ProjectVersion $Version -InnoScriptPath (Join-Path $PSScriptRoot 'CodexControlOtherDevices.iss') -OutputPath $installerDestinationInventoryPath | Out-Null
     $payloadManifestPath = Join-Path $stageRoot 'payload-manifest.json'
     $payloadManifest = [ordered]@{
         schemaVersion = 1
@@ -223,9 +490,6 @@ try {
         )
     }
     Write-CcodBuildUtf8 -Path $releaseManifest -Text (($releaseRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
-    $releaseValidationTool = Join-Path $repoRoot 'tools\Test-ReleaseDefender.ps1'
-    if (-not (Test-Path -LiteralPath $releaseValidationTool -PathType Leaf)) { throw "Release manifest validator is missing: $releaseValidationTool" }
-    . $releaseValidationTool -Library
     Test-CcodReleaseAssetManifest -ManifestPath $releaseManifest -AssetDirectory $dist -ExpectedVersion $Version | Out-Null
 } finally {
     if ([IO.Directory]::Exists($stageRoot)) {
@@ -256,14 +520,27 @@ $isccCandidates = @(
 $iscc = $isccCandidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and [IO.File]::Exists($_) } | Select-Object -First 1
 if (-not $iscc) { throw 'Inno Setup 6 (ISCC.exe) was not found. Install it with: winget install --id JRSoftware.InnoSetup --exact' }
 $issPath = Join-Path $PSScriptRoot 'CodexControlOtherDevices.iss'
-$portableArtifact = Join-Path $PSScriptRoot 'generated\portable'
-& $iscc "/DProjectVersion=$Version" "/DTrayHostArtifactDirectory=$trayHostArtifact" "/DPortableArtifactDirectory=$portableArtifact" "/O$dist\." $issPath
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $setupExe -PathType Leaf)) {
-    throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
-}
-$setupHash = Get-CcodBuildFileSha256 -Path $setupExe
+Import-Module (Join-Path $PSScriptRoot 'SetupArtifact.psm1') -Force
+[IO.File]::Copy((Assert-CcodBuildRegularFile -Path $installerPackageManifestPath -Kind 'Installer package manifest'),$setupPayloadInput,$false)
+[IO.File]::Copy((Assert-CcodBuildRegularFile -Path $installerDestinationInventoryPath -Kind 'Installer destination inventory'),$setupInventoryInput,$false)
+$setupProvenanceRecord = New-CcodSealedSetupBuildProvenance -Version $Version -GitCommit $gitCommit -BuildTimestampUtc $buildTimestampUtc -PackagePath $installerPackagePath -PackageManifestPath $installerPackageManifestPath -ActivationBootstrapPath $activationBootstrapPath -InnoTemplatePath $issPath -DestinationInventoryPath $installerDestinationInventoryPath -CompilerPath $iscc -OutputPath $setupProvenance
+Test-CcodSealedSetupBuildProvenance -ProvenancePath $setupProvenance -ExpectedVersion $Version -ExpectedGitCommit $gitCommit -ExpectedPackageSha256 $installerPackage.PackageSha256 -ExpectedPackageManifestSha256 $installerPackage.ManifestSha256 -ExpectedActivationBootstrapSha256 $activationBootstrapSha256 -ExpectedBuildTimestampUtc $buildTimestampUtc -PackagePath $installerPackagePath -PackageManifestPath $installerPackageManifestPath -ActivationBootstrapPath $activationBootstrapPath -InnoTemplatePath $issPath -DestinationInventoryPath $installerDestinationInventoryPath -CompilerPath $iscc | Out-Null
+$isccArguments = @(
+    "/DProjectVersion=$Version",
+    "/DInstallerPackagePath=$installerPackagePath",
+    "/DInstallerPackageManifestPath=$installerPackageManifestPath",
+    "/DInstallerPackageSha256=$($installerPackage.PackageSha256)",
+    "/DInstallerPackageManifestSha256=$($installerPackage.ManifestSha256)",
+    "/DActivationBootstrapPath=$activationBootstrapPath",
+    "/DActivationBootstrapSha256=$activationBootstrapSha256",
+    "/DSetupGitCommit=$gitCommit",
+    "/DSetupProvenancePath=$setupProvenance",
+    "/O$dist\."
+)
+Invoke-CcodBuildInnoCompiler -TemplatePath $issPath -InventoryPath $installerDestinationInventoryPath -IsccPath $iscc -Arguments $isccArguments -SetupPath $setupExe
+$setupValidation = Test-CcodSetupArtifact -SetupPath $setupExe -ExpectedVersion $Version -ExpectedGitCommit $gitCommit -ExpectedPackageSha256 $installerPackage.PackageSha256 -ExpectedPackageManifestSha256 $installerPackage.ManifestSha256 -ExpectedActivationBootstrapSha256 $activationBootstrapSha256
+$setupHash = [string]$setupValidation.Sha256
 Write-CcodBuildUtf8 -Path $setupChecksum -Text ("{0} *{1}" -f $setupHash,[IO.Path]::GetFileName($setupExe))
-$setupReleaseManifest = Join-Path $dist "CodexRemote-fix-$Version-setup-release-manifest.json"
 $setupRecord = [ordered]@{
     schemaVersion = 1
     product = 'CodexRemote-fix'
@@ -273,15 +550,28 @@ $setupRecord = [ordered]@{
     assets = @(
         [ordered]@{ name = [IO.Path]::GetFileName($setupExe); sha256 = $setupHash },
         [ordered]@{ name = [IO.Path]::GetFileName($setupChecksum); sha256 = Get-CcodBuildFileSha256 -Path $setupChecksum },
-        [ordered]@{ name = [IO.Path]::GetFileName($provenance); sha256 = Get-CcodBuildFileSha256 -Path $provenance }
+        [ordered]@{ name = [IO.Path]::GetFileName($provenance); sha256 = Get-CcodBuildFileSha256 -Path $provenance },
+        [ordered]@{ name = [IO.Path]::GetFileName($setupProvenance); sha256 = Get-CcodBuildFileSha256 -Path $setupProvenance },
+        [ordered]@{ name = [IO.Path]::GetFileName($setupPayloadInput); sha256 = Get-CcodBuildFileSha256 -Path $setupPayloadInput },
+        [ordered]@{ name = [IO.Path]::GetFileName($setupInventoryInput); sha256 = Get-CcodBuildFileSha256 -Path $setupInventoryInput }
     )
 }
 Write-CcodBuildUtf8 -Path $setupReleaseManifest -Text (($setupRecord | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
 Test-CcodReleaseAssetManifest -ManifestPath $setupReleaseManifest -AssetDirectory $dist -ExpectedVersion $Version | Out-Null
+Test-CcodExactReleaseAssetSet -AssetDirectory $dist -Version $Version | Out-Null
 
 Write-Host ''
 Write-Host 'Installer build completed:' -ForegroundColor Green
 Write-Host ("  Setup:    {0}" -f $setupExe)
 Write-Host ("  SHA-256:  {0}" -f $setupChecksum)
+Write-Host ("  Provenance: {0}" -f $setupProvenance)
 Write-Host ("  Manifest: {0}" -f $setupReleaseManifest)
 Write-Host ''
+})
+
+# NOTE: this action must stay a plain scriptblock. PowerShell 7 gives
+# GetNewClosure() a fresh dynamic module whose command resolution cannot see the
+# functions defined in this script, so wrapping the action would break every
+# local call such as Copy-CcodBuildPayloadFile. Windows PowerShell 5.1 happens to
+# resolve those names, so the defect only appears under the pwsh used by the
+# release workflow.

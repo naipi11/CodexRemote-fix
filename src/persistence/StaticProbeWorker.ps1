@@ -114,6 +114,19 @@ function Test-CcodStaticRuntimeId {
     return $Value -is [string] -and $Value -cmatch '^[A-Za-z0-9._-]{1,96}$'
 }
 
+function ConvertTo-CcodStaticRuntimeGeneration {
+    param([Parameter(Mandatory)]$Value,[Parameter(Mandatory)][string]$Path,[switch]$AllowZero)
+    $minimum=if($AllowZero){[decimal]0}else{[decimal]1}
+    $integerTypes=@([byte],[uint16],[uint32],[uint64],[int16],[int32],[int64])
+    $typed=$Value -is [decimal]
+    if(-not$typed){foreach($type in $integerTypes){if($Value -is $type){$typed=$true;break}}}
+    if(-not$typed){Throw-CcodStaticProbeError 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active generation is not an unsigned integer' $Path}
+    try{
+        if([decimal]$Value -lt $minimum -or ($Value -is [decimal] -and [decimal]::Truncate($Value)-ne$Value)){throw 'range'}
+        return [uint64]$Value
+    }catch{Throw-CcodStaticProbeError 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active generation is outside UInt64' $Path}
+}
+
 function Test-CcodStaticCanonicalSid {
     param($Value)
     if ($Value -isnot [string]) { return $false }
@@ -248,6 +261,15 @@ function Get-CcodStaticProbePathAdapters {
         DirectoryExists={param($Path)[IO.Directory]::Exists($Path)}
     }
     if($null -ne $Adapters){foreach($key in @('GetItem','FileExists','DirectoryExists')){if($Adapters.ContainsKey($key)){$resolved[$key]=$Adapters[$key]}}}
+    if($null-ne$Adapters-and$Adapters.ContainsKey('GetSelectorRootResult')){$resolved.GetSelectorRootResult=$Adapters.GetSelectorRootResult}
+    else{
+        $getItem=$resolved.GetItem
+        $resolved.GetSelectorRootResult={
+            param($Path)
+            try{$item=&$getItem $Path $false}catch [Management.Automation.ItemNotFoundException]{return [pscustomobject][ordered]@{Status='Missing';Item=$null}}
+            return [pscustomobject][ordered]@{Status='Found';Item=$item}
+        }.GetNewClosure()
+    }
     return $resolved
 }
 
@@ -421,12 +443,13 @@ function Test-CcodStaticManifestPath {
 }
 
 function Get-CcodStaticRuntimeIdFromRecords {
-    param([string]$ProjectVersion,[object[]]$Files)
+    param([string]$ProjectVersion,[object[]]$Files,[string]$ExpectedRuntimeId)
     $lines=[Collections.Generic.List[string]]::new()
-    foreach($file in $Files){$lines.Add(('{0}`t{1}`t{2}' -f [string]$file.path,[int64]$file.length,[string]$file.sha256))}
+    foreach($file in $Files){$lines.Add(("{0}`t{1}`t{2}" -f [string]$file.path,[int64]$file.length,[string]$file.sha256))}
     $canonical=$lines -join "`n";$sha=[Security.Cryptography.SHA256]::Create()
     try{$digest=[BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
-    $runtimeId='{0}-{1}' -f $ProjectVersion,$digest.Substring(0,16)
+    $match=[regex]::Match($ExpectedRuntimeId,'^(?<version>[A-Za-z0-9][A-Za-z0-9._-]{0,45})-(?<digest>[0-9a-f]{16})-(?<nonce>[0-9a-f]{32})$');if(-not$match.Success-or$match.Groups['version'].Value-cne$ProjectVersion){Throw-CcodStaticProbeError 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Runtime identity format is invalid' $ExpectedRuntimeId}
+    $runtimeId='{0}-{1}-{2}' -f $ProjectVersion,$digest.Substring(0,16),$match.Groups['nonce'].Value
     if(-not (Test-CcodStaticRuntimeId $runtimeId)){Throw-CcodStaticProbeError 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Computed runtime ID is invalid' $null}
     return $runtimeId
 }
@@ -442,6 +465,15 @@ function Get-CcodStaticFileSha256 {
     }finally{$sha.Dispose()}
 }
 
+function Assert-CcodStaticSelectorFile {
+    param([string]$InstallRoot,[string]$Path,[hashtable]$Adapters)
+    Assert-CcodStaticProbeNoReparse $InstallRoot $Path -Adapters $Adapters
+    try{$item=Get-Item -LiteralPath $Path -Force -ErrorAction Stop;if($item.PSIsContainer-or$item-isnot[IO.FileInfo]){throw'not file'};$streams=@(Get-Item -LiteralPath $Path -Stream * -ErrorAction Stop);if($streams.Count-ne1-or[string]$streams[0].Stream-cne':$DATA'){throw'stream'};if($null-eq('CcodStaticSelectorIdentity' -as[type])){Add-Type -TypeDefinition @'
+using System; using System.ComponentModel; using System.IO; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
+public static class CcodStaticSelectorIdentity { [StructLayout(LayoutKind.Sequential)] struct I { public uint A; public System.Runtime.InteropServices.ComTypes.FILETIME C,X,W; public uint V,H,L,N,Ih,Il; } [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetFileInformationByHandle(SafeFileHandle h,out I i); public static uint Links(string p){using(FileStream s=new FileStream(p,FileMode.Open,FileAccess.Read,FileShare.Read)){I i;if(!GetFileInformationByHandle(s.SafeFileHandle,out i))throw new Win32Exception(Marshal.GetLastWin32Error());return i.N;}} }
+'@};if([CcodStaticSelectorIdentity]::Links($Path)-ne1){throw'links'}}catch{Throw-CcodStaticProbeError 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active selector leaf is unsafe' $Path}
+}
+
 function Get-CcodStaticProbeRuntimeAuthorization {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ScriptPath,[hashtable]$Adapters)
@@ -452,11 +484,29 @@ function Get-CcodStaticProbeRuntimeAuthorization {
         if((Split-Path $persistenceRoot -Leaf) -cne 'persistence' -or (Split-Path $srcRoot -Leaf) -cne 'src' -or (Split-Path $runtimeContainer -Leaf) -cne 'runtime' -or -not (Test-CcodStaticRuntimeId $runtimeId)){throw 'layout'}
         $installRoot=[IO.Path]::GetFullPath($installRoot);$runtimeRoot=[IO.Path]::GetFullPath($runtimeRoot)
         Assert-CcodStaticProbeNoReparse -Root $installRoot -Path $ScriptPath -Adapters $Adapters
-        $activePath=[IO.Path]::GetFullPath((Join-Path $installRoot 'active.json'));Assert-CcodStaticProbeNoReparse $installRoot $activePath -Adapters $Adapters
-        $active=Read-CcodStaticProbeLocalJson $activePath;Assert-CcodStaticExactObject $active @('schemaVersion','activeRuntime','previousRuntime','updatedAtUtc') 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active pointer'|Out-Null
-        if($active.schemaVersion -isnot [int] -or $active.schemaVersion -ne 1 -or -not(Test-CcodStaticRuntimeId $active.activeRuntime) -or
-            ($null -ne $active.previousRuntime -and (-not(Test-CcodStaticRuntimeId $active.previousRuntime) -or $active.previousRuntime -ceq $active.activeRuntime)) -or
-            -not(Test-CcodStaticCanonicalUtc $active.updatedAtUtc) -or $active.activeRuntime -cne $runtimeId){throw 'active pointer'}
+        $stateRoot=[IO.Path]::GetFullPath((Join-Path $installRoot 'state'))
+        $pointerRoot=[IO.Path]::GetFullPath((Join-Path $installRoot 'state\active-generation'))
+        $pathAdapters=Get-CcodStaticProbePathAdapters $Adapters
+        $stateResult=Invoke-CcodStaticAdapter $pathAdapters.GetSelectorRootResult @($stateRoot) Single 'CCOD_STATIC_RUNTIME_UNAUTHORIZED'
+        Assert-CcodStaticExactObject $stateResult @('Status','Item') 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active selector state lookup'|Out-Null
+        if($stateResult.Status -isnot [string]){throw 'state lookup status'}
+        if($stateResult.Status-ceq'Missing'){if($null-ne$stateResult.Item){throw 'state missing item'};$pointerRootItem=$null}
+        elseif($stateResult.Status-ceq'Found'){
+            if($null-eq$stateResult.Item-or-not$stateResult.Item.PSIsContainer-or($stateResult.Item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0){throw 'state root type'}
+            $selectorResult=Invoke-CcodStaticAdapter $pathAdapters.GetSelectorRootResult @($pointerRoot) Single 'CCOD_STATIC_RUNTIME_UNAUTHORIZED'
+            Assert-CcodStaticExactObject $selectorResult @('Status','Item') 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active selector lookup'|Out-Null
+            if($selectorResult.Status -isnot [string]){throw 'selector lookup status'}
+            if($selectorResult.Status-ceq'Missing'){if($null-ne$selectorResult.Item){throw 'selector missing item'};$pointerRootItem=$null}
+            elseif($selectorResult.Status-ceq'Found'){if($null-eq$selectorResult.Item){throw 'selector found item'};$pointerRootItem=$selectorResult.Item}
+            else{throw 'selector lookup status'}
+        }else{throw 'state lookup status'}
+        if($null-ne$pointerRootItem-and-not$pointerRootItem.PSIsContainer){throw 'selector root type'}
+        if($null-ne$pointerRootItem){
+            Assert-CcodStaticProbeNoReparse $installRoot $pointerRoot -Adapters $Adapters;$entries=@(Get-ChildItem -LiteralPath $pointerRoot -Force -ErrorAction Stop);if($entries.Count-eq0){throw 'empty active chain'};$records=[Collections.Generic.List[object]]::new()
+            foreach($entry in $entries){if($entry.PSIsContainer-or$entry.Name-cnotmatch'^\d{20}\.json$'){throw 'active entry'};Assert-CcodStaticSelectorFile $installRoot $entry.FullName $Adapters;$record=Read-CcodStaticProbeLocalJson $entry.FullName;Assert-CcodStaticExactObject $record @('schemaVersion','generation','activeRuntime','previousGeneration') 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active generation'|Out-Null;if($record.schemaVersion -isnot [int] -or $record.schemaVersion -ne 1){throw 'active generation schema'};if(-not(Test-CcodStaticRuntimeId $record.activeRuntime)){throw 'active generation'};$generation=ConvertTo-CcodStaticRuntimeGeneration -Value $record.generation -Path $entry.FullName;$previousGeneration=ConvertTo-CcodStaticRuntimeGeneration -Value $record.previousGeneration -Path $entry.FullName -AllowZero;if($generation-eq0-or$previousGeneration-eq[uint64]::MaxValue-or$generation-ne($previousGeneration+1)-or$entry.Name-cne('{0:D20}.json'-f$generation)){throw 'active generation canonical'};$records.Add([pscustomobject]@{generation=$generation;previousGeneration=$previousGeneration;activeRuntime=[string]$record.activeRuntime;path=$entry.FullName})}
+            $ordered=@($records|Sort-Object generation);for($i=0;$i-lt$ordered.Count;$i++){if([uint64]$ordered[$i].generation-ne[uint64]($i+1)-or[uint64]$ordered[$i].previousGeneration-ne[uint64]$i){throw 'active chain'}};$latest=$ordered[-1];$active=[pscustomobject]@{activeRuntime=$latest.activeRuntime};$activePath=$latest.path
+        }else{$activePath=[IO.Path]::GetFullPath((Join-Path $installRoot 'active.json'));Assert-CcodStaticProbeNoReparse $installRoot $activePath -Adapters $Adapters;$active=Read-CcodStaticProbeLocalJson $activePath;Assert-CcodStaticExactObject $active @('schemaVersion','activeRuntime','previousRuntime','updatedAtUtc') 'CCOD_STATIC_RUNTIME_UNAUTHORIZED' 'Active pointer'|Out-Null;if($active.schemaVersion -isnot [int] -or $active.schemaVersion -ne 1 -or -not(Test-CcodStaticRuntimeId $active.activeRuntime) -or($null -ne $active.previousRuntime -and (-not(Test-CcodStaticRuntimeId $active.previousRuntime) -or $active.previousRuntime -ceq $active.activeRuntime)) -or-not(Test-CcodStaticCanonicalUtc $active.updatedAtUtc)){throw 'active pointer'}}
+        if($active.activeRuntime-cne$runtimeId){throw 'active runtime'}
         $expectedRuntime=[IO.Path]::GetFullPath((Join-Path (Join-Path $installRoot 'runtime') $active.activeRuntime))
         $expectedWorker=[IO.Path]::GetFullPath((Join-Path $expectedRuntime 'src\persistence\StaticProbeWorker.ps1'))
         if($expectedRuntime -cne $runtimeRoot -or $expectedWorker -cne $ScriptPath){throw 'self binding'}
@@ -472,7 +522,7 @@ function Get-CcodStaticProbeRuntimeAuthorization {
             $previous=$file.path;$records.Add([pscustomobject][ordered]@{path=$file.path;length=[int64]$file.length;sha256=$file.sha256})
         }
         foreach($required in $script:CcodStaticProbeRequiredFiles){if(@($records|Where-Object{$_.path -ceq $required}).Count -ne 1){throw 'required file'}}
-        $computed=Get-CcodStaticRuntimeIdFromRecords $manifest.projectVersion $records.ToArray()
+        $computed=Get-CcodStaticRuntimeIdFromRecords $manifest.projectVersion $records.ToArray() $manifest.runtimeId
         if($computed -cne $manifest.runtimeId -or $computed -cne $active.activeRuntime -or $computed -cne $runtimeId){throw 'runtime id'}
         foreach($required in $script:CcodStaticProbeRequiredFiles){
             $record=@($records|Where-Object{$_.path -ceq $required})[0];$path=[IO.Path]::GetFullPath((Join-Path $runtimeRoot ($required.Replace('/','\'))))

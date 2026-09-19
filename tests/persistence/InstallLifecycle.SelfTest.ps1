@@ -12,8 +12,25 @@ Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\UiPreferences.
 Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\RuntimeManifest.psm1') -Force
 Import-Module (Join-Path $repositoryRoot 'src\persistence\modules\LifecycleEpoch.psm1') -Force
 
+function Invoke-CcodRuntimeCoreSetForTest {
+    param([Parameter(Mandatory)][string]$InstallRoot,[string]$NewRuntimeId,$TargetGeneration,$FileTransaction,$Ownership,[hashtable]$Adapters)
+    $module = Get-Module -Name RuntimeManifest
+    return & $module { param($Root,$Runtime,$Generation,$Transaction,$Lease,$Injected) Set-CcodActiveRuntimeCore -InstallRoot $Root -NewRuntimeId $Runtime -TargetGeneration $Generation -FileTransaction $Transaction -Ownership $Lease -Adapters $Injected } $InstallRoot $NewRuntimeId $TargetGeneration $FileTransaction $Ownership $Adapters
+}
+
+$v2521LifecycleShortcutNames=@(
+    'Programs\CodexRemote-fix\CodexRemote-fix.lnk',
+    'Programs\CodexRemote-fix\CodexRemote-fix compatibility check.lnk',
+    'Programs\CodexRemote-fix\Uninstall CodexRemote-fix.lnk',
+    'Desktop\CodexRemote-fix.lnk'
+)
+
 function New-CcodLifecycleTempRoot {
-    return (Join-Path ([IO.Path]::GetTempPath()) ("ccod-lifecycle-" + [guid]::NewGuid().ToString('N')))
+    $tempPath = [IO.Path]::GetFullPath(([IO.Path]::GetTempPath()).TrimEnd('\'))
+    $tempLeaf = Split-Path $tempPath -Leaf
+    $parent = Split-Path $tempPath -Parent
+    $base = if ($tempLeaf.Length -gt 8 -and -not [string]::IsNullOrWhiteSpace($parent) -and [IO.Directory]::Exists($parent)) { $parent } else { $tempPath }
+    return (Join-Path $base ('c-' + [guid]::NewGuid().ToString('N').Substring(0,8)))
 }
 
 function New-CcodLifecycleSourceFixture {
@@ -46,6 +63,7 @@ function New-CcodLifecycleSourceFixture {
     [IO.File]::WriteAllText((Join-Path $Root 'src\persistence\UninstallBootstrap.ps1'), "# Uninstall bootstrap fixture`r`n", [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $Root 'src\persistence\bootstrap.ps1'), ("# Stable bootstrap fixture" + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $Root 'src\persistence\PortableUninstallFinalizer.ps1'), ("# Portable finalizer fixture" + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $Root 'src\persistence\InstalledUninstallFinalizer.ps1'), ("# Installed finalizer fixture" + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
     foreach ($module in @('PersistenceIO.psm1', 'RuntimeManifest.psm1', 'CompatibilityProbe.psm1', 'ProcessControl.psm1', 'StateStore.psm1', 'TransitionJournal.psm1', 'SessionEngine.psm1', 'SupervisorEngine.psm1', 'KernelObjects.psm1', 'TrayUi.psm1', 'UiLocalization.psm1', 'UiPreferences.psm1', 'ScheduledTask.psm1', 'PortableRelease.psm1')) {
         [IO.File]::WriteAllText((Join-Path $Root "src\persistence\modules\$module"), "# $module`r`n", [Text.UTF8Encoding]::new($false))
     }
@@ -58,6 +76,171 @@ function New-CcodLifecycleSourceFixture {
         [IO.File]::WriteAllText((Join-Path $Root "bin\$portableFile"), "fixture $portableFile`r`n", [Text.UTF8Encoding]::new($false))
     }
     return $Root
+}
+
+function New-CcodLifecycleV2521LegacyInstallFixture {
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$SourceRoot
+    )
+
+    # Source of truth: merge-base 19803a79af3302c49f129e6a6b3ff7ffaf1b930b.
+    # That release copied this pre-append-only inventory, derived a two-part
+    # version-digest runtime ID, wrote schema-2 active.json, and kept one
+    # mutable post-install activation receipt.
+    $relativeFiles = [Collections.Generic.List[string]]::new()
+    foreach ($relative in @(
+        'src\check-package.mjs',
+        'src\persistence\Supervisor.ps1',
+        'src\persistence\SessionController.ps1',
+        'src\persistence\StaticProbeWorker.ps1',
+        'src\persistence\LifecycleWorker.ps1',
+        'src\persistence\bootstrap.ps1',
+        'src\persistence\UninstallBootstrap.ps1',
+        'src\persistence\PortableUninstallFinalizer.ps1',
+        'Test-CodexControlOtherDevices.ps1',
+        'Start-CodexControlOtherDevices.ps1',
+        'Reset-CodexControlOtherDevices.ps1'
+    )) { $relativeFiles.Add($relative) }
+    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'bin') -File -Force)) {
+        $relativeFiles.Add('bin\' + $file.Name)
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src\runtime') -File -Force -Recurse)) {
+        $relativeFiles.Add('src\runtime\' + $file.FullName.Substring((Join-Path $SourceRoot 'src\runtime').TrimEnd('\').Length + 1))
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src\persistence\modules') -Filter '*.psm1' -File -Force)) {
+        $relativeFiles.Add('src\persistence\modules\' + $file.Name)
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'src\persistence\resources') -File -Force)) {
+        $relativeFiles.Add('src\persistence\resources\' + $file.Name)
+    }
+
+    $runtimeParent = Join-Path $InstallRoot 'runtime'
+    $stagingRoot = Join-Path $runtimeParent '.v2521-fixture'
+    [IO.Directory]::CreateDirectory($stagingRoot) | Out-Null
+    foreach ($relative in $relativeFiles) {
+        $source = Join-Path $SourceRoot $relative
+        $destination = Join-Path $stagingRoot $relative
+        [IO.Directory]::CreateDirectory((Split-Path $destination -Parent)) | Out-Null
+        Copy-Item -LiteralPath $source -Destination $destination -Force
+    }
+
+    $records = [Collections.Generic.List[object]]::new()
+    foreach ($file in @(Get-ChildItem -LiteralPath $stagingRoot -File -Force -Recurse)) {
+        $records.Add([pscustomobject][ordered]@{
+            path = $file.FullName.Substring($stagingRoot.TrimEnd('\').Length + 1).Replace('\','/')
+            length = [int64]$file.Length
+            sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        })
+    }
+    $comparison = [Comparison[object]]{ param($left,$right) [StringComparer]::Ordinal.Compare([string]$left.path,[string]$right.path) }
+    $records.Sort($comparison)
+    $canonical = (@($records) | ForEach-Object { '{0}`t{1}`t{2}' -f $_.path,$_.length,$_.sha256 }) -join "`n"
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = [BitConverter]::ToString($sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))).Replace('-','').ToLowerInvariant()
+    } finally { $sha256.Dispose() }
+    $runtimeId = '2.5.21-' + $digest.Substring(0,16)
+    $runtimeRoot = Join-Path $runtimeParent $runtimeId
+    [IO.Directory]::Move($stagingRoot,$runtimeRoot)
+    $manifest = [pscustomobject][ordered]@{
+        schemaVersion = 1
+        projectVersion = '2.5.21'
+        runtimeId = $runtimeId
+        files = @($records)
+    }
+    [IO.File]::WriteAllText((Join-Path $runtimeRoot 'manifest.json'),($manifest | ConvertTo-Json -Depth 16),[Text.UTF8Encoding]::new($false))
+
+    $timestamp = '2030-02-03T03:04:05.0000000Z'
+    $active = [pscustomobject][ordered]@{
+        schemaVersion = 2
+        activeRuntime = $runtimeId
+        previousRuntime = $null
+        generation = [uint64]1
+        updatedAtUtc = $timestamp
+    }
+    [IO.File]::WriteAllText((Join-Path $InstallRoot 'active.json'),($active | ConvertTo-Json -Depth 4),[Text.UTF8Encoding]::new($false))
+    $stateRoot = Join-Path $InstallRoot 'state'
+    [IO.Directory]::CreateDirectory($stateRoot) | Out-Null
+    $receipt = [pscustomobject][ordered]@{
+        schemaVersion = 1
+        activationId = '11111111-2222-4333-8444-555555555555'
+        phase = 'Ready'
+        runtimeId = $runtimeId
+        previousRuntimeId = $null
+        startedAtUtc = $timestamp
+        updatedAtUtc = $timestamp
+        ready = $true
+        errorCode = $null
+    }
+    [IO.File]::WriteAllText((Join-Path $stateRoot 'post-install-activation.json'),($receipt | ConvertTo-Json -Depth 4),[Text.UTF8Encoding]::new($false))
+    return [pscustomobject][ordered]@{ RuntimeId=$runtimeId;RuntimeRoot=$runtimeRoot;Manifest=$manifest;Active=$active;Receipt=$receipt }
+}
+
+function New-CcodLifecycleLegacyMigrationRetryFixture {
+    $legacySource=New-CcodLifecycleTempRoot;$source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $legacySource -Version '2.5.21'|Out-Null
+        $legacy=New-CcodLifecycleV2521LegacyInstallFixture -InstallRoot $install -SourceRoot $legacySource
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $fake.World.SetActiveFailure={param($InstallRoot,$RuntimeId,$Ownership,$TargetGeneration,$FileTransaction)throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('adapted pointer failure'),'CCOD_RUNTIME_POINTER_COMMIT_FAILED',[Management.Automation.ErrorCategory]::InvalidData,$RuntimeId)}
+        $failure=$null;try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('d'*64) -Adapters $fake.Adapters|Out-Null}catch{$failure=$_}
+        if($null-eq$failure-or([string]$failure.FullyQualifiedErrorId-split',')[0]-cne'CCOD_RUNTIME_POINTER_COMMIT_FAILED'){throw 'legacy migration retry fixture did not reach the expected first failure'}
+        $fake.World.SetActiveFailure=$null
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        return [pscustomobject]@{LegacySource=$legacySource;Source=$source;Install=$install;NodeRoot=$nodeRoot;Node=$node;Legacy=$legacy;Fake=$fake;Head=$head}
+    } catch {
+        foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+        throw
+    }
+}
+
+function Remove-CcodLifecycleLegacyMigrationRetryFixture {
+    param([Parameter(Mandatory)]$Fixture)
+    foreach($path in @($Fixture.LegacySource,$Fixture.Source,$Fixture.Install,$Fixture.NodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+}
+
+function New-CcodLifecyclePayloadManifest {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$Version
+    )
+
+    $module = Get-Module InstallLifecycle
+    $sourceFiles = @(& $module { param($SourceRoot) Get-CcodLifecycleSourceFiles -SourceRoot $SourceRoot -RequireTrayHost } $Root)
+    $recordList = [Collections.Generic.List[object]]::new()
+    foreach ($sourceFile in $sourceFiles) {
+        $recordList.Add([pscustomobject][ordered]@{
+            path = ([string]$sourceFile.Relative).Replace('\','/')
+            length = [int64](Get-Item -LiteralPath $sourceFile.Source -Force).Length
+            sha256 = (Get-FileHash -LiteralPath $sourceFile.Source -Algorithm SHA256).Hash.ToLowerInvariant()
+        })
+    }
+    $comparison = [System.Comparison[object]]{ param($left,$right) [StringComparer]::Ordinal.Compare([string]$left.path,[string]$right.path) }
+    $recordList.Sort($comparison)
+    $records = @($recordList)
+    $manifestPath = Join-Path $Root 'installer-payload.manifest.json'
+    [IO.File]::WriteAllText(
+        $manifestPath,
+        ([ordered]@{ schemaVersion = 1; projectVersion = $Version; files = $records } | ConvertTo-Json -Depth 8),
+        [Text.UTF8Encoding]::new($false)
+    )
+    return $manifestPath
+}
+
+function Get-CcodLifecyclePayloadBinding {
+    param(
+        [Parameter(Mandatory)][string]$ManifestPath,
+        [Parameter(Mandatory)][string]$ExpectedVersion
+    )
+    $bytes = [IO.File]::ReadAllBytes($ManifestPath)
+    return @{
+        ExpectedVersion = $ExpectedVersion
+        PayloadManifestPath = $ManifestPath
+        ExpectedPayloadManifestSha256 = Get-CcodTestFileSha256 -Path $ManifestPath
+        PayloadManifestBytesBase64 = [Convert]::ToBase64String($bytes)
+    }
 }
 
 function New-CcodLifecycleFakeNode {
@@ -142,6 +325,10 @@ function New-CcodLifecycleFake {
         LogRecords = [Collections.Generic.List[object]]::new()
         FailLogCode = $null
         CopyOverride = $null
+        TaskRuntimeIds = [Collections.Generic.List[string]]::new()
+        ProductRegistrationCalls = 0
+        ProductRegistrationFailure = $false
+        ProductRegistrationReadyObserved = $false
     }
     $adapters = @{}
     $adapters.ValidateSource = { param($SourceRoot) $world.Calls.Add("Validate:$([IO.Path]::GetFileName($SourceRoot))"); [bool]$world.ValidateSource }.GetNewClosure()
@@ -150,20 +337,25 @@ function New-CcodLifecycleFake {
     $adapters.ValidateNodeCandidate = { param($Path) $world.Calls.Add("ValidateNode:$([IO.Path]::GetFileName($Path))"); $Path -ceq $world.NodePath }.GetNewClosure()
     $adapters.GetCurrentIdentity = { $world.Calls.Add('Identity'); $world.Identity }.GetNewClosure()
     $adapters.UtcNow = { $world.Calls.Add('Now'); $world.NowUtc }.GetNewClosure()
-    $adapters.NewActivationId = { 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }.GetNewClosure()
+    $adapters.NewActivationId = { [guid]::NewGuid().ToString('D') }.GetNewClosure()
     $adapters.WriteActivationReceipt = {
-        param($InstallRoot, $Receipt)
+        param($InstallRoot, $Receipt, $FileTransaction)
         $world.Phases.Add([string]$Receipt.phase)
-        $stateRoot = Join-Path $InstallRoot 'state'
-        [IO.Directory]::CreateDirectory($stateRoot) | Out-Null
-        [IO.File]::WriteAllText((Join-Path $stateRoot 'post-install-activation.json'), ($Receipt | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+        if ($null -ne $FileTransaction) {
+            $module = Get-Module -Name InstallLifecycle -ErrorAction Stop
+            & $module { param($Root,$Value,$Transaction) Write-CcodActivationReceiptFile -InstallRoot $Root -Receipt $Value -FileTransaction $Transaction } $InstallRoot $Receipt $FileTransaction
+        } else {
+            $stateRoot = Join-Path $InstallRoot 'state'
+            [IO.Directory]::CreateDirectory($stateRoot) | Out-Null
+            [IO.File]::WriteAllText((Join-Path $stateRoot 'post-install-activation.json'), ($Receipt | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+        }
     }.GetNewClosure()
     $adapters.ReadActiveLifecycleRequest = { param($StateRoot) $world.Calls.Add('ReadActiveLifecycleRequest');$world.ActiveLifecycleRequest }.GetNewClosure()
     $adapters.WaitNewRuntimeReady = {
         param($InstallRoot, $RuntimeId, $RuntimeGeneration, $Identity, $TaskStartedAtUtc, $TimeoutMilliseconds)
         [pscustomobject][ordered]@{ SupervisorReady = [bool]$world.NewSupervisorReady; TrayReady = [bool]$world.NewTrayReady }
     }.GetNewClosure()
-    $adapters.InstallSupervisorTask = { param($InstallRoot, $UserSid) $world.Calls.Add("InstallTask:$([IO.Path]::GetFileName($InstallRoot)):$UserSid"); $world.TaskInstalled++ }.GetNewClosure()
+    $adapters.InstallSupervisorTask = { param($InstallRoot, $UserSid, $RuntimeId) $world.Calls.Add("InstallTask:$([IO.Path]::GetFileName($InstallRoot)):${UserSid}:$RuntimeId"); $world.TaskRuntimeIds.Add([string]$RuntimeId); $world.TaskInstalled++ }.GetNewClosure()
     $adapters.RemoveSupervisorTask = { $world.Calls.Add('RemoveTask'); $world.TaskRemoved++ }.GetNewClosure()
     $adapters.TestSupervisorTaskAbsent = { $world.Calls.Add('TaskAbsent'); [bool]$world.TaskAbsent }.GetNewClosure()
     $adapters.StartSupervisorTask = { $world.Calls.Add('StartTask');if($world.StartTaskFailure){throw 'PRIVATE_TASK_START_SECRET'};$world.TaskStarted++ }.GetNewClosure()
@@ -210,10 +402,10 @@ function New-CcodLifecycleFake {
         }
     }.GetNewClosure()
     $adapters.SetActiveRuntime = {
-        param($InstallRoot, $RuntimeId, $Ownership)
-        if ($null -ne $world.SetActiveFailure) { & $world.SetActiveFailure $InstallRoot $RuntimeId $Ownership }
-        $assertFence = { param($Root, $Receipt, $ExpectActivePointer) if ($Receipt.released) { throw 'released lifecycle owner' }; $true }
-        Set-CcodActiveRuntime -InstallRoot $InstallRoot -NewRuntimeId $RuntimeId -Ownership $Ownership -Adapters @{ AssertLifecycleFence=$assertFence }
+        param($InstallRoot, $RuntimeId, $Ownership, $TargetGeneration, $FileTransaction)
+        if ($null -ne $world.SetActiveFailure) { & $world.SetActiveFailure $InstallRoot $RuntimeId $Ownership $TargetGeneration $FileTransaction }
+        $assertFence = { param($Root, $Receipt, $ExpectActivePointer,$TargetRuntimeId) if ($Receipt.released) { throw 'released lifecycle owner' }; $true }
+        Invoke-CcodRuntimeCoreSetForTest -InstallRoot $InstallRoot -NewRuntimeId $RuntimeId -TargetGeneration $TargetGeneration -FileTransaction $FileTransaction -Ownership $Ownership -Adapters @{ AssertLifecycleFence=$assertFence }
     }.GetNewClosure()
     $adapters.ExitLifecycleOwnership = {
         param($Ownership)
@@ -258,12 +450,442 @@ function New-CcodLifecycleFake {
         }
         $world.LogRecords.Add($Record)
     }.GetNewClosure()
+    $adapters.RegisterProduct = {
+        param($InstallRoot,$RuntimeId,$Version,$PackageSha256,$FileTransaction,$TransactionRecord)
+        $world.Calls.Add("RegisterProduct:$RuntimeId")
+        $world.ProductRegistrationCalls++
+        $world.ProductRegistrationReadyObserved = $null -ne $TransactionRecord -and $TransactionRecord.phase -ceq 'Ready'
+        if ($world.ProductRegistrationFailure) { throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('fixture registration failed'),'CCOD_PRODUCT_REGISTRATION_FAILED',[Management.Automation.ErrorCategory]::InvalidData,$RuntimeId) }
+        [pscustomobject]@{ verified=$true; legacyRemoved=$true }
+    }.GetNewClosure()
+    $adapters.AddProductShortcutCandidates = { param($Files) [pscustomobject]@{Files=@($Files);TemporaryRoot=$null} }
     [pscustomobject]@{ World = $world; Adapters = $adapters }
+}
+
+function New-CcodLifecycleProductSideEffectAdapters {
+    param([Parameter(Mandatory)][hashtable]$State)
+    @{
+        WriteProductRegistration={param($Registration,$ReadyEvidence)if($State.FailWrites){throw 'TEST_PRODUCT_WRITE_FAILURE'};$State.Registration=$Registration;$State.ReadyEvidence=$ReadyEvidence;$State.Writes++}.GetNewClosure()
+        ReadProductRegistration={param($Registration)if($State.ContainsKey('FailReadProduct')-and$State.FailReadProduct){throw 'TEST_PRODUCT_READBACK_FAILURE'};$State.Registration}.GetNewClosure()
+        WriteShortcut={
+            param($Kind,$Shortcut,$FileTransaction,$ReadyEvidence)
+            $relative='registration/'+$(if($Kind-ceq'StartMenu'){'StartMenu.CodexRemote-fix.lnk'}else{'Desktop.CodexRemote-fix.lnk'})
+            try{$fileModule=Get-Module -All|Where-Object{$null-ne$_.Path-and[IO.Path]::GetFileName($_.Path)-ceq'InstallFileTransaction.psm1'}|Select-Object -First 1;if($null-eq$fileModule){throw 'install file transaction module unavailable'};$source=&$fileModule {param($Generation,$Path,$Record)Open-CcodInstallRetainedFile -Generation $Generation -RelativePath $Path -ReadyTransaction $Record} $FileTransaction $relative $ReadyEvidence.transactionRecord}catch{$State.RetainedError=([string]$_.FullyQualifiedErrorId-split',')[0];throw}
+            if($null-eq$source){throw 'retained shortcut capability missing'}
+            if($State.ContainsKey('FailShortcutKind')-and[string]$State.FailShortcutKind-ceq$Kind){throw 'TEST_PRODUCT_SHORTCUT_WRITE_FAILURE'}
+            $State.ProductOnlyObserved=$true;$State.Shortcuts[$Kind]=$Shortcut;$State.ShortcutWrites++
+            if($State.ContainsKey('LegacyEntries')){
+                $legacyName=if($Kind-ceq'StartMenu'){$v2521LifecycleShortcutNames[0]}else{$v2521LifecycleShortcutNames[3]}
+                if(-not$State.LegacyEntries.Contains($legacyName)){$State.LegacyEntries.Add($legacyName)}
+                if($State.ContainsKey('LegacyShortcutProofs')){
+                    $candidateBytes=[IO.File]::ReadAllBytes([string]$Shortcut.candidatePath)
+                    $State.LegacyShortcutProofs[$legacyName]=[pscustomobject][ordered]@{
+                        targetPath=[string]$ReadyEvidence.targetPath;arguments=[string]$ReadyEvidence.arguments;workingDirectory='';sha256=$(if($Kind-ceq'StartMenu'){[string]$ReadyEvidence.startMenuSha256}else{[string]$ReadyEvidence.desktopSha256});bytesBase64=[Convert]::ToBase64String($candidateBytes)
+                    }
+                }
+            }
+        }.GetNewClosure()
+        ReadShortcut={param($Kind,$Shortcut)$State.Shortcuts[$Kind]}.GetNewClosure()
+        ReadVerifiedRegistration={
+            [pscustomobject][ordered]@{
+                verified=($null-ne$State.Registration-and$State.Shortcuts.Count-eq2);runtimeId=[string]$State.Registration.runtimeId;version=[string]$State.Registration.version;packageSha256=[string]$State.Registration.packageSha256
+                shortcutNames=@($v2521LifecycleShortcutNames[0],$v2521LifecycleShortcutNames[3]);startMenuSha256=[string]$State.ReadyEvidence.startMenuSha256;desktopSha256=[string]$State.ReadyEvidence.desktopSha256
+            }
+        }.GetNewClosure()
+        ReadLegacyRegistration={
+            param($ExpectedAppId)
+            if(-not$State.ContainsKey('LegacyEntries')-or-not$State.LegacyEntries.Contains('Registry')){return $null}
+            [pscustomobject][ordered]@{
+                appId=[string]$State.LegacyRegistration.appId;displayVersion=[string]$State.LegacyRegistration.displayVersion;installLocation=[string]$State.LegacyRegistration.installLocation
+                uninstallString=[string]$State.LegacyRegistration.uninstallString;shortcutNames=@($State.LegacyEntries|Where-Object{[string]$_-cne'Registry'});unsafeShortcutNames=@($(if($State.ContainsKey('LegacyUnsafeShortcutNames')){@($State.LegacyUnsafeShortcutNames)}else{@()}))
+            }
+        }.GetNewClosure()
+        ReadLegacySnapshot={
+            param($ExpectedAppId,$ExpectedProfile)
+            $entries=[Collections.Generic.List[object]]::new()
+            foreach($entry in @($State.LegacyEntries)){
+                if([string]$entry-cne'Registry'){
+                    $base=if(([string]$entry).StartsWith('Programs\',[StringComparison]::Ordinal)){[Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)}else{[Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)}
+                    $relative=([string]$entry).Substring(([string]$entry).IndexOf('\')+1);$proof=if($State.ContainsKey('LegacyShortcutProofs')){$State.LegacyShortcutProofs[[string]$entry]}else{$null}
+                    $entries.Add([pscustomobject][ordered]@{kind='Shortcut';name=[string]$entry;path=[IO.Path]::GetFullPath((Join-Path $base $relative));sha256=[string]$proof.sha256;bytesBase64=[string]$proof.bytesBase64;targetPath=[string]$proof.targetPath;arguments=[string]$proof.arguments;workingDirectory=[string]$proof.workingDirectory})
+                }else{$entries.Add([pscustomobject][ordered]@{kind='Registry';path=('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\'+$State.LegacyRegistration.appId+'_is1');values=[ordered]@{DisplayVersion=[pscustomobject]@{value=[string]$State.LegacyRegistration.displayVersion;kind='String'};InstallLocation=[pscustomobject]@{value=[string]$State.LegacyRegistration.installLocation;kind='String'};UninstallString=[pscustomobject]@{value=[string]$State.LegacyRegistration.uninstallString;kind='String'}}})}
+            }
+            [pscustomobject][ordered]@{appId=$State.LegacyRegistration.appId;entries=@($entries)}
+        }.GetNewClosure()
+        GetCurrentShortcutProof={
+            param($Kind,$Shortcut,$ReadyEvidence)
+            $name=if($Kind-ceq'StartMenu'){$v2521LifecycleShortcutNames[0]}else{$v2521LifecycleShortcutNames[3]};$base=if($Kind-ceq'StartMenu'){[Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)}else{[Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)};$relative=$name.Substring($name.IndexOf('\')+1);$item=Get-Item -LiteralPath ([string]$Shortcut.candidatePath) -Force
+            [pscustomobject][ordered]@{kind=$Kind;name=$name;path=[IO.Path]::GetFullPath((Join-Path $base $relative));candidatePath=[IO.Path]::GetFullPath([string]$Shortcut.candidatePath);candidateLength=[int64]$item.Length;candidateSha256=$(if($Kind-ceq'StartMenu'){[string]$ReadyEvidence.startMenuSha256}else{[string]$ReadyEvidence.desktopSha256});targetPath=[string]$ReadyEvidence.targetPath;arguments=[string]$ReadyEvidence.arguments;workingDirectory=''}
+        }.GetNewClosure()
+        RemoveLegacyEntry={param($Entry);$name=if($Entry-is[string]){[string]$Entry}elseif($Entry.kind-ceq'Registry'){'Registry'}else{[string]$Entry.name};$State.LegacyRemovalAttempts++;[void]$State.LegacyEntries.Remove($name)}.GetNewClosure()
+        ReadLegacyEntry={param($Entry);$name=if($Entry-is[string]){[string]$Entry}elseif($Entry.kind-ceq'Registry'){'Registry'}else{[string]$Entry.name};if($State.LegacyEntries.Contains($name)){'Exact'}else{$null}}.GetNewClosure()
+        RestoreLegacyEntry={param($Entry);$name=if($Entry-is[string]){[string]$Entry}elseif($Entry.kind-ceq'Registry'){'Registry'}else{[string]$Entry.name};if(-not$State.LegacyEntries.Contains($name)){$State.LegacyEntries.Add($name)}}.GetNewClosure()
+        WriteLegacyCompensationFailure={param($Record);$State.LegacyCompensationFailures.Add($Record)}.GetNewClosure()
+    }
+}
+
+function Set-CcodLifecycleDefaultProductRegistrationFixture {
+    param([Parameter(Mandatory)]$Fake,[Parameter(Mandatory)][hashtable]$ProductState)
+    [void]$Fake.Adapters.Remove('RegisterProduct')
+    $sideEffects=New-CcodLifecycleProductSideEffectAdapters -State $ProductState
+    $Fake.Adapters.GetProductRegistrationAdapters={$sideEffects}.GetNewClosure()
+    $Fake.Adapters.AddProductShortcutCandidates={
+        param($Files)
+        $temporaryRoot=Join-Path ([IO.Path]::GetTempPath()) ('ccod-lifecycle-product-'+[guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($temporaryRoot)|Out-Null
+        $records=[Collections.Generic.List[object]]::new()
+        foreach($leaf in @('StartMenu.CodexRemote-fix.lnk','Desktop.CodexRemote-fix.lnk')){$path=Join-Path $temporaryRoot $leaf;[IO.File]::WriteAllText($path,"sealed $leaf",[Text.UTF8Encoding]::new($false));$item=Get-Item -LiteralPath $path;$sha=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant();$records.Add([pscustomobject]@{Relative=('registration/'+$leaf);Source=$path;ExpectedLength=[int64]$item.Length;ExpectedSha256=$sha})}
+        [pscustomobject]@{Files=@($Files)+@($records);TemporaryRoot=$temporaryRoot}
+    }
+}
+
+function New-CcodLifecycleV2521ShortcutProofs {
+    param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)][string]$InstallerRoot)
+    $powershell=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'WindowsPowerShell\v1.0\powershell.exe'))
+    $bootstrap=[IO.Path]::GetFullPath((Join-Path $InstallRoot 'bootstrap.ps1'))
+    $testScript=[IO.Path]::GetFullPath((Join-Path $InstallerRoot 'Test-CodexControlOtherDevices.ps1'))
+    $uninstaller=[IO.Path]::GetFullPath((Join-Path $InstallerRoot 'unins000.exe'))
+    $mainArguments='-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -InstallRoot "{1}" -EntryMode Explicit' -f $bootstrap,[IO.Path]::GetFullPath($InstallRoot)
+    $specifications=@(
+        [pscustomobject]@{name=$v2521LifecycleShortcutNames[0];targetPath=$powershell;arguments=$mainArguments;workingDirectory=[IO.Path]::GetFullPath($InstallRoot)},
+        [pscustomobject]@{name=$v2521LifecycleShortcutNames[1];targetPath=$powershell;arguments=('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $testScript);workingDirectory=[IO.Path]::GetFullPath($InstallerRoot)},
+        [pscustomobject]@{name=$v2521LifecycleShortcutNames[2];targetPath=$uninstaller;arguments='';workingDirectory=''},
+        [pscustomobject]@{name=$v2521LifecycleShortcutNames[3];targetPath=$powershell;arguments=$mainArguments;workingDirectory=[IO.Path]::GetFullPath($InstallRoot)}
+    )
+    $proofs=@{}
+    foreach($specification in $specifications){
+        $bytes=[Text.UTF8Encoding]::new($false).GetBytes(('legacy-shortcut:'+([string]$specification.name)))
+        $sha=[Security.Cryptography.SHA256]::Create();try{$hash=[BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+        $proofs[[string]$specification.name]=[pscustomobject][ordered]@{targetPath=[string]$specification.targetPath;arguments=[string]$specification.arguments;workingDirectory=[string]$specification.workingDirectory;sha256=$hash;bytesBase64=[Convert]::ToBase64String($bytes)}
+    }
+    return $proofs
+}
+
+function Set-CcodLifecycleProductCloseFailureFixture {
+    param([Parameter(Mandatory)]$Fake,[Parameter(Mandatory)][hashtable]$State)
+    $State.CloseAttempts=0
+    if(-not$State.ContainsKey('CloseFailuresRemaining')){$State.CloseFailuresRemaining=1}
+    $Fake.Adapters.CloseProductTransaction={
+        param($Transaction,$DefaultClose)
+        $State.CloseAttempts++
+        if($State.CloseAttempts-le[int]$State.CloseFailuresRemaining){throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('fixture owned product close failed'),'CCOD_INSTALL_CLOSE_FAILED',[Management.Automation.ErrorCategory]::CloseError,$Transaction)}
+        &$DefaultClose $Transaction
+    }.GetNewClosure()
+}
+
+function Set-CcodLifecycleLowerProductCloseFixture {
+    param([Parameter(Mandatory)][hashtable]$State)
+    $modulePath=Join-Path $repositoryRoot 'src\persistence\modules\InstallFileTransaction.psm1'
+    $fileModule=(Get-Command Close-CcodInstallFileTransaction -ErrorAction SilentlyContinue).Module
+    if($null-ne$fileModule-and($null-eq$fileModule.Path-or[IO.Path]::GetFullPath($fileModule.Path)-cne[IO.Path]::GetFullPath($modulePath))){$fileModule=$null}
+    if($null-eq$fileModule){$fileModule=Import-Module $modulePath -PassThru -DisableNameChecking -ErrorAction Stop}
+    $State.Attempts=0
+    $lowerClose={
+        param($TransactionState,$DefaultClose)
+        if(-not[bool]$TransactionState.ProductOnly){&$DefaultClose $TransactionState;return}
+        $State.Attempts++
+        if([int]$State.FailuresRemaining-gt0){$State.FailuresRemaining=[int]$State.FailuresRemaining-1;throw [IO.IOException]::new('injected lower native close failure')}
+        &$DefaultClose $TransactionState
+    }.GetNewClosure()
+    &$fileModule {param($Close)$script:CcodInstallFileTransactionLowerCloseForTest=$Close} $lowerClose
+    return $fileModule
+}
+
+function Clear-CcodLifecycleLowerProductCloseFixture {
+    param($FileModule)
+    if($null-ne$FileModule){&$FileModule {$script:CcodInstallFileTransactionLowerCloseForTest=$null}}
+}
+
+function Set-CcodLifecycleProductOpenFailureFixture {
+    param([Parameter(Mandatory)][hashtable]$State)
+    $modulePath=Join-Path $repositoryRoot 'src\persistence\modules\InstallFileTransaction.psm1'
+    $fileModule=(Get-Command Close-CcodInstallFileTransaction -ErrorAction SilentlyContinue).Module
+    if($null-ne$fileModule-and($null-eq$fileModule.Path-or[IO.Path]::GetFullPath($fileModule.Path)-cne[IO.Path]::GetFullPath($modulePath))){$fileModule=$null}
+    if($null-eq$fileModule){$fileModule=Import-Module $modulePath -PassThru -DisableNameChecking -ErrorAction Stop}
+    $State.Attempts=0
+    $original=&$fileModule {(Get-Command Invoke-CcodRuntimeStatic -CommandType Function -ErrorAction Stop).ScriptBlock}
+    $replacement={
+        param([string]$Name,[object[]]$Arguments)
+        if($Name-ceq'OpenProduct'){
+            $State.Attempts++
+            if([int]$State.FailuresRemaining-gt0){$State.FailuresRemaining=[int]$State.FailuresRemaining-1;throw [IO.IOException]::new('injected strict product open failure')}
+        }
+        &$original $Name $Arguments
+    }.GetNewClosure()
+    &$fileModule {param($Invoke)Set-Item -LiteralPath Function:\script:Invoke-CcodRuntimeStatic -Value $Invoke} $replacement
+    return [pscustomobject]@{Module=$fileModule;Original=$original}
+}
+
+function Clear-CcodLifecycleProductOpenFailureFixture {
+    param($Fixture)
+    if($null-ne$Fixture){&$Fixture.Module {param($Invoke)Set-Item -LiteralPath Function:\script:Invoke-CcodRuntimeStatic -Value $Invoke} $Fixture.Original}
+}
+
+function Set-CcodLifecycleProductFenceBindFailureFixture {
+    param([Parameter(Mandatory)][hashtable]$State)
+    $modulePath=Join-Path $repositoryRoot 'src\persistence\modules\InstallFileTransaction.psm1'
+    $fileModule=(Get-Command Close-CcodInstallFileTransaction -ErrorAction SilentlyContinue).Module
+    if($null-ne$fileModule-and($null-eq$fileModule.Path-or[IO.Path]::GetFullPath($fileModule.Path)-cne[IO.Path]::GetFullPath($modulePath))){$fileModule=$null}
+    if($null-eq$fileModule){$fileModule=Import-Module $modulePath -PassThru -DisableNameChecking -ErrorAction Stop}
+    $State.Attempts=0
+    $original=&$fileModule {(Get-Command Get-CcodInstallProductCleanupFenceProof -CommandType Function -ErrorAction Stop).ScriptBlock}
+    $replacement={
+        param($TransactionState,$Fence)
+        $State.Attempts++
+        if([int]$State.FailuresRemaining-gt0){$State.FailuresRemaining=[int]$State.FailuresRemaining-1;throw [IO.InvalidDataException]::new('injected durable fence bind failure')}
+        &$original $TransactionState $Fence
+    }.GetNewClosure()
+    &$fileModule {param($GetProof)Set-Item -LiteralPath Function:\script:Get-CcodInstallProductCleanupFenceProof -Value $GetProof} $replacement
+    return [pscustomobject]@{Module=$fileModule;Original=$original}
+}
+
+function Clear-CcodLifecycleProductFenceBindFailureFixture {
+    param($Fixture)
+    if($null-ne$Fixture){&$Fixture.Module {param($GetProof)Set-Item -LiteralPath Function:\script:Get-CcodInstallProductCleanupFenceProof -Value $GetProof} $Fixture.Original}
+}
+
+function Get-CcodLifecycleProductCleanupTestRecords {
+    param([Parameter(Mandatory)][string]$InstallRoot)
+    $directory=Join-Path $InstallRoot 'state\product-cleanup-fences'
+    if(-not[IO.Directory]::Exists($directory)){return @()}
+    $records=[Collections.Generic.List[object]]::new()
+    foreach($file in @(Get-ChildItem -LiteralPath $directory -File -Force|Sort-Object Name)){
+        if($file.Name-cnotmatch'^(?<attempt>\d{20})\.(?<state>Pending|Completed)\.(?<transaction>[0-9a-f-]{36})\.json$'){throw "unexpected cleanup fence leaf $($file.Name)"}
+        $records.Add([pscustomobject]@{Attempt=[uint64]$Matches.attempt;State=[string]$Matches.state;Leaf=$file.Name;Record=((Get-Content -LiteralPath $file.FullName -Raw)|ConvertFrom-Json)})
+    }
+    return @($records|Sort-Object Attempt,@{Expression={if($_.State-ceq'Pending'){0}else{1}}})
+}
+
+function Get-CcodLifecycleCurrentProductCleanupTestIdentity {
+    $process=[Diagnostics.Process]::GetCurrentProcess();$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+    try{return [pscustomobject][ordered]@{pid=[int]$process.Id;creationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture);userSid=[string]$identity.User.Value}}
+    finally{$process.Dispose();$identity.Dispose()}
+}
+
+function Assert-CcodLifecycleProductCleanupTestRecord {
+    param([Parameter(Mandatory)]$Actual,[Parameter(Mandatory)]$Ready,[Parameter(Mandatory)]$Owner,[Parameter(Mandatory)][ValidateSet('Pending','Completed')][string]$State)
+    $fields=@('schemaVersion','transactionId','runtimeId','runtimeGeneration','manifestSha256','packageSha256','ownerPid','ownerCreationTimeUtc','ownerSid','state')
+    Assert-CcodEqual ($fields-join '|') (@($Actual.PSObject.Properties.Name)-join '|') 'cleanup fence contains only the ordered contract fields'
+    Assert-CcodEqual 1 $Actual.schemaVersion 'cleanup fence schema is exact'
+    Assert-CcodEqual $Ready.transactionId $Actual.transactionId 'cleanup fence binds the Ready transaction id'
+    Assert-CcodEqual $Ready.newRuntimeId $Actual.runtimeId 'cleanup fence binds the selected runtime id'
+    Assert-CcodEqual ([uint64]$Ready.newGeneration) ([uint64]$Actual.runtimeGeneration) 'cleanup fence binds the selected generation'
+    Assert-CcodEqual $Ready.newManifestSha256 $Actual.manifestSha256 'cleanup fence binds the manifest hash'
+    Assert-CcodEqual $Ready.sealedPackageSha256 $Actual.packageSha256 'cleanup fence binds the package hash'
+    Assert-CcodEqual ([int]$Owner.pid) ([int]$Actual.ownerPid) 'cleanup fence binds the owner pid'
+    Assert-CcodEqual $Owner.creationTimeUtc $Actual.ownerCreationTimeUtc 'cleanup fence binds the owner creation time'
+    Assert-CcodEqual $Owner.userSid $Actual.ownerSid 'cleanup fence binds the owner SID'
+    Assert-CcodEqual $State $Actual.state 'cleanup fence state is exact'
+}
+
+function Invoke-CcodLifecycleOtherProcessProductReconciliation {
+    param(
+        [Parameter(Mandatory)][string]$SourceRoot,
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$NodePath,
+        [Parameter(Mandatory)][string]$PackageSha256,
+        [Parameter(Mandatory)][string]$MarkerRoot
+    )
+    [IO.Directory]::CreateDirectory($MarkerRoot)|Out-Null
+    $payload=[ordered]@{
+        lifecycleModule=$installLifecycleModule
+        kernelModule=(Join-Path $repositoryRoot 'src\persistence\modules\KernelObjects.psm1')
+        sourceRoot=$SourceRoot
+        installRoot=$InstallRoot
+        nodePath=$NodePath
+        packageSha256=$PackageSha256
+        markerRoot=$MarkerRoot
+    }
+    $payloadBase64=[Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes(($payload|ConvertTo-Json -Compress)))
+    $childScript=@'
+$ErrorActionPreference='Stop'
+$payloadJson=[Text.UTF8Encoding]::new($false,$true).GetString([Convert]::FromBase64String('__PAYLOAD__'))
+$payload=$payloadJson|ConvertFrom-Json -ErrorAction Stop
+Import-Module $payload.lifecycleModule -Force -DisableNameChecking -ErrorAction Stop
+$kernelModule=Import-Module $payload.kernelModule -PassThru -DisableNameChecking -ErrorAction Stop
+$childState=@{Registration=$null;ReadyEvidence=$null;Shortcuts=@{}}
+$productAdapters=@{
+    WriteProductRegistration={param($Registration,$ReadyEvidence)$childState.Registration=$Registration;$childState.ReadyEvidence=$ReadyEvidence;[IO.File]::WriteAllText((Join-Path $payload.markerRoot 'product-write.txt'),'registration')}.GetNewClosure()
+    ReadProductRegistration={param($Registration)$childState.Registration}.GetNewClosure()
+    WriteShortcut={param($Kind,$Shortcut,$FileTransaction,$ReadyEvidence)$childState.Shortcuts[$Kind]=$Shortcut;[IO.File]::WriteAllText((Join-Path $payload.markerRoot 'shortcut-write.txt'),[string]$Kind)}.GetNewClosure()
+    ReadShortcut={param($Kind,$Shortcut)$childState.Shortcuts[$Kind]}.GetNewClosure()
+    ReadVerifiedRegistration={
+        [pscustomobject][ordered]@{
+            verified=($null-ne$childState.Registration-and$childState.Shortcuts.Count-eq2);runtimeId=[string]$childState.Registration.runtimeId;version=[string]$childState.Registration.version;packageSha256=[string]$childState.Registration.packageSha256
+            shortcutNames=@('Programs\CodexRemote-fix\CodexRemote-fix.lnk','Desktop\CodexRemote-fix.lnk');startMenuSha256=[string]$childState.ReadyEvidence.startMenuSha256;desktopSha256=[string]$childState.ReadyEvidence.desktopSha256
+        }
+    }.GetNewClosure()
+    ReadLegacyRegistration={param($ExpectedAppId)$null}
+}
+$process=[Diagnostics.Process]::GetCurrentProcess();$windowsIdentity=[Security.Principal.WindowsIdentity]::GetCurrent()
+try{$childIdentity=[pscustomobject][ordered]@{UserSid=[string]$windowsIdentity.User.Value;SessionId=[int]$process.SessionId;Pid=[int]$process.Id;CreationTimeUtc=$process.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)}}finally{$process.Dispose();$windowsIdentity.Dispose()}
+$adapters=@{
+    ValidateSource={param($Root)$true}
+    GetProjectVersion={param($Root)'2.5.22'}
+    DiscoverNodeCandidates={@([string]$payload.nodePath)}.GetNewClosure()
+    ValidateNodeCandidate={param($Path)$true}
+    GetCurrentIdentity={$childIdentity}.GetNewClosure()
+    AddProductShortcutCandidates={param($Files)[pscustomobject]@{Files=@($Files);TemporaryRoot=$null}}
+    GetProductRegistrationAdapters={$productAdapters}.GetNewClosure()
+    CloseProductTransaction={param($Transaction,$DefaultClose)[IO.File]::WriteAllText((Join-Path $payload.markerRoot 'authority-opened.txt'),'close reached');&$DefaultClose $Transaction}.GetNewClosure()
+}
+$lease=$null;$exitCode=24
+try{
+    $lease=&$kernelModule {param($Sid)Enter-CcodMutex -Kind AccountTransition -UserSid $Sid -TimeoutMilliseconds 15000} $childIdentity.UserSid
+    if($null-eq$lease-or$lease.Outcome-cne'Acquired'){throw 'child account mutex was not acquired'}
+    [IO.File]::WriteAllText((Join-Path $payload.markerRoot 'mutex-acquired.txt'),'acquired')
+    try{
+        $result=Invoke-CcodInstall -SourceRoot ([string]$payload.sourceRoot) -InstallRoot ([string]$payload.installRoot) -SealedPackageSha256 ([string]$payload.packageSha256) -Adapters $adapters
+        if($null-ne$result-and$result.ProductRegistrationVerified){[IO.File]::WriteAllText((Join-Path $payload.markerRoot 'verified.txt'),'verified')}
+        $exitCode=0
+    }catch{
+        $errorId=([string]$_.FullyQualifiedErrorId-split',')[0]
+        [IO.File]::WriteAllText((Join-Path $payload.markerRoot 'error-id.txt'),$errorId)
+        $exitCode=if($errorId-ceq'CCOD_PRODUCT_REGISTRATION_FAILED'){23}else{24}
+    }
+}catch{
+    [IO.File]::WriteAllText((Join-Path $payload.markerRoot 'child-failure.txt'),[string]$_)
+    $exitCode=25
+}finally{
+    if($null-ne$lease-and$lease.Outcome-ceq'Acquired'-and-not$lease.Released){try{&$kernelModule {param($Value)Exit-CcodMutex -Lease $Value} $lease|Out-Null}catch{$exitCode=26}}
+}
+exit $exitCode
+'@.Replace('__PAYLOAD__',$payloadBase64)
+    $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
+    $process=Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$encoded) -PassThru -WindowStyle Hidden
+    try{
+        if(-not$process.WaitForExit(45000)){try{$process.Kill()}catch{};$process.WaitForExit();throw 'other-process product reconciliation timed out'}
+        $exitCode=$process.ExitCode
+    }finally{$process.Dispose()}
+    $errorPath=Join-Path $MarkerRoot 'error-id.txt'
+    return [pscustomobject]@{
+        ExitCode=[int]$exitCode
+        ErrorId=$(if([IO.File]::Exists($errorPath)){[IO.File]::ReadAllText($errorPath)}else{$null})
+        MutexAcquired=[IO.File]::Exists((Join-Path $MarkerRoot 'mutex-acquired.txt'))
+        AuthorityOpened=[IO.File]::Exists((Join-Path $MarkerRoot 'authority-opened.txt'))
+        ProductWritten=[IO.File]::Exists((Join-Path $MarkerRoot 'product-write.txt'))-or[IO.File]::Exists((Join-Path $MarkerRoot 'shortcut-write.txt'))
+        Verified=[IO.File]::Exists((Join-Path $MarkerRoot 'verified.txt'))
+        ChildFailure=$(if([IO.File]::Exists((Join-Path $MarkerRoot 'child-failure.txt'))){[IO.File]::ReadAllText((Join-Path $MarkerRoot 'child-failure.txt'))}else{$null})
+    }
+}
+
+function Invoke-CcodLifecycleRollbackBootstrapMutexProbe {
+    param(
+        [Parameter(Mandatory)][string]$MarkerRoot,
+        [int]$MutexTimeoutMilliseconds = 1500,
+        [int]$ProcessTimeoutMilliseconds = 10000
+    )
+
+    [IO.Directory]::CreateDirectory($MarkerRoot) | Out-Null
+    $payload = [ordered]@{
+        kernelModule = (Join-Path $repositoryRoot 'src\persistence\modules\KernelObjects.psm1')
+        markerRoot = $MarkerRoot
+        mutexTimeoutMilliseconds = $MutexTimeoutMilliseconds
+    }
+    $payloadBase64 = [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes(($payload | ConvertTo-Json -Compress)))
+    $childScript = @'
+$ErrorActionPreference='Stop'
+$payloadJson=[Text.UTF8Encoding]::new($false,$true).GetString([Convert]::FromBase64String('__PAYLOAD__'))
+$payload=$payloadJson|ConvertFrom-Json -ErrorAction Stop
+$kernelModule=Import-Module $payload.kernelModule -PassThru -DisableNameChecking -ErrorAction Stop
+$lease=$null;$exitCode=42
+try{
+    [IO.File]::WriteAllText((Join-Path $payload.markerRoot 'attempted.txt'),'attempted',[Text.UTF8Encoding]::new($false))
+    $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+    try{$sid=[string]$identity.User.Value}finally{$identity.Dispose()}
+    $lease=&$kernelModule {param($UserSid,$Timeout)Enter-CcodMutex -Kind AccountTransition -UserSid $UserSid -TimeoutMilliseconds $Timeout} $sid ([int]$payload.mutexTimeoutMilliseconds)
+    [IO.File]::WriteAllText((Join-Path $payload.markerRoot 'outcome.txt'),[string]$lease.Outcome,[Text.UTF8Encoding]::new($false))
+    if($null-eq$lease-or$lease.Outcome-cne'Acquired'){exit $exitCode}
+    [IO.File]::WriteAllText((Join-Path $payload.markerRoot 'acquired.txt'),'acquired',[Text.UTF8Encoding]::new($false))
+    $exitCode=0
+}catch{
+    [IO.File]::WriteAllText((Join-Path $payload.markerRoot 'child-failure.txt'),[string]$_,[Text.UTF8Encoding]::new($false))
+    $exitCode=43
+}finally{
+    if($null-ne$lease-and$lease.Outcome-ceq'Acquired'-and-not$lease.Released){try{&$kernelModule {param($Value)Exit-CcodMutex -Lease $Value} $lease|Out-Null}catch{$exitCode=44}}
+}
+exit $exitCode
+'@.Replace('__PAYLOAD__',$payloadBase64)
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
+    $process = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$encoded) -PassThru -WindowStyle Hidden
+    try {
+        if (-not $process.WaitForExit($ProcessTimeoutMilliseconds)) {
+            try { $process.Kill() } catch { }
+            $process.WaitForExit()
+            throw 'rollback bootstrap mutex probe exceeded its bounded process timeout'
+        }
+        $exitCode = $process.ExitCode
+    } finally {
+        $process.Dispose()
+    }
+    $outcomePath = Join-Path $MarkerRoot 'outcome.txt'
+    $failurePath = Join-Path $MarkerRoot 'child-failure.txt'
+    return [pscustomobject][ordered]@{
+        ExitCode = [int]$exitCode
+        Attempted = [IO.File]::Exists((Join-Path $MarkerRoot 'attempted.txt'))
+        MutexAcquired = [IO.File]::Exists((Join-Path $MarkerRoot 'acquired.txt'))
+        Outcome = $(if ([IO.File]::Exists($outcomePath)) { [IO.File]::ReadAllText($outcomePath) } else { $null })
+        ChildFailure = $(if ([IO.File]::Exists($failurePath)) { [IO.File]::ReadAllText($failurePath) } else { $null })
+    }
+}
+
+function Invoke-CcodLifecycleDeadOwnerCleanupTest {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    $fileModule=$null;$fake=$null
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $productState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $fake -ProductState $productState
+        $fake.Adapters.RegisterProduct={param($InstallRoot,$RuntimeId,$Version,$PackageSha256,$FileTransaction,$TransactionRecord)[pscustomobject]@{verified=$true;legacyRemoved=$true}}
+        $null=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('b'*64) -Adapters $fake.Adapters
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$ready=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install;$current=Get-CcodLifecycleCurrentProductCleanupTestIdentity
+        $deadOwner=[pscustomobject][ordered]@{pid=[int]2147483647;creationTimeUtc='2000-01-01T00:00:00.0000000Z';userSid=$current.userSid}
+        $outer=&$module {Enter-CcodLifecycleProductCleanupLease}
+        try{&$module {param($Root,$Record,$Owner)[void](New-CcodLifecycleProductCleanupFence -InstallRoot $Root -ReadyTransaction $Record -OwnerIdentity $Owner)} $install $ready $deadOwner}
+        finally{&$module {param($Context)[void](Exit-CcodLifecycleProductCleanupLease -Context $Context)} $outer}
+        [void]$fake.Adapters.Remove('RegisterProduct')
+        $lowerState=@{FailuresRemaining=0};$fileModule=Set-CcodLifecycleLowerProductCloseFixture -State $lowerState
+        $result=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('b'*64) -Adapters $fake.Adapters
+        Assert-CcodEqual 'AlreadyInstalled' $result.Outcome 'dead-owner reconciliation resumes only the exact same-package Ready install'
+        Assert-CcodTrue $result.ProductRegistrationVerified 'dead-owner reconciliation permits verified success only after cleanup'
+        Assert-CcodEqual 2 $lowerState.Attempts 'dead owner requires a fresh strict cleanup close before the new verification close'
+        $records=@(Get-CcodLifecycleProductCleanupTestRecords -InstallRoot $install)
+        Assert-CcodEqual '1:Pending|1:Completed|2:Pending|2:Completed' (($records|ForEach-Object{"$($_.Attempt):$($_.State)"})-join '|') 'dead-owner recovery completes the old fence before a new verification fence'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'dead-owner cleanup appends no lifecycle Failed snapshot'
+    }finally{
+        Clear-CcodLifecycleLowerProductCloseFixture -FileModule $fileModule
+        foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}
+    }
+}
+
+function New-CcodReadyFinalizationGapFixture {
+    $source=New-CcodLifecycleTempRoot
+    $install=New-CcodLifecycleTempRoot
+    $nodeRoot=New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot
+        $fake=New-CcodLifecycleFake -NodePath $node
+        $fake.Adapters.CommitReadyTransaction={throw 'PRIVATE_FINAL_SNAPSHOT_FAILURE'}
+        $failure=$null
+        try { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters | Out-Null } catch { $failure=$_ }
+        Assert-CcodTrue ($null-ne$failure-and$failure.FullyQualifiedErrorId-like'CCOD_INSTALL_READY_FINALIZATION_PENDING*') 'fixture reaches the exact Ready-finalization gap'
+        $module=Get-Module InstallLifecycle -ErrorAction Stop
+        $head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'ProtectionReady' $head.phase 'fixture transaction is recoverable at ProtectionReady'
+        return [pscustomobject]@{Source=$source;Install=$install;NodeRoot=$nodeRoot;Node=$node;Transaction=$head}
+    } catch {
+        foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+        throw
+    }
+}
+
+function Remove-CcodReadyFinalizationGapFixture {
+    param([Parameter(Mandatory)]$Fixture)
+    foreach($path in @($Fixture.Source,$Fixture.Install,$Fixture.NodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
 }
 
 function Read-CcodLifecycleActivePointer {
     param([Parameter(Mandatory)][string]$Root)
-    return (Get-Content -LiteralPath (Join-Path $Root 'active.json') -Raw | ConvertFrom-Json)
+    return Read-CcodActiveRuntime -InstallRoot $Root
 }
 
 function Set-CcodLifecycleTestStatus {
@@ -351,6 +973,611 @@ function Invoke-CcodLifecycleUninstallCleanupTest {
 
 $results = @()
 
+$results += Invoke-CcodTest 'immutable install records advance only through canonical create-only phase snapshots' {
+    $install = New-CcodLifecycleTempRoot
+    [IO.Directory]::CreateDirectory($install) | Out-Null
+    $transactionId = '11111111-2222-3333-4444-555555555555'
+    $packageSha256 = ('a' * 64)
+    $module = Get-Module -Name InstallLifecycle -ErrorAction Stop
+    $fileTransaction = & $module { param($Root) Open-CcodLifecycleInstallGeneration -InstallRoot $Root -RuntimeId 'runtime-new' } $install
+    try {
+        $record = & $module {
+            param($Id,$PackageHash)
+            New-CcodInstallTransactionRecord -TransactionId $Id -OldRuntimeId 'runtime-old' -OldGeneration ([uint64]7) -OldManifestSha256 ('1'*64) -NewRuntimeId 'runtime-new' -NewGeneration ([uint64]8) -NewManifestSha256 ('2'*64) -SealedPackageSha256 $PackageHash -OwnedObjectNames @('runtime-new','bootstrap.ps1','Uninstall-CodexControlOtherDevices.ps1')
+        } $transactionId $packageSha256
+        Assert-CcodEqual 'Prepared' $record.phase 'new immutable transaction begins Prepared'
+        Assert-CcodEqual $null $record.errorCode 'nonterminal immutable transaction has no error code'
+        & $module { param($Root,$Value,$Tx) Write-CcodInstallTransactionRecord -InstallRoot $Root -TransactionRecord $Value -FileTransaction $Tx } $install $record $fileTransaction
+        foreach ($phase in @('PackageVerified','RuntimeStaged','PreviousProtectionStopped','RuntimePromoted','PointerCommitted','StableShellCommitted','ProtectionReady','Ready')) {
+            $previous = [string]$record.phase
+            $record = & $module { param($Root,$Id,$Expected,$Next,$Tx) Set-CcodInstallTransactionPhase -InstallRoot $Root -TransactionId $Id -ExpectedPhase $Expected -NewPhase $Next -FileTransaction $Tx } $install $transactionId $previous $phase $fileTransaction
+            Assert-CcodEqual $phase $record.phase "immutable transaction advances to $phase"
+        }
+        $read = & $module { param($Root,$Id) Read-CcodInstallTransactionRecord -InstallRoot $Root -TransactionId $Id } $install $transactionId
+        Assert-CcodEqual 'Ready' $read.phase 'reader selects the terminal canonical snapshot'
+        Assert-CcodEqual $packageSha256 $read.sealedPackageSha256 'phase snapshots retain the sealed package identity'
+        Assert-CcodThrows { & $module { param($Root,$Id,$Tx) Set-CcodInstallTransactionPhase -InstallRoot $Root -TransactionId $Id -ExpectedPhase 'RuntimeStaged' -NewPhase 'Ready' -FileTransaction $Tx } $install $transactionId $fileTransaction } 'CCOD_INSTALL_TRANSACTION_PHASE_INVALID'
+    } finally {
+        & $module { param($Tx) Close-CcodInstallFileTransaction -Transaction $Tx -Disposition Failed } $fileTransaction
+        if (Test-Path -LiteralPath $install) { Remove-Item -LiteralPath $install -Recurse -Force }
+    }
+}
+
+$results += Invoke-CcodTest 'same-version immutable install identity is idempotent only for the same sealed package hash' {
+    $module = Get-Module -Name InstallLifecycle -ErrorAction Stop
+    $existing = [pscustomobject][ordered]@{
+        schemaVersion=1;transactionId='11111111-2222-3333-4444-555555555555';oldRuntimeId='runtime-old';oldGeneration=[uint64]7
+        oldManifestSha256=('1'*64);newRuntimeId='runtime-new';newGeneration=[uint64]8;newManifestSha256=('2'*64);sealedPackageSha256=('b'*64);ownedObjectNames=@('runtime-new');phase='Ready';errorCode=$null
+    }
+    $same = & $module { param($Record,$Hash) Test-CcodInstallPackageIdentity -TransactionRecord $Record -ProjectVersion '2.5.22' -ActiveProjectVersion '2.5.22' -SealedPackageSha256 $Hash -ActiveRuntimeId 'runtime-new' -ActiveGeneration 8 } $existing ('b'*64)
+    Assert-CcodEqual $true $same 'same version and same package hash is idempotent'
+    Assert-CcodThrows { & $module { param($Record,$Hash) Test-CcodInstallPackageIdentity -TransactionRecord $Record -ProjectVersion '2.5.22' -ActiveProjectVersion '2.5.22' -SealedPackageSha256 $Hash -ActiveRuntimeId 'runtime-new' -ActiveGeneration 8 } $existing ('c'*64) } 'CCOD_INSTALL_PACKAGE_CONFLICT'
+    $drift = & $module { param($Record) Test-CcodInstallPackageIdentity -TransactionRecord $Record -ProjectVersion '2.5.22' -ActiveProjectVersion '2.5.22' -SealedPackageSha256 ('b'*64) -ActiveRuntimeId 'runtime-other' -ActiveGeneration 9 } $existing
+    Assert-CcodEqual $false $drift 'idempotence is bound to the active runtime and pointer generation'
+    $legacy = & $module { Test-CcodInstallPackageIdentity -TransactionRecord $null -ProjectVersion '2.5.22' -ActiveProjectVersion '2.5.21' -SealedPackageSha256 ('d'*64) -ActiveRuntimeId 'legacy' -ActiveGeneration 1 }
+    Assert-CcodEqual $false $legacy 'legacy install without transaction record is treated as non-idempotent Idle'
+}
+
+$results += Invoke-CcodTest 'real v2.5.21 legacy lifecycle state upgrades through the v2.5.22 install entrypoint' {
+    $legacySource=New-CcodLifecycleTempRoot;$source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $legacySource -Version '2.5.21' | Out-Null
+        $legacy=New-CcodLifecycleV2521LegacyInstallFixture -InstallRoot $install -SourceRoot $legacySource
+        Assert-CcodTrue ($legacy.RuntimeId -cmatch '^2\.5\.21-[0-9a-f]{16}$') 'fixture uses the merge-base two-part runtime identity'
+        Assert-CcodEqual 'schemaVersion,activeRuntime,previousRuntime,generation,updatedAtUtc' (@($legacy.Active.PSObject.Properties.Name)-join ',') 'fixture uses the merge-base schema-two active pointer'
+        Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $install 'state\active-generation')) 'legacy fixture has no append-only selector plane'
+        Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $install 'state\install-transactions')) 'legacy fixture has no append-only transaction plane'
+        Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $install 'state\product-cleanup-fences')) 'legacy fixture has no durable cleanup fence plane'
+        $legacyActiveHash=Get-CcodTestFileSha256 -Path (Join-Path $install 'active.json')
+        $legacyManifestHash=Get-CcodTestFileSha256 -Path (Join-Path $legacy.RuntimeRoot 'manifest.json')
+        $legacyPointer=Read-CcodActiveRuntime -InstallRoot $install
+        $legacyValidation=Test-CcodRuntimeManifest -RuntimeDirectory $legacy.RuntimeRoot -ExpectedRuntimeId $legacy.RuntimeId -ExpectedManifestSha256 $legacyManifestHash
+        $module=Get-Module InstallLifecycle -ErrorAction Stop
+        $compatibility=&$module {param($Root,$Pointer,$Validation)Get-CcodLegacyUpgradeCompatibilityContext -InstallRoot $Root -ExistingPointer $Pointer -ActiveValidation $Validation -GlobalTransaction $null} $install $legacyPointer $legacyValidation
+        Assert-CcodEqual 'ProvenLegacyWithoutReady' $compatibility.Kind 'compatibility function returns only the proven legacy classification'
+        Assert-CcodEqual $legacy.RuntimeId $compatibility.ActiveRuntimeId 'compatibility context retains the exact active runtime identity'
+        Assert-CcodEqual ([uint64]1) $compatibility.ActiveGeneration 'compatibility context retains the exact legacy generation'
+        Assert-CcodEqual '2.5.21' $compatibility.ProjectVersion 'compatibility context retains the exact supported project version'
+        Assert-CcodEqual $legacyManifestHash $compatibility.ManifestSha256 'compatibility context retains the exact manifest identity'
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot
+        $fake=New-CcodLifecycleFake -NodePath $node
+        $legacyEntries=[Collections.Generic.List[string]]::new();foreach($entry in @('Registry')+$v2521LifecycleShortcutNames){$legacyEntries.Add($entry)}
+        $productState=@{
+            FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}
+            LegacyRegistration=[pscustomobject][ordered]@{
+                appId='{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}';displayVersion='2.5.21';installLocation='C:\legacy\CodexControlOtherDevices-installer'
+                uninstallString='"C:\legacy\CodexControlOtherDevices-installer\unins000.exe"';shortcutNames=@($v2521LifecycleShortcutNames);unsafeShortcutNames=@()
+            }
+            LegacyEntries=$legacyEntries;LegacyShortcutProofs=(New-CcodLifecycleV2521ShortcutProofs -InstallRoot $install -InstallerRoot 'C:\legacy\CodexControlOtherDevices-installer');LegacyUnsafeShortcutNames=@()
+            LegacyRemovalAttempts=0;LegacyCompensationFailures=[Collections.Generic.List[object]]::new()
+        }
+        Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $fake -ProductState $productState
+        $beforeRuntimeCount=@(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count
+
+        $upgrade=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters $fake.Adapters
+
+        Assert-CcodEqual 'Upgraded' $upgrade.Outcome 'proven legacy state converges through the real install entrypoint'
+        Assert-CcodEqual ($beforeRuntimeCount+1) @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count 'upgrade stages exactly one immutable generation'
+        Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install 'state\active-generation') -PathType Container) 'upgrade creates the append-only selector plane'
+        Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install 'state\install-transactions') -PathType Container) 'upgrade creates the append-only transaction plane'
+        Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install 'active.json') -PathType Leaf) 'legacy active pointer remains only as migration evidence'
+        Assert-CcodEqual $legacyActiveHash (Get-CcodTestFileSha256 -Path (Join-Path $install 'active.json')) 'upgrade never rewrites the legacy active pointer evidence'
+        $pointer=Read-CcodActiveRuntime -InstallRoot $install
+        Assert-CcodEqual $upgrade.RuntimeId $pointer.activeRuntime 'append-only selector chooses the new runtime instead of stale active.json'
+        Assert-CcodEqual ([uint64]2) $pointer.generation 'legacy genesis and new activation form a contiguous two-record selector chain'
+        Assert-CcodEqual 2 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\active-generation') -File -Force).Count 'upgrade publishes legacy genesis and the new active selector exactly once each'
+        $ready=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Ready' $ready.phase 'upgrade publishes a terminal append-only Ready transaction'
+        Assert-CcodEqual $legacy.RuntimeId $ready.oldRuntimeId 'Ready transaction is bound to the exact legacy source runtime'
+        Assert-CcodEqual ([uint64]1) $ready.oldGeneration 'Ready transaction is bound to the exact legacy source generation'
+        Assert-CcodEqual $upgrade.RuntimeId $ready.newRuntimeId 'Ready transaction is bound to the selected new runtime'
+        Assert-CcodEqual ([uint64]2) $ready.newGeneration 'Ready transaction is bound to the selected new generation'
+        $currentRuntimeRoot=Join-Path (Join-Path $install 'runtime') $upgrade.RuntimeId
+        $currentManifestHash=Get-CcodTestFileSha256 -Path (Join-Path $currentRuntimeRoot 'manifest.json')
+        $currentValidation=Test-CcodRuntimeManifest -RuntimeDirectory $currentRuntimeRoot -ExpectedRuntimeId $upgrade.RuntimeId -ExpectedManifestSha256 $currentManifestHash
+        $currentCompatibility=&$module {param($Root,$Pointer,$Validation,$Transaction)Get-CcodLegacyUpgradeCompatibilityContext -InstallRoot $Root -ExistingPointer $Pointer -ActiveValidation $Validation -GlobalTransaction $Transaction} $install $pointer $currentValidation $ready
+        Assert-CcodEqual 'CurrentReady' $currentCompatibility.Kind 'compatibility function returns only the current Ready classification after migration'
+        Assert-CcodEqual $upgrade.RuntimeId $currentCompatibility.ActiveRuntimeId 'current compatibility remains bound to the selected runtime'
+        Assert-CcodEqual ([uint64]2) $currentCompatibility.ActiveGeneration 'current compatibility remains bound to the selected generation'
+        Assert-CcodEqual $currentManifestHash $currentCompatibility.ManifestSha256 'current compatibility remains bound to the selected manifest'
+        Assert-CcodTrue $upgrade.ProductRegistrationVerified 'true legacy migration completes the real product-registration boundary'
+        $migrationPlans=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\legacy-registration-migrations') -File -Force)
+        Assert-CcodEqual 1 $migrationPlans.Count 'Ready-bound legacy migration plan is durable before any overlapping current registration write'
+        $migrationPlan=Get-Content -LiteralPath $migrationPlans[0].FullName -Raw|ConvertFrom-Json -ErrorAction Stop
+        Assert-CcodEqual $ready.transactionId $migrationPlan.transactionId 'durable migration plan binds the exact Ready transaction'
+        Assert-CcodEqual ([uint64]$ready.newGeneration) ([uint64]$migrationPlan.runtimeGeneration) 'durable migration plan binds the selected generation'
+        Assert-CcodEqual $ready.newManifestSha256 $migrationPlan.manifestSha256 'durable migration plan binds the selected manifest'
+        Assert-CcodEqual $ready.sealedPackageSha256 $migrationPlan.packageSha256 'durable migration plan binds the selected package'
+        Assert-CcodEqual 'version,runtimeId,packageSha256,shortcuts' (($migrationPlan.expectedCurrentProof.PSObject.Properties.Name)-join',') 'durable migration plan carries only the exact current proof contract'
+        Assert-CcodEqual 3 $productState.LegacyRemovalAttempts 'true v2.5.21 migration removes the registry compatibility link and uninstall link'
+        Assert-CcodEqual ((@($v2521LifecycleShortcutNames[0],$v2521LifecycleShortcutNames[3])|Sort-Object)-join'|') ((@($productState.LegacyEntries)|Sort-Object)-join'|') 'true v2.5.21 migration preserves both exact current shortcut replacements'
+        Assert-CcodEqual 0 $productState.LegacyCompensationFailures.Count 'successful true legacy cleanup needs no unresolved compensation record'
+
+        $runtimeCount=@(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count
+        $selectorCount=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\active-generation') -File -Force).Count
+        $sameFake=New-CcodLifecycleFake -NodePath $node;Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $sameFake -ProductState $productState
+        $same=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters $sameFake.Adapters
+        Assert-CcodEqual 'AlreadyInstalled' $same.Outcome 'second same-package invocation is idempotent after true legacy registration cleanup'
+        Assert-CcodTrue $same.ProductRegistrationVerified 'idempotent invocation re-verifies the exact current registration'
+        Assert-CcodEqual $runtimeCount @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count 'idempotent true-legacy retry creates no runtime'
+        Assert-CcodEqual $selectorCount @(Get-ChildItem -LiteralPath (Join-Path $install 'state\active-generation') -File -Force).Count 'idempotent true-legacy retry appends no selector'
+        Assert-CcodEqual 3 $productState.LegacyRemovalAttempts 'idempotent true-legacy retry performs no second legacy deletion'
+        Assert-CcodEqual 0 $sameFake.World.TaskInstalled 'idempotent true-legacy retry performs no scheduled-task install'
+        Assert-CcodEqual 0 $sameFake.World.TaskStarted 'idempotent true-legacy retry starts no process'
+    } finally {
+        foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+    }
+}
+
+# Production mutation caught: a Ready product retry recaptures the washed live profile instead of reopening its disk plan.
+$results += Invoke-CcodTest 'new lifecycle invocation replays the disk plan after partial overlapping current writes' {
+    foreach($failurePoint in @('DesktopWrite','CurrentReadBack')){
+        $legacySource=New-CcodLifecycleTempRoot;$source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+        try{
+            New-CcodLifecycleSourceFixture -Root $legacySource -Version '2.5.21'|Out-Null;$legacy=New-CcodLifecycleV2521LegacyInstallFixture -InstallRoot $install -SourceRoot $legacySource
+            New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot
+            $legacyEntries=[Collections.Generic.List[string]]::new();foreach($entry in @('Registry')+$v2521LifecycleShortcutNames){$legacyEntries.Add($entry)}
+            $productState=@{FailWrites=$false;FailShortcutKind=$(if($failurePoint-ceq'DesktopWrite'){'Desktop'}else{$null});FailReadProduct=($failurePoint-ceq'CurrentReadBack');Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{};LegacyRegistration=[pscustomobject][ordered]@{appId='{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}';displayVersion='2.5.21';installLocation='C:\legacy\CodexControlOtherDevices-installer';uninstallString='"C:\legacy\CodexControlOtherDevices-installer\unins000.exe"';shortcutNames=@($v2521LifecycleShortcutNames);unsafeShortcutNames=@()};LegacyEntries=$legacyEntries;LegacyShortcutProofs=(New-CcodLifecycleV2521ShortcutProofs -InstallRoot $install -InstallerRoot 'C:\legacy\CodexControlOtherDevices-installer');LegacyUnsafeShortcutNames=@();LegacyRemovalAttempts=0;LegacyCompensationFailures=[Collections.Generic.List[object]]::new()}
+            $firstFake=New-CcodLifecycleFake -NodePath $node;Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $firstFake -ProductState $productState
+            $firstFailure=$null;try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters $firstFake.Adapters|Out-Null}catch{$firstFailure=$_}
+            Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' (([string]$firstFailure.FullyQualifiedErrorId-split',')[0]) "$failurePoint first invocation fails at the intended post-Ready product boundary"
+            $runtimeCount=@(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count;$selectorCount=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\active-generation') -File -Force).Count;$planFiles=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\legacy-registration-migrations') -File -Force)
+            Assert-CcodEqual 1 $planFiles.Count "$failurePoint first invocation persisted exactly one disk plan"
+            Assert-CcodEqual 0 $productState.LegacyRemovalAttempts "$failurePoint first invocation never begins legacy-only cleanup"
+            $productState.FailShortcutKind=$null;$productState.FailReadProduct=$false
+            $secondFake=New-CcodLifecycleFake -NodePath $node;Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $secondFake -ProductState $productState
+            $second=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters $secondFake.Adapters
+            Assert-CcodEqual 'AlreadyInstalled' $second.Outcome "$failurePoint new invocation reopens the same Ready installation"
+            Assert-CcodTrue $second.ProductRegistrationVerified "$failurePoint new invocation converges product registration from the disk plan"
+            Assert-CcodEqual $runtimeCount @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count "$failurePoint retry creates no runtime"
+            Assert-CcodEqual $selectorCount @(Get-ChildItem -LiteralPath (Join-Path $install 'state\active-generation') -File -Force).Count "$failurePoint retry appends no selector"
+            Assert-CcodEqual 1 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\legacy-registration-migrations') -File -Force).Count "$failurePoint retry leaves one append-only disk plan"
+            Assert-CcodEqual 3 $productState.LegacyRemovalAttempts "$failurePoint retry removes the exact registry and two legacy-only shortcuts"
+            Assert-CcodEqual ((@($v2521LifecycleShortcutNames[0],$v2521LifecycleShortcutNames[3])|Sort-Object)-join'|') ((@($productState.LegacyEntries)|Sort-Object)-join'|') "$failurePoint retry preserves only exact current overlap replacements"
+        }finally{foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}}
+    }
+}
+
+# Production mutation caught: current registration writes the two overlapping names before it
+# proves that one complete historical profile existed, washing missing or foreign legacy leaves.
+$results += Invoke-CcodTest 'legacy profile is captured before any current product or shortcut write' {
+    foreach($kind in @('MissingMain','MissingDesktop','ForeignMain')){
+        $legacySource=New-CcodLifecycleTempRoot;$source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+        try {
+            New-CcodLifecycleSourceFixture -Root $legacySource -Version '2.5.21'|Out-Null
+            $legacy=New-CcodLifecycleV2521LegacyInstallFixture -InstallRoot $install -SourceRoot $legacySource
+            New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null
+            $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+            $entries=[Collections.Generic.List[string]]::new();foreach($entry in @('Registry')+$v2521LifecycleShortcutNames){$entries.Add($entry)}
+            $installerRoot='C:\legacy\CodexControlOtherDevices-installer'
+            $productState=@{
+                FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}
+                LegacyRegistration=[pscustomobject][ordered]@{appId='{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}';displayVersion='2.5.21';installLocation=$installerRoot;uninstallString=('"{0}\unins000.exe"'-f$installerRoot);shortcutNames=@($v2521LifecycleShortcutNames);unsafeShortcutNames=@()}
+                LegacyEntries=$entries;LegacyShortcutProofs=(New-CcodLifecycleV2521ShortcutProofs -InstallRoot $install -InstallerRoot $installerRoot);LegacyUnsafeShortcutNames=@()
+                LegacyRemovalAttempts=0;LegacyCompensationFailures=[Collections.Generic.List[object]]::new()
+            }
+            switch($kind){
+                'MissingMain' {[void]$productState.LegacyEntries.Remove($v2521LifecycleShortcutNames[0]);[void]$productState.LegacyShortcutProofs.Remove($v2521LifecycleShortcutNames[0])}
+                'MissingDesktop' {[void]$productState.LegacyEntries.Remove($v2521LifecycleShortcutNames[3]);[void]$productState.LegacyShortcutProofs.Remove($v2521LifecycleShortcutNames[3])}
+                'ForeignMain' {$foreign=$productState.LegacyShortcutProofs[$v2521LifecycleShortcutNames[0]];$foreign.targetPath='C:\foreign\owned.exe';$foreign.arguments='--foreign';$foreign.workingDirectory='C:\foreign'}
+            }
+            $before=@($productState.LegacyEntries|Sort-Object)-join'|'
+            Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $fake -ProductState $productState
+            $failure=$null;try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('9'*64) -Adapters $fake.Adapters|Out-Null}catch{$failure=$_}
+            Assert-CcodEqual 0 $productState.Writes "$kind is rejected before the current registry write"
+            Assert-CcodEqual 0 $productState.ShortcutWrites "$kind is rejected before either current overlap write"
+            Assert-CcodEqual 0 $productState.LegacyRemovalAttempts "$kind removes no legacy-only entry"
+            Assert-CcodEqual $before ((@($productState.LegacyEntries|Sort-Object))-join'|') "$kind preserves the exact observed legacy set"
+            Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' (([string]$failure.FullyQualifiedErrorId-split',')[0]) "$kind reports the post-Ready product boundary without washing legacy evidence"
+        } finally {foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}}
+    }
+}
+
+foreach($legacyCase in @(
+    [pscustomobject]@{Name='append-only selector without a transaction chain';Kind='selector';Expected='CCOD_INSTALL_UPGRADE_SOURCE_INVALID'},
+    [pscustomobject]@{Name='cleanup fence plane without Ready authority';Kind='fence';Expected='CCOD_INSTALL_UPGRADE_SOURCE_INVALID'},
+    [pscustomobject]@{Name='schema-one active pointer normalized by the general reader';Kind='active';Expected='CCOD_INSTALL_UPGRADE_SOURCE_INVALID'},
+    [pscustomobject]@{Name='generation-one active pointer with a previous runtime';Kind='previous';Expected='CCOD_INSTALL_UPGRADE_SOURCE_INVALID'},
+    [pscustomobject]@{Name='legacy generation without reconstructable append-only history';Kind='generation';Expected='CCOD_INSTALL_UPGRADE_SOURCE_INVALID'},
+    [pscustomobject]@{Name='current nonce runtime format disguised as v2.5.21';Kind='current-format';Expected='CCOD_INSTALL_UPGRADE_SOURCE_INVALID'},
+    [pscustomobject]@{Name='runtime manifest from an unsupported historical version';Kind='version';Expected='CCOD_INSTALL_UPGRADE_SOURCE_INVALID'},
+    [pscustomobject]@{Name='legacy runtime path reparse';Kind='reparse';Expected='CCOD_INSTALL_REPARSE_PATH'}
+)) {
+    $case=$legacyCase
+    $results += Invoke-CcodTest ("legacy upgrade classification rejects {0} before generation staging" -f $case.Name) {
+        $legacySource=New-CcodLifecycleTempRoot;$source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot;$outside=$null;$junction=$null
+        try {
+            New-CcodLifecycleSourceFixture -Root $legacySource -Version '2.5.21' | Out-Null
+            $legacy=New-CcodLifecycleV2521LegacyInstallFixture -InstallRoot $install -SourceRoot $legacySource
+            switch($case.Kind) {
+                'selector' {
+                    $selector=Join-Path $install 'state\active-generation';[IO.Directory]::CreateDirectory($selector)|Out-Null
+                    [IO.File]::WriteAllText((Join-Path $selector '00000000000000000001.json'),([ordered]@{schemaVersion=1;generation=[uint64]1;activeRuntime=$legacy.RuntimeId;previousGeneration=[uint64]0}|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+                }
+                'fence' { [IO.Directory]::CreateDirectory((Join-Path $install 'state\product-cleanup-fences'))|Out-Null }
+                'active' {
+                    [IO.File]::WriteAllText((Join-Path $install 'active.json'),([ordered]@{schemaVersion=1;activeRuntime=$legacy.RuntimeId;previousRuntime=$null;updatedAtUtc=$legacy.Active.updatedAtUtc}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+                }
+                'previous' {
+                    [IO.File]::WriteAllText((Join-Path $install 'active.json'),([ordered]@{schemaVersion=2;activeRuntime=$legacy.RuntimeId;previousRuntime='2.5.20-0000000000000000';generation=[uint64]1;updatedAtUtc=$legacy.Active.updatedAtUtc}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+                }
+                'generation' {
+                    [IO.File]::WriteAllText((Join-Path $install 'active.json'),([ordered]@{schemaVersion=2;activeRuntime=$legacy.RuntimeId;previousRuntime='2.5.20-0000000000000000';generation=[uint64]2;updatedAtUtc=$legacy.Active.updatedAtUtc}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+                }
+                'current-format' {
+                    $currentId=Get-CcodRuntimeId -ProjectVersion '2.5.21' -Files @($legacy.Manifest.files) -Nonce ('f'*32)
+                    $currentRoot=Join-Path (Split-Path $legacy.RuntimeRoot -Parent) $currentId
+                    $legacy.Manifest.runtimeId=$currentId
+                    [IO.File]::WriteAllText((Join-Path $legacy.RuntimeRoot 'manifest.json'),($legacy.Manifest|ConvertTo-Json -Depth 16),[Text.UTF8Encoding]::new($false))
+                    [IO.Directory]::Move($legacy.RuntimeRoot,$currentRoot)
+                    [IO.File]::WriteAllText((Join-Path $install 'active.json'),([ordered]@{schemaVersion=2;activeRuntime=$currentId;previousRuntime=$null;generation=[uint64]1;updatedAtUtc=$legacy.Active.updatedAtUtc}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+                    $legacy.RuntimeId=$currentId;$legacy.RuntimeRoot=$currentRoot
+                }
+                'version' {
+                    $manifestPath=Join-Path $legacy.RuntimeRoot 'manifest.json';$manifest=[IO.File]::ReadAllText($manifestPath)|ConvertFrom-Json;$manifest.projectVersion='2.5.20'
+                    [IO.File]::WriteAllText($manifestPath,($manifest|ConvertTo-Json -Depth 16),[Text.UTF8Encoding]::new($false))
+                }
+                'reparse' {
+                    $outside=New-CcodLifecycleTempRoot
+                    Move-Item -LiteralPath $legacy.RuntimeRoot -Destination $outside
+                    $junction=New-Item -ItemType Junction -Path $legacy.RuntimeRoot -Target $outside
+                }
+            }
+            New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+            $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+            $runtimeBefore=@(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Force).Count
+            $selectorPath=Join-Path $install 'state\active-generation';$selectorBefore=if(Test-Path -LiteralPath $selectorPath -PathType Container){@(Get-ChildItem -LiteralPath $selectorPath -File -Force).Count}else{0}
+            $failure=$null
+            try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('b'*64) -Adapters $fake.Adapters|Out-Null}catch{$failure=$_}
+            $errorId=if($null-eq$failure){$null}else{([string]$failure.FullyQualifiedErrorId-split',')[0]}
+            Assert-CcodEqual $case.Expected $errorId "$($case.Name) uses the expected fail-closed boundary"
+            Assert-CcodEqual $runtimeBefore @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Force).Count "$($case.Name) creates no immutable generation"
+            $selectorAfter=if(Test-Path -LiteralPath $selectorPath -PathType Container){@(Get-ChildItem -LiteralPath $selectorPath -File -Force).Count}else{0}
+            Assert-CcodEqual $selectorBefore $selectorAfter "$($case.Name) appends no selector record"
+            Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $install 'state\install-transactions') -PathType Container) "$($case.Name) creates no transaction plane"
+            Assert-CcodEqual 0 $fake.World.TaskInstalled "$($case.Name) performs no scheduled-task mutation"
+        } finally {
+            if($null-ne$junction-and(Test-Path -LiteralPath $legacy.RuntimeRoot)){[IO.Directory]::Delete([IO.Path]::GetFullPath($legacy.RuntimeRoot))}
+            foreach($path in @($legacySource,$source,$install,$nodeRoot,$outside)){if($null-ne$path-and(Test-Path -LiteralPath $path)){Remove-Item -LiteralPath $path -Recurse -Force}}
+        }
+    }
+}
+
+$results += Invoke-CcodTest 'real v2.5.21 upgrade failure before new Ready restarts the retained legacy runtime' {
+    $legacySource=New-CcodLifecycleTempRoot;$source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $legacySource -Version '2.5.21' | Out-Null
+        $legacy=New-CcodLifecycleV2521LegacyInstallFixture -InstallRoot $install -SourceRoot $legacySource
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $fake.Adapters.WaitNewRuntimeReady={
+            param($InstallRoot,$RuntimeId,$RuntimeGeneration,$Identity,$TaskStartedAtUtc,$TimeoutMilliseconds)
+            $ready=$RuntimeId-ceq$legacy.RuntimeId
+            [pscustomobject][ordered]@{SupervisorReady=$ready;TrayReady=$ready}
+        }.GetNewClosure()
+        $failure=$null
+        try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('c'*64) -Adapters $fake.Adapters|Out-Null}catch{$failure=$_}
+        $errorId=if($null-eq$failure){$null}else{([string]$failure.FullyQualifiedErrorId-split',')[0]}
+        Assert-CcodEqual 'CCOD_INSTALL_NEW_RUNTIME_NOT_READY' $errorId 'new-runtime readiness failure remains the reported cause after successful compensation'
+        $pointer=Read-CcodActiveRuntime -InstallRoot $install
+        Assert-CcodEqual $legacy.RuntimeId $pointer.activeRuntime 'compensating append-only pointer reselects the retained legacy runtime'
+        Assert-CcodEqual ([uint64]3) $pointer.generation 'legacy genesis new activation and compensation form one monotonic selector chain'
+        Assert-CcodEqual 2 $fake.World.TaskStarted 'failed new runtime and retained legacy runtime are each started once'
+        Assert-CcodTrue (Test-Path -LiteralPath $legacy.RuntimeRoot -PathType Container) 'retained legacy runtime remains present after compensation'
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Failed' $head.phase 'failed new generation has a terminal diagnostic transaction'
+        Assert-CcodEqual 'CCOD_INSTALL_NEW_RUNTIME_NOT_READY' $head.errorCode 'failed transaction retains the original pre-Ready error'
+        Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install 'active.json') -PathType Leaf) 'legacy active pointer remains untouched as evidence after compensation'
+        $failedRuntimeId=[string]$head.newRuntimeId
+        $runtimeCount=@(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count
+        $fake.Adapters.WaitNewRuntimeReady={param($InstallRoot,$RuntimeId,$RuntimeGeneration,$Identity,$TaskStartedAtUtc,$TimeoutMilliseconds)[pscustomobject][ordered]@{SupervisorReady=$true;TrayReady=$true}}
+
+        $retry=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('c'*64) -Adapters $fake.Adapters
+
+        Assert-CcodEqual 'Upgraded' $retry.Outcome 'second exact attempt resumes the compensated legacy migration'
+        Assert-CcodEqual $failedRuntimeId $retry.RuntimeId 'compensated retry reuses the exact sealed generation-two runtime'
+        Assert-CcodEqual $runtimeCount @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count 'compensated retry invents no additional runtime generation'
+        $retryPointer=Read-CcodActiveRuntime -InstallRoot $install
+        Assert-CcodEqual $failedRuntimeId $retryPointer.activeRuntime 'compensated retry selects the previously failed sealed runtime'
+        Assert-CcodEqual ([uint64]4) $retryPointer.generation 'compensated retry appends after the canonical three-record rollback chain'
+        Assert-CcodEqual 4 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\active-generation') -File -Force).Count 'compensated retry preserves and extends the complete selector chain'
+        $readyHeads=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Ready.*.json' -File -Force)
+        Assert-CcodEqual 1 $readyHeads.Count 'compensated retry produces exactly one terminal Ready transaction'
+        $ready=[IO.File]::ReadAllText($readyHeads[0].FullName)|ConvertFrom-Json
+        Assert-CcodEqual ([uint64]4) ([uint64]$ready.newGeneration) 'compensated retry Ready is bound to selector generation four'
+        Assert-CcodEqual $failedRuntimeId $ready.newRuntimeId 'compensated retry Ready remains bound to the original failed runtime'
+    } finally {
+        foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+    }
+}
+
+# Production mutation caught: requiring a PointerCommitted journal snapshot even when the
+# exact generation-two selector commit and generation-three compensation are both durable.
+$results += Invoke-CcodTest 'real v2.5.21 selector commit with a missing PointerCommitted journal resumes the exact retained runtime' {
+    $legacySource=New-CcodLifecycleTempRoot;$source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $legacySource -Version '2.5.21' | Out-Null
+        $legacy=New-CcodLifecycleV2521LegacyInstallFixture -InstallRoot $install -SourceRoot $legacySource
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $gate=[pscustomobject]@{Remaining=1}
+        $fake.World.SetActiveFailure={
+            param($Root,$RuntimeId,$Ownership,$TargetGeneration,$FileTransaction)
+            if($gate.Remaining-gt0){
+                $gate.Remaining--
+                $fence={param($InstallRoot,$Receipt,$ExpectActivePointer)$true}
+                Invoke-CcodRuntimeCoreSetForTest -InstallRoot $Root -TargetGeneration $TargetGeneration -FileTransaction $FileTransaction -Ownership $Ownership -Adapters @{AssertLifecycleFence=$fence}|Out-Null
+                throw 'PRIVATE_AFTER_SELECTOR_COMMIT_BEFORE_JOURNAL'
+            }
+        }.GetNewClosure()
+
+        $failure=$null
+        try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('f'*64) -Adapters $fake.Adapters|Out-Null}catch{$failure=$_}
+        Assert-CcodEqual 'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN' (([string]$failure.FullyQualifiedErrorId-split',')[0]) 'post-selector journal failure preserves the stable activation boundary'
+        $selectorFiles=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\active-generation') -File -Force|Sort-Object Name)
+        Assert-CcodEqual 3 $selectorFiles.Count 'selector commit and compensation leave the canonical three-record chain'
+        $selectors=@($selectorFiles|ForEach-Object{[IO.File]::ReadAllText($_.FullName)|ConvertFrom-Json})
+        Assert-CcodEqual ($legacy.RuntimeId+','+$selectors[1].activeRuntime+','+$legacy.RuntimeId) (($selectors|ForEach-Object activeRuntime)-join',') 'selector evidence is exactly old new old'
+        $failedRuntimeId=[string]$selectors[1].activeRuntime
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Failed' $head.phase 'journal-gap transaction has a terminal Failed head'
+        Assert-CcodEqual $failedRuntimeId $head.newRuntimeId 'journal-gap transaction remains bound to the committed generation-two runtime'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.PointerCommitted.*.json' -File -Force).Count 'failure happened before the PointerCommitted journal became durable'
+        Assert-CcodEqual 1 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.RuntimePromoted.*.json' -File -Force).Count 'immutable RuntimePromoted identity is durable before the selector commit'
+        $runtimeCount=@(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count
+
+        $retry=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('f'*64) -Adapters $fake.Adapters
+
+        Assert-CcodEqual 'Upgraded' $retry.Outcome 'second exact attempt resumes the selector-journal gap'
+        Assert-CcodEqual $failedRuntimeId $retry.RuntimeId 'selector-journal retry reuses the exact sealed generation-two runtime'
+        Assert-CcodEqual $runtimeCount @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count 'selector-journal retry creates no additional runtime'
+        $retryPointer=Read-CcodActiveRuntime -InstallRoot $install
+        Assert-CcodEqual $failedRuntimeId $retryPointer.activeRuntime 'selector-journal retry selects the retained failed runtime'
+        Assert-CcodEqual ([uint64]4) ([uint64]$retryPointer.generation) 'selector-journal retry appends generation four after compensation'
+        $readyHeads=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Ready.*.json' -File -Force)
+        Assert-CcodEqual 1 $readyHeads.Count 'selector-journal retry writes one terminal Ready transaction'
+    } finally {
+        foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+    }
+}
+
+$results += Invoke-CcodTest 'real v2.5.21 upgrade failure before new pointer commit keeps the legacy selector active and restarts it' {
+    $legacySource=New-CcodLifecycleTempRoot;$source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $legacySource -Version '2.5.21' | Out-Null
+        $legacy=New-CcodLifecycleV2521LegacyInstallFixture -InstallRoot $install -SourceRoot $legacySource
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $fake.World.SetActiveFailure={
+            param($InstallRoot,$RuntimeId,$Ownership,$TargetGeneration,$FileTransaction)
+            throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('adapted pointer failure'),'CCOD_RUNTIME_POINTER_COMMIT_FAILED',[Management.Automation.ErrorCategory]::InvalidData,$RuntimeId)
+        }
+        $failure=$null
+        try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('d'*64) -Adapters $fake.Adapters|Out-Null}catch{$failure=$_}
+        $errorId=if($null-eq$failure){$null}else{([string]$failure.FullyQualifiedErrorId-split',')[0]}
+        Assert-CcodEqual 'CCOD_RUNTIME_POINTER_COMMIT_FAILED' $errorId 'adapted pre-pointer failure remains the reported cause after old-runtime restart'
+        $pointer=Read-CcodActiveRuntime -InstallRoot $install
+        Assert-CcodEqual $legacy.RuntimeId $pointer.activeRuntime 'selector genesis keeps the legacy runtime active when the new pointer never commits'
+        Assert-CcodEqual ([uint64]1) $pointer.generation 'pre-pointer failure appends no false new or compensating selector'
+        Assert-CcodEqual 1 $fake.World.TaskStarted 'pre-pointer failure restarts only the retained legacy runtime'
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Failed' $head.phase 'pre-pointer failure has a terminal diagnostic transaction'
+        Assert-CcodEqual 'CCOD_RUNTIME_POINTER_COMMIT_FAILED' $head.errorCode 'diagnostic transaction retains the adapted pointer failure'
+        Assert-CcodTrue (Test-Path -LiteralPath $legacy.RuntimeRoot -PathType Container) 'pre-pointer failure retains the old runtime tree'
+        $failedRuntimeId=[string]$head.newRuntimeId
+        $runtimeCount=@(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count
+        $fake.World.SetActiveFailure=$null
+
+        $retry=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('d'*64) -Adapters $fake.Adapters
+
+        Assert-CcodEqual 'Upgraded' $retry.Outcome 'second exact attempt resumes the failed legacy migration'
+        Assert-CcodEqual $failedRuntimeId $retry.RuntimeId 'retry reuses the exact sealed generation-two runtime'
+        Assert-CcodEqual $runtimeCount @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -Force).Count 'retry invents no additional runtime generation'
+        $retryPointer=Read-CcodActiveRuntime -InstallRoot $install
+        Assert-CcodEqual $failedRuntimeId $retryPointer.activeRuntime 'retry selects the previously failed sealed runtime'
+        Assert-CcodEqual ([uint64]2) $retryPointer.generation 'pre-pointer retry completes the missing generation-two selector'
+        $readyHeads=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Ready.*.json' -File -Force)
+        Assert-CcodEqual 1 $readyHeads.Count 'retry produces exactly one terminal Ready transaction'
+    } finally {
+        foreach($path in @($legacySource,$source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+    }
+}
+
+foreach($retryCase in @(
+    [pscustomobject]@{Name='legacy manifest identity drift in the Failed chain';Kind='old-manifest'},
+    [pscustomobject]@{Name='Failed transaction generation drift';Kind='generation'},
+    [pscustomobject]@{Name='foreign terminal transaction chain';Kind='foreign'},
+    [pscustomobject]@{Name='Failed chain without RuntimePromoted evidence';Kind='premature'},
+    [pscustomobject]@{Name='cleanup fence plane';Kind='fence'},
+    [pscustomobject]@{Name='unexpected selector generation';Kind='selector'},
+    [pscustomobject]@{Name='failed runtime manifest byte drift';Kind='new-manifest'},
+    [pscustomobject]@{Name='different sealed package identity';Kind='package'}
+)) {
+    $case=$retryCase
+    $results += Invoke-CcodTest ("legacy migration retry rejects {0} before any new mutation" -f $case.Name) {
+        $fixture=New-CcodLifecycleLegacyMigrationRetryFixture
+        try {
+            $module=Get-Module InstallLifecycle -ErrorAction Stop
+            $store=Join-Path $fixture.Install 'state\install-transactions'
+            switch($case.Kind){
+                'old-manifest' {
+                    foreach($file in @(Get-ChildItem -LiteralPath $store -File -Force)){$record=[IO.File]::ReadAllText($file.FullName)|ConvertFrom-Json;$record.oldManifestSha256=('0'*64);[IO.File]::SetAttributes($file.FullName,[IO.FileAttributes]::Normal);[IO.File]::WriteAllText($file.FullName,($record|ConvertTo-Json -Depth 8 -Compress),[Text.UTF8Encoding]::new($false))}
+                }
+                'generation' {
+                    foreach($file in @(Get-ChildItem -LiteralPath $store -File -Force)){$record=[IO.File]::ReadAllText($file.FullName)|ConvertFrom-Json;$record.newGeneration=[uint64]3;$newLeaf=&$module {param($Value)Get-CcodInstallTransactionRecordLeaf -Record $Value} $record;[IO.File]::SetAttributes($file.FullName,[IO.FileAttributes]::Normal);[IO.File]::WriteAllText($file.FullName,($record|ConvertTo-Json -Depth 8 -Compress),[Text.UTF8Encoding]::new($false));[IO.File]::Move($file.FullName,(Join-Path $store $newLeaf))}
+                }
+                'foreign' {
+                    $foreign=&$module {New-CcodInstallTransactionRecord -TransactionId 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' -OldRuntimeId $null -OldGeneration $null -OldManifestSha256 $null -NewRuntimeId 'foreign-runtime' -NewGeneration ([uint64]1) -NewManifestSha256 ('1'*64) -SealedPackageSha256 ('2'*64) -OwnedObjectNames @('foreign-runtime')}
+                    foreach($phase in @('Prepared','Failed')){$record=$foreign.PSObject.Copy();$record.phase=$phase;$record.errorCode=if($phase-ceq'Failed'){'CCOD_INSTALL_FAILED'}else{$null};$leaf=&$module {param($Value)Get-CcodInstallTransactionRecordLeaf -Record $Value} $record;[IO.File]::WriteAllText((Join-Path $store $leaf),($record|ConvertTo-Json -Depth 8 -Compress),[Text.UTF8Encoding]::new($false))}
+                }
+                'premature' {
+                    foreach($file in @(Get-ChildItem -LiteralPath $store -File -Force)){$record=[IO.File]::ReadAllText($file.FullName)|ConvertFrom-Json;if($record.phase-notin@('Prepared','PackageVerified','Failed')){[IO.File]::SetAttributes($file.FullName,[IO.FileAttributes]::Normal);[IO.File]::Delete($file.FullName)}}
+                }
+                'fence' {[IO.Directory]::CreateDirectory((Join-Path $fixture.Install 'state\product-cleanup-fences'))|Out-Null}
+                'selector' {[IO.File]::WriteAllText((Join-Path $fixture.Install 'state\active-generation\00000000000000000002.json'),([ordered]@{schemaVersion=1;generation=[uint64]2;activeRuntime=$fixture.Legacy.RuntimeId;previousGeneration=[uint64]1}|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))}
+                'new-manifest' {$manifestPath=Join-Path $fixture.Install "runtime\$($fixture.Head.newRuntimeId)\manifest.json";[IO.File]::SetAttributes($manifestPath,[IO.FileAttributes]::Normal);[IO.File]::AppendAllText($manifestPath,"`n",[Text.UTF8Encoding]::new($false))}
+            }
+            $runtimeCount=@(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'runtime') -Directory -Force).Count
+            $selectorCount=@(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\active-generation') -File -Force).Count
+            $transactionCount=@(Get-ChildItem -LiteralPath $store -File -Force).Count
+            $taskInstalled=$fixture.Fake.World.TaskInstalled;$taskStarted=$fixture.Fake.World.TaskStarted
+            $packageHash=if($case.Kind-ceq'package'){('e'*64)}else{('d'*64)}
+            $failure=$null;try{Invoke-CcodInstall -SourceRoot $fixture.Source -InstallRoot $fixture.Install -SealedPackageSha256 $packageHash -Adapters $fixture.Fake.Adapters|Out-Null}catch{$failure=$_}
+            Assert-CcodEqual 'CCOD_INSTALL_UPGRADE_SOURCE_INVALID' (([string]$failure.FullyQualifiedErrorId-split',')[0]) "$($case.Name) fails through the retry compatibility boundary"
+            Assert-CcodEqual $runtimeCount @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'runtime') -Directory -Force).Count "$($case.Name) creates no runtime"
+            Assert-CcodEqual $selectorCount @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\active-generation') -File -Force).Count "$($case.Name) appends no selector"
+            Assert-CcodEqual $transactionCount @(Get-ChildItem -LiteralPath $store -File -Force).Count "$($case.Name) appends no transaction snapshot"
+            Assert-CcodEqual $taskInstalled $fixture.Fake.World.TaskInstalled "$($case.Name) performs no task install"
+            Assert-CcodEqual $taskStarted $fixture.Fake.World.TaskStarted "$($case.Name) performs no process start"
+        } finally {Remove-CcodLifecycleLegacyMigrationRetryFixture $fixture}
+    }
+}
+
+$results += Invoke-CcodTest 'Invoke-CcodInstall is idempotent only for the active Ready runtime and exact sealed package identity' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null
+        $nodePath=New-CcodLifecycleFakeNode -Root $nodeRoot
+        $firstFake=New-CcodLifecycleFake -NodePath $nodePath
+        $first=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters $firstFake.Adapters
+        $firstPointer=Read-CcodActiveRuntime -InstallRoot $install
+        $sameFake=New-CcodLifecycleFake -NodePath $nodePath
+        $same=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters $sameFake.Adapters
+        $samePointer=Read-CcodActiveRuntime -InstallRoot $install
+        Assert-CcodEqual 'AlreadyInstalled' $same.Outcome 'same version and package identity returns an idempotent outcome'
+        Assert-CcodEqual $first.RuntimeId $same.RuntimeId 'idempotence remains bound to the active runtime'
+        Assert-CcodEqual $firstPointer.generation $samePointer.generation 'idempotence does not append a pointer generation'
+        Assert-CcodEqual 1 @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory).Count 'idempotence creates no generation'
+        Assert-CcodEqual 0 $sameFake.World.TaskInstalled 'idempotence performs no task mutation'
+        Assert-CcodEqual 0 $sameFake.World.TaskStarted 'idempotence starts no process'
+        Assert-CcodEqual 1 $sameFake.World.ProductRegistrationCalls 'AlreadyInstalled reconciles product registration after revalidating exact Ready identity'
+        Assert-CcodTrue $same.ProductRegistrationVerified 'AlreadyInstalled reports a fresh verified registration reconciliation'
+        $conflictFake=New-CcodLifecycleFake -NodePath $nodePath
+        Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('b'*64) -Adapters $conflictFake.Adapters|Out-Null} 'CCOD_INSTALL_PACKAGE_CONFLICT'
+        $conflictPointer=Read-CcodActiveRuntime -InstallRoot $install
+        Assert-CcodEqual $firstPointer.generation $conflictPointer.generation 'package conflict leaves the active pointer unchanged'
+        Assert-CcodEqual $first.RuntimeId $conflictPointer.activeRuntime 'package conflict remains bound to the old active runtime'
+        Assert-CcodEqual 1 @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory).Count 'package conflict creates no generation'
+        Assert-CcodEqual 0 $conflictFake.World.TaskInstalled 'package conflict performs no task mutation'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}}
+}
+
+$results += Invoke-CcodTest 'missing sealed package identity never enables idempotence or package-conflict decisions' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22-no-identity'|Out-Null;$nodePath=New-CcodLifecycleFakeNode -Root $nodeRoot
+        $first=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
+        $second=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
+        Assert-CcodEqual 'Upgraded' $second.Outcome 'legacy direct call without canonical package identity is not treated as idempotent'
+        Assert-CcodTrue ($second.RuntimeId-cne$first.RuntimeId) 'missing package identity creates a fresh unique generation'
+        Assert-CcodEqual 2 (Read-CcodActiveRuntime -InstallRoot $install).generation 'missing package identity follows the normal monotonic upgrade path'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}}
+}
+
+$results += Invoke-CcodTest 'unique immutable runtime ids bind project and manifest file identity while preserving per-attempt uniqueness' {
+    $module=Get-Module InstallLifecycle -ErrorAction Stop
+    $filesA=@([pscustomobject]@{Relative='a.txt';ExpectedLength=[int64]1;ExpectedSha256=('a'*64);Source='unused'})
+    $filesB=@([pscustomobject]@{Relative='a.txt';ExpectedLength=[int64]1;ExpectedSha256=('b'*64);Source='unused'})
+    $first=&$module {param($Files)New-CcodUniqueRuntimeId -ProjectVersion '2.5.22' -Files $Files -NewNonce { '1'*32 }} $filesA
+    $second=&$module {param($Files)New-CcodUniqueRuntimeId -ProjectVersion '2.5.22' -Files $Files -NewNonce { '2'*32 }} $filesA
+    $differentContent=&$module {param($Files)New-CcodUniqueRuntimeId -ProjectVersion '2.5.22' -Files $Files -NewNonce { '1'*32 }} $filesB
+    $differentVersion=&$module {param($Files)New-CcodUniqueRuntimeId -ProjectVersion '2.5.23' -Files $Files -NewNonce { '1'*32 }} $filesA
+    Assert-CcodEqual '2.5.22-4b2146780452e12e-11111111111111111111111111111111' $first 'runtime id contains project version, manifest file digest, and canonical nonce'
+    Assert-CcodTrue ($first.Length-le96) 'runtime id remains within the manifest identity bound'
+    Assert-CcodTrue ($first-cne$second) 'identical package content receives a unique generation id per attempt'
+    Assert-CcodTrue ($first-cne$differentContent) 'manifest file content changes the deterministic runtime identity'
+    Assert-CcodTrue ($first-cne$differentVersion) 'project version changes the deterministic runtime identity'
+    Assert-CcodThrows { &$module {param($Files)New-CcodUniqueRuntimeId -ProjectVersion '2.5.22' -Files $Files -NewNonce { 'not-a-guid' }} $filesA } 'CCOD_INSTALL_RUNTIME_ID_INVALID'
+}
+
+$results += Invoke-CcodTest 'immutable record helpers reject a cross-root transaction before creating state' {
+    $a=New-CcodLifecycleTempRoot;$b=New-CcodLifecycleTempRoot;[IO.Directory]::CreateDirectory($a)|Out-Null;[IO.Directory]::CreateDirectory($b)|Out-Null
+    $module=Get-Module InstallLifecycle -ErrorAction Stop;$tx=&$module {param($Root)Open-CcodLifecycleInstallGeneration -InstallRoot $Root -RuntimeId 'scope-runtime'} $a
+    try {
+        $record=&$module {New-CcodInstallTransactionRecord -TransactionId '22222222-3333-4444-5555-666666666666' -OldRuntimeId $null -OldGeneration $null -OldManifestSha256 $null -NewRuntimeId 'scope-runtime' -NewGeneration 1 -NewManifestSha256 ('2'*64) -SealedPackageSha256 ('e'*64) -OwnedObjectNames @('scope-runtime')}
+        Assert-CcodThrows { &$module {param($Root,$Record,$Tx)Write-CcodInstallTransactionRecord -InstallRoot $Root -TransactionRecord $Record -FileTransaction $Tx} $b $record $tx } 'CCOD_INSTALL_TRANSACTION_SCOPE'
+        Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $b 'state')) 'cross-root call creates no state'
+    } finally { &$module {param($Tx)Close-CcodInstallFileTransaction -Transaction $Tx -Disposition Failed} $tx;if(Test-Path $a){Remove-Item $a -Recurse -Force};if(Test-Path $b){Remove-Item $b -Recurse -Force} }
+}
+
+$results += Invoke-CcodTest 'state and UI initialization reject a cross-root transaction before either state plane is written' {
+    $a=New-CcodLifecycleTempRoot;$b=New-CcodLifecycleTempRoot;[IO.Directory]::CreateDirectory($a)|Out-Null;[IO.Directory]::CreateDirectory($b)|Out-Null
+    $module=Get-Module InstallLifecycle -ErrorAction Stop;$runtimeId='2.5.22-1111111111111111-22222222222222222222222222222222';$tx=&$module {param($Root,$Id)Open-CcodLifecycleInstallGeneration -InstallRoot $Root -RuntimeId $Id} $a $runtimeId
+    try{Assert-CcodThrows {&$module {param($Root,$Id,$Transaction)Initialize-CcodInstallStatePlanes -InstallRoot $Root -RuntimeId $Id -FileTransaction $Transaction -NodeCandidates @() -CandidateCompatibleOptIn $false} $b $runtimeId $tx} 'CCOD_INSTALL_TRANSACTION_SCOPE';Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $a 'state')) 'root A receives no baseline on cross-root rejection';Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $b 'state')) 'root B receives no operational or UI state on cross-root rejection'}finally{&$module {param($Transaction)Close-CcodInstallFileTransaction -Transaction $Transaction -Disposition Failed} $tx;if(Test-Path $a){Remove-Item $a -Recurse -Force};if(Test-Path $b){Remove-Item $b -Recurse -Force}}
+}
+
+$results += Invoke-CcodTest 'partial operational state fails closed without overwrite or activation' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source|Out-Null;$stateRoot=Join-Path $install 'state';[IO.Directory]::CreateDirectory($stateRoot)|Out-Null
+        $settingsPath=Join-Path $stateRoot 'settings.json';[IO.File]::WriteAllText($settingsPath,'{"schemaVersion":1,"sentinel":"partial"}',[Text.UTF8Encoding]::new($false));$before=Get-CcodTestFileSha256 $settingsPath
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot;Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $node).Adapters|Out-Null} 'CCOD_STATE_ALREADY_INITIALIZED'
+        Assert-CcodEqual $before (Get-CcodTestFileSha256 $settingsPath) 'partial operational state is not overwritten';Assert-CcodEqual 1 @(Get-ChildItem -LiteralPath $stateRoot -File).Count 'no other operational state leaf is materialized';Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $stateRoot 'active-generation')) 'partial state cannot activate a generation'
+    }finally{foreach($p in @($source,$install,$nodeRoot)){if(Test-Path $p){Remove-Item $p -Recurse -Force}}}
+}
+
+$results += Invoke-CcodTest 'transaction reader rejects immutable identity drift across a contiguous snapshot chain' {
+    $install=New-CcodLifecycleTempRoot;$transactionId='33333333-4444-5555-6666-777777777777'
+    try{
+        $store=Join-Path $install 'state\install-transactions';[IO.Directory]::CreateDirectory($store)|Out-Null
+        $prepared=[pscustomobject][ordered]@{schemaVersion=1;transactionId=$transactionId;oldRuntimeId='runtime-old-a';oldGeneration=1;oldManifestSha256=('1'*64);newRuntimeId='runtime-new';newGeneration=2;newManifestSha256=('2'*64);sealedPackageSha256=('f'*64);ownedObjectNames=@('runtime-new');phase='Prepared';errorCode=$null}
+        $verified=[pscustomobject][ordered]@{schemaVersion=1;transactionId=$transactionId;oldRuntimeId='runtime-old-b';oldGeneration=1;oldManifestSha256=('1'*64);newRuntimeId='runtime-new';newGeneration=2;newManifestSha256=('2'*64);sealedPackageSha256=('f'*64);ownedObjectNames=@('runtime-new');phase='PackageVerified';errorCode=$null}
+        [IO.File]::WriteAllText((Join-Path $store "00000000000000000002.00.Prepared.$transactionId.json"),($prepared|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $store "00000000000000000002.01.PackageVerified.$transactionId.json"),($verified|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+        $module=Get-Module InstallLifecycle -ErrorAction Stop
+        Assert-CcodThrows {&$module {param($Root,$Id)Read-CcodInstallTransactionRecord -InstallRoot $Root -TransactionId $Id|Out-Null} $install $transactionId} 'CCOD_INSTALL_TRANSACTION_INVALID'
+    }finally{if(Test-Path -LiteralPath $install){Remove-Item -LiteralPath $install -Recurse -Force}}
+}
+
+$results += Invoke-CcodTest 'transaction store rejects unknown reparse ADS multilink and ambiguous chains' {
+    $module=Get-Module InstallLifecycle -ErrorAction Stop
+    $newRecord={param($Id,[uint64]$Generation)[pscustomobject][ordered]@{schemaVersion=1;transactionId=$Id;oldRuntimeId='runtime-old';oldGeneration=[uint64]1;oldManifestSha256=('1'*64);newRuntimeId=("runtime-new-$Generation");newGeneration=$Generation;newManifestSha256=('2'*64);sealedPackageSha256=('a'*64);ownedObjectNames=@("runtime-new-$Generation");phase='Prepared';errorCode=$null}}
+    foreach($kind in @('unknown','reparse','ads','multilink','ambiguous')){
+        $install=New-CcodLifecycleTempRoot;$outside=New-CcodLifecycleTempRoot
+        try{
+            $store=Join-Path $install 'state\install-transactions';[IO.Directory]::CreateDirectory($store)|Out-Null;[IO.Directory]::CreateDirectory($outside)|Out-Null
+            if($kind-ceq'unknown'){[IO.File]::WriteAllText((Join-Path $store 'unknown.bin'),'x',[Text.UTF8Encoding]::new($false))}
+            elseif($kind-ceq'reparse'){New-Item -ItemType Junction -Path (Join-Path $store '00000000000000000002.00.Prepared.44444444-5555-6666-7777-888888888888.json') -Target $outside|Out-Null}
+            elseif($kind-ceq'ads'){$id='44444444-5555-6666-7777-888888888888';$path=Join-Path $store "00000000000000000002.00.Prepared.$id.json";[IO.File]::WriteAllText($path,((&$newRecord $id 2)|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false));Set-Content -LiteralPath $path -Stream 'evidence' -Value 'x' -NoNewline}
+            elseif($kind-ceq'multilink'){$id='44444444-5555-6666-7777-888888888888';$outsideFile=Join-Path $outside 'record.json';[IO.File]::WriteAllText($outsideFile,((&$newRecord $id 2)|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false));New-Item -ItemType HardLink -Path (Join-Path $store "00000000000000000002.00.Prepared.$id.json") -Target $outsideFile|Out-Null}
+            else{foreach($pair in @(@('44444444-5555-6666-7777-888888888888',[uint64]2),@('55555555-6666-7777-8888-999999999999',[uint64]3))){$id=[string]$pair[0];$generation=[uint64]$pair[1];[IO.File]::WriteAllText((Join-Path $store ('{0:D20}.00.Prepared.{1}.json'-f$generation,$id)),((&$newRecord $id $generation)|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))}}
+            $expected=if($kind-ceq'ambiguous'){'CCOD_INSTALL_TRANSACTION_AMBIGUOUS'}else{'CCOD_INSTALL_TRANSACTION_INVALID'}
+            Assert-CcodThrows {&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root|Out-Null} $install} $expected
+        }finally{if(Test-Path -LiteralPath $install){Remove-Item -LiteralPath $install -Recurse -Force -ErrorAction SilentlyContinue};if(Test-Path -LiteralPath $outside){Remove-Item -LiteralPath $outside -Recurse -Force -ErrorAction SilentlyContinue}}
+    }
+}
+
+$results += Invoke-CcodTest 'transaction reader rejects ambiguous Ready and latest Failed terminal heads' {
+    $module=Get-Module InstallLifecycle -ErrorAction Stop
+    foreach($terminalKind in @('Ready','Failed')){
+        $install=New-CcodLifecycleTempRoot
+        try{
+            $store=Join-Path $install 'state\install-transactions';[IO.Directory]::CreateDirectory($store)|Out-Null
+            $runtimeId='runtime-terminal';$generation=if($terminalKind-ceq'Ready'){[uint64]1}else{[uint64]2}
+            foreach($id in @('66666666-7777-8888-9999-aaaaaaaaaaaa','77777777-8888-9999-aaaa-bbbbbbbbbbbb')){
+                $phases=if($terminalKind-ceq'Ready'){@('Prepared','PackageVerified','RuntimeStaged','PreviousProtectionStopped','RuntimePromoted','PointerCommitted','StableShellCommitted','ProtectionReady','Ready')}else{@('Prepared','Failed')}
+                foreach($phase in $phases){$index=if($phase-ceq'Failed'){99}else{[Array]::IndexOf(@('Prepared','PackageVerified','RuntimeStaged','PreviousProtectionStopped','RuntimePromoted','PointerCommitted','StableShellCommitted','ProtectionReady','Ready'),$phase)};$record=[pscustomobject][ordered]@{schemaVersion=1;transactionId=$id;oldRuntimeId=$null;oldGeneration=$null;oldManifestSha256=$null;newRuntimeId=$runtimeId;newGeneration=$generation;newManifestSha256=('2'*64);sealedPackageSha256=('b'*64);ownedObjectNames=@($runtimeId);phase=$phase;errorCode=if($phase-ceq'Failed'){'CCOD_INSTALL_FAILED'}else{$null}};[IO.File]::WriteAllText((Join-Path $store ('{0:D20}.{1:D2}.{2}.{3}.json'-f$generation,$index,$phase,$id)),($record|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))}
+            }
+            if($terminalKind-ceq'Ready'){$pointerRoot=Join-Path $install 'state\active-generation';[IO.Directory]::CreateDirectory($pointerRoot)|Out-Null;[IO.File]::WriteAllText((Join-Path $pointerRoot '00000000000000000001.json'),('{"schemaVersion":1,"generation":1,"activeRuntime":"'+$runtimeId+'","previousGeneration":0}'),[Text.UTF8Encoding]::new($false))}
+            Assert-CcodThrows {&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root|Out-Null} $install} 'CCOD_INSTALL_TRANSACTION_AMBIGUOUS'
+        }finally{if(Test-Path -LiteralPath $install){Remove-Item -LiteralPath $install -Recurse -Force}}
+    }
+}
+
+$results += Invoke-CcodTest 'real install entry rejects pointerless and ambiguous nonterminal transaction state before generation creation' {
+    foreach($count in @(1,2)){
+        $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+        try{
+            New-CcodLifecycleSourceFixture -Root $source|Out-Null;$store=Join-Path $install 'state\install-transactions';[IO.Directory]::CreateDirectory($store)|Out-Null
+            for($i=1;$i-le$count;$i++){$id=if($i-eq1){'88888888-9999-aaaa-bbbb-cccccccccccc'}else{'99999999-aaaa-bbbb-cccc-dddddddddddd'};$runtime="pending-$i";$record=[pscustomobject][ordered]@{schemaVersion=1;transactionId=$id;oldRuntimeId=$null;oldGeneration=$null;oldManifestSha256=$null;newRuntimeId=$runtime;newGeneration=[uint64]$i;newManifestSha256=('2'*64);sealedPackageSha256=('3'*64);ownedObjectNames=@($runtime);phase='Prepared';errorCode=$null};[IO.File]::WriteAllText((Join-Path $store ('{0:D20}.00.Prepared.{1}.json'-f$i,$id)),($record|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))}
+            $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$expected=if($count-eq1){'CCOD_INSTALL_TRANSACTION_BUSY'}else{'CCOD_INSTALL_TRANSACTION_AMBIGUOUS'}
+            Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $node).Adapters|Out-Null} $expected
+            Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $install 'runtime')) "global transaction gate creates no generation for $count head(s)"
+        }finally{foreach($p in @($source,$install,$nodeRoot)){if(Test-Path $p){Remove-Item $p -Recurse -Force}}}
+    }
+}
+
 $results += Invoke-CcodTest 'waits for the previous IgnoreNew task instance before starting the new supervisor' {
     $module = Get-Module -Name InstallLifecycle -ErrorAction Stop
     $calls = [Collections.Generic.List[string]]::new()
@@ -387,6 +1614,7 @@ $results += Invoke-CcodTest 'default installer validation uses the structural ru
     }
 }
 
+<# Superseded: Setup no longer parses mutable JSON progress or owns an app payload tree.
 # Production mutation caught: recognizing JSON members only when the colon has zero or one following space.
 $results += Invoke-CcodTest 'Inno activation progress parser accepts every legal JSON whitespace form' {
     $installerPath = Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'
@@ -491,17 +1719,27 @@ $results += Invoke-CcodTest 'Inno visibly starts and synchronously owns the boun
     Assert-CcodTrue ($activationWorker -cmatch '(?s)function Stop-CcodOwnedInstallProcess.*?WaitForExit\(5000\).*?while \(\$true\).*?\.Kill\(\).*?\.WaitForExit\(\).*?\.HasExited.*?return') 'an unproven bounded stop escalates to waiting until exact child exit instead of returning to Setup'
 }
 
+#>
+
+$results += Invoke-CcodTest 'sealed Setup delegates strict append-only receipt validation to the locked bootstrap' {
+    $installerScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
+    $activationWorker = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -Raw -Encoding UTF8
+    Assert-CcodTrue ($installerScript -cmatch '(?s)function PrepareToInstall.*ExtractAndLockCcodInputs.*procedure CurStepChanged.*GetArrayLength\(CcodInputHandles\) <> 3.*GetCcodBootstrapParameters.*ewWaitUntilTerminated, ActivationResultCode.*GetCcodBootstrapParameters\(ActivationId, True\).*ewWaitUntilTerminated, ValidationResultCode') 'Setup retains one pre-install locked bootstrap across activation and strict validation'
+    Assert-CcodTrue ($installerScript -cmatch '-PackagePath' -and $installerScript -cmatch '-ExpectedPackageSha256' -and $installerScript -cnotmatch 'post-install-activation\.json') 'Setup passes the compile-bound sealed package and owns no mutable receipt path'
+    Assert-CcodTrue ($activationWorker -cmatch 'state\\activation-receipts' -and $activationWorker -cmatch '\$ExpectedActivationId\.\$phase\.json' -and $activationWorker -cnotmatch "Join-Path \`$Root 'state\\post-install-activation\.json'") 'bootstrap validates only append-only activation receipts'
+}
+
 $results += Invoke-CcodTest 'activation owner kills and proves exit before a timed-out child can change the receipt' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-owned-timeout-' + [guid]::NewGuid().ToString('N'))
     try {
-        [IO.Directory]::CreateDirectory((Join-Path $root 'state')) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $root 'state\activation-receipts')) | Out-Null
         $lateMarker = Join-Path $root 'late-write.txt'
         $installScript = Join-Path $root 'Install-CodexControlOtherDevices.ps1'
         $installSource = @"
 param([string]`$InstallRoot,[string]`$ActivationId,[switch]`$EnableCandidateCompatibleUpdates)
 Start-Sleep -Milliseconds 1200
 `$receipt=[ordered]@{schemaVersion=1;activationId=`$ActivationId;phase='Ready';runtimeId='late-runtime';previousRuntimeId=`$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=`$true;errorCode=`$null}
-[IO.File]::WriteAllText((Join-Path `$InstallRoot 'state\post-install-activation.json'),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
+[IO.File]::WriteAllText((Join-Path `$InstallRoot "state\activation-receipts\`$ActivationId.Ready.json"),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
 [IO.File]::WriteAllText('$lateMarker','late',[Text.UTF8Encoding]::new(`$false))
 exit 0
 "@
@@ -511,7 +1749,7 @@ exit 0
         Assert-CcodEqual 1 $LASTEXITCODE 'missing first receipt makes the owned activation fail'
         Start-Sleep -Milliseconds 1400
         Assert-CcodTrue (-not (Test-Path -LiteralPath $lateMarker)) 'the exact install child cannot write after the activation owner returns'
-        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $root 'state\post-install-activation.json'))) 'the killed child cannot later publish Ready'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $root "state\activation-receipts\$activationId.Ready.json"))) 'the killed child cannot later publish Ready'
         $log = Get-Content -LiteralPath (Join-Path $root 'logs\post-install-activation.log') -Raw -Encoding UTF8
         Assert-CcodTrue ($log -cmatch 'CCOD_ACTIVATION_FIRST_RECEIPT_TIMEOUT') 'the owner records the stable first-receipt timeout code'
         Assert-CcodTrue (($output -join "`n") -cmatch 'CCOD_ACTIVATION_FIRST_RECEIPT_TIMEOUT') 'the owner reports the bounded timeout without a safe terminal receipt'
@@ -523,16 +1761,16 @@ exit 0
 $results += Invoke-CcodTest 'activation owner freezes a correlated progress receipt at the total deadline' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-owned-total-timeout-' + [guid]::NewGuid().ToString('N'))
     try {
-        [IO.Directory]::CreateDirectory((Join-Path $root 'state')) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $root 'state\activation-receipts')) | Out-Null
         $lateMarker = Join-Path $root 'late-total-write.txt'
         $installScript = Join-Path $root 'Install-CodexControlOtherDevices.ps1'
         $installSource = @"
 param([string]`$InstallRoot,[string]`$ActivationId,[switch]`$EnableCandidateCompatibleUpdates)
 `$receipt=[ordered]@{schemaVersion=1;activationId=`$ActivationId;phase='StartingProtection';runtimeId='pending-runtime';previousRuntimeId=`$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=`$false;errorCode=`$null}
-[IO.File]::WriteAllText((Join-Path `$InstallRoot 'state\post-install-activation.json'),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
+[IO.File]::WriteAllText((Join-Path `$InstallRoot "state\activation-receipts\`$ActivationId.StartingProtection.json"),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
 Start-Sleep -Milliseconds 3000
 `$receipt.phase='Ready';`$receipt.ready=`$true;`$receipt.updatedAtUtc='2030-02-03T04:05:08.0000000Z'
-[IO.File]::WriteAllText((Join-Path `$InstallRoot 'state\post-install-activation.json'),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
+[IO.File]::WriteAllText((Join-Path `$InstallRoot "state\activation-receipts\`$ActivationId.Ready.json"),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
 [IO.File]::WriteAllText('$lateMarker','late',[Text.UTF8Encoding]::new(`$false))
 exit 0
 "@
@@ -542,7 +1780,7 @@ exit 0
         Assert-CcodEqual 1 $LASTEXITCODE 'total deadline makes the owned activation fail after correlated progress'
         Start-Sleep -Milliseconds 3200
         Assert-CcodTrue (-not (Test-Path -LiteralPath $lateMarker)) 'the exact install child cannot write after the total deadline owner return'
-        $receipt = Get-Content -LiteralPath (Join-Path $root 'state\post-install-activation.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        $receipt = Get-Content -LiteralPath (Join-Path $root "state\activation-receipts\$activationId.StartingProtection.json") -Raw -Encoding UTF8 | ConvertFrom-Json
         Assert-CcodEqual 'StartingProtection' $receipt.phase 'the killed child cannot change progress into Ready after Setup regains control'
         $log = Get-Content -LiteralPath (Join-Path $root 'logs\post-install-activation.log') -Raw -Encoding UTF8
         Assert-CcodTrue ($log -cmatch 'CCOD_ACTIVATION_TIMEOUT') 'the owner records the stable total timeout code'
@@ -556,14 +1794,14 @@ exit 0
 $results += Invoke-CcodTest 'activation worker reports the strict Failed receipt support code without prompting' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-failed-report-' + [guid]::NewGuid().ToString('N'))
     try {
-        [IO.Directory]::CreateDirectory((Join-Path $root 'state')) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $root 'state\activation-receipts')) | Out-Null
         $promptMarker = Join-Path $root 'prompt-marker.txt'
         $installScript = Join-Path $root 'Install-CodexControlOtherDevices.ps1'
         $promptScript = Join-Path $root 'Prompt-CcodRestart.ps1'
         $installSource = @"
 param([string]`$InstallRoot,[string]`$ActivationId,[switch]`$EnableCandidateCompatibleUpdates)
 `$receipt=[ordered]@{schemaVersion=1;activationId=`$ActivationId;phase='Failed';runtimeId='runtime-new';previousRuntimeId='runtime-old';startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=`$false;errorCode='CCOD_INSTALL_NEW_RUNTIME_NOT_READY'}
-[IO.File]::WriteAllText((Join-Path `$InstallRoot 'state\post-install-activation.json'),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
+[IO.File]::WriteAllText((Join-Path `$InstallRoot "state\activation-receipts\`$ActivationId.Failed.json"),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
 exit 1
 "@
         [IO.File]::WriteAllText($installScript,$installSource,[Text.UTF8Encoding]::new($false))
@@ -609,10 +1847,15 @@ $results += Invoke-CcodTest 'first install stages verifies activates task and pe
         $receipt = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -EnableCandidateCompatibleUpdates -Adapters $fake.Adapters
         Assert-CcodEqual 'Installed' $receipt.Outcome 'first install outcome'
         Assert-CcodEqual $true $receipt.Installed 'first install flag'
-        Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install 'bootstrap.ps1') -PathType Leaf) 'stable bootstrap copied'
-        Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install 'active.json') -PathType Leaf) 'active pointer written'
-        Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install "runtime\$($receipt.RuntimeId)") -PathType Container) 'runtime staged'
+        $runtimeRoot = Join-Path $install "runtime\$($receipt.RuntimeId)"
+        Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $runtimeRoot 'src\persistence\bootstrap.ps1') -PathType Leaf) 'generation-specific bootstrap is sealed with the runtime'
+        Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $install 'bootstrap.ps1')) 'first install does not create a mutable root bootstrap'
+        Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $install 'active.json')) 'new install never writes the legacy active pointer'
+        Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $install 'state\post-install-activation.json')) 'new install never writes the mutable legacy activation receipt'
+        Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install 'state\active-generation\00000000000000000001.json') -PathType Leaf) 'append-only active generation pointer written'
+        Assert-CcodTrue (Test-Path -LiteralPath $runtimeRoot -PathType Container) 'runtime staged'
         Assert-CcodEqual 1 $fake.World.TaskInstalled 'task installed'
+        Assert-CcodEqual $receipt.RuntimeId $fake.World.TaskRuntimeIds[0] 'scheduled task selects the committed generation bootstrap'
         Assert-CcodEqual 1 $fake.World.TaskStarted 'task started'
         Assert-CcodEqual $null $receipt.PreviousRuntimeId 'first install has no previous runtime'
         $state = Read-CcodState -StateRoot (Join-Path $install 'state')
@@ -623,7 +1866,19 @@ $results += Invoke-CcodTest 'first install stages verifies activates task and pe
         $preference = Read-CcodUiPreference -StateRoot $stateRoot
         Assert-CcodEqual 'System' $preference.LanguageMode 'first install follows Windows'
         Assert-CcodEqual $false $preference.FallbackUsed 'first install persisted preference'
-        $runtimeRoot = Join-Path $install "runtime\$($receipt.RuntimeId)"
+        $baselineRoot = Join-Path $stateRoot "install-initializations\$($receipt.RuntimeId)"
+        foreach ($leaf in @('settings.json','status.json','verified-packages.json','transition.json','ui-preferences.json')) {
+            $baselinePath = Join-Path $baselineRoot $leaf
+            Assert-CcodTrue (Test-Path -LiteralPath $baselinePath -PathType Leaf) "immutable initialization baseline contains $leaf"
+            Assert-CcodTrue (((Get-Item -LiteralPath $baselinePath -Force).Attributes -band [IO.FileAttributes]::ReadOnly) -ne 0) "immutable initialization baseline seals $leaf"
+        }
+        foreach ($leaf in @('settings.json','status.json','verified-packages.json','transition.json','ui-preferences.json')) {
+            Assert-CcodEqual 0 ((Get-Item -LiteralPath (Join-Path $stateRoot $leaf) -Force).Attributes -band [IO.FileAttributes]::ReadOnly) "operational $leaf remains writable"
+        }
+        Set-CcodAutomationEnabled -StateRoot $stateRoot -Enabled $false
+        Assert-CcodEqual $false (Read-CcodSettings -StateRoot $stateRoot).automationEnabled 'StateStore can update and read operational state after immutable initialization'
+        Set-CcodUiLanguageMode -StateRoot $stateRoot -LanguageMode 'zh-CN' | Out-Null
+        Assert-CcodEqual 'zh-CN' (Read-CcodUiPreference -StateRoot $stateRoot).LanguageMode 'UI preferences can update and read operational state after immutable initialization'
         Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $runtimeRoot 'src\persistence\resources\ui.en-US.json') -PathType Leaf) 'English catalog staged'
         Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $runtimeRoot 'src\persistence\resources\ui.zh-CN.json') -PathType Leaf) 'Chinese catalog staged'
         $manifest = Test-CcodRuntimeManifest -RuntimeDirectory $runtimeRoot -ExpectedRuntimeId $receipt.RuntimeId
@@ -636,6 +1891,239 @@ $results += Invoke-CcodTest 'first install stages verifies activates task and pe
         Assert-CcodEqual '5770fe0f20f1623648a185cc7a0a99ff37b6aef6c07426ffc8a984493e0f2a2f' $chinese[0].sha256 'manifest hashes Chinese catalog'
     } finally {
         foreach ($path in @($source, $install, $nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+# Production mutation caught: accepting an old setup payload for a newer expected setup version and stopping the active runtime before rejecting it.
+$results += Invoke-CcodTest 'upgrade rejects a payload version mismatch before active-pointer or protection mutation' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.13' | Out-Null
+        $manifestPath = New-CcodLifecyclePayloadManifest -Root $source -Version '2.5.13'
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        $first = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
+        $oldRuntime = [string]$first.RuntimeId
+        $before = Read-CcodActiveRuntime -InstallRoot $install
+        $fake = New-CcodLifecycleFake -NodePath $nodePath
+
+        $payloadBinding = Get-CcodLifecyclePayloadBinding -ManifestPath $manifestPath -ExpectedVersion '2.5.22'
+        Assert-CcodThrows {
+            Invoke-CcodInstall -SourceRoot $source -InstallRoot $install @payloadBinding -Adapters $fake.Adapters | Out-Null
+        } 'CCOD_INSTALL_PAYLOAD_VERSION_MISMATCH'
+
+        $after = Read-CcodActiveRuntime -InstallRoot $install
+        Assert-CcodEqual $oldRuntime $after.activeRuntime 'old payload cannot replace the active runtime'
+        Assert-CcodEqual $before.generation $after.generation 'version mismatch cannot advance the active generation'
+        Assert-CcodEqual 0 $fake.World.ShutdownSignaled 'version mismatch cannot stop the existing protection'
+        Assert-CcodEqual 0 $fake.World.TaskInstalled 'version mismatch performs no task mutation'
+    } finally {
+        foreach ($path in @($source,$install,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+# Production mutation caught: rediscovering the payload directory after manifest validation and copying an unlisted leftover into the runtime.
+$results += Invoke-CcodTest 'matching payload stages only immutable manifest-listed records' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $manifestPath = New-CcodLifecyclePayloadManifest -Root $source -Version '2.5.22'
+        $stalePath = Join-Path $source 'src\runtime\stale-old-payload.js'
+        [IO.File]::WriteAllText($stalePath,"module.exports = 'stale';`n",[Text.UTF8Encoding]::new($false))
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+
+        $payloadBinding = Get-CcodLifecyclePayloadBinding -ManifestPath $manifestPath -ExpectedVersion '2.5.22'
+        $receipt = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install @payloadBinding -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
+
+        $runtimeRoot = Join-Path $install "runtime\$($receipt.RuntimeId)"
+        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $runtimeRoot 'src\runtime\stale-old-payload.js'))) 'unlisted stale source file is absent from the runtime'
+        $runtimeManifest = Test-CcodRuntimeManifest -RuntimeDirectory $runtimeRoot -ExpectedRuntimeId $receipt.RuntimeId
+        Assert-CcodEqual $true $runtimeManifest.Valid 'manifest-filtered runtime remains valid'
+        Assert-CcodEqual 0 @($runtimeManifest.Manifest.files | Where-Object { $_.path -ceq 'src/runtime/stale-old-payload.js' }).Count 'runtime manifest contains no unlisted stale record'
+    } finally {
+        foreach ($path in @($source,$install,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+# Production mutation caught: trusting readiness without rereading the active pointer and selected runtime manifest before the terminal Ready receipt.
+$results += Invoke-CcodTest 'payload-bound install rereads the active pointer after readiness before reporting Ready' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.21' | Out-Null
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        $first = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
+        $oldPointer = Read-CcodActiveRuntime -InstallRoot $install
+        [IO.File]::WriteAllText((Join-Path $source 'package.json'),(@{name='codexremote-fix';version='2.5.22';private=$true}|ConvertTo-Json -Depth 4),[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'),"module.exports = 'fixture-2.5.22';`n",[Text.UTF8Encoding]::new($false))
+        $manifestPath = New-CcodLifecyclePayloadManifest -Root $source -Version '2.5.22'
+        $fake = New-CcodLifecycleFake -NodePath $nodePath
+        $fake.Adapters.NewActivationId = { 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff' }
+        $fake.Adapters.WaitNewRuntimeReady = {
+            param($InstallRoot,$RuntimeId,$RuntimeGeneration,$Identity,$TaskStartedAtUtc,$TimeoutMilliseconds)
+            $pointerRoot = Join-Path $InstallRoot 'state\active-generation'
+            $drift = [pscustomobject][ordered]@{ schemaVersion=1; generation=[uint64]3; activeRuntime=[string]$oldPointer.activeRuntime; previousGeneration=[uint64]2 }
+            [IO.File]::WriteAllText((Join-Path $pointerRoot '00000000000000000003.json'),($drift | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+            [pscustomobject][ordered]@{ SupervisorReady = $true; TrayReady = $true }
+        }.GetNewClosure()
+
+        $payloadBinding = Get-CcodLifecyclePayloadBinding -ManifestPath $manifestPath -ExpectedVersion '2.5.22'
+        Assert-CcodThrows {
+            Invoke-CcodInstall -SourceRoot $source -InstallRoot $install @payloadBinding -Adapters $fake.Adapters | Out-Null
+        } 'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN'
+        Assert-CcodTrue ($fake.World.Phases -notcontains 'Ready') 'pointer drift after readiness cannot produce a Ready receipt'
+    } finally {
+        foreach ($path in @($source,$install,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+# Production mutation caught: copying stable bootstrap/uninstaller from mutable source paths after their manifest-verified staging copies already exist.
+$results += Invoke-CcodTest 'stable bootstrap and uninstaller come from manifest-verified staging bytes' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $uninstallerSource = Join-Path $source 'Uninstall-CodexControlOtherDevices.ps1'
+        [IO.File]::WriteAllText($uninstallerSource,"# verified uninstaller`r`n",[Text.UTF8Encoding]::new($false))
+        [IO.Directory]::CreateDirectory($install) | Out-Null
+        $legacyBootstrap = Join-Path $install 'bootstrap.ps1'
+        $legacyUninstaller = Join-Path $install 'Uninstall-CodexControlOtherDevices.ps1'
+        [IO.File]::WriteAllText($legacyBootstrap,"# legacy bootstrap sentinel`r`n",[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($legacyUninstaller,"# legacy uninstaller sentinel`r`n",[Text.UTF8Encoding]::new($false))
+        $legacyBootstrapHash = Get-CcodTestFileSha256 -Path $legacyBootstrap
+        $legacyUninstallerHash = Get-CcodTestFileSha256 -Path $legacyUninstaller
+        $manifestPath = New-CcodLifecyclePayloadManifest -Root $source -Version '2.5.22'
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        $fake = New-CcodLifecycleFake -NodePath $nodePath
+
+        $payloadBinding = Get-CcodLifecyclePayloadBinding -ManifestPath $manifestPath -ExpectedVersion '2.5.22'
+        $receipt = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install @payloadBinding -Adapters $fake.Adapters
+
+        $runtimeRoot = Join-Path $install "runtime\$($receipt.RuntimeId)"
+        Assert-CcodEqual (Get-CcodTestFileSha256 -Path (Join-Path $source 'src\persistence\bootstrap.ps1')) (Get-CcodTestFileSha256 -Path (Join-Path $runtimeRoot 'src\persistence\bootstrap.ps1')) 'generation bootstrap equals the manifest-verified sealed source bytes'
+        Assert-CcodEqual (Get-CcodTestFileSha256 -Path $uninstallerSource) (Get-CcodTestFileSha256 -Path (Join-Path $runtimeRoot 'Uninstall-CodexControlOtherDevices.ps1')) 'generation uninstaller equals the manifest-verified sealed source bytes'
+        Assert-CcodEqual $legacyBootstrapHash (Get-CcodTestFileSha256 -Path $legacyBootstrap) 'legacy root bootstrap bytes remain unchanged'
+        Assert-CcodEqual $legacyUninstallerHash (Get-CcodTestFileSha256 -Path $legacyUninstaller) 'legacy root uninstaller bytes remain unchanged'
+    } finally {
+        foreach ($path in @($source,$install,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+$results += Invoke-CcodTest 'install root junction is rejected before staging writes' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $target = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source | Out-Null
+        [IO.Directory]::CreateDirectory($target) | Out-Null
+        New-Item -ItemType Junction -Path $install -Target $target | Out-Null
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        Assert-CcodThrows { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters | Out-Null } 'CCOD_INSTALL_REPARSE_PATH'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $target 'active.json'))) 'install-root junction target receives no active pointer'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $target '.staging'))) 'install-root junction target receives no staging directory'
+    } finally {
+        if (Test-Path -LiteralPath $install) { [IO.Directory]::Delete($install) }
+        foreach ($path in @($source,$target,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+$results += Invoke-CcodTest 'runtime junction is rejected before staging promotion' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $target = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source | Out-Null
+        [IO.Directory]::CreateDirectory($install) | Out-Null
+        [IO.Directory]::CreateDirectory($target) | Out-Null
+        New-Item -ItemType Junction -Path (Join-Path $install 'runtime') -Target $target | Out-Null
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        Assert-CcodThrows { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters | Out-Null } 'CCOD_INSTALL_FAILED'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath $target -Force).Count 'runtime junction target receives no promoted runtime'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $install 'active.json'))) 'runtime junction cannot reach active pointer mutation'
+    } finally {
+        $junction = Join-Path $install 'runtime'
+        if (Test-Path -LiteralPath $junction) { [IO.Directory]::Delete($junction) }
+        foreach ($path in @($source,$install,$target,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+# Production mutation caught: recursive whole-install deletion bypassing the strict per-leaf hard-link contract.
+$results += Invoke-CcodTest 'whole-install deletion rejects a nested hard-link before removing any in-tree leaf' {
+    $install = New-CcodLifecycleTempRoot
+    $outside = New-CcodLifecycleTempRoot
+    try {
+        $nested = Join-Path $install 'runtime\nested'
+        [IO.Directory]::CreateDirectory($nested) | Out-Null
+        [IO.Directory]::CreateDirectory($outside) | Out-Null
+        $sentinel = Join-Path $outside 'outside-sentinel.txt'
+        $linkedLeaf = Join-Path $nested 'linked-state.json'
+        $ordinaryLeaf = Join-Path $install 'ordinary-state.json'
+        [IO.File]::WriteAllText($sentinel,'outside-original',[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($ordinaryLeaf,'ordinary-original',[Text.UTF8Encoding]::new($false))
+        New-Item -ItemType HardLink -Path $linkedLeaf -Target $sentinel | Out-Null
+
+        $caughtId = $null
+        try {
+            $module = Get-Module InstallLifecycle
+            & $module { param($Root) Remove-CcodLifecycleInstallTree -InstallRoot $Root -Adapters @{} } $install
+        } catch { $caughtId = ([string]$_.FullyQualifiedErrorId -split ',')[0] }
+
+        Assert-CcodEqual 'CCOD_INSTALL_UNSAFE_LEAF' $caughtId 'whole-install deletion rejects the nested hard-link before recursive removal'
+        Assert-CcodTrue ([IO.File]::Exists($linkedLeaf)) 'rejected delete retains the in-tree hard-link'
+        Assert-CcodEqual 'ordinary-original' ([IO.File]::ReadAllText($ordinaryLeaf,[Text.UTF8Encoding]::new($false))) 'preflight rejection retains other in-tree leaves'
+        Assert-CcodEqual 'outside-original' ([IO.File]::ReadAllText($sentinel,[Text.UTF8Encoding]::new($false))) 'preflight rejection retains outside sentinel bytes'
+    } finally {
+        foreach ($path in @($install,$outside)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue } }
+    }
+}
+
+$results += Invoke-CcodTest 'payload manifest ancestry treats Windows root equality case-insensitively' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $manifestPath = New-CcodLifecyclePayloadManifest -Root $source -Version '2.5.22'
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        $payloadBinding = Get-CcodLifecyclePayloadBinding -ManifestPath $manifestPath -ExpectedVersion '2.5.22'
+        $receipt = Invoke-CcodInstall -SourceRoot $source.ToUpperInvariant() -InstallRoot $install @payloadBinding -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
+        Assert-CcodEqual 'Installed' $receipt.Outcome 'case-only source-root difference preserves valid Windows payload ancestry'
+    } finally {
+        foreach ($path in @($source,$install,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+    }
+}
+
+$results += Invoke-CcodTest 'payload-bound install rejects a changed runtime manifest after readiness' {
+    $source = New-CcodLifecycleTempRoot
+    $install = New-CcodLifecycleTempRoot
+    $nodeRoot = New-CcodLifecycleTempRoot
+    try {
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $manifestPath = New-CcodLifecyclePayloadManifest -Root $source -Version '2.5.22'
+        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
+        $fake = New-CcodLifecycleFake -NodePath $nodePath
+        $fake.Adapters.WaitNewRuntimeReady = {
+            param($InstallRoot,$RuntimeId,$RuntimeGeneration,$Identity,$TaskStartedAtUtc,$TimeoutMilliseconds)
+            $runtimeManifestPath = Join-Path $InstallRoot "runtime\$RuntimeId\manifest.json"
+            $runtimeManifest = Get-Content -LiteralPath $runtimeManifestPath -Raw | ConvertFrom-Json
+            $runtimeManifest.projectVersion = '2.5.13'
+            [IO.File]::WriteAllText($runtimeManifestPath,($runtimeManifest|ConvertTo-Json -Depth 16),[Text.UTF8Encoding]::new($false))
+            [pscustomobject][ordered]@{SupervisorReady=$true;TrayReady=$true}
+        }.GetNewClosure()
+        $payloadBinding = Get-CcodLifecyclePayloadBinding -ManifestPath $manifestPath -ExpectedVersion '2.5.22'
+        Assert-CcodThrows {
+            Invoke-CcodInstall -SourceRoot $source -InstallRoot $install @payloadBinding -Adapters $fake.Adapters | Out-Null
+        } 'CCOD_INSTALL_NEW_RUNTIME_NOT_READY'
+        Assert-CcodTrue ($fake.World.Phases -notcontains 'Ready') 'changed selected runtime manifest cannot produce Ready'
+    } finally {
+        foreach ($path in @($source,$install,$nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
     }
 }
 
@@ -681,7 +2169,7 @@ $results += Invoke-CcodTest 'hidden persistence module is staged and manifest-ha
         $receipt = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
         $runtimeRoot = Join-Path $install "runtime\$($receipt.RuntimeId)"
         $stagedModule = Join-Path $runtimeRoot 'src\persistence\modules\HiddenRuntime.psm1'
-        Assert-CcodTrue (Test-Path -LiteralPath $stagedModule -PathType Leaf) 'hidden module is staged'
+        Assert-CcodTrue (Test-Path -LiteralPath $stagedModule -PathType Leaf) 'hidden module is staged into the sealed generation'
         $manifest = Test-CcodRuntimeManifest -RuntimeDirectory $runtimeRoot -ExpectedRuntimeId $receipt.RuntimeId
         Assert-CcodEqual $true $manifest.Valid 'hidden module runtime manifest validates'
         $record = @($manifest.Manifest.files | Where-Object { $_.path -ceq 'src/persistence/modules/HiddenRuntime.psm1' })
@@ -706,6 +2194,7 @@ $results += Invoke-CcodTest 'upgrade retains one previous runtime and starts the
         Set-CcodUiLanguageMode -StateRoot $stateRoot -LanguageMode 'en-US' -Adapters @{ UtcNow = { [DateTimeOffset]::Parse('2030-02-03T03:04:06.0000000Z') } } | Out-Null
         $preferencePath = Join-Path $stateRoot 'ui-preferences.json'
         $preferenceBytes = [IO.File]::ReadAllBytes($preferencePath)
+        $operationalHashes=@{};foreach($leaf in @('settings.json','status.json','verified-packages.json','transition.json','ui-preferences.json')){$operationalHashes[$leaf]=Get-CcodTestFileSha256 -Path (Join-Path $stateRoot $leaf)}
         [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'), "module.exports = 'fixture-v2';`n", [Text.UTF8Encoding]::new($false))
         $fake2 = New-CcodLifecycleFake -NodePath $nodePath
         $second = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake2.Adapters
@@ -725,6 +2214,8 @@ $results += Invoke-CcodTest 'upgrade retains one previous runtime and starts the
         Assert-CcodEqual $first.RuntimeId $pointer.previousRuntime 'previous points at old runtime'
         Assert-CcodEqual (($preferenceBytes | ForEach-Object { $_.ToString('x2') }) -join '') (([IO.File]::ReadAllBytes($preferencePath) | ForEach-Object { $_.ToString('x2') }) -join '') 'upgrade preserves valid UI preference bytes'
         Assert-CcodEqual 'en-US' (Read-CcodUiPreference -StateRoot $stateRoot).LanguageMode 'upgrade retains selected UI language'
+        $upgradeBaseline=Join-Path $stateRoot "install-initializations\$($second.RuntimeId)"
+        foreach($leaf in @('settings.json','status.json','verified-packages.json','transition.json','ui-preferences.json')){Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $upgradeBaseline $leaf) -PathType Leaf) "upgrade baseline contains $leaf";Assert-CcodEqual $operationalHashes[$leaf] (Get-CcodTestFileSha256 -Path (Join-Path $stateRoot $leaf)) "upgrade does not overwrite operational $leaf"}
         $runtimeRoot = Join-Path $install 'runtime'
         $ids = @(Get-ChildItem -LiteralPath $runtimeRoot -Directory | ForEach-Object { $_.Name } | Sort-Object)
         Assert-CcodEqual (($ids -join '|')) ((@($first.RuntimeId, $second.RuntimeId) | Sort-Object) -join '|') 'only active and previous runtime remain'
@@ -758,9 +2249,15 @@ $results += Invoke-CcodTest 'upgrade emits a strict ordered Ready receipt only a
         Assert-CcodTrue ($fake.World.NewSupervisorReady -and $fake.World.NewTrayReady) 'new Supervisor signal proves the authenticated TrayHost handshake completed'
         Assert-CcodEqual $expectedKeyHash (Get-FileHash -LiteralPath $deviceKey -Algorithm SHA256).Hash 'upgrade preserves device-key bytes'
 
-        $activationPath = Join-Path $install 'state\post-install-activation.json'
-        Assert-CcodTrue (Test-Path -LiteralPath $activationPath -PathType Leaf) 'activation receipt is durable'
-        $activation = Get-Content -LiteralPath $activationPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $activationRoot = Join-Path $install 'state\activation-receipts'
+        $matching = @(Get-ChildItem -LiteralPath $activationRoot -Filter '*.Ready.json' -File | ForEach-Object {
+            $value = Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ([string]$value.runtimeId -ceq [string]$receipt.RuntimeId) { [pscustomobject]@{ Path=$_.FullName; Value=$value } }
+        })
+        Assert-CcodEqual 1 $matching.Count 'exactly one create-only Ready activation receipt binds the upgraded runtime'
+        $activationPath = $matching[0].Path
+        $activation = $matching[0].Value
+        Assert-CcodTrue ([IO.Path]::GetFileName($activationPath) -ceq ("$($activation.activationId).Ready.json")) 'activation receipt filename binds its canonical activation id and phase'
         Assert-CcodEqual 'schemaVersion,activationId,phase,runtimeId,previousRuntimeId,startedAtUtc,updatedAtUtc,ready,errorCode' (($activation.PSObject.Properties.Name) -join ',') 'activation receipt has exact properties'
         Assert-CcodEqual 'Ready' $activation.phase 'terminal activation phase is Ready'
         Assert-CcodEqual $true $activation.ready 'Ready receipt is the only successful terminal state'
@@ -783,7 +2280,7 @@ $results += Invoke-CcodTest 'new-runtime readiness accepts only the exact post-t
         $installed = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
         $identity = New-CcodLifecycleIdentity
         $taskStartedAt = [DateTime]::Parse('2030-02-03T03:04:05Z').ToUniversalTime()
-        $bootstrapPath = [IO.Path]::GetFullPath((Join-Path $install 'bootstrap.ps1'))
+        $bootstrapPath = [IO.Path]::GetFullPath((Join-Path $install "runtime\$($installed.RuntimeId)\src\persistence\bootstrap.ps1"))
         $supervisorPath = [IO.Path]::GetFullPath((Join-Path $install "runtime\$($installed.RuntimeId)\src\persistence\Supervisor.ps1"))
         $token = 'a' * 64
         $snapshots = @(
@@ -829,7 +2326,7 @@ $results += Invoke-CcodTest 'new-runtime readiness retries a temporary Ready eve
         $installed = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
         $identity = New-CcodLifecycleIdentity
         $started = [DateTime]::Parse('2030-02-03T03:04:05Z').ToUniversalTime()
-        $bootstrap = [IO.Path]::GetFullPath((Join-Path $install 'bootstrap.ps1'))
+        $bootstrap = [IO.Path]::GetFullPath((Join-Path $install "runtime\$($installed.RuntimeId)\src\persistence\bootstrap.ps1"))
         $supervisor = [IO.Path]::GetFullPath((Join-Path $install "runtime\$($installed.RuntimeId)\src\persistence\Supervisor.ps1"))
         $token = 'e' * 64
         $items = @(
@@ -886,7 +2383,7 @@ $results += Invoke-CcodTest 'new-runtime readiness rejects every mismatched or a
         $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
         $installed = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
         $identity = New-CcodLifecycleIdentity;$started=[DateTime]::Parse('2030-02-03T03:04:05Z').ToUniversalTime()
-        $bootstrap=[IO.Path]::GetFullPath((Join-Path $install 'bootstrap.ps1'));$supervisor=[IO.Path]::GetFullPath((Join-Path $install "runtime\$($installed.RuntimeId)\src\persistence\Supervisor.ps1"));$token='b'*64
+        $bootstrap=[IO.Path]::GetFullPath((Join-Path $install "runtime\$($installed.RuntimeId)\src\persistence\bootstrap.ps1"));$supervisor=[IO.Path]::GetFullPath((Join-Path $install "runtime\$($installed.RuntimeId)\src\persistence\Supervisor.ps1"));$token='b'*64
         $newSnapshots = {
             $parent=[pscustomobject][ordered]@{ProcessId=600;ParentProcessId=1;SessionId=$identity.SessionId;CreationDate=[DateTime]::Parse('2030-02-03T03:04:05.1000000Z').ToUniversalTime();Name='powershell.exe';CommandLine="powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$bootstrap`" -InstallRoot `"$install`" -EntryMode Task"}
             $child=[pscustomobject][ordered]@{ProcessId=601;ParentProcessId=600;SessionId=$identity.SessionId;CreationDate=[DateTime]::Parse('2030-02-03T03:04:06.0000000Z').ToUniversalTime();Name='powershell.exe';CommandLine="powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File `"$supervisor`" -ReadyToken $token"}
@@ -926,7 +2423,7 @@ $results += Invoke-CcodTest 'new-runtime readiness requires a live exact process
     try{
         New-CcodLifecycleSourceFixture -Root $source -Version '2.5.0-ready-event'|Out-Null;$nodePath=New-CcodLifecycleFakeNode -Root $nodeRoot
         $installed=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
-        $identity=New-CcodLifecycleIdentity;$started=[DateTime]::Parse('2030-02-03T03:04:05Z').ToUniversalTime();$bootstrap=[IO.Path]::GetFullPath((Join-Path $install 'bootstrap.ps1'));$supervisor=[IO.Path]::GetFullPath((Join-Path $install "runtime\$($installed.RuntimeId)\src\persistence\Supervisor.ps1"));$token='d'*64
+        $identity=New-CcodLifecycleIdentity;$started=[DateTime]::Parse('2030-02-03T03:04:05Z').ToUniversalTime();$bootstrap=[IO.Path]::GetFullPath((Join-Path $install "runtime\$($installed.RuntimeId)\src\persistence\bootstrap.ps1"));$supervisor=[IO.Path]::GetFullPath((Join-Path $install "runtime\$($installed.RuntimeId)\src\persistence\Supervisor.ps1"));$token='d'*64
         $items=@([pscustomobject]@{ProcessId=700;ParentProcessId=1;SessionId=1;CreationDate=[DateTime]::Parse('2030-02-03T03:04:05.1Z').ToUniversalTime();Name='powershell.exe';CommandLine="powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$bootstrap`" -InstallRoot `"$install`" -EntryMode Task"},[pscustomobject]@{ProcessId=701;ParentProcessId=700;SessionId=1;CreationDate=[DateTime]::Parse('2030-02-03T03:04:06Z').ToUniversalTime();Name='powershell.exe';CommandLine="powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File `"$supervisor`" -ReadyToken $token"})
         $cases=@(
             [pscustomobject]@{Name='TrayHost handshake remains unsignaled';OpenThrows=$false;AliveChecks=99;Signal=$false},
@@ -951,43 +2448,48 @@ $results += Invoke-CcodTest 'upgrade boundaries fail closed with phase receipts 
         [pscustomobject]@{ Name='old task still running';Code='CCOD_INSTALL_SUPERVISOR_TASK_BUSY';Committed=$false;Configure={param($Fake)$Fake.World.TaskIdle=$false} },
         [pscustomobject]@{ Name='stale lifecycle generation';Code='CCOD_LIFECYCLE_FENCE_STALE';Committed=$false;Configure={param($Fake)$Fake.World.SetActiveFailure={throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('stale'), 'CCOD_LIFECYCLE_FENCE_STALE', [Management.Automation.ErrorCategory]::InvalidData, $null)}} },
         [pscustomobject]@{ Name='active pointer write failure';Code='CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN';Committed=$false;Configure={param($Fake)$Fake.World.SetActiveFailure={throw 'PRIVATE_POINTER_SECRET'}} },
-        [pscustomobject]@{ Name='crash after generation commit';Code='CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN';Committed=$true;Configure={param($Fake)$Fake.World.SetActiveFailure={param($Root,$RuntimeId,$Ownership)$fence={param($InstallRoot,$Receipt,$ExpectActivePointer)$true};Set-CcodActiveRuntime -InstallRoot $Root -NewRuntimeId $RuntimeId -Ownership $Ownership -Adapters @{AssertLifecycleFence=$fence}|Out-Null;throw 'PRIVATE_AFTER_COMMIT_SECRET'}} },
-        [pscustomobject]@{ Name='new task start failure';Code='CCOD_INSTALL_SUPERVISOR_START_FAILED';Committed=$true;Configure={param($Fake)$Fake.World.StartTaskFailure=$true} },
-        [pscustomobject]@{ Name='Supervisor ready timeout';Code='CCOD_INSTALL_NEW_RUNTIME_NOT_READY';Committed=$true;Configure={param($Fake)$Fake.World.NewSupervisorReady=$false} },
-        [pscustomobject]@{ Name='TrayHost ready timeout';Code='CCOD_INSTALL_NEW_RUNTIME_NOT_READY';Committed=$true;Configure={param($Fake)$Fake.World.NewTrayReady=$false} }
+        [pscustomobject]@{ Name='crash after generation commit';Code='CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN';Committed=$true;Configure={param($Fake,$OldRuntime)$gate=[pscustomobject]@{Remaining=1};$Fake.World.SetActiveFailure={param($Root,$RuntimeId,$Ownership,$TargetGeneration,$FileTransaction)if($gate.Remaining-gt0){$gate.Remaining--;$fence={param($InstallRoot,$Receipt,$ExpectActivePointer)$true};Invoke-CcodRuntimeCoreSetForTest -InstallRoot $Root -TargetGeneration $TargetGeneration -FileTransaction $FileTransaction -Ownership $Ownership -Adapters @{AssertLifecycleFence=$fence}|Out-Null;throw 'PRIVATE_AFTER_COMMIT_SECRET'}}.GetNewClosure()} },
+        [pscustomobject]@{ Name='new task start failure';Code='CCOD_INSTALL_SUPERVISOR_START_FAILED';Committed=$true;Configure={param($Fake,$OldRuntime)$gate=[pscustomobject]@{Remaining=1};$Fake.Adapters.StartSupervisorTask={if($gate.Remaining-gt0){$gate.Remaining--;throw 'PRIVATE_TASK_START_SECRET'};$Fake.World.TaskStarted++}.GetNewClosure()} },
+        [pscustomobject]@{ Name='Supervisor ready timeout';Code='CCOD_INSTALL_NEW_RUNTIME_NOT_READY';Committed=$true;Configure={param($Fake,$OldRuntime)$Fake.Adapters.WaitNewRuntimeReady={param($Root,$RuntimeId,$Generation,$Identity,$Started,$Timeout)[pscustomobject]@{SupervisorReady=([string]$RuntimeId-ceq[string]$OldRuntime);TrayReady=$true}}.GetNewClosure()} },
+        [pscustomobject]@{ Name='TrayHost ready timeout';Code='CCOD_INSTALL_NEW_RUNTIME_NOT_READY';Committed=$true;Configure={param($Fake,$OldRuntime)$Fake.Adapters.WaitNewRuntimeReady={param($Root,$RuntimeId,$Generation,$Identity,$Started,$Timeout)[pscustomobject]@{SupervisorReady=$true;TrayReady=([string]$RuntimeId-ceq[string]$OldRuntime)}}.GetNewClosure()} },
+        [pscustomobject]@{ Name='rollback readiness failure';Code='CCOD_INSTALL_ROLLBACK_FAILED';Committed=$true;Configure={param($Fake,$OldRuntime)$Fake.World.NewSupervisorReady=$false} }
     )
     foreach ($case in $cases) {
         $source = New-CcodLifecycleTempRoot
         $install = New-CcodLifecycleTempRoot
         $nodeRoot = New-CcodLifecycleTempRoot
         try {
-            New-CcodLifecycleSourceFixture -Root $source -Version ('2.5.0-boundary-' + ($case.Name -replace '[^A-Za-z0-9]','-')) | Out-Null
+            New-CcodLifecycleSourceFixture -Root $source -Version '2.5.0-b' | Out-Null
             $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
             $first = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
             Set-CcodLifecycleTestStatus -InstallRoot $install -RuntimeId $first.RuntimeId
             [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'), "module.exports = 'boundary-$($case.Name)';`n", [Text.UTF8Encoding]::new($false))
             $fake = New-CcodLifecycleFake -NodePath $nodePath
-            & $case.Configure $fake
+            & $case.Configure $fake $first.RuntimeId
 
             $failure = $null
             try { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters | Out-Null } catch { $failure = $_ }
             Assert-CcodTrue ($null -ne $failure) "$($case.Name) fails closed"
-            Assert-CcodTrue ($failure.FullyQualifiedErrorId -like "$($case.Code)*") "$($case.Name) returns its stable support code"
-            $activation = Get-Content -LiteralPath (Join-Path $install 'state\post-install-activation.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+            Assert-CcodTrue ($failure.FullyQualifiedErrorId -like "$($case.Code)*") "$($case.Name) returns its stable support code (actual=$($failure.FullyQualifiedErrorId); calls=$($fake.World.Calls -join ','))"
+            $failedReceipts = @(Get-ChildItem -LiteralPath (Join-Path $install 'state\activation-receipts') -Filter '*.Failed.json' -File | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json })
+            Assert-CcodEqual 1 $failedReceipts.Count "$($case.Name) writes one create-only Failed receipt"
+            $activation = $failedReceipts[0]
             Assert-CcodEqual 'Failed' $activation.phase "$($case.Name) writes Failed"
             Assert-CcodEqual $false $activation.ready "$($case.Name) never writes Ready"
             Assert-CcodEqual $case.Code $activation.errorCode "$($case.Name) persists the stable code"
+            $failedTransactions = @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } | Where-Object { [string]$_.newRuntimeId -cne [string]$first.RuntimeId })
+            Assert-CcodEqual 1 $failedTransactions.Count "$($case.Name) writes one terminal transaction snapshot"
+            Assert-CcodEqual $case.Code $failedTransactions[0].errorCode "$($case.Name) binds the transaction head to the stable code"
 
             $pointer = Read-CcodLifecycleActivePointer -Root $install
             $runtimeIds = @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory | ForEach-Object Name)
+            Assert-CcodEqual 2 $runtimeIds.Count "$($case.Name) retains old and failed generations"
             if ($case.Committed) {
-                Assert-CcodTrue ($pointer.activeRuntime -cne $first.RuntimeId) "$($case.Name) keeps the committed new generation instead of regressing the pointer"
-                Assert-CcodEqual $first.RuntimeId $pointer.previousRuntime "$($case.Name) preserves the previous runtime for recovery"
-                Assert-CcodEqual 2 $runtimeIds.Count "$($case.Name) preserves both committed generations"
+                Assert-CcodEqual $first.RuntimeId $pointer.activeRuntime "$($case.Name) appends a compensating pointer to the retained old runtime"
+                Assert-CcodTrue ([uint64]$pointer.generation -ge 3) "$($case.Name) compensation advances rather than regresses the generation"
             } else {
                 Assert-CcodEqual $first.RuntimeId $pointer.activeRuntime "$($case.Name) leaves the old pointer active before mutation"
-                Assert-CcodEqual 1 $runtimeIds.Count "$($case.Name) removes any uncommitted staged runtime"
-                Assert-CcodEqual $first.RuntimeId $runtimeIds[0] "$($case.Name) retains only the previous runtime"
+                Assert-CcodEqual 1 ([uint64]$pointer.generation) "$($case.Name) does not append a pre-pointer compensation"
             }
         } finally {
             foreach ($path in @($source, $install, $nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
@@ -995,31 +2497,64 @@ $results += Invoke-CcodTest 'upgrade boundaries fail closed with phase receipts 
     }
 }
 
-# Production mutation caught: reporting a pre-generation upgrade failure after stopping the old runtime without first restarting and proving the still-active generation.
-$results += Invoke-CcodTest 'pre-generation upgrade failure restores and proves previous runtime protection before Failed' {
-    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+# Production mutation caught: retaining the outer AccountTransition cleanup lease while starting the old Supervisor makes its bootstrap deadlock before readiness.
+$results += Invoke-CcodTest 'pre-pointer rollback releases the outer cleanup lease before old Supervisor bootstrap' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot;$markerRoot=New-CcodLifecycleTempRoot
     try {
-        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.0-rollback-a'|Out-Null
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.0-rollback-cleanup-lease-a' | Out-Null
         $nodePath=New-CcodLifecycleFakeNode -Root $nodeRoot
         $first=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
         Set-CcodLifecycleTestStatus -InstallRoot $install -RuntimeId $first.RuntimeId
-        [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'),"module.exports='rollback-b';`n",[Text.UTF8Encoding]::new($false))
-        $fake=New-CcodLifecycleFake -NodePath $nodePath
-        $fake.World.CopyOverride=[pscustomobject]@{Match='*Supervisor.ps1';Action={param($SourcePath,$DestinationPath)throw 'PRIVATE_PREGENERATION_COPY_FAILURE'}}
-        $originalWriter=$fake.Adapters.WriteActivationReceipt
-        $fake.Adapters.WriteActivationReceipt={param($Root,$Receipt)$fake.World.Calls.Add("Receipt:$($Receipt.phase)");&$originalWriter $Root $Receipt}.GetNewClosure()
-        $fake.Adapters.WaitNewRuntimeReady={param($Root,$Runtime,$Generation,$Identity,$Started,$Timeout)$fake.World.Calls.Add("WaitRollbackReady:${Runtime}:${Generation}:${Timeout}");[pscustomobject][ordered]@{SupervisorReady=$true;TrayReady=$true}}.GetNewClosure()
+        [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'),"module.exports='rollback-cleanup-lease-b';`n",[Text.UTF8Encoding]::new($false))
 
-        Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters|Out-Null} 'CCOD_INSTALL_STAGING_FAILED'
-        [string[]]$calls=@($fake.World.Calls)
-        $close=[Array]::IndexOf($calls,'CloseShutdownGate');$lease=[Array]::IndexOf($calls,'ExitInstallLease');$start=[Array]::IndexOf($calls,'StartTask')
-        $wait=@($calls|Where-Object{$_-like"WaitRollbackReady:$($first.RuntimeId):1:*"})[0];$waitIndex=[Array]::IndexOf($calls,$wait);$failed=[Array]::IndexOf($calls,'Receipt:Failed')
-        Assert-CcodTrue ($close-ge0-and$lease-gt$close-and$start-gt$lease-and$waitIndex-gt$start-and$failed-gt$waitIndex) 'shutdown gate and install ownership release before old task restart, readiness proof, and Failed receipt'
-        Assert-CcodEqual 1 $fake.World.TaskStarted 'previous protection is restarted exactly once'
+        $fake=New-CcodLifecycleFake -NodePath $nodePath
+        $world=[pscustomobject][ordered]@{
+            PointerCommitted=$false
+            PreviousProtectionStopped=$false
+            BootstrapAttempted=$false
+            BootstrapMutexAcquired=$false
+            OldRuntimeOutcome='NotReady'
+            ChildExitCode=$null
+            ChildMutexOutcome=$null
+            ChildFailure=$null
+        }
+        $fake.World.SetActiveFailure={throw 'INJECTED_PRE_POINTER_COMMIT_FAILURE'}
+        $fake.Adapters.StartSupervisorTask={
+            $probe=Invoke-CcodLifecycleRollbackBootstrapMutexProbe -MarkerRoot $markerRoot
+            $world.BootstrapAttempted=[bool]$probe.Attempted
+            $world.BootstrapMutexAcquired=[bool]$probe.MutexAcquired
+            $world.ChildExitCode=[int]$probe.ExitCode
+            $world.ChildMutexOutcome=$probe.Outcome
+            $world.ChildFailure=$probe.ChildFailure
+        }.GetNewClosure()
+        $fake.Adapters.WaitNewRuntimeReady={
+            param($Root,$Runtime,$Generation,$Identity,$Started,$Timeout)
+            $ready=[string]$Runtime-ceq[string]$first.RuntimeId-and[UInt64]$Generation-eq[UInt64]1-and$world.BootstrapMutexAcquired
+            if($ready){$world.OldRuntimeOutcome='Ready'}
+            [pscustomobject][ordered]@{SupervisorReady=[bool]$ready;TrayReady=[bool]$ready}
+        }.GetNewClosure()
+
+        $failure=$null
+        try { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters | Out-Null } catch { $failure=$_ }
         $pointer=Read-CcodLifecycleActivePointer -Root $install
-        Assert-CcodEqual $first.RuntimeId $pointer.activeRuntime 'rollback proof remains bound to the previous active runtime'
-        Assert-CcodEqual 1 ([UInt64]$pointer.generation) 'rollback proof remains bound to the previous active generation'
-    } finally {foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}}
+        $world.PointerCommitted=([string]$pointer.activeRuntime-cne[string]$first.RuntimeId-or[UInt64]$pointer.generation-ne[UInt64]1)
+        $world.PreviousProtectionStopped=[bool]$fake.World.OldSupervisorExitProven
+
+        Assert-CcodTrue ($null-ne$failure) 'injected SetActiveRuntime failure remains fail closed after rollback'
+        Assert-CcodEqual $false $world.PointerCommitted 'failure occurs before selector commit'
+        Assert-CcodTrue $world.PreviousProtectionStopped 'old protection was stopped'
+        Assert-CcodTrue $world.BootstrapAttempted 'rollback attempted old Supervisor bootstrap'
+        Assert-CcodTrue $world.BootstrapMutexAcquired "old bootstrap acquires AccountTransition before readiness (childExit=$($world.ChildExitCode); outcome=$($world.ChildMutexOutcome); childFailure=$($world.ChildFailure))"
+        Assert-CcodEqual 'Ready' $world.OldRuntimeOutcome 'old runtime is restored and proven ready'
+        Assert-CcodTrue ($failure.FullyQualifiedErrorId-like'CCOD_INSTALL_RUNTIME_ACTIVATION_UNPROVEN*') 'successful rollback preserves the original pre-pointer failure code'
+    } finally {
+        foreach($path in @($source,$install,$nodeRoot,$markerRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
+    }
+}
+
+$results += Invoke-CcodTest 'compensation refuses a replaced old manifest using the transaction-recorded hash' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22-old-manifest'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$first=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $node).Adapters;Set-CcodLifecycleTestStatus -InstallRoot $install -RuntimeId $first.RuntimeId;[IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'),"module.exports='upgrade';`n",[Text.UTF8Encoding]::new($false));$oldManifest=Join-Path $install "runtime\$($first.RuntimeId)\manifest.json";$fake=New-CcodLifecycleFake -NodePath $node;$changed=[pscustomobject]@{Done=$false};$fake.Adapters.WaitNewRuntimeReady={param($Root,$Runtime,$Generation,$Identity,$Started,$Timeout)if(-not$changed.Done){$changed.Done=$true;[IO.File]::SetAttributes($oldManifest,[IO.FileAttributes]::Normal);[IO.File]::AppendAllText($oldManifest,' ',[Text.UTF8Encoding]::new($false))};[pscustomobject]@{SupervisorReady=$false;TrayReady=$false}}.GetNewClosure();Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters|Out-Null} 'CCOD_INSTALL_ROLLBACK_FAILED';$pointer=Read-CcodActiveRuntime -InstallRoot $install;Assert-CcodTrue ($pointer.activeRuntime-cne$first.RuntimeId) 'replaced old manifest cannot receive a compensating pointer';Assert-CcodEqual 2 $pointer.generation 'failed old-manifest proof leaves the committed new pointer generation';Assert-CcodEqual 2 @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory).Count 'both generations remain retained'}finally{foreach($p in @($source,$install,$nodeRoot)){if(Test-Path $p){Remove-Item $p -Recurse -Force}}}
 }
 
 # Production mutation caught: setting previousProtectionStopped only after task-idle proof, which skips rollback when exact Supervisor exit succeeds but IgnoreNew remains busy.
@@ -1033,7 +2568,7 @@ $results += Invoke-CcodTest 'task-idle failure restarts and proves the old activ
         [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'),"module.exports='task-idle-rollback-b';`n",[Text.UTF8Encoding]::new($false))
         $fake=New-CcodLifecycleFake -NodePath $nodePath;$fake.World.TaskIdle=$false
         $originalWriter=$fake.Adapters.WriteActivationReceipt
-        $fake.Adapters.WriteActivationReceipt={param($Root,$Receipt)$fake.World.Calls.Add("Receipt:$($Receipt.phase)");&$originalWriter $Root $Receipt}.GetNewClosure()
+        $fake.Adapters.WriteActivationReceipt={param($Root,$Receipt,$FileTransaction)$fake.World.Calls.Add("Receipt:$($Receipt.phase)");&$originalWriter $Root $Receipt $FileTransaction}.GetNewClosure()
         $fake.Adapters.WaitNewRuntimeReady={param($Root,$Runtime,$Generation,$Identity,$Started,$Timeout)$fake.World.Calls.Add("WaitRollbackReady:${Runtime}:${Generation}:${Timeout}");[pscustomobject][ordered]@{SupervisorReady=$true;TrayReady=$true}}.GetNewClosure()
 
         Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters|Out-Null} 'CCOD_INSTALL_SUPERVISOR_TASK_BUSY'
@@ -1048,28 +2583,8 @@ $results += Invoke-CcodTest 'task-idle failure restarts and proves the old activ
     } finally {foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}}
 }
 
-$results += Invoke-CcodTest 'pre-generation rollback proof failure reports a bounded rollback code and preserves the old generation' {
-    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
-    try{
-        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.0-rollback-proof-a'|Out-Null;$nodePath=New-CcodLifecycleFakeNode -Root $nodeRoot
-        $first=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
-        Set-CcodLifecycleTestStatus -InstallRoot $install -RuntimeId $first.RuntimeId
-        [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'),"module.exports='rollback-proof-b';`n",[Text.UTF8Encoding]::new($false))
-        $fake=New-CcodLifecycleFake -NodePath $nodePath;$fake.World.StartTaskFailure=$true
-        $fake.World.CopyOverride=[pscustomobject]@{Match='*Supervisor.ps1';Action={param($SourcePath,$DestinationPath)throw 'PRIVATE_PREGENERATION_COPY_FAILURE'}}
-
-        Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters|Out-Null} 'CCOD_INSTALL_ROLLBACK_FAILED'
-        $activation=Get-Content -LiteralPath (Join-Path $install 'state\post-install-activation.json') -Raw -Encoding UTF8|ConvertFrom-Json
-        Assert-CcodEqual 'Failed' $activation.phase 'unproven rollback remains terminally Failed'
-        Assert-CcodEqual 'CCOD_INSTALL_ROLLBACK_FAILED' $activation.errorCode 'unproven rollback exposes only the bounded support code'
-        $pointer=Read-CcodLifecycleActivePointer -Root $install
-        Assert-CcodEqual $first.RuntimeId $pointer.activeRuntime 'unproven rollback never mutates the previous active pointer'
-        Assert-CcodEqual 1 ([UInt64]$pointer.generation) 'unproven rollback never regresses or advances generation'
-    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}}
-}
-
-# Production mutation caught: removing superseded runtime directories before readiness or retaining them after a verified Ready transition.
-$results += Invoke-CcodTest 'old runtime cleanup occurs only after combined readiness succeeds' {
+# Production mutation caught: physically deleting retained generations after readiness.
+$results += Invoke-CcodTest 'old and unknown runtime generations remain retained after Ready and failure' {
     $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
     try{
         New-CcodLifecycleSourceFixture -Root $source -Version '2.5.0-cleanup-a'|Out-Null;$nodePath=New-CcodLifecycleFakeNode -Root $nodeRoot
@@ -1081,42 +2596,18 @@ $results += Invoke-CcodTest 'old runtime cleanup occurs only after combined read
         $readyFake.Adapters.WaitNewRuntimeReady={param($Root,$Runtime,$Generation,$Identity,$Started,$Timeout)$cleanupWorld.ObservedBeforeReady=Test-Path -LiteralPath $orphan -PathType Container;[pscustomobject][ordered]@{SupervisorReady=$true;TrayReady=$true}}.GetNewClosure()
         $second=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $readyFake.Adapters
         Assert-CcodTrue $cleanupWorld.ObservedBeforeReady 'superseded runtime still exists while readiness is being proven'
-        Assert-CcodTrue (-not(Test-Path -LiteralPath $orphan)) 'superseded runtime is cleaned only after Ready'
+        Assert-CcodTrue (Test-Path -LiteralPath $orphan -PathType Container) 'Ready retains unknown runtime directories for separate maintenance'
 
         Set-CcodLifecycleTestStatus -InstallRoot $install -RuntimeId $second.RuntimeId
         $orphanAfterFailure=Join-Path $install 'runtime\superseded-after-failure';[IO.Directory]::CreateDirectory($orphanAfterFailure)|Out-Null
         [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'),"module.exports='cleanup-timeout';`n",[Text.UTF8Encoding]::new($false))
         $blocked=New-CcodLifecycleFake -NodePath $nodePath;$blocked.World.NewTrayReady=$false
-        Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $blocked.Adapters|Out-Null} 'CCOD_INSTALL_NEW_RUNTIME_NOT_READY'
+        Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $blocked.Adapters|Out-Null} 'CCOD_INSTALL_ROLLBACK_FAILED'
         Assert-CcodTrue (Test-Path -LiteralPath $orphanAfterFailure -PathType Container) 'readiness failure never performs old-runtime cleanup'
     }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}}
 }
 
 # Production mutation caught: allowing a best-effort post-Ready cleanup exception to enter activation failure handling and overwrite the terminal Ready receipt.
-$results += Invoke-CcodTest 'post-Ready cleanup failure retains Ready and the undeleted old runtime' {
-    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot;$lock=$null
-    try{
-        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.0-cleanup-failure-a'|Out-Null;$nodePath=New-CcodLifecycleFakeNode -Root $nodeRoot
-        $first=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
-        Set-CcodLifecycleTestStatus -InstallRoot $install -RuntimeId $first.RuntimeId
-        $orphan=Join-Path $install 'runtime\superseded-locked';[IO.Directory]::CreateDirectory($orphan)|Out-Null
-        $lockedPath=Join-Path $orphan 'locked.bin';$lock=[IO.File]::Open($lockedPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
-        [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'),"module.exports='cleanup-failure-b';`n",[Text.UTF8Encoding]::new($false))
-        $fake=New-CcodLifecycleFake -NodePath $nodePath
-
-        $second=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters
-        Assert-CcodEqual 'Upgraded' $second.Outcome 'cleanup failure does not invalidate the verified upgrade'
-        $activation=Get-Content -LiteralPath (Join-Path $install 'state\post-install-activation.json') -Raw -Encoding UTF8|ConvertFrom-Json
-        Assert-CcodEqual 'Ready' $activation.phase 'cleanup failure cannot overwrite Ready with Failed'
-        Assert-CcodEqual $true $activation.ready 'terminal readiness remains successful'
-        Assert-CcodTrue (Test-Path -LiteralPath $orphan -PathType Container) 'cleanup failure retains the undeleted old runtime'
-        Assert-CcodEqual 1 @($fake.World.LogRecords|Where-Object{$_.code-ceq'CCOD_INSTALL_OLD_RUNTIME_CLEANUP_FAILED'}).Count 'cleanup failure leaves one safe diagnostic record'
-    }finally{
-        if($null-ne$lock){$lock.Dispose()}
-        foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}
-    }
-}
-
 # Production mutation caught: silently losing a completion-log failure or allowing any post-Ready diagnostic path to overwrite Ready.
 $results += Invoke-CcodTest 'post-Ready completion-log failure stays Ready retains previous runtime and emits a bounded diagnostic' {
     $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
@@ -1129,7 +2620,7 @@ $results += Invoke-CcodTest 'post-Ready completion-log failure stays Ready retai
 
         $second=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters
         Assert-CcodEqual 'Upgraded' $second.Outcome 'post-Ready log failure does not invalidate the verified upgrade'
-        $activation=Get-Content -LiteralPath (Join-Path $install 'state\post-install-activation.json') -Raw -Encoding UTF8|ConvertFrom-Json
+        $activation=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\activation-receipts') -Filter '*.Ready.json' -File|ForEach-Object{Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8|ConvertFrom-Json}|Where-Object{$_.runtimeId-ceq$second.RuntimeId})[0]
         Assert-CcodEqual 'Ready' $activation.phase 'post-Ready log failure cannot overwrite Ready'
         Assert-CcodEqual $true $activation.ready 'post-Ready log failure preserves successful readiness'
         Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $install "runtime\$($first.RuntimeId)") -PathType Container) 'post-Ready log failure retains the previous runtime'
@@ -1171,62 +2662,114 @@ $results += Invoke-CcodTest 'upgrade stops the old owner and task before acquiri
     }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Recurse -Force}}}
 }
 
-$results += Invoke-CcodTest 'staging copy failure fails closed before activation' {
+$results += Invoke-CcodTest 'sealed-source copy failure retains the candidate and leaves pointer and legacy shells unchanged' {
     $source = New-CcodLifecycleTempRoot
     $install = New-CcodLifecycleTempRoot
     $nodeRoot = New-CcodLifecycleTempRoot
+    $lockHolder = [pscustomobject]@{Stream=$null}
     try {
-        New-CcodLifecycleSourceFixture -Root $source | Out-Null
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22' | Out-Null
+        $manifestPath=New-CcodLifecyclePayloadManifest -Root $source -Version '2.5.22';$payloadBinding=Get-CcodLifecyclePayloadBinding -ManifestPath $manifestPath -ExpectedVersion '2.5.22'
+        [IO.Directory]::CreateDirectory($install) | Out-Null
+        $legacyBootstrap=Join-Path $install 'bootstrap.ps1';$legacyUninstaller=Join-Path $install 'Uninstall-CodexControlOtherDevices.ps1'
+        [IO.File]::WriteAllText($legacyBootstrap,'legacy-bootstrap',[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllText($legacyUninstaller,'legacy-uninstaller',[Text.UTF8Encoding]::new($false))
+        $bootstrapHash=Get-CcodTestFileSha256 $legacyBootstrap;$uninstallerHash=Get-CcodTestFileSha256 $legacyUninstaller
         $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
         $fake = New-CcodLifecycleFake -NodePath $nodePath
-        $fake.World.CopyOverride = [pscustomobject]@{ Match = '*Supervisor.ps1'; Action = { param($Source, $Destination) throw 'PRIVATE_COPY_SECRET' } }
-        Assert-CcodThrows { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters } 'CCOD_INSTALL_STAGING_FAILED'
-        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $install 'active.json'))) 'staging failure never writes active pointer'
-        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $install 'bootstrap.ps1'))) 'staging failure never writes bootstrap'
-        Assert-CcodEqual 0 (Get-ChildItem -LiteralPath $install -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq '.staging' }).Count 'staging directory cleaned'
+        $fake.Adapters.ValidateSource={param($Root)$lockHolder.Stream=[IO.File]::Open((Join-Path $Root 'src\persistence\Supervisor.ps1'),[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None);$true}.GetNewClosure()
+        $failure=$null;try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install @payloadBinding -Adapters $fake.Adapters|Out-Null}catch{$failure=$_}
+        Assert-CcodTrue ($null-ne$failure) 'sealed source lock fails the immutable copy'
+        Assert-CcodTrue ($failure.FullyQualifiedErrorId-like'CCOD_INSTALL_*') 'sealed source copy failure is bounded'
+        Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $install 'active.json')) 'sealed source failure never writes legacy active pointer'
+        Assert-CcodEqual $false (Test-Path -LiteralPath (Join-Path $install 'state\active-generation')) 'sealed source failure occurs before append-only pointer commit'
+        Assert-CcodEqual $bootstrapHash (Get-CcodTestFileSha256 $legacyBootstrap) 'sealed source failure leaves legacy bootstrap bytes unchanged'
+        Assert-CcodEqual $uninstallerHash (Get-CcodTestFileSha256 $legacyUninstaller) 'sealed source failure leaves legacy uninstaller bytes unchanged'
+        Assert-CcodEqual 1 @(Get-ChildItem -LiteralPath (Join-Path $install 'runtime') -Directory -ErrorAction SilentlyContinue).Count 'failed immutable candidate is retained for diagnosis'
     } finally {
+        if($null-ne$lockHolder.Stream){$lockHolder.Stream.Dispose()}
         foreach ($path in @($source, $install, $nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
     }
 }
 
-$results += Invoke-CcodTest 'manifest hash mismatch fails closed and cleans staging' {
-    $source = New-CcodLifecycleTempRoot
-    $install = New-CcodLifecycleTempRoot
-    $nodeRoot = New-CcodLifecycleTempRoot
-    try {
-        New-CcodLifecycleSourceFixture -Root $source | Out-Null
-        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
-        $fake = New-CcodLifecycleFake -NodePath $nodePath
-        $fake.World.CopyOverride = [pscustomobject]@{ Match = '*SessionController.ps1'; Action = { param($Source, $Destination) [IO.Directory]::CreateDirectory((Split-Path $Destination -Parent)) | Out-Null; [IO.File]::WriteAllText($Destination, 'tampered', [Text.UTF8Encoding]::new($false)) } }
-        Assert-CcodThrows { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters } 'CCOD_INSTALL_FILE_HASH_MISMATCH'
-        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $install 'active.json'))) 'hash mismatch never activates'
-        Assert-CcodEqual 0 (Get-ChildItem -LiteralPath $install -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq '.staging' }).Count 'hash mismatch cleans staging'
-    } finally {
-        foreach ($path in @($source, $install, $nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
-    }
+$results += Invoke-CcodTest 'final transaction snapshot failure leaves Ready receipt and recoverable nonterminal without Failed ambiguity' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22-final-gap'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node;$fake.Adapters.CommitReadyTransaction={throw 'PRIVATE_FINAL_SNAPSHOT_FAILURE'};$failure=$null;try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters|Out-Null}catch{$failure=$_};Assert-CcodTrue ($failure.FullyQualifiedErrorId-like'CCOD_INSTALL_READY_FINALIZATION_PENDING*') 'final snapshot failure reports recoverable pending status';$ready=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\activation-receipts') -Filter '*.Ready.json' -File);$failed=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\activation-receipts') -Filter '*.Failed.json' -File);Assert-CcodEqual 1 $ready.Count 'Ready activation receipt remains visible exactly once';Assert-CcodEqual 0 $failed.Count 'no contradictory Failed activation receipt is appended';$transactionFailed=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File);$transactionReady=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Ready.*.json' -File);Assert-CcodEqual 0 $transactionFailed.Count 'no Failed transaction snapshot follows Ready receipt';Assert-CcodEqual 0 $transactionReady.Count 'missing final transaction snapshot remains absent for recovery';$module=Get-Module InstallLifecycle;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install;Assert-CcodEqual 'ProtectionReady' $head.phase 'transaction remains recoverable at ProtectionReady'}finally{foreach($p in @($source,$install,$nodeRoot)){if(Test-Path $p){Remove-Item $p -Recurse -Force}}}
 }
 
-$results += Invoke-CcodTest 'selected UI catalog mutation after inventory fails hash verification before activation' {
-    $source = New-CcodLifecycleTempRoot
-    $install = New-CcodLifecycleTempRoot
-    $nodeRoot = New-CcodLifecycleTempRoot
+# Production mutation caught: treating every nonterminal transaction as permanently busy instead of finalizing an already-proven Ready activation.
+$results += Invoke-CcodTest 'a later invocation recovers one missing Ready transaction snapshot without another install mutation' {
+    $fixture=New-CcodReadyFinalizationGapFixture
     try {
-        New-CcodLifecycleSourceFixture -Root $source | Out-Null
-        $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
-        $fake = New-CcodLifecycleFake -NodePath $nodePath
-        $fake.World.CopyOverride = [pscustomobject]@{
-            Match = '*ui.en-US.json'
-            Action = {
-                param($Source, $Destination)
-                [IO.Directory]::CreateDirectory((Split-Path $Destination -Parent)) | Out-Null
-                [IO.File]::Copy($Source, $Destination, $true)
-                [IO.File]::WriteAllText($Source, '{"schemaVersion":1,"language":"tampered-after-inventory"}', [Text.UTF8Encoding]::new($false))
-            }
+        $runtimeCount=@(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'runtime') -Directory -Force).Count
+        $pointerCount=@(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\active-generation') -File -Force).Count
+        Remove-Item -LiteralPath $fixture.Source -Recurse -Force
+        $recoveryFake=New-CcodLifecycleFake -NodePath $fixture.Node
+        $result=Invoke-CcodInstall -SourceRoot $fixture.Source -InstallRoot $fixture.Install -Adapters $recoveryFake.Adapters
+        Assert-CcodEqual 'Recovered' $result.Outcome 'finalization recovery reports a bounded recovered outcome'
+        Assert-CcodEqual 1 $recoveryFake.World.ProductRegistrationCalls 'Ready-finalization recovery completes post-Ready product registration exactly once'
+        Assert-CcodEqual $fixture.Transaction.newRuntimeId $result.RuntimeId 'recovery result binds the pending transaction runtime'
+        Assert-CcodEqual $runtimeCount @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'runtime') -Directory -Force).Count 'recovery creates no runtime generation'
+        Assert-CcodEqual $pointerCount @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\active-generation') -File -Force).Count 'recovery appends no active pointer'
+        Assert-CcodEqual 1 @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\install-transactions') -Filter '*.Ready.*.json' -File -Force).Count 'recovery appends exactly one Ready transaction snapshot'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\install-transactions') -Filter '*.Failed.*.json' -File -Force).Count 'recovery appends no Failed transaction snapshot'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $fixture.Install 'state\activation-receipts') -Filter '*.Failed.json' -File -Force).Count 'recovery appends no Failed activation receipt'
+        $module=Get-Module InstallLifecycle -ErrorAction Stop
+        $head=&$module {param($Root,$Id)Read-CcodInstallTransactionRecord -InstallRoot $Root -TransactionId $Id} $fixture.Install $fixture.Transaction.transactionId
+        Assert-CcodEqual 'Ready' $head.phase 'the original transaction alone becomes terminal Ready'
+        Assert-CcodEqual 0 $recoveryFake.World.TaskInstalled 'recovery does not reinstall the scheduled task'
+        Assert-CcodEqual 0 $recoveryFake.World.TaskStarted 'recovery does not restart the product'
+        Assert-CcodEqual 0 @($recoveryFake.World.Calls|Where-Object{$_-like'Validate:*'}).Count 'state-only recovery does not depend on the vanished source checkout'
+    } finally { Remove-CcodReadyFinalizationGapFixture $fixture }
+}
+
+$results += Invoke-CcodTest 'registration failure during Ready-finalization recovery is retried by a later same-package invocation' {
+    $fixture=New-CcodReadyFinalizationGapFixture
+    try{
+        Remove-Item -LiteralPath $fixture.Source -Recurse -Force
+        $failed=New-CcodLifecycleFake -NodePath $fixture.Node;$failed.World.ProductRegistrationFailure=$true
+        Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $fixture.Source -InstallRoot $fixture.Install -Adapters $failed.Adapters|Out-Null} 'CCOD_PRODUCT_REGISTRATION_FAILED'
+        $module=Get-Module InstallLifecycle;$ready=&$module {param($Root,$Id)Read-CcodInstallTransactionRecord -InstallRoot $Root -TransactionId $Id} $fixture.Install $fixture.Transaction.transactionId
+        Assert-CcodEqual 'Ready' $ready.phase 'recovery registration failure leaves the recovered transaction Ready'
+        New-CcodLifecycleSourceFixture -Root $fixture.Source -Version '2.5.22'|Out-Null
+        $retry=New-CcodLifecycleFake -NodePath $fixture.Node
+        $result=Invoke-CcodInstall -SourceRoot $fixture.Source -InstallRoot $fixture.Install -SealedPackageSha256 ([string]$ready.sealedPackageSha256) -Adapters $retry.Adapters
+        Assert-CcodEqual 'AlreadyInstalled' $result.Outcome 'same-package invocation reconciles registration after recovery failure'
+        Assert-CcodEqual 1 $retry.World.ProductRegistrationCalls 'recovery registration retry occurs exactly once'
+    }finally{foreach($path in @($fixture.Source,$fixture.Install,$fixture.NodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
+}
+
+# Production mutation caught: finalizing ProtectionReady when any receipt, selected pointer, or recorded manifest proof no longer matches.
+$results += Invoke-CcodTest 'invalid Ready receipt pointer or manifest leaves ProtectionReady without runtime pointer or Failed writes' {
+    $fixture=New-CcodReadyFinalizationGapFixture
+    $caseRoots=[Collections.Generic.List[string]]::new()
+    try {
+        Remove-Item -LiteralPath $fixture.Source -Recurse -Force
+        foreach($case in @(
+            @{Name='receipt';Mutate={param($Root,$Transaction)$path=@(Get-ChildItem -LiteralPath (Join-Path $Root 'state\activation-receipts') -Filter '*.Ready.json' -File)[0].FullName;[IO.File]::SetAttributes($path,[IO.FileAttributes]::Normal);[IO.File]::WriteAllText($path,'{',[Text.UTF8Encoding]::new($false))}},
+            @{Name='pointer';Mutate={param($Root,$Transaction)$path=@(Get-ChildItem -LiteralPath (Join-Path $Root 'state\active-generation') -Filter '*.json' -File|Sort-Object Name)[-1].FullName;$record=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json;$replacement=if($record.activeRuntime.EndsWith('0')){'1'}else{'0'};$record.activeRuntime=$record.activeRuntime.Substring(0,$record.activeRuntime.Length-1)+$replacement;[IO.File]::SetAttributes($path,[IO.FileAttributes]::Normal);[IO.File]::WriteAllText($path,($record|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))}},
+            @{Name='manifest';Mutate={param($Root,$Transaction)$path=Join-Path $Root "runtime\$($Transaction.newRuntimeId)\manifest.json";[IO.File]::SetAttributes($path,[IO.FileAttributes]::Normal);[IO.File]::AppendAllText($path,"`n",[Text.UTF8Encoding]::new($false))}}
+        )) {
+            $caseRoot=New-CcodLifecycleTempRoot
+            $caseRoots.Add($caseRoot)
+            Copy-Item -LiteralPath $fixture.Install -Destination $caseRoot -Recurse -Force
+            $runtimeCount=@(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'runtime') -Directory -Force).Count
+            $pointerCount=@(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'state\active-generation') -File -Force).Count
+            & $case.Mutate $caseRoot $fixture.Transaction
+            $failure=$null
+            try { Invoke-CcodInstall -SourceRoot $fixture.Source -InstallRoot $caseRoot -Adapters (New-CcodLifecycleFake -NodePath $fixture.Node).Adapters | Out-Null } catch { $failure=$_ }
+            Assert-CcodTrue ($null-ne$failure-and$failure.FullyQualifiedErrorId-like'CCOD_INSTALL_READY_RECOVERY_INVALID*') "$($case.Name) mismatch fails the bounded recovery contract"
+            Assert-CcodEqual $runtimeCount @(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'runtime') -Directory -Force).Count "$($case.Name) mismatch creates no runtime generation"
+            Assert-CcodEqual $pointerCount @(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'state\active-generation') -File -Force).Count "$($case.Name) mismatch appends no active pointer"
+            Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'state\install-transactions') -Filter '*.Ready.*.json' -File -Force).Count "$($case.Name) mismatch appends no Ready transaction snapshot"
+            Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'state\install-transactions') -Filter '*.Failed.*.json' -File -Force).Count "$($case.Name) mismatch appends no Failed transaction snapshot"
+            Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'state\activation-receipts') -Filter '*.Failed.json' -File -Force).Count "$($case.Name) mismatch appends no Failed activation receipt"
+            $module=Get-Module InstallLifecycle -ErrorAction Stop
+            $head=&$module {param($Root,$Id)Read-CcodInstallTransactionRecord -InstallRoot $Root -TransactionId $Id} $caseRoot $fixture.Transaction.transactionId
+            Assert-CcodEqual 'ProtectionReady' $head.phase "$($case.Name) mismatch remains recoverable and nonterminal"
         }
-        Assert-CcodThrows { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters } 'CCOD_INSTALL_FILE_HASH_MISMATCH'
-        Assert-CcodTrue (-not (Test-Path -LiteralPath (Join-Path $install 'active.json'))) 'post-inventory catalog mutation never activates'
     } finally {
-        foreach ($path in @($source, $install, $nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+        foreach($caseRoot in $caseRoots){if(Test-Path -LiteralPath $caseRoot){Remove-Item -LiteralPath $caseRoot -Recurse -Force}}
+        Remove-CcodReadyFinalizationGapFixture $fixture
     }
 }
 
@@ -1416,7 +2959,7 @@ $results += Invoke-CcodTest 'invalid active pointer fails closed before upgrade'
         $nodePath = New-CcodLifecycleFakeNode -Root $nodeRoot
         $fake = New-CcodLifecycleFake -NodePath $nodePath
         Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters | Out-Null
-        [IO.File]::WriteAllText((Join-Path $install 'active.json'), '{"schemaVersion":9,"activeRuntime":"x","previousRuntime":null,"updatedAtUtc":"2030-02-03T03:04:05.0000000Z"}', [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $install 'state\active-generation\00000000000000000002.json'), '{"schemaVersion":9,"generation":2,"activeRuntime":"x","previousGeneration":1}', [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'), "module.exports = 'fixture-v2';`n", [Text.UTF8Encoding]::new($false))
         Assert-CcodThrows { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $fake.Adapters } 'CCOD_SCHEMA_UNSUPPORTED'
     } finally {
@@ -1473,7 +3016,7 @@ $results += Invoke-CcodTest 'repair state quarantines damage and resets consent 
     }
 }
 
-$results += Invoke-CcodTest 'upgrade and repair preserve malformed UI preference without safety damage' {
+$results += Invoke-CcodTest 'upgrade fails closed on malformed UI baseline while repair preserves its bytes' {
     $source = New-CcodLifecycleTempRoot
     $install = New-CcodLifecycleTempRoot
     $nodeRoot = New-CcodLifecycleTempRoot
@@ -1488,9 +3031,9 @@ $results += Invoke-CcodTest 'upgrade and repair preserve malformed UI preference
         [byte[]]$malformed = 0x00,0x7b,0xff,0x13,0x0a
         [IO.File]::WriteAllBytes($preferencePath, $malformed)
         [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'), "module.exports = 'fixture-ui-malformed-v2';`n", [Text.UTF8Encoding]::new($false))
-        $upgrade = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
-        Assert-CcodEqual 'Upgraded' $upgrade.Outcome 'malformed preference does not block ordinary upgrade'
-        Assert-CcodEqual '007bff130a' (([IO.File]::ReadAllBytes($preferencePath) | ForEach-Object { $_.ToString('x2') }) -join '') 'ordinary upgrade preserves malformed UI preference bytes'
+        Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters|Out-Null} 'CCOD_STATE_MALFORMED'
+        Assert-CcodEqual $first.RuntimeId (Read-CcodActiveRuntime -InstallRoot $install).activeRuntime 'malformed UI baseline cannot advance the active pointer'
+        Assert-CcodEqual '007bff130a' (([IO.File]::ReadAllBytes($preferencePath) | ForEach-Object { $_.ToString('x2') }) -join '') 'failed upgrade preserves malformed UI preference bytes'
         $repairFake = New-CcodLifecycleFake -NodePath $nodePath
         $repair = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -RepairState -Adapters $repairFake.Adapters
         Assert-CcodEqual 'Repaired' $repair.Outcome 'malformed preference does not block repair'
@@ -1505,7 +3048,7 @@ $results += Invoke-CcodTest 'upgrade and repair preserve malformed UI preference
     }
 }
 
-$results += Invoke-CcodTest 'legacy missing UI preference remains absent across upgrade and follows Windows' {
+$results += Invoke-CcodTest 'legacy missing UI preference is safely materialized during upgrade' {
     $source = New-CcodLifecycleTempRoot
     $install = New-CcodLifecycleTempRoot
     $nodeRoot = New-CcodLifecycleTempRoot
@@ -1521,10 +3064,10 @@ $results += Invoke-CcodTest 'legacy missing UI preference remains absent across 
         [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'), "module.exports = 'fixture-ui-legacy-v2';`n", [Text.UTF8Encoding]::new($false))
         $upgrade = Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters (New-CcodLifecycleFake -NodePath $nodePath).Adapters
         Assert-CcodEqual 'Upgraded' $upgrade.Outcome 'legacy preference absence does not block upgrade'
-        Assert-CcodTrue (-not (Test-Path -LiteralPath $preferencePath)) 'legacy missing preference remains absent after upgrade'
+        Assert-CcodTrue (Test-Path -LiteralPath $preferencePath -PathType Leaf) 'legacy missing preference is materialized from the upgrade baseline'
         $preference = Read-CcodUiPreference -StateRoot $stateRoot
         Assert-CcodEqual 'System' $preference.LanguageMode 'legacy missing preference follows Windows'
-        Assert-CcodEqual $true $preference.FallbackUsed 'legacy missing preference uses safe fallback'
+        Assert-CcodEqual $false $preference.FallbackUsed 'materialized preference no longer requires fallback'
     } finally {
         foreach ($path in @($source, $install, $nodeRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
     }
@@ -1971,14 +3514,11 @@ $results += Invoke-CcodTest 'portable release keeps the fail-closed bootstrap ha
     $inno = Get-Content -LiteralPath $innoPath -Raw
     $wrapper = Get-Content -LiteralPath $wrapperPath -Raw
     Assert-CcodTrue ($inno -notmatch '(?m)^\s*\[UninstallRun\]') 'Inno has no legacy pre-delete UninstallRun route'
-    Assert-CcodTrue ($inno -match 'function\s+InitializeUninstall\s*\(\)\s*:\s*Boolean') 'Inno has a pre-delete uninstall gate'
-    Assert-CcodTrue ($inno -match 'UninstallBootstrap\.ps1' -and $inno -match '-Mode\s+Prepare') 'Inno invokes the staged bootstrap prepare phase'
-    Assert-CcodTrue ($inno -match 'CurUninstallStepChanged' -and $inno -match '-Mode\s+FinalizeReceipt') 'Inno writes completion only after its file deletion phase'
-    Assert-CcodTrue ($inno -match 'CCOD_UNINSTALL_FINALIZATION_MISSING' -and $inno -match 'CCOD_UNINSTALL_FINALIZATION_FAILED') 'Inno propagates a missing or failed post-delete completion receipt instead of reporting a false successful uninstall'
+    Assert-CcodTrue ($inno -match '(?m)^Uninstallable=no\s*$' -and $inno -notmatch 'InitializeUninstall|CurUninstallStepChanged|UninstallBootstrap\.ps1') 'sealed Setup creates no pre-Ready Inno uninstall surface'
     Assert-CcodTrue ($inno -notmatch 'BackupDeviceKeyStore|RemoveDeviceKeyStore|KeepCurrentSpecialSession') 'Inno exposes no key or special-session uninstall options'
     Assert-CcodTrue (Test-Path -LiteralPath $finalizerPath -PathType Leaf) 'portable release includes an external finalizer'
     Assert-CcodTrue (Test-Path -LiteralPath $portableModulePath -PathType Leaf) 'portable release includes a marker-bound removal module'
-    Assert-CcodTrue ($wrapper -match 'PortableUninstallFinalizer\.ps1' -and $wrapper -match '-Mode\s+Prepare') 'public wrapper prepares protected cleanup before launching the external portable finalizer'
+    Assert-CcodTrue ($wrapper -match 'PortableUninstallFinalizer\.ps1' -and $wrapper -match 'Invoke-CcodPublicUninstallPrepare[^\r\n]+-PrepareMode\s+Prepare\s+-Identity\s+\$null') 'public wrapper prepares protected cleanup before launching the external portable finalizer'
     Assert-CcodTrue ($wrapper -match 'Start-Process' -and $wrapper -match 'portable-finalizer\.stderr\.log') 'public wrapper delegates final deletion to a detached external process with auditable output'
     Assert-CcodTrue ($wrapper -notmatch 'Remove-Item') 'public wrapper cannot delete the portable installer root directly'
     Assert-CcodTrue ((Get-Content -LiteralPath $finalizerPath -Raw) -match 'Remove-CcodPortableInstallerRoot') 'external finalizer owns the bound portable root deletion'
@@ -2122,6 +3662,11 @@ $results += Invoke-CcodTest 'upgrade stops a verified fallback supervisor when s
     }
 }
 
+$results += Invoke-CcodTest 'fallback accepts generation parent and rejects root parent when append-only selector exists' {
+    $install=New-CcodLifecycleTempRoot
+    try{$identity=New-CcodLifecycleIdentity;[IO.Directory]::CreateDirectory($install)|Out-Null;$runtimeId='2.5.22-1111111111111111-22222222222222222222222222222222';$runtimeRoot=Join-Path $install "runtime\$runtimeId";$supervisor=Join-Path $runtimeRoot 'src\persistence\Supervisor.ps1';$generationBootstrap=Join-Path $runtimeRoot 'src\persistence\bootstrap.ps1';[IO.Directory]::CreateDirectory((Split-Path $supervisor -Parent))|Out-Null;[IO.File]::WriteAllText($generationBootstrap,'# generation',[Text.UTF8Encoding]::new($false));$pointerRoot=Join-Path $install 'state\active-generation';[IO.Directory]::CreateDirectory($pointerRoot)|Out-Null;[IO.File]::WriteAllText((Join-Path $pointerRoot '00000000000000000001.json'),('{"schemaVersion":1,"generation":1,"activeRuntime":"'+$runtimeId+'","previousGeneration":0}'),[Text.UTF8Encoding]::new($false));$parent=[pscustomobject]@{ProcessId=96;ParentProcessId=1;SessionId=$identity.SessionId;CreationDate=[DateTime]::Parse('2030-02-03T02:59:59Z').ToUniversalTime();CommandLine="powershell.exe -File `"$generationBootstrap`" -InstallRoot `"$install`""};$child=[pscustomobject]@{ProcessId=97;ParentProcessId=96;SessionId=$identity.SessionId;CreationDate=[DateTime]::Parse('2030-02-03T03:00:00Z').ToUniversalTime();CommandLine="powershell.exe -File `"$supervisor`" -ReadyToken $('a'*64)"};$module=Get-Module InstallLifecycle;$accepted=&$module {param($Root,$Current,$Items)Get-CcodLifecycleVerifiedSupervisorFallback -InstallRoot $Root -Identity $Current -ProcessEnumerator {param($Ignored)$Items} -OwnerSidResolver {param($P)[pscustomobject]@{ReturnValue=0;Sid=$Current.UserSid}}} $install $identity @($parent,$child);Assert-CcodEqual 97 $accepted.Pid 'append-only task accepts exact same-generation bootstrap parent';$rootBootstrap=Join-Path $install 'bootstrap.ps1';[IO.File]::WriteAllText($rootBootstrap,'# legacy',[Text.UTF8Encoding]::new($false));$parent.CommandLine="powershell.exe -File `"$rootBootstrap`" -InstallRoot `"$install`"";$rejected=&$module {param($Root,$Current,$Items)Get-CcodLifecycleVerifiedSupervisorFallback -InstallRoot $Root -Identity $Current -ProcessEnumerator {param($Ignored)$Items} -OwnerSidResolver {param($P)[pscustomobject]@{ReturnValue=0;Sid=$Current.UserSid}}} $install $identity @($parent,$child);Assert-CcodTrue ($null-eq$rejected) 'append-only selector rejects legacy root bootstrap parent'}finally{if(Test-Path $install){Remove-Item $install -Recurse -Force}}
+}
+
 $results += Invoke-CcodTest 'fallback accepts a deleted legacy runtime only through the exact stable bootstrap parent' {
     $install = New-CcodLifecycleTempRoot
     try {
@@ -2217,18 +3762,11 @@ $results += Invoke-CcodTest 'fallback rejects two verified supervisor children a
     }
 }
 
-$results += Invoke-CcodTest 'installer exposes a CodexRemote-fix desktop entry that only starts the stable tray bootstrap' {
+$results += Invoke-CcodTest 'sealed installer defers every desktop and Start menu entry until post-Ready registration' {
     $installerScript = Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'
-    $entries = @(Get-Content -LiteralPath $installerScript | Where-Object { $_ -cmatch '^Name: "\{userdesktop\}\\' })
-    Assert-CcodEqual 1 $entries.Count 'installer defines exactly one desktop entry'
-    $entry = [string]$entries[0]
-    Assert-CcodTrue ($entry -cmatch 'Name: "\{userdesktop\}\\CodexRemote-fix"') 'desktop entry has the public product name'
-    Assert-CcodTrue ($entry -cmatch 'Filename: "\{sys\}\\WindowsPowerShell\\v1\.0\\powershell\.exe"') 'desktop entry uses the Windows PowerShell host'
-    Assert-CcodTrue ($entry -cmatch '-WindowStyle Hidden') 'desktop entry hides the bootstrap host window'
-    Assert-CcodTrue ($entry -cmatch '\{localappdata\}\\CodexControlOtherDevices\\bootstrap\.ps1') 'desktop entry targets the stable bootstrap'
-    Assert-CcodTrue ($entry -cmatch '-InstallRoot ""\{localappdata\}\\CodexControlOtherDevices""') 'desktop entry supplies the stable install root'
-    Assert-CcodTrue ($entry -cmatch 'IconFilename: "\{app\}\\assets\\CodexRemote-fix\.ico"') 'desktop entry uses the public product icon'
-    Assert-CcodTrue ($entry -cnotmatch 'Start-CodexControlOtherDevices\.ps1') 'desktop entry never invokes a direct repair session'
+    $content = Get-Content -LiteralPath $installerScript -Raw
+    Assert-CcodEqual 0 @(Get-Content -LiteralPath $installerScript | Where-Object { $_ -cmatch '^Name: "\{(userdesktop|group)\}\\' }).Count 'Task 3 defines no user-visible shortcut entry'
+    Assert-CcodTrue ($content -cnotmatch '(?m)^\[Icons\]\s*$|\{userdesktop\}|\{group\}') 'no shortcut destination is reachable before strict Ready'
 }
 
 $results += Invoke-CcodTest 'installer exposes CodexRemote-fix as the searchable primary bootstrap entry' {
@@ -2239,35 +3777,24 @@ $results += Invoke-CcodTest 'installer exposes CodexRemote-fix as the searchable
     Assert-CcodTrue ($lines -ccontains 'AppId={{2B9E9F2E-7A32-4A7E-9C1D-9F5B5C6D7E8F}') 'installer retains the v2.1.6 AppId for in-place upgrades'
     Assert-CcodTrue ($lines -ccontains 'AppName=CodexRemote-fix') 'installed app has the public CodexRemote-fix name'
     Assert-CcodTrue ($lines -ccontains 'AppVerName=CodexRemote-fix {#ProjectVersion}') 'installed app version has the public CodexRemote-fix name'
-    Assert-CcodTrue ($lines -ccontains 'DefaultGroupName=CodexRemote-fix') 'current-user Start menu group has the public CodexRemote-fix name'
     Assert-CcodTrue ($lines -ccontains 'SetupIconFile=..\assets\codexremote-fix\codexremote-fix.ico') 'setup uses the CodexRemote-fix icon'
-    Assert-CcodTrue ($lines -ccontains 'UninstallDisplayIcon={app}\assets\CodexRemote-fix.ico') 'Apps and Features uses the installed CodexRemote-fix icon'
     Assert-CcodTrue ($lines -ccontains 'OutputBaseFilename=CodexRemote-fix-{#ProjectVersion}-setup') 'build output uses the public release name'
-    Assert-CcodEqual 2 @($lines | Where-Object { $_ -match '^Name: "\{(group|userdesktop)\}\\CodexRemote-fix";.*bootstrap\.ps1"".*-EntryMode Explicit' }).Count 'Start menu and desktop shortcuts enter bootstrap Explicit mode'
-    Assert-CcodTrue ($content -cmatch 'Activate-CcodRemoteFix\.ps1') 'installer delegates upgrades to the durable activation worker instead of relying on uninstall metadata'
-
-    $primaryEntries = @($content -split "`r?`n" | Where-Object { $_ -cmatch '^Name: "\{(group|userdesktop)\}\\CodexRemote-fix";' })
-    Assert-CcodEqual 2 $primaryEntries.Count 'Start menu and desktop each expose one primary CodexRemote-fix entry'
-    foreach ($entry in $primaryEntries) {
-        Assert-CcodTrue ($entry -cmatch 'Filename: "\{sys\}\\WindowsPowerShell\\v1\.0\\powershell\.exe"') 'primary entry uses the PowerShell host'
-        Assert-CcodTrue ($entry -cmatch '\{localappdata\}\\CodexControlOtherDevices\\bootstrap\.ps1') 'primary entry invokes the verified stable bootstrap'
-        Assert-CcodTrue ($entry -cmatch '-InstallRoot ""\{localappdata\}\\CodexControlOtherDevices""') 'primary entry supplies the stable legacy install root'
-        Assert-CcodTrue ($entry -cmatch 'IconFilename: "\{app\}\\assets\\CodexRemote-fix\.ico"') 'primary entry uses the public product icon'
-        Assert-CcodTrue ($entry -cnotmatch 'README\.md') 'primary entry never opens documentation'
-    }
+    Assert-CcodTrue ($lines -ccontains 'CreateAppDir=no' -and $lines -ccontains 'Uninstallable=no') 'Task 3 Setup has no product registration surface before Ready'
+    Assert-CcodTrue ($content -cnotmatch '(?m)^\[(Icons|Registry|UninstallRun)\]\s*$|DefaultGroupName=|UninstallDisplayIcon=') 'shortcuts registry and uninstall registration remain deferred to Task 4'
+    Assert-CcodEqual 4 @($lines | Where-Object { $_ -cmatch '^Source: .*Flags: dontcopy$' }).Count 'Setup carries only four sealed temporary inputs'
 
     $buildScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
-    Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-windows-x64\.zip') 'build script locates the public portable ZIP filename'
-    Assert-CcodTrue ($buildScript -cmatch '\$bundle\.sha256\.txt') 'build script writes a hash beside the public portable ZIP filename'
+    Assert-CcodTrue ($buildScript -cmatch 'ReleaseAssetContract\.psm1' -and $buildScript -cmatch '\$bundle\s*=\s*Join-Path\s+\$dist\s+\$releaseAssetNames\[0\]') 'build script locates the public portable ZIP through the central contract'
+    Assert-CcodTrue ($buildScript -cmatch '\$checksum\s*=\s*Join-Path\s+\$dist\s+\$releaseAssetNames\[1\]') 'build script locates the public ZIP checksum through the central contract'
 }
 
-$results += Invoke-CcodTest 'portable builder publishes the exact CodexRemote-fix 2.5.21 release artifact contract' {
+$results += Invoke-CcodTest 'portable builder publishes the exact CodexRemote-fix 2.5.22 release artifact contract' {
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
-    Assert-CcodEqual '2.5.21' ([string]$package.version) 'package version is exactly 2.5.21'
+    Assert-CcodEqual '2.5.22' ([string]$package.version) 'package version is exactly 2.5.22'
 
     $buildScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
-    Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-windows-x64\.zip') 'portable build resolves the exact public ZIP filename'
-    Assert-CcodTrue ($buildScript -cmatch 'CodexRemote-fix-\$Version-payload-manifest\.json') 'portable build publishes a separately bound payload manifest'
+    Assert-CcodTrue ($buildScript -cmatch '\$bundle\s*=\s*Join-Path\s+\$dist\s+\$releaseAssetNames\[0\]') 'portable build resolves the exact public ZIP through the central contract'
+    Assert-CcodTrue ($buildScript -cmatch '\$payloadManifestAsset\s*=\s*Join-Path\s+\$dist\s+\$releaseAssetNames\[3\]') 'portable build publishes the separately bound payload manifest through the central contract'
     Assert-CcodTrue ($buildScript -cmatch 'schemaVersion = 2') 'portable build writes a schema-two release manifest'
     Assert-CcodTrue ($buildScript -cmatch "distribution = 'portable-zip'") 'portable build labels the release distribution explicitly'
 }
@@ -2277,19 +3804,15 @@ $results += Invoke-CcodTest 'installer accepts success only from the exited owne
     $installerScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
     $activationWorker = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -Raw -Encoding UTF8
     $activationScript = Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1'
-    $promptScript = Join-Path $repositoryRoot 'Prompt-CcodRestart.ps1'
     Assert-CcodTrue (Test-Path -LiteralPath $activationScript -PathType Leaf) 'post-install activation worker exists'
-    Assert-CcodTrue (Test-Path -LiteralPath $promptScript -PathType Leaf) 'post-install Codex restart prompt exists'
     Assert-CcodTrue ($installerScript -cmatch '(?m)^CloseApplications=no\r?$') 'installer never lets Restart Manager close Codex'
-    Assert-CcodTrue ($installerScript -cmatch 'Activate-CcodRemoteFix\.ps1') 'installer bundles the activation worker'
-    Assert-CcodTrue ($installerScript -cmatch '(?s)RefuseStaleActivationReceipt\(ReceiptPath\).*UpdateActivationStartingPresentation\(\).*Activate-CcodRemoteFix\.ps1.*ewWaitUntilTerminated, ActivationResultCode') 'installer clears stale state, shows startup, and waits for the exact owner to exit'
-    Assert-CcodTrue ($installerScript -cmatch '(?s)if ActivationResultCode <> 0 then.*RaiseException.*?-ValidateReceiptWithTimeout.*ewWaitUntilTerminated, ValidationResultCode') 'only a normal owner exit reaches the separate bounded validator'
-    $readyBranch=[regex]::Match($installerScript,'(?s)if ValidationResultCode = 0 then\s*begin(.*?)\s*end;')
-    Assert-CcodTrue ($readyBranch.Success -and $readyBranch.Groups[1].Value-cmatch'ProgressGauge\.Position\s*:=\s*100' -and $readyBranch.Groups[1].Value-cmatch'Prompt-CcodRestart\.ps1') 'only strict validator exit zero reaches completion and prompting'
-    Assert-CcodTrue ($installerScript -cmatch 'if ValidationResultCode <> 0 then' -and $installerScript -cmatch 'RaiseException') 'every nonzero validator result fails closed'
+    Assert-CcodTrue ($installerScript -cmatch 'ActivationBootstrapPath' -and $installerScript -cmatch 'Flags: dontcopy') 'installer embeds the activation worker only as a temporary sealed input'
+    Assert-CcodTrue ($installerScript -cmatch '(?s)function PrepareToInstall.*ExtractAndLockCcodInputs\(\).*procedure CurStepChanged.*GetArrayLength\(CcodInputHandles\) <> 3.*GetCcodBootstrapParameters\(ActivationId, False\).*ewWaitUntilTerminated, ActivationResultCode') 'installer locks inputs before waiting for the exact owner to exit'
+    Assert-CcodTrue ($installerScript -cmatch '(?s)ActivationResultCode <> 0.*RaiseException.*GetCcodBootstrapParameters\(ActivationId, True\).*ewWaitUntilTerminated, ValidationResultCode') 'only a normal owner exit reaches the strict one-shot validator'
+    Assert-CcodTrue ($installerScript -cmatch 'ProgressGauge\.Position := 100' -and $installerScript -cnotmatch 'Prompt-CcodRestart\.ps1') 'strict validation alone reaches completion while Task 4 registration and prompting stay absent'
+    Assert-CcodTrue ($installerScript -cmatch '\(ValidationResultCode <> 0\) then RaiseException\(.CCOD_SETUP_READY_VALIDATION_FAILED.' ) 'every nonzero validator result fails closed'
     Assert-CcodTrue ($installerScript -cnotmatch '(?s)Activate-CcodRemoteFix\.ps1[^;]*-Prompt') 'background activation worker never owns the prompt'
     Assert-CcodTrue ($activationWorker -cmatch '(?s)if \(\$ValidateReceiptOnly\).*Read-CcodTerminalActivationReceipt.*phase -ceq .Ready.*exit 0.*phase -ceq .Failed.*exit 2' -and $activationWorker -cnotmatch 'ValidationResultPath|ValidationId|Start-Sleep') 'inner validator is a one-shot strict receipt reader with only direct terminal exit codes'
-    Assert-CcodTrue ($activationWorker -cmatch '(?s)function Invoke-CcodBoundedReceiptValidator.*WaitForExit\(\$TimeoutMilliseconds\).*\.Kill\(\).*return 3' -and $activationWorker -cmatch '(?s)if \(\$ValidateReceiptWithTimeout\).*Invoke-CcodBoundedReceiptValidator.*exit \$validationResult') 'outer validator owns a finite child wait and reduces timeout to a fail-closed direct exit'
     Assert-CcodTrue ($installerScript -cnotmatch 'ValidationResultPath|ReadValidationResultState|post-install-activation\.validation') 'Inno never accepts a file sidecar as validator authority'
     Assert-CcodTrue ($installerScript -cnotmatch 'Prepare-CcodRemoteUpgrade\.ps1') 'installer does not pre-stop the supervisor outside the gated runtime activation transaction'
     Assert-CcodTrue ($installerScript -cnotmatch '(?ms)^\[Run\]\s*\r?\nFilename: "powershell\.exe"; Parameters: ".*Install-CodexControlOtherDevices\.ps1') 'installer does not silently ignore its runtime installer exit code through a Run entry'
@@ -2299,15 +3822,14 @@ $results += Invoke-CcodTest 'installer accepts success only from the exited owne
 $results += Invoke-CcodTest 'installer waits for its process owner and accepts terminal status only from its strict validator child' {
     $installerScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
     Assert-CcodTrue ($installerScript -cmatch 'CoCreateGuid@ole32\.dll' -and $installerScript -cmatch 'StringFromGUID2@ole32\.dll') 'installer generates a canonical activation GUID before worker launch'
-    Assert-CcodTrue ($installerScript -cmatch '(?s)ActivationId\s*:=\s*NewActivationId\(\).*ReceiptPath\s*:=.*RefuseStaleActivationReceipt\(ReceiptPath\).*Activate-CcodRemoteFix\.ps1.*-ActivationId\s+"' ) 'installer removes or refuses the stale receipt and passes its own activation id to the worker'
-    Assert-CcodTrue ($installerScript -cmatch 'ewWaitUntilTerminated, ActivationResultCode' -and $installerScript -cmatch 'ewWaitUntilTerminated, ValidationResultCode' -and $installerScript -cmatch '-ValidateReceiptWithTimeout' -and $installerScript -cmatch 'VALIDATION_TIMEOUT_MILLISECONDS') 'Inno waits for both the activation owner and bounded validator exit codes'
+    Assert-CcodTrue ($installerScript -cmatch '(?s)ActivationId\s*:=\s*NewActivationId\(\).*GetCcodBootstrapParameters\(ActivationId, False\).*GetCcodBootstrapParameters\(ActivationId, True\)' ) 'installer passes one fresh activation id to owner and validator without deleting append-only receipts'
+    Assert-CcodTrue ($installerScript -cmatch 'ewWaitUntilTerminated, ActivationResultCode' -and $installerScript -cmatch 'ewWaitUntilTerminated, ValidationResultCode' -and $installerScript -cmatch '-ValidateReceiptOnly') 'Inno waits for both owner and strict validator exit codes'
     Assert-CcodTrue ($installerScript -cnotmatch 'ewNoWait') 'Inno never releases an unowned activation worker'
     foreach($forbidden in @('OpenProcess@kernel32.dll','WaitForSingleObject@kernel32.dll','GetExitCodeProcess@kernel32.dll','PROCESS_QUERY_INFORMATION','ProcessHandle := OpenProcess')){Assert-CcodTrue ($installerScript -cnotmatch [regex]::Escape($forbidden)) "installer never uses $forbidden to infer worker identity"}
-    Assert-CcodTrue ($installerScript -cmatch '(?s)if ActivationResultCode <> 0 then.*RaiseException.*?-ValidateReceiptWithTimeout.*ewWaitUntilTerminated, ValidationResultCode.*if ValidationResultCode <> 0 then.*RaiseException') 'owner failure cannot reach validation and every nonzero validator result fails closed'
-    Assert-CcodTrue ($installerScript -cmatch '(?s)function IsSafeActivationFile.*ExtractFileDir.*DirectoryAttributes.*RootAttributes.*FILE_ATTRIBUTE_REPARSE_POINT') 'Inno rejects reparse-point state ancestors even for raw presentation reads'
+    Assert-CcodTrue ($installerScript -cmatch '(?s)ActivationResultCode <> 0.*RaiseException.*GetCcodBootstrapParameters\(ActivationId, True\).*ValidationResultCode <> 0.*RaiseException') 'owner failure cannot reach validation and every nonzero validator result fails closed'
+    Assert-CcodTrue ($installerScript -cnotmatch 'ReadActivationProgressPhase|LoadBoundedActivationReceipt') 'Inno delegates all receipt authority to the locked bootstrap'
     Assert-CcodTrue ($installerScript -cnotmatch 'ValidationResultPath|ReadValidationResultState|post-install-activation\.validation') 'no writable sidecar can impersonate the strict validator'
-    $readyBranch=[regex]::Match($installerScript,'(?s)if ValidationResultCode = 0 then\s*begin(.*?)\s+end;')
-    Assert-CcodTrue ($readyBranch.Groups[1].Value-cmatch'Prompt-CcodRestart\.ps1') 'only strict Ready exit zero reaches the restart prompt'
+    Assert-CcodTrue ($installerScript -cnotmatch 'Prompt-CcodRestart\.ps1') 'Task 3 does not create a post-Ready product prompt or registration path'
 }
 
 # Production mutation caught: compiling a script with an unrecognized built-in identifier, or leaving the bounded validator route uncompiled.
@@ -2347,8 +3869,8 @@ $results += Invoke-CcodTest 'activation terminal validator enforces the complete
     $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-validator-'+[guid]::NewGuid().ToString('N'))
     $reparseTarget=Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-validator-target-'+[guid]::NewGuid().ToString('N'))
     try{
-        [IO.Directory]::CreateDirectory((Join-Path $root 'state'))|Out-Null
-        $activationId='77777777-6666-5555-4444-333333333333';$receiptPath=Join-Path $root 'state\post-install-activation.json'
+        $receiptDirectory=Join-Path $root 'state\activation-receipts';[IO.Directory]::CreateDirectory($receiptDirectory)|Out-Null
+        $activationId='77777777-6666-5555-4444-333333333333'
         $activationScript=Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1';$powershellExecutable=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $invokeValidator={param([string]$ErrorPath)
             $outputPath="$ErrorPath.stdout"
@@ -2372,6 +3894,8 @@ $results += Invoke-CcodTest 'activation terminal validator enforces the complete
         )
         foreach($case in $cases){
             $receipt=[ordered]@{};foreach($key in $valid.Keys){$receipt[$key]=$valid[$key]};&$case.Mutate $receipt
+            Get-ChildItem -LiteralPath $receiptDirectory -File -Force -ErrorAction SilentlyContinue|Remove-Item -Force
+            $receiptPath=Join-Path $receiptDirectory ("$activationId.$($receipt.phase).json")
             [IO.File]::WriteAllText($receiptPath,($receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
             $stderrPath=Join-Path $root (('validator-{0}.err' -f ($case.Name-replace'[^A-Za-z0-9]','-')))
             $invocation=&$invokeValidator $stderrPath
@@ -2379,6 +3903,7 @@ $results += Invoke-CcodTest 'activation terminal validator enforces the complete
             Assert-CcodEqual 0 $invocation.Stdout.Count "$($case.Name) emits no receipt data to stdout"
             if($case.Exit-ne0-and$case.Exit-ne2){Assert-CcodTrue ((Get-Content -LiteralPath $stderrPath -Raw)-cmatch'CCOD_ACTIVATION_RECEIPT_') "$($case.Name) retains a bounded support code on stderr"}
         }
+        $receiptPath=Join-Path $receiptDirectory "$activationId.Ready.json"
         [IO.File]::WriteAllText($receiptPath,'{"schemaVersion":1,"activationId":"77777777-6666-5555-4444-333333333333","phase":"Ready","runtimeId":"runtime-new"',[Text.UTF8Encoding]::new($false))
         $stderrPath=Join-Path $root 'validator-truncated.err';$invocation=&$invokeValidator $stderrPath
         Assert-CcodEqual 3 $invocation.ExitCode 'truncated Ready JSON is rejected by the executable validator'
@@ -2388,8 +3913,8 @@ $results += Invoke-CcodTest 'activation terminal validator enforces the complete
         Assert-CcodEqual 3 $invocation.ExitCode 'oversized receipt is refused before JSON parsing'
         Assert-CcodEqual 0 $invocation.Stdout.Count 'oversized receipt emits no data to stdout'
         Remove-Item -LiteralPath (Join-Path $root 'state') -Recurse -Force
-        [IO.Directory]::CreateDirectory($reparseTarget)|Out-Null
-        [IO.File]::WriteAllText((Join-Path $reparseTarget 'post-install-activation.json'),($valid|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+        [IO.Directory]::CreateDirectory((Join-Path $reparseTarget 'activation-receipts'))|Out-Null
+        [IO.File]::WriteAllText((Join-Path $reparseTarget "activation-receipts\$activationId.Ready.json"),($valid|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
         New-Item -ItemType Junction -Path (Join-Path $root 'state') -Target $reparseTarget|Out-Null
         $stderrPath=Join-Path $root 'validator-reparse.err';$invocation=&$invokeValidator $stderrPath
         Assert-CcodEqual 3 $invocation.ExitCode 'receipt beneath a reparse-point parent is refused before parsing'
@@ -2407,25 +3932,28 @@ $results += Invoke-CcodTest 'activation terminal validator enforces the complete
 $results += Invoke-CcodTest 'activation validator watchdog preserves direct terminal exits and bounds a slow child' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-watchdog-' + [guid]::NewGuid().ToString('N'))
     try {
-        [IO.Directory]::CreateDirectory((Join-Path $root 'state')) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $root 'state\activation-receipts')) | Out-Null
         $activationId = '88888888-7777-6666-5555-444444444444'
-        $receiptPath = Join-Path $root 'state\post-install-activation.json'
+        $readyPath = Join-Path $root "state\activation-receipts\$activationId.Ready.json"
+        $failedPath = Join-Path $root "state\activation-receipts\$activationId.Failed.json"
         $stderrPath = Join-Path $root 'watchdog.err'
         $activationScript = Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1'
         $ready = [ordered]@{schemaVersion=1;activationId=$activationId;phase='Ready';runtimeId='runtime-watchdog';previousRuntimeId=$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=$true;errorCode=$null}
-        [IO.File]::WriteAllText($receiptPath,($ready | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($readyPath,($ready | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
 
         $stdout = @(& $activationScript -AppRoot $repositoryRoot -InstallRoot $root -ActivationId $activationId -ValidateReceiptWithTimeout -ValidationTimeoutMilliseconds 10000 2>$stderrPath)
         Assert-CcodEqual 0 $LASTEXITCODE 'watchdog returns the strict Ready child exit directly'
         Assert-CcodEqual 0 $stdout.Count 'watchdog Ready path emits no receipt data to stdout'
 
         $failed = [ordered]@{}; foreach ($key in $ready.Keys) { $failed[$key] = $ready[$key] }; $failed.phase = 'Failed'; $failed.ready = $false; $failed.errorCode = 'CCOD_INSTALL_FAILED'
-        [IO.File]::WriteAllText($receiptPath,($failed | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+        Remove-Item -LiteralPath $readyPath -Force
+        [IO.File]::WriteAllText($failedPath,($failed | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
         $stdout = @(& $activationScript -AppRoot $repositoryRoot -InstallRoot $root -ActivationId $activationId -ValidateReceiptWithTimeout -ValidationTimeoutMilliseconds 10000 2>$stderrPath)
         Assert-CcodEqual 2 $LASTEXITCODE 'watchdog returns the strict Failed child exit directly'
         Assert-CcodEqual 0 $stdout.Count 'watchdog Failed path emits no receipt data to stdout'
 
-        [IO.File]::WriteAllText($receiptPath,($ready | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+        Remove-Item -LiteralPath $failedPath -Force
+        [IO.File]::WriteAllText($readyPath,($ready | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
         $stopwatch = [Diagnostics.Stopwatch]::StartNew()
         try {
             $stdout = @(& $activationScript -AppRoot $repositoryRoot -InstallRoot $root -ActivationId $activationId -ValidateReceiptWithTimeout -ValidationTimeoutMilliseconds 1 2>$stderrPath)
@@ -2466,11 +3994,11 @@ $results += Invoke-CcodTest 'post-install restart prompt does nothing when the u
 $results += Invoke-CcodTest 'activation worker installs first and prompts only after a successful runtime activation' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-worker-' + [guid]::NewGuid().ToString('N'))
     try {
-        [IO.Directory]::CreateDirectory((Join-Path $root 'state')) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $root 'state\activation-receipts')) | Out-Null
         $marker = Join-Path $root 'marker.txt'
         $installScript = Join-Path $root 'Install-CodexControlOtherDevices.ps1'
         $promptScript = Join-Path $root 'Prompt-CcodRestart.ps1'
-        $installSource = "param([string]`$InstallRoot,[string]`$ActivationId,[switch]`$EnableCandidateCompatibleUpdates);[IO.File]::AppendAllText('$marker','install,',[Text.UTF8Encoding]::new(`$false));`$r=[ordered]@{schemaVersion=1;activationId=`$ActivationId;phase='Ready';runtimeId='runtime-new';previousRuntimeId=`$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=`$true;errorCode=`$null};[IO.File]::WriteAllText((Join-Path `$InstallRoot 'state\post-install-activation.json'),(`$r|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false));exit 0"
+        $installSource = "param([string]`$InstallRoot,[string]`$ActivationId,[switch]`$EnableCandidateCompatibleUpdates);[IO.File]::AppendAllText('$marker','install,',[Text.UTF8Encoding]::new(`$false));`$r=[ordered]@{schemaVersion=1;activationId=`$ActivationId;phase='Ready';runtimeId='runtime-new';previousRuntimeId=`$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=`$true;errorCode=`$null};[IO.File]::WriteAllText((Join-Path `$InstallRoot `"state\activation-receipts\`$ActivationId.Ready.json`"),(`$r|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false));exit 0"
         [IO.File]::WriteAllText($installScript, $installSource, [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText($promptScript, "param([string]`$AppRoot,[string]`$InstallRoot,[string]`$ActivationId,[switch]`$NoUi);[IO.File]::AppendAllText('$marker','prompt',[Text.UTF8Encoding]::new(`$false)); exit 0", [Text.UTF8Encoding]::new($false))
         $output = @(& (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -AppRoot $root -InstallRoot $root -Prompt 2>&1)
@@ -2485,11 +4013,11 @@ $results += Invoke-CcodTest 'activation worker installs first and prompts only a
 $results += Invoke-CcodTest 'activation worker preserves an activated runtime when optional restart confirmation fails' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-restart-warning-' + [guid]::NewGuid().ToString('N'))
     try {
-        [IO.Directory]::CreateDirectory((Join-Path $root 'state')) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $root 'state\activation-receipts')) | Out-Null
         $marker = Join-Path $root 'marker.txt'
         $installScript = Join-Path $root 'Install-CodexControlOtherDevices.ps1'
         $promptScript = Join-Path $root 'Prompt-CcodRestart.ps1'
-        $installSource = "param([string]`$InstallRoot,[string]`$ActivationId,[switch]`$EnableCandidateCompatibleUpdates);[IO.File]::AppendAllText('$marker','install,',[Text.UTF8Encoding]::new(`$false));`$r=[ordered]@{schemaVersion=1;activationId=`$ActivationId;phase='Ready';runtimeId='runtime-new';previousRuntimeId=`$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=`$true;errorCode=`$null};[IO.File]::WriteAllText((Join-Path `$InstallRoot 'state\post-install-activation.json'),(`$r|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false));exit 0"
+        $installSource = "param([string]`$InstallRoot,[string]`$ActivationId,[switch]`$EnableCandidateCompatibleUpdates);[IO.File]::AppendAllText('$marker','install,',[Text.UTF8Encoding]::new(`$false));`$r=[ordered]@{schemaVersion=1;activationId=`$ActivationId;phase='Ready';runtimeId='runtime-new';previousRuntimeId=`$null;startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=`$true;errorCode=`$null};[IO.File]::WriteAllText((Join-Path `$InstallRoot `"state\activation-receipts\`$ActivationId.Ready.json`"),(`$r|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false));exit 0"
         [IO.File]::WriteAllText($installScript, $installSource, [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText($promptScript, "param([string]`$AppRoot,[string]`$InstallRoot,[string]`$ActivationId,[switch]`$NoUi);[IO.File]::AppendAllText('$marker','prompt',[Text.UTF8Encoding]::new(`$false)); exit 1", [Text.UTF8Encoding]::new($false))
         $output = @(& (Join-Path $repositoryRoot 'Activate-CcodRemoteFix.ps1') -AppRoot $root -InstallRoot $root -Prompt -NoUi 2>&1)
@@ -2508,14 +4036,14 @@ $results += Invoke-CcodTest 'activation worker preserves an activated runtime wh
 $results += Invoke-CcodTest 'activation worker requires a strict Ready receipt before prompting' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-activation-nonterminal-' + [guid]::NewGuid().ToString('N'))
     try {
-        [IO.Directory]::CreateDirectory((Join-Path $root 'state')) | Out-Null
+        [IO.Directory]::CreateDirectory((Join-Path $root 'state\activation-receipts')) | Out-Null
         $marker = Join-Path $root 'prompt-marker.txt'
         $installScript = Join-Path $root 'Install-CodexControlOtherDevices.ps1'
         $promptScript = Join-Path $root 'Prompt-CcodRestart.ps1'
         $installSource = @"
 param([string]`$InstallRoot,[string]`$ActivationId,[switch]`$EnableCandidateCompatibleUpdates)
 `$receipt=[ordered]@{schemaVersion=1;activationId=`$ActivationId;phase='StartingProtection';runtimeId='runtime-new';previousRuntimeId='runtime-old';startedAtUtc='2030-02-03T04:05:06.0000000Z';updatedAtUtc='2030-02-03T04:05:07.0000000Z';ready=`$false;errorCode=`$null}
-[IO.File]::WriteAllText((Join-Path `$InstallRoot 'state\post-install-activation.json'),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
+[IO.File]::WriteAllText((Join-Path `$InstallRoot "state\activation-receipts\`$ActivationId.StartingProtection.json"),(`$receipt|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new(`$false))
 exit 0
 "@
         [IO.File]::WriteAllText($installScript,$installSource,[Text.UTF8Encoding]::new($false))
@@ -2598,21 +4126,11 @@ $results += Invoke-CcodTest 'CodexRemote-fix icon is a bounded multi-resolution 
     }
 }
 
-$results += Invoke-CcodTest 'setup uninstall Start menu and desktop use one installed CodexRemote-fix icon' {
+$results += Invoke-CcodTest 'sealed Setup uses its wizard icon without installing product icons or shortcuts' {
     $installerScript = Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'
     $lines = @(Get-Content -LiteralPath $installerScript)
-    $installedIcon = '{app}\assets\CodexRemote-fix.ico'
     Assert-CcodTrue ($lines -ccontains 'SetupIconFile=..\assets\codexremote-fix\codexremote-fix.ico') 'setup uses the source product icon'
-    Assert-CcodTrue ($lines -ccontains "UninstallDisplayIcon=$installedIcon") 'uninstall registration uses the installed product icon'
-    Assert-CcodTrue ($lines -ccontains 'Source: "..\assets\codexremote-fix\codexremote-fix.ico"; DestDir: "{app}\assets"; DestName: "CodexRemote-fix.ico"; Flags: ignoreversion') 'installer carries the source icon to the common installed icon path'
-    Assert-CcodTrue ($lines -ccontains 'Source: "..\assets\codexremote-fix\codexremote-fix.ico"; DestDir: "{app}\assets\codexremote-fix"; Flags: ignoreversion') 'installer preserves the hermetic source icon path for installed validation'
-    Assert-CcodTrue ($lines -ccontains 'Source: "..\.github\workflows\release.yml"; DestDir: "{app}\.github\workflows"; Flags: ignoreversion') 'installer carries the release workflow required by installed validation'
-
-    $shortcutEntries = @($lines | Where-Object { $_ -cmatch '^Name: "\{(group|userdesktop)\}\\' })
-    Assert-CcodTrue ($shortcutEntries.Count -ge 3) 'installer exposes Start menu and desktop shortcuts'
-    foreach ($entry in $shortcutEntries) {
-        Assert-CcodTrue ($entry -cmatch ('IconFilename: "' + [regex]::Escape($installedIcon) + '"')) 'every Start menu and desktop shortcut uses the common installed icon'
-    }
+    Assert-CcodTrue (($lines -join "`n") -cnotmatch 'UninstallDisplayIcon=|DestDir:\s*"\{app\}|^Name:\s*"\{(group|userdesktop)\}') 'Task 3 installs no product icon registration workflow or shortcut before Ready'
 }
 
 $results += Invoke-CcodTest 'README and release workflow publish current portable-release branding' {
@@ -2622,16 +4140,16 @@ $results += Invoke-CcodTest 'README and release workflow publish current portabl
     Assert-CcodTrue ($readmeChinese -cmatch '\A(?s:<div align="center">.*?<h1>CodexRemote-fix</h1>)') 'Chinese README uses the centered public product heading'
 
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start[^\r\n]*\r?\n(.*?)(?=^## )').Groups[1].Value
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.21-setup\.exe') 'English Quick Start names the setup installer'
-    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.21-windows-x64\.zip') 'English Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.22-setup\.exe') 'English Quick Start names the setup installer'
+    Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix-2\.5\.22-windows-x64\.zip') 'English Quick Start names the exact portable artifact'
     Assert-CcodTrue ($quickStart -cmatch 'CodexRemote-fix\.exe') 'English Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($quickStart -cmatch '\.sha256\.txt') 'English Quick Start names the checksum artifact'
 
     $quickStartChineseMatch = [regex]::Match($readmeChinese, '(?ms)^## [^\r\n]+\r?\n(?:\r?\n)?(?=1\.[^\r\n]*\[Releases\])(.*?)(?=^## |\z)')
     Assert-CcodTrue $quickStartChineseMatch.Success 'Chinese README exposes a Quick Start section'
     $quickStartChinese = $quickStartChineseMatch.Groups[1].Value
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.21-setup\.exe') 'Chinese Quick Start names the setup installer'
-    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.21-windows-x64\.zip') 'Chinese Quick Start names the exact portable artifact'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.22-setup\.exe') 'Chinese Quick Start names the setup installer'
+    Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix-2\.5\.22-windows-x64\.zip') 'Chinese Quick Start names the exact portable artifact'
     Assert-CcodTrue ($quickStartChinese -cmatch 'CodexRemote-fix\.exe') 'Chinese Quick Start names the portable double-click entrypoint'
     Assert-CcodTrue ($quickStartChinese -cmatch '\.sha256\.txt') 'Chinese Quick Start names the checksum artifact'
 
@@ -2643,11 +4161,28 @@ $results += Invoke-CcodTest 'README and release workflow publish current portabl
     $workflow = Get-Content -LiteralPath (Join-Path $repositoryRoot '.github\workflows\release.yml') -Raw -Encoding UTF8
     Assert-CcodTrue ($workflow -cmatch '(?m)^name: CodexRemote-fix release\r?$') 'release workflow uses public product branding'
     Assert-CcodTrue ($workflow -cmatch '(?m)^\s+name: CodexRemote-fix portable bundle\r?$') 'uploaded artifact uses public portable bundle branding'
-    Assert-CcodTrue ($workflow -cmatch '--title "CodexRemote-fix \$version"') 'GitHub release title uses public product branding'
-    Assert-CcodTrue ($workflow -cmatch 'englishSection = \[regex\]::Match') 'GitHub release notes extract the English changelog section only'
-    Assert-CcodTrue ($workflow -cmatch 'has no English release section') 'release fails clearly when the English changelog section is missing'
+    $draftTool = Join-Path $repositoryRoot 'tools\Invoke-GitHubDraftRelease.ps1'
+    $draftToolContent = Get-Content -LiteralPath $draftTool -Raw -Encoding UTF8
+    Assert-CcodTrue ($draftToolContent -cmatch '(?s)release.*create.*--draft' -and $draftToolContent -cmatch 'CodexRemote-fix \$version') 'draft tool creates a private release with public product branding'
+    Assert-CcodTrue ($workflow -cmatch 'Invoke-CcodGitHubDraftRelease -Mode Stage') 'release workflow stages through the draft-only production tool'
+    Assert-CcodTrue ($workflow -cmatch 'tools\\New-GitHubReleaseNotes\.ps1''\) -ChangelogPath .*? -Tag \$tag -OutputPath \$notesPath') 'GitHub release notes use the behavior-tested target-English extractor'
+    Assert-CcodTrue ($workflow -cnotmatch 'englishSection\s*=\s*\[regex\]::Match') 'release workflow does not retain a second inline English extractor'
+    $notesTool = Join-Path $repositoryRoot 'tools\New-GitHubReleaseNotes.ps1'
+    Assert-CcodTrue (Test-Path -LiteralPath $notesTool -PathType Leaf) 'behavior-tested GitHub release notes extractor exists'
+    $notesFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('ccod-install-release-notes-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [IO.Directory]::CreateDirectory($notesFixtureRoot) | Out-Null
+        $missingEnglishChangelog = Join-Path $notesFixtureRoot 'CHANGELOG.md'
+        $notesOutput = Join-Path $notesFixtureRoot 'notes.md'
+        [IO.File]::WriteAllText($missingEnglishChangelog,"## v2.5.22`r`n`r`n### Simplified Chinese`r`n`r`n- fixture`r`n",[Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows { & $notesTool -ChangelogPath $missingEnglishChangelog -Tag 'v2.5.22' -OutputPath $notesOutput | Out-Null } 'CCOD_RELEASE_NOTES_ENGLISH_SECTION_INVALID'
+        Assert-CcodTrue (-not (Test-Path -LiteralPath $notesOutput)) 'missing English notes cannot create a GitHub release body'
+    } finally {
+        if (Test-Path -LiteralPath $notesFixtureRoot) { Remove-Item -LiteralPath $notesFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }
 
+<# Superseded by Task 3 sealed package and Task 4 post-Ready registration.
 $results += Invoke-CcodTest 'installer carries the Inno contract needed by its self-validation' {
     $installerScript = Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'
     $sourceEntries = @(Get-Content -LiteralPath $installerScript | Where-Object { $_ -cmatch '^Source: "\.\.\\build\\CodexControlOtherDevices\.iss"; DestDir: "\{app\}\\build";' })
@@ -2687,6 +4222,410 @@ $results += Invoke-CcodTest 'installer carries build.ps1 so installed self-valid
     $installerScript = Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss'
     $sourceEntries = @(Get-Content -LiteralPath $installerScript | Where-Object { $_ -cmatch '^Source: "\.\.\\build\\build\.ps1"; DestDir: "\{app\}\\build";' })
     Assert-CcodEqual 1 $sourceEntries.Count 'installer carries build.ps1 required by Validate.ps1'
+}
+#>
+
+$results += Invoke-CcodTest 'sealed Setup carries no mutable validation or legacy shortcut migration payload' {
+    $installerScript = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw -Encoding UTF8
+    Assert-CcodTrue ($installerScript -cnotmatch 'DestDir:\s*"\{app\}|\[InstallDelete\]|CodexControlOtherDevices\.iss"; DestDir|build\.ps1"; DestDir') 'Task 3 leaves installed validation and legacy registration migration to immutable payload and Task 4'
+    Assert-CcodTrue ($installerScript -cmatch '(?m)^CreateAppDir=no\s*$' -and $installerScript -cmatch '(?m)^Uninstallable=no\s*$') 'Setup cannot create the old mutable validation root'
+}
+
+# Production mutation caught: product state written from ProtectionReady or before the terminal transaction snapshot.
+$results += Invoke-CcodTest 'product registration runs exactly once only after the Task 2 Ready transaction is durable' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $result=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('3'*64) -Adapters $fake.Adapters
+        Assert-CcodEqual 1 $fake.World.ProductRegistrationCalls 'successful install commits product registration exactly once'
+        Assert-CcodTrue $fake.World.ProductRegistrationReadyObserved 'registration adapter receives only the durable Ready transaction'
+        Assert-CcodTrue $result.ProductRegistrationVerified 'install result reports verified post-Ready registration'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
+}
+
+# Production mutation caught: an AlreadyInstalled return must not strand the
+# temporary shortcut candidates prepared before the idempotence check.
+$results += Invoke-CcodTest 'AlreadyInstalled product reconciliation removes temporary shortcut candidates before returning' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot;$temporaryRoot=$null
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$first=New-CcodLifecycleFake -NodePath $node
+        $firstResult=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters $first.Adapters
+        Assert-CcodEqual 'Installed' $firstResult.Outcome 'fixture reaches a Ready install before idempotent reconciliation'
+        $second=New-CcodLifecycleFake -NodePath $node
+        $preparedState=@{Calls=0;TemporaryRoot=$null}
+        $second.Adapters.AddProductShortcutCandidates={
+            param($Files)
+            $preparedState.Calls++
+            $temporaryRoot=Join-Path ([IO.Path]::GetTempPath()) ('ccod-lifecycle-same-identity-'+[guid]::NewGuid().ToString('N'))
+            [IO.Directory]::CreateDirectory($temporaryRoot)|Out-Null
+            [IO.File]::WriteAllText((Join-Path $temporaryRoot 'candidate.tmp'),'fixture',[Text.UTF8Encoding]::new($false))
+            $preparedState.TemporaryRoot=$temporaryRoot
+            [pscustomobject]@{Files=@($Files);TemporaryRoot=$temporaryRoot}
+        }.GetNewClosure()
+        $secondResult=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters $second.Adapters
+        Assert-CcodEqual 'AlreadyInstalled' $secondResult.Outcome 'same package takes the idempotent reconciliation path'
+        Assert-CcodEqual 0 $preparedState.Calls 'idempotent reconciliation checks package identity before preparing product candidates'
+        Assert-CcodTrue ([string]::IsNullOrWhiteSpace([string]$preparedState.TemporaryRoot)) 'idempotent reconciliation creates no temporary product candidates'
+    }finally{
+        foreach($path in @($source,$install,$nodeRoot,$temporaryRoot)){if(-not[string]::IsNullOrWhiteSpace([string]$path)-and(Test-Path -LiteralPath $path)){Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue}}
+    }
+}
+
+# Production mutation caught: treating post-Ready registration failure as an install rollback or Failed lifecycle snapshot.
+$results += Invoke-CcodTest 'registration failure preserves durable Ready without rollback or Failed transaction' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null
+        $node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node;$fake.World.ProductRegistrationFailure=$true
+        Assert-CcodThrows { Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('3'*64) -Adapters $fake.Adapters|Out-Null } 'CCOD_PRODUCT_REGISTRATION_FAILED'
+        $module=Get-Module InstallLifecycle;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Ready' $head.phase 'post-Ready registration failure cannot downgrade the lifecycle transaction'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'registration failure appends no Failed transaction snapshot'
+        $retry=New-CcodLifecycleFake -NodePath $node
+        $result=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('3'*64) -Adapters $retry.Adapters
+        Assert-CcodEqual 'AlreadyInstalled' $result.Outcome 'later same-package invocation retries after post-Ready registration failure'
+        Assert-CcodEqual 1 $retry.World.ProductRegistrationCalls 'normal Ready registration retry occurs exactly once'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
+}
+
+# Production mutation caught: normal first install passed its writable generation transaction to the default product path instead of reopening strict Ready authority.
+$results += Invoke-CcodTest 'normal first install reaches the default registration path with only a strict product capability' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $productState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}}
+        Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $fake -ProductState $productState
+        $result=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('6'*64) -Adapters $fake.Adapters
+        Assert-CcodEqual 'Installed' $result.Outcome 'normal first install completes through the real default registration adapter'
+        Assert-CcodTrue $result.ProductRegistrationVerified 'normal first install reports verified product registration'
+        Assert-CcodTrue $productState.ProductOnlyObserved 'lower shortcut side effect receives a product-only retained capability'
+        Assert-CcodEqual 1 $productState.Writes 'registry side effect boundary is invoked once'
+        Assert-CcodEqual 2 $productState.ShortcutWrites 'both shortcut side effect boundaries are invoked once'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
+}
+
+# Production mutation caught: default registration failure after durable Ready must remain outside lifecycle failure and reconcile through AlreadyInstalled.
+$results += Invoke-CcodTest 'default first-install registration failure leaves Ready and retries with strict product authority' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$first=New-CcodLifecycleFake -NodePath $node
+        $failedState=@{FailWrites=$true;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $first -ProductState $failedState
+        Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('7'*64) -Adapters $first.Adapters|Out-Null} 'CCOD_PRODUCT_REGISTRATION_FAILED'
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Ready' $head.phase 'default registration failure leaves the lifecycle transaction durably Ready'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'default registration failure appends no Failed lifecycle snapshot'
+        $retry=New-CcodLifecycleFake -NodePath $node;$retryState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $retry -ProductState $retryState
+        $result=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('7'*64) -Adapters $retry.Adapters
+        Assert-CcodEqual 'AlreadyInstalled' $result.Outcome 'later same-package invocation retries default product registration'
+        Assert-CcodTrue $retryState.ProductOnlyObserved 'recovery retry receives only strict product authority'
+        Assert-CcodEqual 2 $retryState.ShortcutWrites 'recovery retry publishes both shortcut records through lower side effects'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
+}
+
+# Production mutation caught: failure to close the writable generation at the post-Ready handoff must not enter lifecycle rollback or prevent reconciliation.
+$results += Invoke-CcodTest 'post-Ready writable close failure preserves Ready and retries before product side effects' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$first=New-CcodLifecycleFake -NodePath $node
+        $failedState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $first -ProductState $failedState
+        $first.Adapters.CloseReadyGeneration={param($Transaction)throw [Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('fixture Ready close failed'),'CCOD_INSTALL_CLOSE_FAILED',[Management.Automation.ErrorCategory]::InvalidData,$null)}
+        Assert-CcodThrows {Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('8'*64) -Adapters $first.Adapters|Out-Null} 'CCOD_PRODUCT_REGISTRATION_FAILED'
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$head=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Ready' $head.phase 'post-Ready writable close failure leaves the lifecycle transaction Ready'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'post-Ready writable close failure appends no Failed snapshot'
+        Assert-CcodEqual 0 $failedState.Writes 'no product side effect begins before the writable generation closes'
+        $retry=New-CcodLifecycleFake -NodePath $node;$retryState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $retry -ProductState $retryState
+        $result=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('8'*64) -Adapters $retry.Adapters
+        Assert-CcodEqual 'AlreadyInstalled' $result.Outcome 'same-package retry reconciles after post-Ready writable close failure'
+        Assert-CcodTrue $retryState.ProductOnlyObserved 'retry uses strict product authority after cleanup succeeds'
+        Assert-CcodEqual 2 $retryState.ShortcutWrites 'retry completes both lower shortcut side effects'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
+}
+
+# Production mutation caught: marking a dead owner's Pending fence Completed without opening and closing fresh strict authority skips the required cleanup proof.
+$results += Invoke-CcodTest 'dead-owner Pending fence requires fresh strict cleanup before registration' {
+    Invoke-CcodLifecycleDeadOwnerCleanupTest
+}
+
+# Production mutation caught: initializing cleanup as complete before strict OpenProduct lets an open failure append a false Completed fence.
+$results += Invoke-CcodTest 'strict product open failure retains Pending and later reconciles before verified success' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    $openFixture=$null
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $productState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $fake -ProductState $productState
+        $fake.Adapters.RegisterProduct={param($InstallRoot,$RuntimeId,$Version,$PackageSha256,$FileTransaction,$TransactionRecord)[pscustomobject]@{verified=$true;legacyRemoved=$true}}
+        $null=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('c'*64) -Adapters $fake.Adapters
+        [void]$fake.Adapters.Remove('RegisterProduct')
+        $openState=@{FailuresRemaining=1};$openFixture=Set-CcodLifecycleProductOpenFailureFixture -State $openState
+        $unexpectedReceipt=$null;$failure=$null
+        try{$unexpectedReceipt=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('c'*64) -Adapters $fake.Adapters}catch{$failure=$_}
+        Assert-CcodEqual $null $unexpectedReceipt 'strict product open failure emits no verified registration receipt'
+        $records=@(Get-CcodLifecycleProductCleanupTestRecords -InstallRoot $install)
+        Assert-CcodEqual 1 $records.Count 'strict product open failure leaves only its durable Pending record'
+        Assert-CcodEqual 'Pending' $records[0].State 'strict product open failure never appends Completed without an opened transaction'
+        Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' (([string]$failure.FullyQualifiedErrorId-split',')[0]) 'strict product open failure is normalized to the stable product registration error'
+        Assert-CcodEqual 1 $openState.Attempts 'failed registration makes exactly one strict product open attempt'
+        Assert-CcodEqual 0 $productState.Writes 'strict product open failure performs no product write'
+        Assert-CcodEqual 0 $productState.ShortcutWrites 'strict product open failure performs no shortcut write'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'strict product open failure appends no lifecycle Failed snapshot'
+
+        $retry=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('c'*64) -Adapters $fake.Adapters
+        Assert-CcodEqual 'AlreadyInstalled' $retry.Outcome 'same-package retry reconciles the open-failure Pending fence'
+        Assert-CcodTrue $retry.ProductRegistrationVerified 'same-package retry verifies only after exact strict cleanup and new registration close'
+        Assert-CcodEqual 3 $openState.Attempts 'retry opens once to reconcile the old Pending fence and once for new verification'
+        $records=@(Get-CcodLifecycleProductCleanupTestRecords -InstallRoot $install)
+        Assert-CcodEqual '1:Pending|1:Completed|2:Pending|2:Completed' (($records|ForEach-Object{"$($_.Attempt):$($_.State)"})-join '|') 'open-failure recovery preserves append-only exact cleanup history'
+    }finally{
+        Clear-CcodLifecycleProductOpenFailureFixture -Fixture $openFixture
+        foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}
+    }
+}
+
+# Production mutation caught: a Ready-close fence assertion must not skip native abort cleanup after strict OpenProduct succeeds but binding fails.
+$results += Invoke-CcodTest 'fence bind failure aborts the real strict transaction before exact retry recovery' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot;$markerRoot=New-CcodLifecycleTempRoot
+    $bindFixture=$null;$fileModule=$null
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $productState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $fake -ProductState $productState
+        $fake.Adapters.RegisterProduct={param($InstallRoot,$RuntimeId,$Version,$PackageSha256,$FileTransaction,$TransactionRecord)[pscustomobject]@{verified=$true;legacyRemoved=$true}}
+        $null=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('d'*64) -Adapters $fake.Adapters
+        [void]$fake.Adapters.Remove('RegisterProduct')
+        $lowerState=@{FailuresRemaining=0};$fileModule=Set-CcodLifecycleLowerProductCloseFixture -State $lowerState
+        $bindState=@{FailuresRemaining=1};$bindFixture=Set-CcodLifecycleProductFenceBindFailureFixture -State $bindState
+
+        $unexpectedReceipt=$null;$failure=$null
+        try{$unexpectedReceipt=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('d'*64) -Adapters $fake.Adapters}catch{$failure=$_}
+        Assert-CcodEqual $null $unexpectedReceipt 'bind failure emits no verified registration receipt'
+        Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' (([string]$failure.FullyQualifiedErrorId-split',')[0]) 'bind failure is normalized to the stable product registration error'
+        $records=@(Get-CcodLifecycleProductCleanupTestRecords -InstallRoot $install)
+        Assert-CcodEqual '1:Pending' (($records|ForEach-Object{"$($_.Attempt):$($_.State)"})-join '|') 'bind failure retains Pending without false completion'
+        Assert-CcodEqual 0 $productState.Writes 'bind failure performs no product write'
+        Assert-CcodEqual 0 $productState.ShortcutWrites 'bind failure performs no shortcut write'
+
+        $child=Invoke-CcodLifecycleOtherProcessProductReconciliation -SourceRoot $source -InstallRoot $install -NodePath $node -PackageSha256 ('d'*64) -MarkerRoot $markerRoot
+        Assert-CcodTrue $child.MutexAcquired 'Failed abort releases the inner real AccountTransition mutex for another process'
+        Assert-CcodEqual 23 $child.ExitCode 'another process observes live Pending after acquiring the released mutex'
+        Assert-CcodEqual $false $child.AuthorityOpened 'live Pending blocks the other process before strict product authority'
+        Assert-CcodEqual 1 $lowerState.Attempts 'unbound strict transaction executes one real lower Failed close'
+
+        $bindState.FailuresRemaining=0
+        $retry=$null;$retryFailure=$null
+        try{$retry=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('d'*64) -Adapters $fake.Adapters}catch{$retryFailure=$_}
+        Assert-CcodEqual $null $retryFailure "same-package retry reaches fresh recovery bind=$($bindState.Attempts) close=$($lowerState.Attempts) writes=$($productState.Writes) shortcuts=$($productState.ShortcutWrites) retained=$($productState.RetainedError)"
+        Assert-CcodEqual 'AlreadyInstalled' $retry.Outcome 'same-package retry recovers the exact Pending only through fresh bound authority'
+        Assert-CcodTrue $retry.ProductRegistrationVerified 'retry verifies only after fresh bound Ready close succeeds'
+        Assert-CcodEqual 3 $bindState.Attempts 'retry binds one fresh recovery transaction and one new verification transaction'
+        Assert-CcodEqual 3 $lowerState.Attempts 'Failed abort and two bound Ready closes all reach real lower cleanup'
+        $records=@(Get-CcodLifecycleProductCleanupTestRecords -InstallRoot $install)
+        Assert-CcodEqual '1:Pending|1:Completed|2:Pending|2:Completed' (($records|ForEach-Object{"$($_.Attempt):$($_.State)"})-join '|') 'bind failure recovery preserves exact append-only cleanup history'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'post-Ready bind failure appends no lifecycle Failed snapshot'
+    }finally{
+        Clear-CcodLifecycleProductFenceBindFailureFixture -Fixture $bindFixture
+        Clear-CcodLifecycleLowerProductCloseFixture -FileModule $fileModule
+        foreach($path in @($source,$install,$nodeRoot,$markerRoot)){if(Test-Path $path){try{Remove-Item $path -Recurse -Force}catch{}}}
+    }
+}
+
+# Production mutation caught: validating every historical record against the latest Ready transaction makes any completed prior version poison an upgrade.
+$results += Invoke-CcodTest 'completed cleanup history from an older Ready transaction permits new upgrade registration' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$firstFake=New-CcodLifecycleFake -NodePath $node
+        $firstProduct=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $firstFake -ProductState $firstProduct
+        $first=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $firstFake.Adapters
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$oldReady=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Installed' $first.Outcome 'first product version reaches Ready registration'
+        Assert-CcodEqual '1:Pending|1:Completed' ((@(Get-CcodLifecycleProductCleanupTestRecords -InstallRoot $install)|ForEach-Object{"$($_.Attempt):$($_.State)"})-join '|') 'first Ready transaction owns one complete cleanup attempt'
+        Set-CcodLifecycleTestStatus -InstallRoot $install -RuntimeId $first.RuntimeId
+        [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'),"module.exports = 'fixture-upgrade-cleanup-history';`n",[Text.UTF8Encoding]::new($false))
+        $upgradeFake=New-CcodLifecycleFake -NodePath $node;$upgradeProduct=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $upgradeFake -ProductState $upgradeProduct
+        $upgrade=$null;$upgradeFailure=$null
+        try{$upgrade=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $upgradeFake.Adapters}catch{$upgradeFailure=$_}
+        $upgradeErrorId=if($null-eq$upgradeFailure){$null}else{([string]$upgradeFailure.FullyQualifiedErrorId-split',')[0]}
+        Assert-CcodEqual $null $upgradeErrorId 'older completed cleanup history is ignored for the new Ready attempt sequence'
+        Assert-CcodEqual 'Upgraded' $upgrade.Outcome 'new Ready transaction completes upgrade registration'
+        Assert-CcodTrue $upgrade.ProductRegistrationVerified 'new upgrade reports verified only after its own cleanup completion'
+        $newReady=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodTrue ($newReady.transactionId-cne$oldReady.transactionId) 'upgrade commits a distinct Ready transaction identity'
+        $records=@(Get-CcodLifecycleProductCleanupTestRecords -InstallRoot $install)
+        Assert-CcodEqual 4 $records.Count 'append-only history retains both transaction cleanup pairs'
+        $oldRecords=@($records|Where-Object{$_.Record.transactionId-ceq$oldReady.transactionId});$newRecords=@($records|Where-Object{$_.Record.transactionId-ceq$newReady.transactionId})
+        Assert-CcodEqual '1:Pending|1:Completed' (($oldRecords|ForEach-Object{"$($_.Attempt):$($_.State)"})-join '|') 'older transaction retains its independent attempt sequence'
+        Assert-CcodEqual '1:Pending|1:Completed' (($newRecords|ForEach-Object{"$($_.Attempt):$($_.State)"})-join '|') 'new transaction starts and completes its own attempt sequence'
+        Assert-CcodEqual 1 $upgradeProduct.Writes 'upgrade reaches the product write boundary once'
+        Assert-CcodEqual 2 $upgradeProduct.ShortcutWrites 'upgrade reaches both shortcut write boundaries'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
+}
+
+# Production mutation caught: resolving old cleanup only after the selector advances makes the old Ready authority permanently stale.
+$results += Invoke-CcodTest 'upgrade resolves a dead-owner old Pending while the old Ready is still selected' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$firstFake=New-CcodLifecycleFake -NodePath $node
+        $first=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $firstFake.Adapters
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$oldReady=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install;$currentOwner=Get-CcodLifecycleCurrentProductCleanupTestIdentity
+        $owner=[pscustomobject][ordered]@{pid=[int]2147483647;creationTimeUtc='2000-01-01T00:00:00.0000000Z';userSid=$currentOwner.userSid}
+        $outer=&$module {Enter-CcodLifecycleProductCleanupLease}
+        try{&$module {param($Root,$Ready,$Identity)[void](New-CcodLifecycleProductCleanupFence -InstallRoot $Root -ReadyTransaction $Ready -OwnerIdentity $Identity)} $install $oldReady $owner}
+        finally{&$module {param($Context)[void](Exit-CcodLifecycleProductCleanupLease -Context $Context)} $outer}
+        Set-CcodLifecycleTestStatus -InstallRoot $install -RuntimeId $first.RuntimeId
+        [IO.File]::WriteAllText((Join-Path $source 'src\runtime\main-payload.js'),"module.exports = 'fixture-upgrade-prior-pending';`n",[Text.UTF8Encoding]::new($false))
+        $upgradeFake=New-CcodLifecycleFake -NodePath $node;$upgradeProduct=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $upgradeFake -ProductState $upgradeProduct
+        $upgrade=$null;$failure=$null
+        try{$upgrade=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -Adapters $upgradeFake.Adapters}catch{$failure=$_}
+        Assert-CcodEqual $null $failure 'dead-owner old Pending is reconciled before selector advance'
+        Assert-CcodEqual 'Upgraded' $upgrade.Outcome 'upgrade proceeds only after old cleanup completion'
+        Assert-CcodTrue $upgrade.ProductRegistrationVerified 'upgrade verifies only after old and new strict cleanup complete'
+        $newReady=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodTrue ($newReady.transactionId-cne$oldReady.transactionId) 'upgrade commits a distinct Ready only after old cleanup completion'
+        $records=@(Get-CcodLifecycleProductCleanupTestRecords -InstallRoot $install)
+        $oldRecords=@($records|Where-Object{$_.Record.transactionId-ceq$oldReady.transactionId});$newRecords=@($records|Where-Object{$_.Record.transactionId-ceq$newReady.transactionId})
+        Assert-CcodEqual '1:Pending|1:Completed' (($oldRecords|ForEach-Object{"$($_.Attempt):$($_.State)"})-join '|') 'old Pending completes against the still-selected old Ready'
+        Assert-CcodEqual '1:Pending|1:Completed' (($newRecords|ForEach-Object{"$($_.Attempt):$($_.State)"})-join '|') 'new Ready owns an independent completed cleanup attempt'
+        Assert-CcodEqual 1 $upgradeProduct.Writes 'upgrade reaches the product write boundary once after old cleanup'
+        Assert-CcodEqual 2 $upgradeProduct.ShortcutWrites 'upgrade reaches both shortcut writes after old cleanup'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'old cleanup recovery fabricates no lifecycle Failed snapshot'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
+}
+
+# Production mutation caught: accepting an extra cleanup member weakens the exact ten-field durable authority contract.
+$results += Invoke-CcodTest 'cleanup history rejects an unknown record field before product authority opens' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+        $productState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $fake -ProductState $productState
+        $null=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('2'*64) -Adapters $fake.Adapters
+        $completed=@(Get-ChildItem -LiteralPath (Join-Path $install 'state\product-cleanup-fences') -Filter '*.Completed.*.json' -File)
+        Assert-CcodEqual 1 $completed.Count 'fixture starts from one valid completed cleanup record'
+        $record=(Get-Content -LiteralPath $completed[0].FullName -Raw)|ConvertFrom-Json
+        $mutated=[ordered]@{};foreach($property in $record.PSObject.Properties){$mutated[$property.Name]=$property.Value};$mutated['unknownFenceField']='rejected'
+        $completed[0].IsReadOnly=$false
+        [IO.File]::WriteAllText($completed[0].FullName,(($mutated|ConvertTo-Json -Depth 8 -Compress)+"`n"),[Text.UTF8Encoding]::new($false))
+        $completed[0].Refresh();$completed[0].IsReadOnly=$true
+        $productState.Writes=0;$productState.ShortcutWrites=0
+        $unexpectedReceipt=$null;$failure=$null
+        try{$unexpectedReceipt=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('2'*64) -Adapters $fake.Adapters}catch{$failure=$_}
+        Assert-CcodEqual $null $unexpectedReceipt 'unknown cleanup field emits no verified receipt'
+        Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' (([string]$failure.FullyQualifiedErrorId-split',')[0]) 'unknown cleanup field fails closed with the stable error'
+        Assert-CcodEqual 0 $productState.Writes 'unknown cleanup field blocks before product writes'
+        Assert-CcodEqual 0 $productState.ShortcutWrites 'unknown cleanup field blocks before shortcut writes'
+    }finally{foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}}
+}
+
+# Production mutation caught: broad temp-name deletion could remove attacker-controlled reparse, ADS, hardlink, or live objects from the authority plane.
+$results += Invoke-CcodTest 'cleanup fence orphan recovery rejects every hostile temporary lookalike' {
+    foreach($case in @('unexpected-name','reparse','ads','hardlink','open')){
+        $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot;$outside=New-CcodLifecycleTempRoot;$held=$null
+        try{
+            New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$fake=New-CcodLifecycleFake -NodePath $node
+            $null=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('e'*64) -Adapters $fake.Adapters
+            $plane=Join-Path $install 'state\product-cleanup-fences';[IO.Directory]::CreateDirectory($plane)|Out-Null
+            $exactName='.ccod.'+('a'*32)+'.tmp';$name=if($case-ceq'unexpected-name'){'.ccod.not-a-canonical-guid.tmp'}else{$exactName};$artifact=Join-Path $plane $name
+            switch($case){
+                'unexpected-name'{[IO.File]::WriteAllText($artifact,'hostile unexpected name',[Text.UTF8Encoding]::new($false))}
+                'reparse'{[IO.Directory]::CreateDirectory($outside)|Out-Null;New-Item -ItemType Junction -Path $artifact -Target $outside|Out-Null}
+                'ads'{[IO.File]::WriteAllText($artifact,'hostile alternate stream',[Text.UTF8Encoding]::new($false));$previous=$ErrorActionPreference;try{$ErrorActionPreference='Continue';$output=&cmd.exe /d /c "echo ads>`"$($artifact):metadata`"" 2>&1;$exitCode=$LASTEXITCODE}finally{$ErrorActionPreference=$previous};if($exitCode-ne0){throw "ADS fixture failed: $($output-join' ')"}}
+                'hardlink'{[IO.Directory]::CreateDirectory($outside)|Out-Null;$outsideFile=Join-Path $outside 'hostile.tmp';[IO.File]::WriteAllText($outsideFile,'hostile hardlink',[Text.UTF8Encoding]::new($false));New-Item -ItemType HardLink -Path $artifact -Target $outsideFile|Out-Null}
+                'open'{[IO.File]::WriteAllText($artifact,'hostile live handle',[Text.UTF8Encoding]::new($false));$held=[IO.File]::Open($artifact,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)}
+            }
+            [void]$fake.Adapters.Remove('RegisterProduct');$productState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $fake -ProductState $productState
+            $unexpectedReceipt=$null;$failure=$null
+            try{$unexpectedReceipt=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('e'*64) -Adapters $fake.Adapters}catch{$failure=$_}
+            Assert-CcodEqual $null $unexpectedReceipt "$case hostile temporary emits no verified receipt"
+            Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' (([string]$failure.FullyQualifiedErrorId-split',')[0]) "$case hostile temporary fails closed"
+            Assert-CcodTrue (Test-Path -LiteralPath $artifact) "$case hostile object is never deleted or ignored"
+            Assert-CcodEqual 0 $productState.Writes "$case blocks before product writes"
+            Assert-CcodEqual 0 $productState.ShortcutWrites "$case blocks before shortcut writes"
+        }finally{
+            if($null-ne$held){$held.Dispose()}
+            foreach($path in @($source,$install,$nodeRoot,$outside)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}
+        }
+    }
+}
+
+# Production mutation caught: releasing strict product authority after a lower close failure without a durable fence lets another process report verified registration.
+$results += Invoke-CcodTest 'live-owner durable product cleanup blocks another real process after mutex acquisition' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot;$markerRoot=New-CcodLifecycleTempRoot
+    $fileModule=$null;$first=$null
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$first=New-CcodLifecycleFake -NodePath $node
+        $productState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $first -ProductState $productState
+        $lowerState=@{FailuresRemaining=1};$fileModule=Set-CcodLifecycleLowerProductCloseFixture -State $lowerState
+        $unexpectedReceipt=$null;$failure=$null
+        try{$unexpectedReceipt=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters $first.Adapters}catch{$failure=$_}
+        Assert-CcodEqual $null $unexpectedReceipt 'lower native close failure returns no verified receipt to the first process'
+        Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' (([string]$failure.FullyQualifiedErrorId-split',')[0]) 'lower native close failure surfaces as product registration failure'
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$ready=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install
+        Assert-CcodEqual 'Ready' $ready.phase 'first process lower close failure leaves lifecycle Ready'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'first process lower close failure appends no Failed lifecycle snapshot'
+
+        $child=Invoke-CcodLifecycleOtherProcessProductReconciliation -SourceRoot $source -InstallRoot $install -NodePath $node -PackageSha256 ('a'*64) -MarkerRoot $markerRoot
+        [Console]::Error.WriteLine(('CCOD_CROSS_PROCESS_OBSERVED exit={0} mutex={1} authority={2} product={3} verified={4} error={5}'-f$child.ExitCode,$child.MutexAcquired,$child.AuthorityOpened,$child.ProductWritten,$child.Verified,$child.ErrorId))
+        Assert-CcodTrue $child.MutexAcquired 'fresh process acquires the real AccountTransition mutex after the first failure'
+        Assert-CcodEqual 23 $child.ExitCode 'fresh process fails closed on the durable pending fence'
+        Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' $child.ErrorId 'fresh process reports the stable product registration failure'
+        Assert-CcodEqual $false $child.AuthorityOpened 'fresh process opens no strict product authority while the live owner is pending'
+        Assert-CcodEqual $false $child.ProductWritten 'fresh process writes no product registration or shortcut'
+        Assert-CcodEqual $false $child.Verified 'fresh process emits no verified success'
+        Assert-CcodEqual $null $child.ChildFailure 'fresh process has no setup or adapter failure'
+        $records=@(Get-CcodLifecycleProductCleanupTestRecords -InstallRoot $install);$owner=Get-CcodLifecycleCurrentProductCleanupTestIdentity
+        Assert-CcodEqual 1 $records.Count 'other process observes one on-disk Pending fence rather than parent memory'
+        Assert-CcodLifecycleProductCleanupTestRecord -Actual $records[0].Record -Ready $ready -Owner $owner -State Pending
+        Assert-CcodEqual 1 $lowerState.Attempts 'first process performs exactly one lower product close attempt'
+    }finally{
+        Clear-CcodLifecycleLowerProductCloseFixture -FileModule $fileModule
+        if($null-ne$first-and(Test-Path -LiteralPath $install)){try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('a'*64) -Adapters $first.Adapters|Out-Null}catch{}}
+        foreach($path in @($source,$install,$nodeRoot,$markerRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}
+    }
+}
+
+# Production mutation caught: dropping the retained same-thread capability or completing its fence before exact close permits false verified success after Ready.
+$results += Invoke-CcodTest 'same-thread AlreadyInstalled drains durable product cleanup before verified success' {
+    $source=New-CcodLifecycleTempRoot;$install=New-CcodLifecycleTempRoot;$nodeRoot=New-CcodLifecycleTempRoot
+    $fileModule=$null;$cleanupNeeded=$true
+    try{
+        New-CcodLifecycleSourceFixture -Root $source -Version '2.5.22'|Out-Null;$node=New-CcodLifecycleFakeNode -Root $nodeRoot;$first=New-CcodLifecycleFake -NodePath $node
+        $productState=@{FailWrites=$false;Registration=$null;ReadyEvidence=$null;RetainedError=$null;Writes=0;ShortcutWrites=0;ProductOnlyObserved=$false;Shortcuts=@{}};Set-CcodLifecycleDefaultProductRegistrationFixture -Fake $first -ProductState $productState
+        $lowerState=@{FailuresRemaining=2};$fileModule=Set-CcodLifecycleLowerProductCloseFixture -State $lowerState
+        $firstReceipt=$null;$firstFailure=$null
+        try{$firstReceipt=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('9'*64) -Adapters $first.Adapters}catch{$firstFailure=$_}
+        Assert-CcodEqual $null $firstReceipt 'first lower close failure emits no successful install or registration receipt'
+        Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' (([string]$firstFailure.FullyQualifiedErrorId-split',')[0]) 'first lower close failure is a stable product registration failure'
+        $module=Get-Module InstallLifecycle -ErrorAction Stop;$ready=&$module {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install;$owner=Get-CcodLifecycleCurrentProductCleanupTestIdentity
+        Assert-CcodEqual 'Ready' $ready.phase 'first lower close failure retains lifecycle Ready'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'first lower close failure appends no lifecycle Failed snapshot'
+        $records=@(Get-CcodLifecycleProductCleanupTestRecords -InstallRoot $install)
+        Assert-CcodEqual 1 $records.Count 'first lower close failure leaves exactly one durable Pending record'
+        Assert-CcodLifecycleProductCleanupTestRecord -Actual $records[0].Record -Ready $ready -Owner $owner -State Pending
+        Assert-CcodEqual 1 $lowerState.Attempts 'one Invoke call performs one lower close attempt'
+
+        $secondReceipt=$null;$secondFailure=$null
+        try{$secondReceipt=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('9'*64) -Adapters $first.Adapters}catch{$secondFailure=$_}
+        Assert-CcodEqual $null $secondReceipt 'second retained-capability close failure emits no verified receipt'
+        Assert-CcodEqual 'CCOD_PRODUCT_REGISTRATION_FAILED' (([string]$secondFailure.FullyQualifiedErrorId-split',')[0]) 'second retained-capability close failure remains retryable'
+        Assert-CcodEqual 2 $lowerState.Attempts 'second same-thread invocation retries the original lower close exactly once'
+        Assert-CcodEqual 'Ready' (&$module {param($Root)(Read-CcodInstallTransactionRecord -InstallRoot $Root).phase} $install) 'two close failures leave lifecycle Ready'
+        Assert-CcodEqual 0 @(Get-ChildItem -LiteralPath (Join-Path $install 'state\install-transactions') -Filter '*.Failed.*.json' -File).Count 'two close failures append no lifecycle Failed snapshot'
+        Assert-CcodEqual 1 @(Get-CcodLifecycleProductCleanupTestRecords -InstallRoot $install).Count 'failed retained retry appends no false Completed record'
+
+        $result=Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('9'*64) -Adapters $first.Adapters
+        Assert-CcodEqual 'AlreadyInstalled' $result.Outcome 'exact same-package invocation returns only after original cleanup drains'
+        Assert-CcodTrue $result.ProductRegistrationVerified 'exact same-package invocation verifies only after durable completion'
+        Assert-CcodEqual 4 $lowerState.Attempts 'successful retry closes the retained original and the new strict verification transaction'
+        $records=@(Get-CcodLifecycleProductCleanupTestRecords -InstallRoot $install)
+        Assert-CcodEqual 4 $records.Count 'successful retry appends original completion and a complete verification pair'
+        Assert-CcodEqual '1:Pending|1:Completed|2:Pending|2:Completed' (($records|ForEach-Object{"$($_.Attempt):$($_.State)"})-join '|') 'cleanup history is append-only and ordered'
+        Assert-CcodLifecycleProductCleanupTestRecord -Actual $records[1].Record -Ready $ready -Owner $owner -State Completed
+        $cleanupNeeded=$false
+    }finally{
+        Clear-CcodLifecycleLowerProductCloseFixture -FileModule $fileModule
+        if($cleanupNeeded-and(Test-Path -LiteralPath $install)){try{Invoke-CcodInstall -SourceRoot $source -InstallRoot $install -SealedPackageSha256 ('9'*64) -Adapters $first.Adapters|Out-Null}catch{}}
+        foreach($path in @($source,$install,$nodeRoot)){if(Test-Path $path){Remove-Item $path -Recurse -Force}}
+    }
 }
 
 Write-Output "Install lifecycle self-tests passed: $($results.Count)"

@@ -2,7 +2,8 @@
 param(
     [string]$InstallerRoot,
     [string]$InstallRoot,
-    [ValidateSet('Prepare','FinalizeReceipt')][string]$Mode
+    [ValidateSet('Prepare','PrepareInstalled','FinalizeReceipt')][string]$Mode,
+    $WrapperIdentity
 )
 
 Set-StrictMode -Version Latest
@@ -10,17 +11,20 @@ $ErrorActionPreference = 'Stop'
 
 $script:CcodUninstallTransactionFields = @(
     'schemaVersion','transactionId','runtimeId','runtimeGeneration','leaseEpoch','userSid','sessionId',
-    'phase','resumePhase','startedAtUtc','updatedAtUtc','errorCode'
+    'readyEvidence','installedBinding','phase','resumePhase','startedAtUtc','updatedAtUtc','errorCode'
 )
 $script:CcodUninstallPhases = @(
     'Requested','Recovering','RecoveryProven','StoppingProtection','ProtectionStopped','TaskRemoved',
     'ApplicationStateRemoved','ReadyForInno','Completed','Failed'
 )
-$script:CcodUninstallContextFields = @('runtimeId','runtimeGeneration','leaseEpoch','userSid','sessionId','payloadRecords')
+$script:CcodUninstallContextFields = @('runtimeId','runtimeGeneration','leaseEpoch','userSid','sessionId','readyEvidence','payloadRecords')
 $script:CcodUninstallPayloadEntries = @(
     'src/persistence/UninstallBootstrap.ps1',
     'src/persistence/PortableUninstallFinalizer.ps1',
+    'src/persistence/InstalledUninstallFinalizer.ps1',
+    'src/persistence/modules/GenerationReclamation.psm1',
     'src/persistence/modules/InstallLifecycle.psm1',
+    'src/persistence/modules/ProductRegistration.psm1',
     'src/persistence/modules/PortableRelease.psm1',
     'src/persistence/modules/PersistenceIO.psm1',
     'src/persistence/modules/RuntimeManifest.psm1',
@@ -199,6 +203,11 @@ function Read-CcodUninstallBootstrapJson {
     try {
         $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
         if ($item.PSIsContainer -or $item -isnot [IO.FileInfo] -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.Length -lt 1 -or $item.Length -gt $MaximumBytes) { throw 'invalid file' }
+        $streams=@(Get-Item -LiteralPath $Path -Stream * -ErrorAction Stop);if($streams.Count-ne1-or[string]$streams[0].Stream-cne':$DATA'){throw 'alternate stream'}
+        if($null-eq('CcodUninstallSelectorIdentity' -as[type])){Add-Type -TypeDefinition @'
+using System; using System.ComponentModel; using System.IO; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
+public static class CcodUninstallSelectorIdentity { [StructLayout(LayoutKind.Sequential)] struct I { public uint A; public System.Runtime.InteropServices.ComTypes.FILETIME C,X,W; public uint V,H,L,N,Ih,Il; } [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetFileInformationByHandle(SafeFileHandle h,out I i); public static uint Links(string p){using(FileStream s=new FileStream(p,FileMode.Open,FileAccess.Read,FileShare.Read)){I i;if(!GetFileInformationByHandle(s.SafeFileHandle,out i))throw new Win32Exception(Marshal.GetLastWin32Error());return i.N;}} }
+'@};if([CcodUninstallSelectorIdentity]::Links($Path)-ne1){throw 'multi-link'}
         $json = [IO.File]::ReadAllText($Path,[Text.UTF8Encoding]::new($false,$true))
         if (-not (Test-CcodUninstallBootstrapJsonHasNoDuplicateProperties $json)) { throw 'duplicate JSON properties' }
         $value = $json | ConvertFrom-Json -ErrorAction Stop
@@ -257,16 +266,17 @@ function Get-CcodUninstallBootstrapRuntimeRecords {
 }
 
 function Get-CcodUninstallBootstrapRuntimeId {
-    param([Parameter(Mandatory)][string]$ProjectVersion,[Parameter(Mandatory)][object[]]$Records)
+    param([Parameter(Mandatory)][string]$ProjectVersion,[Parameter(Mandatory)][object[]]$Records,[Parameter(Mandatory)][string]$Nonce)
     if ($ProjectVersion -isnot [string] -or $ProjectVersion -notmatch '^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$') {
         Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The runtime manifest version is invalid' $ProjectVersion
     }
     $lines = [Collections.Generic.List[string]]::new()
-    foreach ($record in $Records) { $lines.Add(('{0}`t{1}`t{2}' -f $record.path,[int64]$record.length,$record.sha256)) }
+    foreach ($record in $Records) { $lines.Add(("{0}`t{1}`t{2}" -f $record.path,[int64]$record.length,$record.sha256)) }
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
         $digest = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($lines -join "`n")))).Replace('-','').ToLowerInvariant()
-        return '{0}-{1}' -f $ProjectVersion,$digest.Substring(0,16)
+        if($Nonce-cnotmatch'^[0-9a-f]{32}$'){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The runtime nonce is invalid' $Nonce}
+        return '{0}-{1}-{2}' -f $ProjectVersion,$digest.Substring(0,16),$Nonce
     } finally { $sha.Dispose() }
 }
 
@@ -316,7 +326,7 @@ function New-CcodUninstallBootstrapResumeContext {
         [Parameter(Mandatory)]$Transaction,
         [Parameter(Mandatory)]$Identity
     )
-    Assert-CcodUninstallBootstrapTransaction $Transaction
+    Assert-CcodUninstallBootstrapTransaction $Transaction -ExpectedInstallRoot $InstallRoot
     if ($Transaction.userSid -cne $Identity.userSid -or $Transaction.sessionId -ne $Identity.sessionId) {
         Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'The interrupted uninstall transaction does not match the current user and session' $Transaction
     }
@@ -340,6 +350,7 @@ function New-CcodUninstallBootstrapResumeContext {
         leaseEpoch = [uint64]$Transaction.leaseEpoch
         userSid = [string]$Transaction.userSid
         sessionId = [int]$Transaction.sessionId
+        readyEvidence = $Transaction.readyEvidence
         # Resume never re-stages payload after the application-state boundary.
         # Zero records therefore fail closed if a later change tries to stage them.
         payloadRecords = New-CcodUninstallBootstrapPayloadRecords -ResumeOnly
@@ -347,7 +358,7 @@ function New-CcodUninstallBootstrapResumeContext {
 }
 
 function Get-CcodUninstallBootstrapVerifiedRuntimeContext {
-    param([Parameter(Mandatory)][string]$InstallerRoot,[Parameter(Mandatory)][string]$InstallRoot)
+    param([Parameter(Mandatory)][string]$InstallerRoot,[Parameter(Mandatory)][string]$InstallRoot,[hashtable]$SelectorAdapters,[string]$InvocationPath=$PSCommandPath)
     try {
         $installer = Get-CcodUninstallBootstrapComparablePath -Path $InstallerRoot -Kind 'Installer root'
         $install = Get-CcodUninstallBootstrapComparablePath -Path $InstallRoot -Kind 'Install root'
@@ -359,19 +370,21 @@ function Get-CcodUninstallBootstrapVerifiedRuntimeContext {
         }
         Assert-CcodUninstallBootstrapInstallRootOwner -Path $install -UserSid $identity.userSid
         $expectedScript = Resolve-CcodUninstallBootstrapChildPath -Root $installer -RelativePath 'src\persistence\UninstallBootstrap.ps1' -RequireLeafFile
-        if ([string]::IsNullOrWhiteSpace($PSCommandPath) -or (Get-CcodUninstallBootstrapFullPath -Path $PSCommandPath -Kind 'Bootstrap script') -cne $expectedScript) {
-            Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'The uninstall bootstrap was not launched from the installed application root' $PSCommandPath
+        if ([string]::IsNullOrWhiteSpace($InvocationPath) -or (Get-CcodUninstallBootstrapFullPath -Path $InvocationPath -Kind 'Bootstrap script') -cne $expectedScript) {
+            Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'The uninstall bootstrap was not launched from the installed application root' $InvocationPath
         }
-        $activePath = Resolve-CcodUninstallBootstrapChildPath -Root $install -RelativePath 'active.json' -RequireLeafFile
-        $active = Read-CcodUninstallBootstrapJson -Path $activePath -Kind 'Active runtime pointer'
-        if (-not (Test-CcodUninstallBootstrapExactProperties $active @('schemaVersion','activeRuntime','previousRuntime','generation','updatedAtUtc')) -or
-            $active.schemaVersion -isnot [int] -or $active.schemaVersion -ne 2 -or
-            $active.activeRuntime -isnot [string] -or $active.activeRuntime -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$' -or
-            ($null -ne $active.previousRuntime -and ($active.previousRuntime -isnot [string] -or $active.previousRuntime -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$')) -or
-            -not (Test-CcodUninstallBootstrapCanonicalUtc $active.updatedAtUtc)) {
-            Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active runtime pointer is invalid' $activePath
-        }
-        $generation = ConvertTo-CcodUninstallBootstrapUInt64 $active.generation 'active runtime generation'
+        try{$stateRoot=Resolve-CcodUninstallBootstrapChildPath -Root $install -RelativePath 'state' -AllowMissingLeaf}catch{Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active generation selector path is unsafe' $install}
+        $pointerRootItem=$null;$pointerRootAbsent=$false;$getSelectorRootItem=if($null-ne$SelectorAdapters-and$SelectorAdapters.ContainsKey('GetSelectorRootItem')){$SelectorAdapters.GetSelectorRootItem}else{{param($Path)Get-Item -LiteralPath $Path -Force -ErrorAction Stop}}
+        $stateRootItem=$null;$stateRootAbsent=$false
+        try{$stateRootItem=&$getSelectorRootItem $stateRoot;if($null-eq$stateRootItem){throw [IO.InvalidDataException]::new('state lookup returned no proof')}}catch [Management.Automation.ItemNotFoundException]{$stateRootAbsent=$true}catch{Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active generation state ancestor lookup failed' $stateRoot}
+        if(-not$stateRootAbsent-and(-not$stateRootItem.PSIsContainer-or($stateRootItem.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0)){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active generation selector state ancestor is not a plain directory' $stateRoot}
+        if($stateRootAbsent){$pointerRootAbsent=$true}else{try{$pointerRoot=Resolve-CcodUninstallBootstrapChildPath -Root $install -RelativePath 'state\active-generation' -AllowMissingLeaf}catch{Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active generation selector path is unsafe' $install};try{$pointerRootItem=&$getSelectorRootItem $pointerRoot;if($null-eq$pointerRootItem){throw [IO.InvalidDataException]::new('selector lookup returned no proof')}}catch [Management.Automation.ItemNotFoundException]{$pointerRootAbsent=$true}catch{Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active generation selector root lookup failed' $pointerRoot}}
+        if(-not$pointerRootAbsent-and-not$pointerRootItem.PSIsContainer){throw 'selector root type'}
+        if(-not$pointerRootAbsent){
+            $entries=@(Get-ChildItem -LiteralPath $pointerRoot -Force -ErrorAction Stop);if($entries.Count-eq0){throw 'empty selector'};$records=[Collections.Generic.List[object]]::new()
+            foreach($entry in $entries){if($entry.PSIsContainer-or$entry.Name-cnotmatch'^\d{20}\.json$'){throw 'selector entry'};try{$path=Resolve-CcodUninstallBootstrapChildPath -Root $install -RelativePath ('state\active-generation\'+$entry.Name) -RequireLeafFile;$record=Read-CcodUninstallBootstrapJson -Path $path -Kind 'Active generation'}catch{Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active generation selector leaf is unsafe' $entry.FullName};$integerTypes=@([byte],[uint16],[uint32],[uint64],[int16],[int32],[int64]);$gType=$false;$pType=$false;foreach($t in $integerTypes){if($record.generation-is$t){$gType=$true};if($record.previousGeneration-is$t){$pType=$true}};if(-not(Test-CcodUninstallBootstrapExactProperties $record @('schemaVersion','generation','activeRuntime','previousGeneration'))-or$record.schemaVersion-isnot[int]-or$record.schemaVersion-ne1-or-not$gType-or-not$pType-or$record.activeRuntime-isnot[string]-or$record.activeRuntime-cnotmatch'^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$'){throw 'selector record'};[uint64]$g=ConvertTo-CcodUninstallBootstrapUInt64 $record.generation 'active generation';[uint64]$p=[uint64]$record.previousGeneration;if($p-eq[uint64]::MaxValue-or$g-ne($p+1)-or$entry.Name-cne('{0:D20}.json'-f$g)){throw 'selector canonical'};$records.Add([pscustomobject]@{generation=$g;previousGeneration=$p;activeRuntime=[string]$record.activeRuntime})}
+            $ordered=@($records|Sort-Object generation);for($i=0;$i-lt$ordered.Count;$i++){if([uint64]$ordered[$i].generation-ne[uint64]($i+1)-or[uint64]$ordered[$i].previousGeneration-ne[uint64]$i){throw 'selector chain'}};$latest=$ordered[-1];$active=[pscustomobject]@{activeRuntime=$latest.activeRuntime};$generation=[uint64]$latest.generation
+        }else{$activePath = Resolve-CcodUninstallBootstrapChildPath -Root $install -RelativePath 'active.json' -RequireLeafFile;$active = Read-CcodUninstallBootstrapJson -Path $activePath -Kind 'Active runtime pointer';if (-not (Test-CcodUninstallBootstrapExactProperties $active @('schemaVersion','activeRuntime','previousRuntime','generation','updatedAtUtc')) -or$active.schemaVersion -isnot [int] -or $active.schemaVersion -ne 2 -or$active.activeRuntime -isnot [string] -or $active.activeRuntime -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$' -or($null -ne $active.previousRuntime -and ($active.previousRuntime -isnot [string] -or $active.previousRuntime -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$')) -or-not (Test-CcodUninstallBootstrapCanonicalUtc $active.updatedAtUtc)){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active runtime pointer is invalid' $activePath};$generation = ConvertTo-CcodUninstallBootstrapUInt64 $active.generation 'active runtime generation'}
         $runtimeRoot = Resolve-CcodUninstallBootstrapChildPath -Root $install -RelativePath ('runtime\' + $active.activeRuntime)
         $runtimeItem = Get-Item -LiteralPath $runtimeRoot -Force -ErrorAction Stop
         if (-not $runtimeItem.PSIsContainer) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active runtime directory is invalid' $runtimeRoot }
@@ -401,7 +414,8 @@ function Get-CcodUninstallBootstrapVerifiedRuntimeContext {
             }
             $recordMap[$expected.path] = $expected
         }
-        if ((Get-CcodUninstallBootstrapRuntimeId -ProjectVersion $manifest.projectVersion -Records $actualRecords) -cne $active.activeRuntime) {
+        $identityMatch=[regex]::Match([string]$active.activeRuntime,'^(?<version>[A-Za-z0-9][A-Za-z0-9._-]{0,45})-(?<digest>[0-9a-f]{16})-(?<nonce>[0-9a-f]{32})$')
+        if(-not$identityMatch.Success-or$identityMatch.Groups['version'].Value-cne[string]$manifest.projectVersion-or(Get-CcodUninstallBootstrapRuntimeId -ProjectVersion $manifest.projectVersion -Records $actualRecords -Nonce $identityMatch.Groups['nonce'].Value) -cne $active.activeRuntime) {
             Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The active runtime ID does not match its verified manifest' $runtimeRoot
         }
         foreach ($entry in $script:CcodUninstallPayloadEntries) {
@@ -420,12 +434,15 @@ function Get-CcodUninstallBootstrapVerifiedRuntimeContext {
             Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'The lifecycle epoch is invalid' $epochPath
         }
         $epoch = ConvertTo-CcodUninstallBootstrapUInt64 $epochState.epoch 'lifecycle epoch'
+        $manifestFingerprint=Get-CcodUninstallBootstrapFileFingerprint -Path $manifestPath;$readyTransaction=$null;if([string]$manifest.projectVersion-ceq'2.5.22'){$lifecycleModule=Import-Module (Join-Path $runtimeRoot 'src\persistence\modules\InstallLifecycle.psm1') -Force -PassThru -ErrorAction Stop;$readyTransaction=&$lifecycleModule {param($Root)Read-CcodInstallTransactionRecord -InstallRoot $Root} $install;if($null-eq$readyTransaction-or$readyTransaction.phase-cne'Ready'-or$readyTransaction.newRuntimeId-cne$active.activeRuntime-or[uint64]$readyTransaction.newGeneration-ne[uint64]$generation-or$readyTransaction.newManifestSha256-cne$manifestFingerprint.sha256){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_RUNTIME_INVALID' 'Exact Ready install transaction is missing' $runtimeRoot}}
+        $system=[Environment]::GetFolderPath([Environment+SpecialFolder]::System);$readyEvidence=[pscustomobject][ordered]@{phase='Ready';installRoot=$install;runtimeId=[string]$active.activeRuntime;runtimeGeneration=[uint64]$generation;packageSha256=$(if($null-ne$readyTransaction){[string]$readyTransaction.sealedPackageSha256}else{'0'*64});manifestSha256=[string]$manifestFingerprint.sha256;startMenuSha256=$(if($recordMap.ContainsKey('registration/StartMenu.CodexRemote-fix.lnk')){[string]$recordMap['registration/StartMenu.CodexRemote-fix.lnk'].sha256}else{'0'*64});desktopSha256=$(if($recordMap.ContainsKey('registration/Desktop.CodexRemote-fix.lnk')){[string]$recordMap['registration/Desktop.CodexRemote-fix.lnk'].sha256}else{'0'*64});targetPath=[IO.Path]::GetFullPath((Join-Path $system 'schtasks.exe'));arguments='/Run /TN "Codex Control Other Devices Supervisor"'}
         return [pscustomobject][ordered]@{
             runtimeId = [string]$active.activeRuntime
             runtimeGeneration = [uint64]$generation
             leaseEpoch = [uint64]$epoch
             userSid = [string]$identity.userSid
             sessionId = [int]$identity.sessionId
+            readyEvidence = $readyEvidence
             payloadRecords = New-CcodUninstallBootstrapPayloadRecords -RecordMap $recordMap
         }
     } catch {
@@ -588,7 +605,8 @@ function Read-CcodUninstallBootstrapStoredTransaction {
     param(
         [Parameter(Mandatory)][string]$TransactionRoot,
         [string]$ExpectedUserSid,
-        [switch]$IncludeCompleted
+        [switch]$IncludeCompleted,
+        [string]$ExpectedInstallRoot
     )
     if (-not [IO.Directory]::Exists($TransactionRoot)) { return $null }
     $root = Get-CcodUninstallBootstrapComparablePath -Path $TransactionRoot -Kind 'External uninstall transaction root'
@@ -606,7 +624,7 @@ function Read-CcodUninstallBootstrapStoredTransaction {
     Assert-CcodUninstallBootstrapSafePath -Root $root -Path $transactionDirectory | Out-Null
     $transactionPath = Resolve-CcodUninstallBootstrapChildPath -Root $transactionDirectory -RelativePath 'transaction.json' -RequireLeafFile
     $transaction = Read-CcodUninstallBootstrapJson -Path $transactionPath -Kind 'Uninstall transaction'
-    Assert-CcodUninstallBootstrapTransaction $transaction
+    Assert-CcodUninstallBootstrapTransaction $transaction -ExpectedInstallRoot $ExpectedInstallRoot
     if ($transaction.transactionId -cne $current.transactionId) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_INVALID' 'The uninstall transaction locator does not match its receipt' $transactionPath }
     if (-not [string]::IsNullOrWhiteSpace($ExpectedUserSid) -and $transaction.userSid -cne $ExpectedUserSid) {
         Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'The external uninstall transaction belongs to another user' $transactionPath
@@ -664,11 +682,12 @@ function Assert-CcodUninstallBootstrapFinalizationInvocation {
     param(
         [Parameter(Mandatory)][string]$TransactionRoot,
         [Parameter(Mandatory)]$Transaction,
-        [Parameter(Mandatory)]$Identity
+        [Parameter(Mandatory)]$Identity,
+        [string]$InvocationPath=$PSCommandPath
     )
     Assert-CcodUninstallBootstrapTransaction $Transaction
-    if ($Transaction.userSid -cne $Identity.userSid -or $Transaction.sessionId -ne $Identity.sessionId) {
-        Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'The finalizing uninstall transaction does not match the current user and session' $Transaction
+    if ($Transaction.userSid -cne $Identity.userSid) {
+        Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'The finalizing uninstall transaction does not match the current user' $Transaction
     }
     $root = Get-CcodUninstallBootstrapComparablePath -Path $TransactionRoot -Kind 'External uninstall transaction root'
     Assert-CcodUninstallBootstrapDirectoryAcl -Path $root -UserSid $Identity.userSid
@@ -676,9 +695,9 @@ function Assert-CcodUninstallBootstrapFinalizationInvocation {
     Assert-CcodUninstallBootstrapSafePath -Root $root -Path $directory | Out-Null
     Assert-CcodUninstallBootstrapDirectoryAcl -Path $directory -UserSid $Identity.userSid
     $expectedScript = Resolve-CcodUninstallBootstrapChildPath -Root $directory -RelativePath 'payload\src\persistence\UninstallBootstrap.ps1' -RequireLeafFile
-    if ([string]::IsNullOrWhiteSpace($PSCommandPath) -or
-        (Get-CcodUninstallBootstrapFullPath -Path $PSCommandPath -Kind 'Staged bootstrap script') -cne $expectedScript) {
-        Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'The finalization bootstrap was not launched from the staged transaction payload' $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($InvocationPath) -or
+        (Get-CcodUninstallBootstrapFullPath -Path $InvocationPath -Kind 'Staged bootstrap script') -cne $expectedScript) {
+        Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'The finalization bootstrap was not launched from the staged transaction payload' $InvocationPath
     }
 }
 
@@ -710,7 +729,7 @@ function Write-CcodUninstallBootstrapStoredReceipt {
 
 function Stage-CcodUninstallBootstrapPayload {
     param([Parameter(Mandatory)][string]$InstallRoot,[Parameter(Mandatory)]$Context,[Parameter(Mandatory)][string]$TransactionDirectory)
-    Assert-CcodUninstallBootstrapContext $Context
+    Assert-CcodUninstallBootstrapContext $Context -ExpectedInstallRoot $InstallRoot
     $install = Get-CcodUninstallBootstrapComparablePath -Path $InstallRoot -Kind 'Install root'
     $runtimeRoot = Resolve-CcodUninstallBootstrapChildPath -Root $install -RelativePath ('runtime\' + $Context.runtimeId)
     $transactionDirectory = Get-CcodUninstallBootstrapComparablePath -Path $TransactionDirectory -Kind 'Uninstall transaction directory'
@@ -775,17 +794,92 @@ function ConvertTo-CcodUninstallBootstrapUInt64 {
     try { return [uint64]$Value } catch { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_INVALID' "$Name is outside the unsigned range" $Value }
 }
 
+function Assert-CcodUninstallBootstrapReadyEvidence {
+    param(
+        [Parameter(Mandatory)]$ReadyEvidence,
+        [Parameter(Mandatory)][string]$ExpectedInstallRoot,
+        [Parameter(Mandatory)][string]$ExpectedRuntimeId,
+        [Parameter(Mandatory)]$ExpectedRuntimeGeneration,
+        [Parameter(Mandatory)][string]$ErrorId
+    )
+    $fields=@('phase','installRoot','runtimeId','runtimeGeneration','packageSha256','manifestSha256','startMenuSha256','desktopSha256','targetPath','arguments')
+    try{
+        $install=Get-CcodUninstallBootstrapComparablePath -Path $ExpectedInstallRoot -Kind 'Install root'
+        $readyInstall=Get-CcodUninstallBootstrapComparablePath -Path ([string]$ReadyEvidence.installRoot) -Kind 'Ready install root'
+        $canonicalTarget=Get-CcodUninstallBootstrapFullPath -Path (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'schtasks.exe') -Kind 'Task target'
+        $generation=ConvertTo-CcodUninstallBootstrapUInt64 $ReadyEvidence.runtimeGeneration 'Ready runtimeGeneration'
+        $expectedGeneration=ConvertTo-CcodUninstallBootstrapUInt64 $ExpectedRuntimeGeneration 'Expected runtimeGeneration'
+        if(-not(Test-CcodUninstallBootstrapExactProperties $ReadyEvidence $fields)-or
+            $ReadyEvidence.phase-isnot[string]-or$ReadyEvidence.phase-cne'Ready'-or
+            $readyInstall-cne$install-or$ReadyEvidence.runtimeId-isnot[string]-or$ReadyEvidence.runtimeId-cne$ExpectedRuntimeId-or
+            $generation-ne$expectedGeneration-or$ReadyEvidence.packageSha256-isnot[string]-or$ReadyEvidence.packageSha256-cnotmatch'^[0-9a-f]{64}$'-or
+            $ReadyEvidence.manifestSha256-isnot[string]-or$ReadyEvidence.manifestSha256-cnotmatch'^[0-9a-f]{64}$'-or
+            $ReadyEvidence.startMenuSha256-isnot[string]-or$ReadyEvidence.startMenuSha256-cnotmatch'^[0-9a-f]{64}$'-or
+            $ReadyEvidence.desktopSha256-isnot[string]-or$ReadyEvidence.desktopSha256-cnotmatch'^[0-9a-f]{64}$'-or
+            $ReadyEvidence.targetPath-isnot[string]-or(Get-CcodUninstallBootstrapFullPath -Path $ReadyEvidence.targetPath -Kind 'Ready task target')-cne$canonicalTarget-or
+            $ReadyEvidence.arguments-isnot[string]-or$ReadyEvidence.arguments-cne'/Run /TN "Codex Control Other Devices Supervisor"'){throw 'Ready evidence mismatch'}
+    }catch{
+        Throw-CcodUninstallBootstrapError $ErrorId 'Ready cleanup evidence is invalid' $ReadyEvidence
+    }
+    return $ReadyEvidence
+}
+
+function Read-CcodUninstallBootstrapStoredReceipt {
+    param([Parameter(Mandatory)][string]$TransactionDirectory)
+    $directory=Get-CcodUninstallBootstrapComparablePath -Path $TransactionDirectory -Kind 'Uninstall transaction directory';$path=Resolve-CcodUninstallBootstrapChildPath -Root $directory -RelativePath 'receipt.json' -RequireLeafFile;Read-CcodUninstallBootstrapJson -Path $path -Kind 'Uninstall receipt'
+}
+
+function Test-CcodUninstallBootstrapReceiptMatchesTransaction {
+    param($Receipt,[Parameter(Mandatory)]$Transaction)
+    try{
+        if(-not(Test-CcodUninstallBootstrapExactProperties $Receipt @('schemaVersion','transactionId','runtimeId','runtimeGeneration','leaseEpoch','phase','updatedAtUtc','errorCode'))){return $false}
+        $errorMatches=($null-eq$Receipt.errorCode-and$null-eq$Transaction.errorCode)-or($Receipt.errorCode-is[string]-and$Transaction.errorCode-is[string]-and$Receipt.errorCode-cne''-and$Receipt.errorCode-ceq$Transaction.errorCode)
+        return $Receipt.schemaVersion-is[int]-and$Receipt.schemaVersion-eq1-and$Receipt.transactionId-is[string]-and$Receipt.transactionId-ceq$Transaction.transactionId-and$Receipt.runtimeId-is[string]-and$Receipt.runtimeId-ceq$Transaction.runtimeId-and
+            [uint64]$Receipt.runtimeGeneration-eq[uint64]$Transaction.runtimeGeneration-and[uint64]$Receipt.leaseEpoch-eq[uint64]$Transaction.leaseEpoch-and$Receipt.phase-is[string]-and$Receipt.phase-ceq$Transaction.phase-and
+            $Receipt.updatedAtUtc-is[string]-and$Receipt.updatedAtUtc-ceq$Transaction.updatedAtUtc-and$errorMatches
+    }catch{return $false}
+}
+
+function Test-CcodUninstallBootstrapStoredCompletedReceipt {
+    param([Parameter(Mandatory)][string]$TransactionRoot,[Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)][string]$ExpectedUserSid)
+    try{
+        Assert-CcodUninstallBootstrapTransaction $Transaction
+        if($Transaction.phase-cne'Completed'-or$Transaction.resumePhase-cne'Completed'-or$Transaction.userSid-cne$ExpectedUserSid){return $false}
+        $root=Get-CcodUninstallBootstrapComparablePath -Path $TransactionRoot -Kind 'External uninstall transaction root';Assert-CcodUninstallBootstrapDirectoryAcl -Path $root -UserSid $ExpectedUserSid
+        $directory=Get-CcodUninstallBootstrapTransactionPath -TransactionRoot $root -TransactionId $Transaction.transactionId;Assert-CcodUninstallBootstrapSafePath -Root $root -Path $directory|Out-Null;Assert-CcodUninstallBootstrapDirectoryAcl -Path $directory -UserSid $ExpectedUserSid
+        $path=Resolve-CcodUninstallBootstrapChildPath -Root $directory -RelativePath 'receipt.json' -RequireLeafFile;$receipt=Read-CcodUninstallBootstrapJson -Path $path -Kind 'Uninstall receipt'
+        if(-not(Test-CcodUninstallBootstrapExactProperties $receipt @('schemaVersion','transactionId','runtimeId','runtimeGeneration','leaseEpoch','phase','updatedAtUtc','errorCode'))){return $false}
+        return $receipt.schemaVersion-is[int]-and$receipt.schemaVersion-eq1-and$receipt.transactionId-cne$null-and$receipt.transactionId-ceq$Transaction.transactionId-and$receipt.runtimeId-ceq$Transaction.runtimeId-and[uint64]$receipt.runtimeGeneration-eq[uint64]$Transaction.runtimeGeneration-and[uint64]$receipt.leaseEpoch-eq[uint64]$Transaction.leaseEpoch-and$receipt.phase-ceq'Completed'-and$receipt.updatedAtUtc-ceq$Transaction.updatedAtUtc-and$null-eq$receipt.errorCode
+    }catch{return $false}
+}
+
+function Get-CcodUninstallBootstrapInstalledResumeCommand {
+    param(
+        [Parameter(Mandatory)][string]$ResumeScriptPath,
+        [Parameter(Mandatory)][string]$TransactionId,
+        [Parameter(Mandatory)][string]$RuntimeRoot,
+        [Parameter(Mandatory)][string]$InstallRoot
+    )
+    foreach($value in @($ResumeScriptPath,$RuntimeRoot,$InstallRoot)){if($value.Contains('"')){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'Installed resume command path contains a quote.' $value}}
+    $system=[Environment]::GetFolderPath([Environment+SpecialFolder]::System);if([string]::IsNullOrWhiteSpace($system)){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'Windows system folder is unavailable.' $null}
+    $powershell=[IO.Path]::GetFullPath((Join-Path $system 'WindowsPowerShell\v1.0\powershell.exe'))
+    return '"{0}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{1}" -Resume -TransactionId "{2}" -RuntimeRoot "{3}" -InstallRoot "{4}"'-f$powershell,[IO.Path]::GetFullPath($ResumeScriptPath),$TransactionId,[IO.Path]::GetFullPath($RuntimeRoot),[IO.Path]::GetFullPath($InstallRoot)
+}
+
 function Assert-CcodUninstallBootstrapContext {
-    param([Parameter(Mandatory)]$Context)
+    param([Parameter(Mandatory)]$Context,[string]$ExpectedInstallRoot)
     if (-not (Test-CcodUninstallBootstrapExactProperties $Context $script:CcodUninstallContextFields) -or
         $Context.runtimeId -isnot [string] -or $Context.runtimeId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$' -or
         $Context.userSid -isnot [string] -or $Context.userSid -cnotmatch '^S-\d-\d+(?:-\d+)+$' -or
         $Context.sessionId -isnot [int] -or $Context.sessionId -lt 0 -or
+        $null -eq $Context.readyEvidence -or
         $null -eq $Context.payloadRecords) {
         Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'The uninstall bootstrap context is invalid' $Context
     }
     [void](ConvertTo-CcodUninstallBootstrapUInt64 $Context.runtimeGeneration 'runtimeGeneration')
     [void](ConvertTo-CcodUninstallBootstrapUInt64 $Context.leaseEpoch 'leaseEpoch')
+    $readyRoot=if([string]::IsNullOrWhiteSpace($ExpectedInstallRoot)){[string]$Context.readyEvidence.installRoot}else{$ExpectedInstallRoot}
+    [void](Assert-CcodUninstallBootstrapReadyEvidence -ReadyEvidence $Context.readyEvidence -ExpectedInstallRoot $readyRoot -ExpectedRuntimeId $Context.runtimeId -ExpectedRuntimeGeneration $Context.runtimeGeneration -ErrorId 'CCOD_UNINSTALL_BOOTSTRAP_INVALID')
     $records = @($Context.payloadRecords)
     if ($records.Count -ne $script:CcodUninstallPayloadEntries.Count) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'The cleanup payload record set is incomplete' $Context }
     for ($index = 0; $index -lt $records.Count; $index++) {
@@ -801,7 +895,7 @@ function Assert-CcodUninstallBootstrapContext {
 }
 
 function Assert-CcodUninstallBootstrapTransaction {
-    param([Parameter(Mandatory)]$Transaction)
+    param([Parameter(Mandatory)]$Transaction,[string]$ExpectedInstallRoot)
     if (-not (Test-CcodUninstallBootstrapExactProperties $Transaction $script:CcodUninstallTransactionFields) -or
         $Transaction.schemaVersion -isnot [int] -or $Transaction.schemaVersion -ne 1 -or
         -not (Test-CcodUninstallBootstrapCanonicalGuid $Transaction.transactionId) -or
@@ -817,6 +911,25 @@ function Assert-CcodUninstallBootstrapTransaction {
     }
     [void](ConvertTo-CcodUninstallBootstrapUInt64 $Transaction.runtimeGeneration 'runtimeGeneration')
     [void](ConvertTo-CcodUninstallBootstrapUInt64 $Transaction.leaseEpoch 'leaseEpoch')
+    $readyRoot=if([string]::IsNullOrWhiteSpace($ExpectedInstallRoot)){[string]$Transaction.readyEvidence.installRoot}else{$ExpectedInstallRoot}
+    [void](Assert-CcodUninstallBootstrapReadyEvidence -ReadyEvidence $Transaction.readyEvidence -ExpectedInstallRoot $readyRoot -ExpectedRuntimeId $Transaction.runtimeId -ExpectedRuntimeGeneration $Transaction.runtimeGeneration -ErrorId 'CCOD_UNINSTALL_TRANSACTION_INVALID')
+    if($null-ne$Transaction.installedBinding){
+        $binding=$Transaction.installedBinding
+        try{$resumeLength=ConvertTo-CcodUninstallBootstrapUInt64 $binding.resumeScriptLength 'resumeScriptLength'}catch{Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_INVALID' 'Installed finalization binding is invalid' $binding}
+        $resumeWrapperEmpty=$null-eq$binding.resumeWrapperPid-and$null-eq$binding.resumeWrapperCreationTimeUtc-and$null-eq$binding.resumeWrapperSessionId-and$null-eq$binding.resumeWrapperUserSid
+        $resumeWrapperValid=$binding.resumeWrapperPid-is[int]-and$binding.resumeWrapperPid-gt0-and(Test-CcodUninstallBootstrapCanonicalUtc $binding.resumeWrapperCreationTimeUtc)-and$binding.resumeWrapperSessionId-is[int]-and$binding.resumeWrapperSessionId-ge0-and$binding.resumeWrapperUserSid-is[string]-and$binding.resumeWrapperUserSid-ceq$Transaction.userSid
+        if(-not(Test-CcodUninstallBootstrapExactProperties $binding @('selectedRuntimeRoot','runtimeManifestSha256','wrapperPid','wrapperCreationTimeUtc','wrapperSessionId','wrapperUserSid','resumeWrapperPid','resumeWrapperCreationTimeUtc','resumeWrapperSessionId','resumeWrapperUserSid','resumeScriptPath','resumeScriptLength','resumeScriptSha256','resumeCommand','payloadRecords'))-or
+           $binding.selectedRuntimeRoot-isnot[string]-or-not[IO.Path]::IsPathRooted($binding.selectedRuntimeRoot)-or$binding.runtimeManifestSha256-isnot[string]-or$binding.runtimeManifestSha256-cnotmatch'^[0-9a-f]{64}$'-or
+           $binding.wrapperPid-isnot[int]-or$binding.wrapperPid-lt1-or-not(Test-CcodUninstallBootstrapCanonicalUtc $binding.wrapperCreationTimeUtc)-or$binding.wrapperSessionId-isnot[int]-or$binding.wrapperSessionId-lt0-or$binding.wrapperSessionId-ne$Transaction.sessionId-or
+           $binding.wrapperUserSid-isnot[string]-or$binding.wrapperUserSid-cnotmatch'^S-'-or$binding.wrapperUserSid-cne$Transaction.userSid-or$binding.resumeScriptPath-isnot[string]-or-not[IO.Path]::IsPathRooted($binding.resumeScriptPath)-or
+           [char[]]$binding.resumeScriptPath-ccontains[char]'"'-or[char[]]$binding.selectedRuntimeRoot-ccontains[char]'"'-or$binding.resumeScriptSha256-isnot[string]-or$binding.resumeScriptSha256-cnotmatch'^[0-9a-f]{64}$'-or
+           (-not$resumeWrapperEmpty-and-not$resumeWrapperValid)-or$binding.resumeCommand-isnot[string]-or$binding.resumeCommand-cne(Get-CcodUninstallBootstrapInstalledResumeCommand -ResumeScriptPath $binding.resumeScriptPath -TransactionId $Transaction.transactionId -RuntimeRoot $binding.selectedRuntimeRoot -InstallRoot $Transaction.readyEvidence.installRoot)){
+            Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_INVALID' 'Installed finalization binding is invalid' $binding
+        }
+        $records=@($binding.payloadRecords);if($records.Count-ne$script:CcodUninstallPayloadEntries.Count){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_INVALID' 'Installed finalization payload binding is incomplete' $binding}
+        for($index=0;$index-lt$records.Count;$index++){$record=$records[$index];if(-not(Test-CcodUninstallBootstrapExactProperties $record @('path','length','sha256'))-or$record.path-isnot[string]-or$record.path-cne$script:CcodUninstallPayloadEntries[$index]-or$record.sha256-isnot[string]-or$record.sha256-cnotmatch'^[0-9a-f]{64}$'){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_INVALID' 'Installed finalization payload binding is invalid' $record};[void](ConvertTo-CcodUninstallBootstrapUInt64 $record.length 'payload length')}
+        $resumeRecord=@($records|Where-Object{$_.path-ceq'src/persistence/InstalledUninstallFinalizer.ps1'});if($resumeRecord.Count-ne1-or[uint64]$resumeRecord[0].length-ne$resumeLength-or$resumeRecord[0].sha256-cne$binding.resumeScriptSha256){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_INVALID' 'Installed resume script is not bound to the complete payload' $binding}
+    }
     $started = [DateTime]::ParseExact($Transaction.startedAtUtc,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind)
     $updated = [DateTime]::ParseExact($Transaction.updatedAtUtc,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind)
     $resumable = @('Requested','Recovering','RecoveryProven','StoppingProtection','ProtectionStopped','TaskRemoved','ApplicationStateRemoved','ReadyForInno')
@@ -828,7 +941,7 @@ function Assert-CcodUninstallBootstrapTransaction {
 }
 
 function New-CcodUninstallBootstrapTransaction {
-    param([Parameter(Mandatory)]$Context,[Parameter(Mandatory)][string]$TransactionId,[Parameter(Mandatory)][DateTime]$NowUtc)
+    param([Parameter(Mandatory)]$Context,[Parameter(Mandatory)][string]$TransactionId,[Parameter(Mandatory)][DateTime]$NowUtc,$InstalledBinding)
     $timestamp = $NowUtc.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)
     $transaction = [pscustomobject][ordered]@{
         schemaVersion = 1
@@ -838,6 +951,8 @@ function New-CcodUninstallBootstrapTransaction {
         leaseEpoch = [uint64]$Context.leaseEpoch
         userSid = [string]$Context.userSid
         sessionId = [int]$Context.sessionId
+        readyEvidence = $Context.readyEvidence
+        installedBinding = $InstalledBinding
         phase = 'Requested'
         resumePhase = 'Requested'
         startedAtUtc = $timestamp
@@ -849,12 +964,107 @@ function New-CcodUninstallBootstrapTransaction {
 }
 
 function Assert-CcodUninstallBootstrapTransactionMatchesContext {
-    param([Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)]$Context)
-    Assert-CcodUninstallBootstrapTransaction $Transaction
-    Assert-CcodUninstallBootstrapContext $Context
+    param([Parameter(Mandatory)]$Transaction,[Parameter(Mandatory)]$Context,[string]$ExpectedInstallRoot)
+    Assert-CcodUninstallBootstrapTransaction $Transaction -ExpectedInstallRoot $ExpectedInstallRoot
+    Assert-CcodUninstallBootstrapContext $Context -ExpectedInstallRoot $ExpectedInstallRoot
     if ($Transaction.runtimeId -cne $Context.runtimeId -or [uint64]$Transaction.runtimeGeneration -ne [uint64]$Context.runtimeGeneration -or
-        [uint64]$Transaction.leaseEpoch -ne [uint64]$Context.leaseEpoch -or $Transaction.userSid -cne $Context.userSid -or $Transaction.sessionId -ne $Context.sessionId) {
+        [uint64]$Transaction.leaseEpoch -ne [uint64]$Context.leaseEpoch -or $Transaction.userSid -cne $Context.userSid -or $Transaction.sessionId -ne $Context.sessionId -or
+        ($Transaction.readyEvidence|ConvertTo-Json -Depth 8 -Compress)-cne($Context.readyEvidence|ConvertTo-Json -Depth 8 -Compress)) {
         Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'The existing uninstall transaction does not match the current verified runtime' $Transaction
+    }
+}
+
+function Initialize-CcodUninstallPayloadAuthority {
+    if ($null -ne ('CcodUninstallPayloadAuthorityV1' -as [type])) { return }
+    Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public sealed class CcodUninstallPayloadAuthorityV1 : IDisposable
+{
+    [StructLayout(LayoutKind.Sequential)] private struct Info
+    {
+        public uint Attributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME Creation, Access, Write;
+        public uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern SafeFileHandle CreateFileW(string path,uint access,uint share,IntPtr security,uint creation,uint flags,IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle handle,out Info info);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle,StringBuilder value,uint length,uint flags);
+    private readonly List<SafeFileHandle> handles = new List<SafeFileHandle>();
+    private readonly HashSet<string> paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private bool disposed;
+    public void Add(string path)
+    {
+        if(disposed)throw new ObjectDisposedException("uninstall payload authority");
+        if(String.IsNullOrWhiteSpace(path)||!Path.IsPathRooted(path)||path.StartsWith(@"\\?\")||path.StartsWith(@"\\.\"))throw new IOException("Payload path");
+        string full=Path.GetFullPath(path),root=Path.GetPathRoot(full);
+        if(!String.Equals(full,path,StringComparison.OrdinalIgnoreCase)||full.Substring(root.Length).IndexOf(':')>=0)throw new IOException("Payload canonical path");
+        var parents=new List<string>();
+        for(DirectoryInfo parent=Directory.GetParent(full);parent!=null;parent=parent.Parent)parents.Add(parent.FullName);
+        parents.Reverse();
+        foreach(string parent in parents)Open(parent,true);
+        Open(full,false);
+    }
+    private void Open(string path,bool directory)
+    {
+        if(paths.Contains(path))return;
+        uint access=directory?0x00100081U:0x80100080U;
+        uint flags=0x00200000U|(directory?0x02000000U:0U);
+        SafeFileHandle handle=CreateFileW(path,access,1U,IntPtr.Zero,3U,flags,IntPtr.Zero);
+        if(handle.IsInvalid){int error=Marshal.GetLastWin32Error();handle.Dispose();throw new Win32Exception(error);}
+        try{
+            Info info;if(!GetFileInformationByHandle(handle,out info))throw new Win32Exception(Marshal.GetLastWin32Error());
+            if((info.Attributes&0x400U)!=0||((info.Attributes&0x10U)!=0)!=directory||(!directory&&info.Links!=1))throw new IOException("Payload file kind");
+            var value=new StringBuilder(512);uint length=GetFinalPathNameByHandleW(handle,value,(uint)value.Capacity,0);
+            if(length>=value.Capacity){value.Capacity=checked((int)length+1);length=GetFinalPathNameByHandleW(handle,value,(uint)value.Capacity,0);}
+            if(length==0||length>=value.Capacity)throw new IOException("Payload final path unavailable");
+            string final=value.ToString();
+            if(final.StartsWith(@"\\?\UNC\",StringComparison.OrdinalIgnoreCase))final=@"\\"+final.Substring(8);
+            else if(final.StartsWith(@"\\?\",StringComparison.OrdinalIgnoreCase))final=final.Substring(4);
+            if(!String.Equals(final.TrimEnd('\\'),path.TrimEnd('\\'),StringComparison.OrdinalIgnoreCase))throw new IOException("Payload final path mismatch");
+            handles.Add(handle);paths.Add(path);
+        }catch{handle.Dispose();throw;}
+    }
+    public void Dispose()
+    {
+        if(disposed)return;disposed=true;
+        for(int index=handles.Count-1;index>=0;index--)handles[index].Dispose();
+        handles.Clear();paths.Clear();
+    }
+}
+'@
+}
+
+function Open-CcodUninstallBootstrapPayloadAuthority {
+    param([Parameter(Mandatory)][string]$PayloadRoot,[Parameter(Mandatory)][object[]]$Records)
+    $lease=$null
+    try {
+        Initialize-CcodUninstallPayloadAuthority
+        $lease=[CcodUninstallPayloadAuthorityV1]::new()
+        if ($Records.Count -lt 1) { throw 'payload records missing' }
+        $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($record in $Records) {
+            [void](Assert-CcodUninstallBootstrapManifestRecord $record)
+            if (-not $seen.Add($record.path)) { throw 'duplicate payload path' }
+            $path=Resolve-CcodUninstallBootstrapChildPath -Root $PayloadRoot -RelativePath $record.path -RequireLeafFile
+            $lease.Add($path)
+            $streams=@(Get-Item -LiteralPath $path -Stream * -ErrorAction Stop)
+            $fingerprint=Get-CcodUninstallBootstrapFileFingerprint $path
+            if ($streams.Count -ne 1 -or $streams[0].Stream -cne ':$DATA' -or
+                $fingerprint.length -ne $record.length -or $fingerprint.sha256 -cne $record.sha256) { throw 'staged payload changed' }
+        }
+        return $lease
+    } catch {
+        if ($null -ne $lease) { $lease.Dispose() }
+        Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PAYLOAD_HASH_MISMATCH' 'Staged cleanup authority could not be acquired before consumption.' $PayloadRoot
     }
 }
 
@@ -868,9 +1078,17 @@ function Get-CcodUninstallBootstrapAdapters {
         GetTransactionRoot = {
             Get-CcodUninstallBootstrapDefaultTransactionRoot
         }
+        EnterAccountTransition = {
+            param($UserSid)
+            Import-Module (Join-Path $PSScriptRoot 'modules\KernelObjects.psm1') -Force -DisableNameChecking -ErrorAction Stop
+            $lease=Enter-CcodMutex -Kind AccountTransition -UserSid $UserSid -TimeoutMilliseconds 30000
+            if($null-eq$lease-or$lease.Outcome-cne'Acquired'-or$lease.Kind-cne'AccountTransition'){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_BUSY' 'The shared account transition authority is busy' $UserSid}
+            $lease
+        }
+        ExitAccountTransition = {param($Lease)Import-Module (Join-Path $PSScriptRoot 'modules\KernelObjects.psm1') -Force -DisableNameChecking -ErrorAction Stop;[void](Exit-CcodMutex -Lease $Lease)}
         ReadTransaction = {
-            param($TransactionRoot,$ExpectedUserSid,$IncludeCompleted)
-            Read-CcodUninstallBootstrapStoredTransaction -TransactionRoot $TransactionRoot -ExpectedUserSid $ExpectedUserSid -IncludeCompleted:([bool]$IncludeCompleted)
+            param($TransactionRoot,$ExpectedUserSid,$IncludeCompleted,$ExpectedInstallRoot)
+            Read-CcodUninstallBootstrapStoredTransaction -TransactionRoot $TransactionRoot -ExpectedUserSid $ExpectedUserSid -IncludeCompleted:([bool]$IncludeCompleted) -ExpectedInstallRoot $ExpectedInstallRoot
         }
         ValidateFinalizationInvocation = {
             param($TransactionRoot,$Transaction,$Identity)
@@ -901,9 +1119,16 @@ function Get-CcodUninstallBootstrapAdapters {
             param($TransactionRoot,$Transaction)
             Write-CcodUninstallBootstrapStoredReceipt -TransactionDirectory $TransactionRoot -Transaction $Transaction
         }
+        ReadReceipt = {
+            param($TransactionRoot)
+            Read-CcodUninstallBootstrapStoredReceipt -TransactionDirectory $TransactionRoot
+        }
         RunCleanup = {
-            param($InstallerRoot,$InstallRoot,$TransactionRoot,$Transaction,$WriteTransaction)
+            param($InstallerRoot,$InstallRoot,$TransactionRoot,$Transaction,$WriteTransaction,$Mode,$PayloadRecords)
             $payloadRoot = Resolve-CcodUninstallBootstrapChildPath -Root $TransactionRoot -RelativePath 'payload'
+            $records=if($null-ne$Transaction.installedBinding){@($Transaction.installedBinding.payloadRecords)}else{@($PayloadRecords)}
+            $payloadAuthority=Open-CcodUninstallBootstrapPayloadAuthority -PayloadRoot $payloadRoot -Records $records
+            try {
             $modulePath = Resolve-CcodUninstallBootstrapChildPath -Root $payloadRoot -RelativePath 'src\persistence\modules\InstallLifecycle.psm1' -RequireLeafFile
             $module = Import-Module -Name $modulePath -Force -PassThru -ErrorAction Stop
             $writer = {
@@ -911,9 +1136,23 @@ function Get-CcodUninstallBootstrapAdapters {
                 & $WriteTransaction $TransactionRoot $Value
             }.GetNewClosure()
             return (& $module {
-                param($Root,$Value,$Writer)
-                Invoke-CcodUninstallCleanup -InstallRoot $Root -Transaction $Value -WriteTransaction $Writer
-            } $InstallRoot $Transaction $writer)
+                param($Root,$Value,$Writer,$DeferRemoval)
+                Invoke-CcodUninstallCleanup -InstallRoot $Root -Transaction $Value -WriteTransaction $Writer -StopAfterTaskRemoval:([bool]$DeferRemoval)
+            } $InstallRoot $Transaction $writer ($Mode -ceq 'PrepareInstalled'))
+            } finally { $payloadAuthority.Dispose() }
+        }
+        RemoveProductRegistration = {
+            param($Context)
+            Remove-CcodUninstallBootstrapProductRegistration -Context $Context
+        }
+        GetInstalledBinding = {
+            param($InstallerRoot,$InstallRoot,$Context,$WrapperIdentity,$TransactionDirectory,$TransactionId)
+            $identity=Get-CcodUninstallBootstrapCurrentIdentity;$process=[Diagnostics.Process]::GetCurrentProcess();try{$created=$process.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture);if($WrapperIdentity.pid-ne[int]$process.Id-or$WrapperIdentity.creationTimeUtc-cne$created-or$WrapperIdentity.sessionId-ne[int]$process.SessionId-or$WrapperIdentity.userSid-cne$identity.userSid){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'Installed wrapper identity does not match the current verified process' $WrapperIdentity}}finally{$process.Dispose()}
+            $selected=[IO.Path]::GetFullPath((Join-Path (Join-Path $InstallRoot 'runtime') ([string]$Context.runtimeId)));if([IO.Path]::GetFullPath($InstallerRoot)-cne$selected){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'Installed wrapper is outside the selected runtime' $InstallerRoot};$manifest=Get-CcodUninstallBootstrapFileFingerprint -Path (Join-Path $selected 'manifest.json')
+            $resumeRecord=@($Context.payloadRecords|Where-Object{[string]$_.path-ceq'src/persistence/InstalledUninstallFinalizer.ps1'});if($resumeRecord.Count-ne1){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_BOOTSTRAP_INVALID' 'Installed resume payload record is missing.' $Context.runtimeId}
+            $resumeScript=[IO.Path]::GetFullPath((Join-Path $TransactionDirectory 'payload\src\persistence\InstalledUninstallFinalizer.ps1'))
+            $resumeCommand=Get-CcodUninstallBootstrapInstalledResumeCommand -ResumeScriptPath $resumeScript -TransactionId $TransactionId -RuntimeRoot $selected -InstallRoot $InstallRoot
+            [pscustomobject][ordered]@{selectedRuntimeRoot=$selected;runtimeManifestSha256=[string]$manifest.sha256;wrapperPid=[int]$WrapperIdentity.pid;wrapperCreationTimeUtc=[string]$WrapperIdentity.creationTimeUtc;wrapperSessionId=[int]$WrapperIdentity.sessionId;wrapperUserSid=[string]$WrapperIdentity.userSid;resumeWrapperPid=$null;resumeWrapperCreationTimeUtc=$null;resumeWrapperSessionId=$null;resumeWrapperUserSid=$null;resumeScriptPath=$resumeScript;resumeScriptLength=[int64]$resumeRecord[0].length;resumeScriptSha256=[string]$resumeRecord[0].sha256;resumeCommand=$resumeCommand;payloadRecords=@($Context.payloadRecords)}
         }
         TestInstallRootAbsent = { param($InstallerRoot) -not ([IO.Directory]::Exists($InstallerRoot) -or [IO.File]::Exists($InstallerRoot)) }
         GetUtcNow = { [DateTime]::UtcNow }
@@ -929,6 +1168,41 @@ function Get-CcodUninstallBootstrapAdapters {
         $resolved[$key] = $Adapters[$key]
     }
     return $resolved
+}
+
+function Assert-CcodUninstallBootstrapInstalledTaskRemovedContext {
+    param(
+        [Parameter(Mandatory)]$Transaction,
+        [Parameter(Mandatory)]$FreshContext,
+        [Parameter(Mandatory)][string]$InstallerRoot,
+        [Parameter(Mandatory)][string]$InstallRoot
+    )
+    Assert-CcodUninstallBootstrapTransaction $Transaction -ExpectedInstallRoot $InstallRoot
+    Assert-CcodUninstallBootstrapContext $FreshContext -ExpectedInstallRoot $InstallRoot
+    $taskRemovedProfile=($Transaction.phase-ceq'TaskRemoved'-and$Transaction.resumePhase-ceq'TaskRemoved')-or($Transaction.phase-ceq'Failed'-and$Transaction.resumePhase-ceq'TaskRemoved')
+    if(-not$taskRemovedProfile-or$null-eq$Transaction.installedBinding){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'Only an exact installed TaskRemoved transaction may relax its historical session.' $Transaction}
+    $installer=Get-CcodUninstallBootstrapComparablePath -Path $InstallerRoot -Kind 'Installed runtime root';$install=Get-CcodUninstallBootstrapComparablePath -Path $InstallRoot -Kind 'Install root';$expectedRuntime=Get-CcodUninstallBootstrapComparablePath -Path (Join-Path (Join-Path $install 'runtime') ([string]$Transaction.runtimeId)) -Kind 'Selected runtime root'
+    if($installer-cne$expectedRuntime-or(Get-CcodUninstallBootstrapComparablePath -Path ([string]$Transaction.installedBinding.selectedRuntimeRoot) -Kind 'Bound selected runtime root')-cne$expectedRuntime-or
+       $Transaction.userSid-cne$FreshContext.userSid-or$Transaction.runtimeId-cne$FreshContext.runtimeId-or[uint64]$Transaction.runtimeGeneration-ne[uint64]$FreshContext.runtimeGeneration-or
+       [uint64]$Transaction.leaseEpoch-ne[uint64]$FreshContext.leaseEpoch-or($Transaction.readyEvidence|ConvertTo-Json -Depth 8 -Compress)-cne($FreshContext.readyEvidence|ConvertTo-Json -Depth 8 -Compress)-or
+       ($Transaction.installedBinding.payloadRecords|ConvertTo-Json -Depth 8 -Compress)-cne($FreshContext.payloadRecords|ConvertTo-Json -Depth 8 -Compress)){
+        Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'Installed TaskRemoved replacement does not match the locked fresh runtime proof.' $Transaction
+    }
+    return $true
+}
+
+function Test-CcodUninstallBootstrapInstalledBindingResume {
+    param($Existing,$Observed)
+    if($null-eq$Existing-or$null-eq$Observed){return $false}
+    foreach($name in @('selectedRuntimeRoot','runtimeManifestSha256','resumeScriptPath','resumeScriptLength','resumeScriptSha256','resumeCommand')){if(($Existing.$name|ConvertTo-Json -Compress)-cne($Observed.$name|ConvertTo-Json -Compress)){return $false}}
+    return ($Existing.payloadRecords|ConvertTo-Json -Depth 6 -Compress)-ceq($Observed.payloadRecords|ConvertTo-Json -Depth 6 -Compress)
+}
+
+function Remove-CcodUninstallBootstrapProductRegistration {
+    param([Parameter(Mandatory)]$Context)
+    Assert-CcodUninstallBootstrapContext $Context
+    $modulePath=Join-Path $PSScriptRoot 'modules\ProductRegistration.psm1';if(-not[IO.File]::Exists($modulePath)){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PRODUCT_REGISTRATION_INVALID' 'Matched product registration module is missing' $modulePath}
+    try{Import-Module $modulePath -Force -ErrorAction Stop;Remove-CcodProductRegistration -ReadyEvidence $Context.readyEvidence}catch{Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PRODUCT_REGISTRATION_INVALID' 'Current product registration did not match exact Ready uninstall evidence' $Context.runtimeId}
 }
 
 function Set-CcodUninstallBootstrapFailedTransaction {
@@ -949,7 +1223,8 @@ function Invoke-CcodUninstallBootstrap {
     param(
         [Parameter(Mandatory)][string]$InstallerRoot,
         [Parameter(Mandatory)][string]$InstallRoot,
-        [Parameter(Mandatory)][ValidateSet('Prepare','FinalizeReceipt')][string]$Mode,
+        [Parameter(Mandatory)][ValidateSet('Prepare','PrepareInstalled','FinalizeReceipt')][string]$Mode,
+        $WrapperIdentity,
         [hashtable]$Adapters
     )
 
@@ -959,22 +1234,24 @@ function Invoke-CcodUninstallBootstrap {
         $identity = Get-CcodUninstallBootstrapCurrentIdentity
         $transactionLock = Enter-CcodUninstallBootstrapTransactionLock -UserSid $identity.userSid
         try {
-            $transaction = & $adapter.ReadTransaction $transactionRoot $identity.userSid $true
+            $transaction = & $adapter.ReadTransaction $transactionRoot $identity.userSid $true $InstallRoot
             if ($null -eq $transaction) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_MISSING' 'No resumable uninstall transaction exists' $transactionRoot }
-            Assert-CcodUninstallBootstrapTransaction $transaction
-            if ($transaction.phase -ne 'ReadyForInno') { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_FINALIZATION_INVALID' 'The uninstall transaction is not ready for Inno finalization' $transaction }
+            Assert-CcodUninstallBootstrapTransaction $transaction -ExpectedInstallRoot $InstallRoot
+            if ($transaction.phase -notin @('ReadyForInno','Completed')) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_FINALIZATION_INVALID' 'The uninstall transaction is not ready for Inno finalization' $transaction }
             & $adapter.ValidateFinalizationInvocation $transactionRoot $transaction $identity
             if (-not (& $adapter.TestInstallRootAbsent $InstallerRoot)) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_FINALIZATION_INCOMPLETE' 'Inno did not remove the application root' $InstallerRoot }
             $transactionDirectory = & $adapter.GetTransactionDirectory $transactionRoot $transaction.transactionId
             if ($transactionDirectory -isnot [string] -or [string]::IsNullOrWhiteSpace($transactionDirectory)) {
                 Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_ROOT_INVALID' 'The external uninstall transaction root is invalid' $transactionDirectory
             }
-            $transaction.phase = 'Completed'
-            $transaction.resumePhase = 'Completed'
-            $transaction.updatedAtUtc = (& $adapter.GetUtcNow).ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)
-            $transaction.errorCode = $null
-            Assert-CcodUninstallBootstrapTransaction $transaction
-            & $adapter.WriteTransaction $transactionDirectory $transaction
+            if($transaction.phase-ceq'ReadyForInno'){
+                $transaction.phase = 'Completed'
+                $transaction.resumePhase = 'Completed'
+                $transaction.updatedAtUtc = (& $adapter.GetUtcNow).ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)
+                $transaction.errorCode = $null
+                Assert-CcodUninstallBootstrapTransaction $transaction
+                & $adapter.WriteTransaction $transactionDirectory $transaction
+            }
             & $adapter.WriteReceipt $transactionDirectory $transaction
             return $transaction
         } finally {
@@ -987,14 +1264,18 @@ function Invoke-CcodUninstallBootstrap {
     $transaction = $null
     $stageRoot = $null
     $stagePayload = $false
+    $returnExistingInstalledTaskRemoved = $false
+    $installedTaskRemovedRecovery = $false
     $transactionLock = $null
+    $accountTransition = $null
     try {
         $validationFailure = $null
         try {
             $context = & $adapter.ValidateInvocation $InstallerRoot $InstallRoot
-            Assert-CcodUninstallBootstrapContext $context
+            Assert-CcodUninstallBootstrapContext $context -ExpectedInstallRoot $InstallRoot
         } catch {
             $validationFailure = $_
+            $context = $null
         }
         $transactionRoot = & $adapter.GetTransactionRoot
         $identity = if ($null -ne $context) {
@@ -1003,7 +1284,8 @@ function Invoke-CcodUninstallBootstrap {
             Get-CcodUninstallBootstrapCurrentIdentity
         }
         $transactionLock = Enter-CcodUninstallBootstrapTransactionLock -UserSid $identity.userSid
-        $existing = & $adapter.ReadTransaction $transactionRoot $identity.userSid $true
+        if($Mode-ceq'PrepareInstalled'){$accountTransition=&$adapter.EnterAccountTransition $identity.userSid}
+        $existing = & $adapter.ReadTransaction $transactionRoot $identity.userSid $true $InstallRoot
         if ($null -eq $context) {
             if ($null -eq $existing) { throw $validationFailure }
             $context = New-CcodUninstallBootstrapResumeContext -InstallerRoot $InstallerRoot -InstallRoot $InstallRoot -Transaction $existing -Identity $identity
@@ -1018,38 +1300,65 @@ function Invoke-CcodUninstallBootstrap {
             if ($stageRoot -isnot [string] -or [string]::IsNullOrWhiteSpace($stageRoot)) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_ROOT_INVALID' 'The external uninstall transaction root is invalid' $stageRoot }
             $now = & $adapter.GetUtcNow
             if ($now -isnot [DateTime]) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_CLOCK_INVALID' 'The uninstall clock is invalid' $now }
-            $transaction = New-CcodUninstallBootstrapTransaction -Context $context -TransactionId $transactionId -NowUtc $now
+            $installedBinding=if($Mode-ceq'PrepareInstalled'){&$adapter.GetInstalledBinding $InstallerRoot $InstallRoot $context $WrapperIdentity $stageRoot $transactionId}else{$null}
+            $transaction = New-CcodUninstallBootstrapTransaction -Context $context -TransactionId $transactionId -NowUtc $now -InstalledBinding $installedBinding
             & $adapter.WriteTransaction $stageRoot $transaction
             & $adapter.PublishTransaction $transactionRoot $transactionId $context.userSid ([bool]$replaceCompletedLocator)
             $stagePayload = $true
         } else {
-            Assert-CcodUninstallBootstrapTransactionMatchesContext $transaction $context
+            $taskRemovedProfile=($transaction.phase-ceq'TaskRemoved'-and$transaction.resumePhase-ceq'TaskRemoved')-or($transaction.phase-ceq'Failed'-and$transaction.resumePhase-ceq'TaskRemoved')
+            $installedTaskRemovedCandidate=$Mode-ceq'PrepareInstalled'-and$taskRemovedProfile-and$null-ne$transaction.installedBinding
+            if($installedTaskRemovedCandidate){
+                $installedTaskRemovedRecovery=$true
+                $freshContext=&$adapter.ValidateInvocation $InstallerRoot $InstallRoot
+                Assert-CcodUninstallBootstrapContext $freshContext -ExpectedInstallRoot $InstallRoot
+                [void](Assert-CcodUninstallBootstrapInstalledTaskRemovedContext -Transaction $transaction -FreshContext $freshContext -InstallerRoot $InstallerRoot -InstallRoot $InstallRoot)
+                $context=$freshContext
+            }else{Assert-CcodUninstallBootstrapTransactionMatchesContext $transaction $context $InstallRoot}
             $stageRoot = & $adapter.GetTransactionDirectory $transactionRoot $transaction.transactionId
             if ($stageRoot -isnot [string] -or [string]::IsNullOrWhiteSpace($stageRoot)) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_ROOT_INVALID' 'The external uninstall transaction root is invalid' $stageRoot }
+            if($Mode-ceq'PrepareInstalled'){
+                $binding=&$adapter.GetInstalledBinding $InstallerRoot $InstallRoot $context $WrapperIdentity $stageRoot $transaction.transactionId
+                if(-not(Test-CcodUninstallBootstrapInstalledBindingResume -Existing $transaction.installedBinding -Observed $binding)){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_MISMATCH' 'Installed wrapper binding changed during resume' $binding}
+                if($installedTaskRemovedCandidate){
+                    $now=&$adapter.GetUtcNow;if($now-isnot[DateTime]){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_WRITE_FAILED' 'Replacement wrapper clock is invalid.' $transaction.transactionId};$prior=[DateTime]::ParseExact([string]$transaction.updatedAtUtc,'o',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind);$next=$now.ToUniversalTime();if($next-le$prior){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_WRITE_FAILED' 'Replacement wrapper timestamp is not strictly newer.' $transaction.transactionId}
+                    $transaction.installedBinding.resumeWrapperPid=[int]$WrapperIdentity.pid;$transaction.installedBinding.resumeWrapperCreationTimeUtc=[string]$WrapperIdentity.creationTimeUtc;$transaction.installedBinding.resumeWrapperSessionId=[int]$WrapperIdentity.sessionId;$transaction.installedBinding.resumeWrapperUserSid=[string]$WrapperIdentity.userSid
+                    $transaction.phase='TaskRemoved';$transaction.resumePhase='TaskRemoved';$transaction.errorCode=$null;$transaction.updatedAtUtc=$next.ToString('o',[Globalization.CultureInfo]::InvariantCulture)
+                    Assert-CcodUninstallBootstrapTransaction $transaction -ExpectedInstallRoot $InstallRoot;&$adapter.WriteTransaction $stageRoot $transaction
+                    $readBack=&$adapter.ReadTransaction $transactionRoot $identity.userSid $true $InstallRoot
+                    if($null-eq$readBack-or($readBack|ConvertTo-Json -Depth 16 -Compress)-cne($transaction|ConvertTo-Json -Depth 16 -Compress)){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_WRITE_FAILED' 'Replacement wrapper transaction read-back did not match.' $transaction.transactionId}
+                    $transaction=$readBack;$returnExistingInstalledTaskRemoved=$true
+                }
+            }
             $stagePayload = $transaction.phase -ceq 'Requested' -or ($transaction.phase -ceq 'Failed' -and $transaction.resumePhase -ceq 'Requested')
         }
         if ($stagePayload) { & $adapter.StagePayload $InstallerRoot $InstallRoot $context $stageRoot }
-        $result = & $adapter.RunCleanup $InstallerRoot $InstallRoot $stageRoot $transaction $adapter.WriteTransaction
+        if($returnExistingInstalledTaskRemoved){&$adapter.WriteReceipt $stageRoot $transaction;$receipt=&$adapter.ReadReceipt $stageRoot;if(-not(Test-CcodUninstallBootstrapReceiptMatchesTransaction -Receipt $receipt -Transaction $transaction)){Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_TRANSACTION_WRITE_FAILED' 'Replacement wrapper receipt read-back did not match.' $transaction.transactionId};return $transaction}
+        $result = & $adapter.RunCleanup $InstallerRoot $InstallRoot $stageRoot $transaction $adapter.WriteTransaction $Mode $context.payloadRecords
         if ($null -eq $result) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PREPARE_FAILED' 'The staged cleanup returned no transaction receipt' $stageRoot }
-        Assert-CcodUninstallBootstrapTransactionMatchesContext $result $context
-        if ($result.phase -ne 'ReadyForInno') { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PREPARE_FAILED' 'The staged cleanup did not reach the Inno boundary' $result }
+        Assert-CcodUninstallBootstrapTransactionMatchesContext $result $context $InstallRoot
+        $expectedPhase=if($Mode-ceq'PrepareInstalled'){'TaskRemoved'}else{'ReadyForInno'}
+        if ($result.phase -cne $expectedPhase) { Throw-CcodUninstallBootstrapError 'CCOD_UNINSTALL_PREPARE_FAILED' 'The staged cleanup did not reach its expected external boundary' $result }
+        if($Mode-ceq'Prepare'){& $adapter.RemoveProductRegistration $context}
         & $adapter.WriteReceipt $stageRoot $result
         return $result
     } catch {
         $code = Get-CcodUninstallBootstrapErrorId $_
         if ($code -notmatch '^CCOD_[A-Z0-9_]+$') { $code = 'CCOD_UNINSTALL_PREPARE_FAILED' }
-        if ($null -ne $transaction) { Set-CcodUninstallBootstrapFailedTransaction -Transaction $transaction -Code $code -Adapters $adapter -TransactionRoot $stageRoot }
+        if (-not$installedTaskRemovedRecovery-and$null -ne $transaction -and -not [string]::IsNullOrWhiteSpace([string]$stageRoot)) { Set-CcodUninstallBootstrapFailedTransaction -Transaction $transaction -Code $code -Adapters $adapter -TransactionRoot $stageRoot }
         if ((Get-CcodUninstallBootstrapErrorId $_) -ceq $code) { throw }
         Throw-CcodUninstallBootstrapError $code 'The uninstall bootstrap failed before Inno deletion' $stageRoot
     } finally {
+        if($null-ne$accountTransition){try{&$adapter.ExitAccountTransition $accountTransition}catch{}}
         Exit-CcodUninstallBootstrapTransactionLock -Lock $transactionLock
     }
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
     try {
-        $receipt = Invoke-CcodUninstallBootstrap -InstallerRoot $InstallerRoot -InstallRoot $InstallRoot -Mode $Mode
+        $receipt = Invoke-CcodUninstallBootstrap -InstallerRoot $InstallerRoot -InstallRoot $InstallRoot -Mode $Mode -WrapperIdentity $WrapperIdentity
         if ($Mode -eq 'Prepare' -and $receipt.phase -ne 'ReadyForInno') { exit 3 }
+        if ($Mode -eq 'PrepareInstalled' -and $receipt.phase -ne 'TaskRemoved') { exit 3 }
         if ($Mode -eq 'FinalizeReceipt' -and $receipt.phase -ne 'Completed') { exit 3 }
         exit 0
     } catch {

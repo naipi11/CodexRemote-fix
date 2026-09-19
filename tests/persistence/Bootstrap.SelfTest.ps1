@@ -114,7 +114,9 @@ function Add-CcodTestRuntime {
         [Parameter(Mandatory)][string]$SupervisorScript,
         [AllowNull()][string]$RuntimeId,
         [bool]$IncludeFenceModules = $true,
-        [bool]$FailLifecycleRelease = $false
+        [bool]$FailLifecycleRelease = $false,
+        [AllowNull()][string]$LifecycleReleaseMarkerPath,
+        [bool]$IncludeGenerationBootstrap = $false
     )
 
     if ([string]::IsNullOrWhiteSpace($RuntimeId)) {
@@ -131,26 +133,31 @@ function Add-CcodTestRuntime {
     New-Item -ItemType Directory -Path $kernelDirectory -Force | Out-Null
     $kernelPath = Join-Path $kernelDirectory 'KernelObjects.psm1'
     [IO.File]::Copy($kernelObjectsModule, $kernelPath, $true)
+    if($IncludeGenerationBootstrap){[IO.File]::Copy($bootstrapScript,(Join-Path $supervisorDirectory 'bootstrap.ps1'),$true)}
     if ($IncludeFenceModules) {
         foreach ($moduleName in @('PersistenceIO.psm1','LifecycleEpoch.psm1','LifecycleTransaction.psm1','RuntimeManifest.psm1','TrustedLogonIdentity.psm1')) {
             [IO.File]::Copy((Join-Path $repositoryRoot ('src\persistence\modules\' + $moduleName)), (Join-Path $kernelDirectory $moduleName), $true)
         }
         if ($FailLifecycleRelease) {
-            [IO.File]::AppendAllText((Join-Path $kernelDirectory 'LifecycleEpoch.psm1'), @'
+            if ([string]::IsNullOrWhiteSpace($LifecycleReleaseMarkerPath)) { throw 'A lifecycle release failure marker path is required' }
+            $releaseMarkerBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($LifecycleReleaseMarkerPath)))
+            $releaseFailureInjection = @'
 
 function Exit-CcodLifecycleOwnership {
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Ownership, [hashtable]$Adapters)
+    [IO.File]::WriteAllText([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CCOD_RELEASE_MARKER_BASE64__')),'release-attempted',[Text.UTF8Encoding]::new($false))
     throw [Management.Automation.ErrorRecord]::new(
         [InvalidOperationException]::new('injected lifecycle release failure'),
         'CCOD_LIFECYCLE_RELEASE_FAILED',
         [Management.Automation.ErrorCategory]::CloseError,
         $Ownership)
 }
-'@, [Text.UTF8Encoding]::new($false))
+'@
+            [IO.File]::AppendAllText((Join-Path $kernelDirectory 'LifecycleEpoch.psm1'), $releaseFailureInjection.Replace('__CCOD_RELEASE_MARKER_BASE64__',$releaseMarkerBase64), [Text.UTF8Encoding]::new($false))
         }
     }
-    $manifest = New-CcodRuntimeManifest -RuntimeDirectory $runtimeDirectory -ProjectVersion '0.0.0-bootstrap-test'
+    $manifest = New-CcodRuntimeManifest -RuntimeDirectory $runtimeDirectory -ProjectVersion '0.0.0-b'
     if ([string]::IsNullOrWhiteSpace($RuntimeId)) {
         $RuntimeId = $manifest.runtimeId
         $targetDirectory = Join-Path $Root "runtime\$RuntimeId"
@@ -200,15 +207,23 @@ function Read-CcodTestActivePointer {
     return (Get-Content -LiteralPath (Join-Path $Root 'active.json') -Raw | ConvertFrom-Json)
 }
 
+function Set-CcodTestActiveGenerationPointer {
+    param([Parameter(Mandatory)][string]$Root,[Parameter(Mandatory)][string]$ActiveRuntime,[UInt64]$Generation=1)
+    $pointerRoot=Join-Path $Root 'state\active-generation';[IO.Directory]::CreateDirectory($pointerRoot)|Out-Null
+    $record=[pscustomobject][ordered]@{schemaVersion=1;generation=$Generation;activeRuntime=$ActiveRuntime;previousGeneration=($Generation-1)}
+    [IO.File]::WriteAllText((Join-Path $pointerRoot ('{0:D20}.json'-f$Generation)),($record|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+}
+
 function Invoke-CcodBootstrapUnderTest {
     param(
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$ReadyToken,
         [int]$ReadyTimeoutSeconds = 3,
-        [ValidateSet('Task','Explicit')][string]$EntryMode = 'Explicit'
+        [ValidateSet('Task','Explicit')][string]$EntryMode = 'Explicit',
+        [string]$BootstrapPath = $bootstrapScript
     )
 
-    $output = & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $bootstrapScript `
+    $output = & $powershellExecutable -NoProfile -ExecutionPolicy Bypass -File $BootstrapPath `
         -InstallRoot $Root -ReadyToken $ReadyToken -ReadyTimeoutSeconds $ReadyTimeoutSeconds -EntryMode $EntryMode 2>&1
     $exitCode = [int]$LASTEXITCODE
     return $exitCode
@@ -218,7 +233,8 @@ function Invoke-CcodBootstrapTimed {
     param(
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$ReadyToken,
-        [int]$TimeoutMilliseconds = 4000
+        [int]$TimeoutMilliseconds = 15000,
+        [AllowNull()][string]$ReleaseAttemptMarkerPath
     )
 
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
@@ -231,7 +247,21 @@ function Invoke-CcodBootstrapTimed {
     $stopwatch = [Diagnostics.Stopwatch]::StartNew()
     try {
         [void]$process.Start()
-        $exited = $process.WaitForExit($TimeoutMilliseconds)
+        $markerObserved = $false
+        $markerAtMilliseconds = $null
+        if (-not [string]::IsNullOrWhiteSpace($ReleaseAttemptMarkerPath)) {
+            while ($stopwatch.ElapsedMilliseconds -lt $TimeoutMilliseconds) {
+                if ([IO.File]::Exists($ReleaseAttemptMarkerPath)) {
+                    $markerObserved = $true
+                    $markerAtMilliseconds = [long]$stopwatch.ElapsedMilliseconds
+                    break
+                }
+                if ($process.HasExited) { break }
+                Start-Sleep -Milliseconds 10
+            }
+        }
+        $remainingMilliseconds = [Math]::Max(0,$TimeoutMilliseconds - [int]$stopwatch.ElapsedMilliseconds)
+        $exited = if ($process.HasExited) { $true } else { $process.WaitForExit($remainingMilliseconds) }
         if (-not $exited) {
             $process.Kill()
             $process.WaitForExit()
@@ -240,6 +270,8 @@ function Invoke-CcodBootstrapTimed {
             TimedOut = -not $exited
             ExitCode = if ($exited) { [int]$process.ExitCode } else { $null }
             ElapsedMilliseconds = [long]$stopwatch.ElapsedMilliseconds
+            ReleaseAttemptObserved = $markerObserved
+            ElapsedAfterReleaseAttemptMilliseconds = if ($markerObserved) { [long]($stopwatch.ElapsedMilliseconds - $markerAtMilliseconds) } else { $null }
         }
     } finally {
         $stopwatch.Stop()
@@ -327,6 +359,50 @@ $results += Invoke-CcodTest 'production suppression caller fails closed for unsa
     Assert-CcodThrows { Test-CcodBootstrapSafeExitSuppression @arguments -GetMarkerItem { $reparse } } 'CCOD_SAFE_EXIT_INTENT_INVALID'
 }
 
+
+$results += Invoke-CcodTest 'bootstrap append-only selector rejects unsafe roots leaves JSON and generations' {
+    foreach($kind in @('unknown','root-file','root-reparse','leaf-reparse','ads','multilink','malformed','schema','duplicate','fractional','noncanonical')){$root=Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-pointer-$kind-"+[guid]::NewGuid().ToString('N'));$outside=Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-pointer-outside-$kind-"+[guid]::NewGuid().ToString('N'));try{New-CcodBootstrapFixture -Root $root|Out-Null;[IO.Directory]::CreateDirectory($outside)|Out-Null;$pointerRoot=Join-Path $root 'state\active-generation';[IO.Directory]::CreateDirectory($pointerRoot)|Out-Null;$path=Join-Path $pointerRoot '00000000000000000001.json';$id='2.5.22-1111111111111111-22222222222222222222222222222222';$json='{"schemaVersion":1,"generation":1,"activeRuntime":"'+$id+'","previousGeneration":0}';if($kind-ceq'unknown'){[IO.File]::WriteAllText((Join-Path $pointerRoot 'unknown.bin'),'x',[Text.UTF8Encoding]::new($false))}elseif($kind-ceq'root-file'){Remove-Item $pointerRoot -Recurse -Force;[IO.File]::WriteAllText($pointerRoot,'x',[Text.UTF8Encoding]::new($false))}elseif($kind-ceq'root-reparse'){Remove-Item $pointerRoot -Recurse -Force;New-Item -ItemType Junction -Path $pointerRoot -Target $outside|Out-Null}elseif($kind-ceq'leaf-reparse'){New-Item -ItemType Junction -Path $path -Target $outside|Out-Null}elseif($kind-ceq'ads'){[IO.File]::WriteAllText($path,$json,[Text.UTF8Encoding]::new($false));Set-Content -LiteralPath $path -Stream evidence -Value x -NoNewline}elseif($kind-ceq'multilink'){$outsideFile=Join-Path $outside 'pointer.json';[IO.File]::WriteAllText($outsideFile,$json,[Text.UTF8Encoding]::new($false));New-Item -ItemType HardLink -Path $path -Target $outsideFile|Out-Null}elseif($kind-ceq'malformed'){[IO.File]::WriteAllText($path,'{',[Text.UTF8Encoding]::new($false))}elseif($kind-ceq'schema'){[IO.File]::WriteAllText($path,$json.Replace('"schemaVersion":1','"schemaVersion":2'),[Text.UTF8Encoding]::new($false))}elseif($kind-ceq'duplicate'){[IO.File]::WriteAllText($path,('{"schemaVersion":1,"schemaVersion":1,"generation":1,"activeRuntime":"'+$id+'","previousGeneration":0}'),[Text.UTF8Encoding]::new($false))}elseif($kind-ceq'fractional'){[IO.File]::WriteAllText($path,('{"schemaVersion":1,"generation":1.5,"activeRuntime":"'+$id+'","previousGeneration":0}'),[Text.UTF8Encoding]::new($false))}else{[IO.File]::WriteAllText((Join-Path $pointerRoot '00000000000000000002.json'),$json,[Text.UTF8Encoding]::new($false))};Assert-CcodThrows {Read-CcodBootstrapActivePointer -InstallRoot $root|Out-Null} 'CCOD_BOOTSTRAP_POINTER_INVALID'}finally{if(Test-Path $root){Remove-Item $root -Recurse -Force};if(Test-Path $outside){Remove-Item $outside -Recurse -Force}}}
+}
+
+$results += Invoke-CcodTest 'bootstrap selector fallback requires proven ItemNotFound instead of a lookup error' {
+    $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-bootstrap-pointer-lookup-'+[guid]::NewGuid().ToString('N'))
+    try{New-CcodBootstrapFixture -Root $root|Out-Null;Assert-CcodThrows {Read-CcodBootstrapActivePointer -InstallRoot $root -SelectorAdapters @{GetSelectorRootItem={param($Path)throw [UnauthorizedAccessException]::new('selector lookup denied')}}|Out-Null} 'CCOD_BOOTSTRAP_POINTER_INVALID'}finally{if(Test-Path $root){Remove-Item $root -Recurse -Force}}
+}
+
+$results += Invoke-CcodTest 'bootstrap legacy fallback rejects a state ancestor file' {
+    $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-bootstrap-pointer-state-file-'+[guid]::NewGuid().ToString('N'))
+    try{
+        [IO.Directory]::CreateDirectory($root)|Out-Null
+        $runtimeId='2.5.22-1111111111111111-22222222222222222222222222222222'
+        Set-CcodTestActivePointer -Root $root -ActiveRuntime $runtimeId
+        [IO.File]::WriteAllText((Join-Path $root 'state'),'not-a-directory',[Text.UTF8Encoding]::new($false))
+        Assert-CcodThrows {Read-CcodBootstrapActivePointer -InstallRoot $root|Out-Null} 'CCOD_BOOTSTRAP_POINTER_INVALID'
+    }finally{if(Test-Path $root){Remove-Item $root -Recurse -Force}}
+}
+
+$results += Invoke-CcodTest 'bootstrap runtime IDs use canonical TAB delimiters' {
+    $files = @(
+        [pscustomobject]@{ path = 'a.txt'; length = [int64]5; sha256 = ('a' * 64) }
+        [pscustomobject]@{ path = 'b.txt'; length = [int64]4; sha256 = ('b' * 64) }
+    )
+    $nonce = '0123456789abcdef0123456789abcdef'
+    $expected = '2.5.22-e71f4818a0f8e98f-0123456789abcdef0123456789abcdef'
+    Assert-CcodExactEqual $expected (Get-CcodBootstrapRuntimeId -ProjectVersion '2.5.22' -Files $files -Nonce $nonce) 'bootstrap runtime ID digest input must use literal TAB delimiters'
+}
+
+$results += Invoke-CcodTest 'generation bootstrap launches the append-only selected runtime without root active json' {
+    $root=Join-Path ([IO.Path]::GetTempPath()) ('ccod-bootstrap-generation-'+[guid]::NewGuid().ToString('N'))
+    try{
+        New-CcodBootstrapFixture -Root $root|Out-Null
+        $marker=Join-Path $root 'generation.started'
+        $runtimeId=Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'Ready' -MarkerPath $marker) -IncludeGenerationBootstrap $true
+        Set-CcodTestActiveGenerationPointer -Root $root -ActiveRuntime $runtimeId
+        $generationBootstrap=Join-Path $root "runtime\$runtimeId\src\persistence\bootstrap.ps1"
+        Assert-CcodExactEqual $false (Test-Path -LiteralPath (Join-Path $root 'active.json')) 'fresh append-only fixture has no root active json'
+        Assert-CcodExactEqual 0 (Invoke-CcodBootstrapUnderTest -Root $root -ReadyToken (New-CcodBootstrapToken) -EntryMode Task -BootstrapPath $generationBootstrap) 'generation bootstrap launches selected Supervisor'
+        Assert-CcodTrue (Test-Path -LiteralPath $marker) 'selected generation Supervisor actually starts and signals ready'
+    }finally{if(Test-Path -LiteralPath $root){Remove-Item -LiteralPath $root -Recurse -Force}}
+}
 
 $results += Invoke-CcodTest 'selects previous runtime after active exits before ready and swaps pointer' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ("ccod-bootstrap-" + [guid]::NewGuid().ToString('N'))
@@ -440,17 +516,22 @@ $results += Invoke-CcodTest 'fails promptly when fallback lifecycle ownership ca
         New-CcodBootstrapFixture -Root $root | Out-Null
         $activeId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'ExitEarly' -MarkerPath (Join-Path $root 'release-active.started'))
         $pidPath = Join-Path $root 'release-previous.pid'
-        $previousId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'ReadyLongLived' -MarkerPath $pidPath) -FailLifecycleRelease $true
+        $releaseAttemptPath = Join-Path $root 'release-attempted'
+        $previousId = Add-CcodTestRuntime -Root $root -SupervisorScript (New-CcodTestSupervisorScript -Kind 'ReadyLongLived' -MarkerPath $pidPath) -FailLifecycleRelease $true -LifecycleReleaseMarkerPath $releaseAttemptPath
         Set-CcodTestActivePointer -Root $root -ActiveRuntime $activeId -PreviousRuntime $previousId -SchemaVersion 2 -Generation 9
 
-        $run = Invoke-CcodBootstrapTimed -Root $root -ReadyToken (New-CcodBootstrapToken)
+        $run = Invoke-CcodBootstrapTimed -Root $root -ReadyToken (New-CcodBootstrapToken) -ReleaseAttemptMarkerPath $releaseAttemptPath
         if ([IO.File]::Exists($pidPath)) { $supervisorPid = [int][IO.File]::ReadAllText($pidPath) }
+        Assert-CcodExactEqual $true $run.ReleaseAttemptObserved 'release failure timing starts only after the injected release attempt'
         Assert-CcodExactEqual $false $run.TimedOut 'release failure exits instead of waiting for the ready long-lived Supervisor'
         Assert-CcodExactEqual 1 $run.ExitCode 'release failure is a stable nonzero bootstrap outcome'
-        Assert-CcodTrue ($run.ElapsedMilliseconds -lt 4000) 'release failure returns within the bounded prompt-exit window'
+        Assert-CcodTrue ($run.ElapsedAfterReleaseAttemptMilliseconds -le 2000) 'release failure exits within two seconds of the injected release attempt'
         $log = [IO.File]::ReadAllText((Join-Path $root 'logs\bootstrap.log'))
         Assert-CcodTrue ($log.Contains('CCOD_BOOTSTRAP_FENCE_RELEASE_FAILED')) 'release failure is normalized to the stable bootstrap code'
         Assert-CcodTrue (-not $log.Contains('signaled ready; active pointer switched')) 'release failure never logs successful fallback readiness'
+        Assert-CcodTrue ($null-ne$supervisorPid) 'fallback Supervisor published its process identity before release failed'
+        $fallbackProcess = Get-Process -Id $supervisorPid -ErrorAction SilentlyContinue
+        try { Assert-CcodExactEqual $null $fallbackProcess 'bootstrap failure exits the fallback Supervisor before returning' } finally { if ($null-ne$fallbackProcess) { $fallbackProcess.Dispose() } }
 
         $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         $lease = Enter-CcodMutex -Kind AccountTransition -UserSid $sid -TimeoutMilliseconds 1000
@@ -664,6 +745,14 @@ $results += Invoke-CcodTest 'prelaunch evaluates safe-exit policy before lease a
     Assert-CcodExactEqual 'MarkerPolicy' ($calls -join '|') 'same-logon suppression never acquires AccountTransition'
     Assert-CcodExactEqual $true $suppressed.Suppressed 'same-logon marker suppresses startup'
     Assert-CcodExactEqual $null $suppressed.LaunchLease 'suppressed startup owns no launch lease'
+}
+
+$results += Invoke-CcodTest 'clean release runner fail-closes contaminated product state without invoking bootstrap' {
+    $path = Join-Path $repositoryRoot 'tools\Test-CleanReleaseRunner.ps1'
+    Assert-CcodTrue (Test-Path -LiteralPath $path -PathType Leaf) 'clean release runner script exists'
+    $source = [IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false))
+    Assert-CcodTrue ($source -cnotmatch 'bootstrap\.ps1') 'clean runner does not invoke bootstrap'
+    Assert-CcodTrue ($source -cmatch 'CCOD_CLEAN_RUNNER_CONTAMINATED') 'clean runner fail-closes contaminated product state'
 }
 
 $results | Format-Table -AutoSize

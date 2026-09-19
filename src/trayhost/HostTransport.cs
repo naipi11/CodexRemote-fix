@@ -1,6 +1,12 @@
 using System;
 using System.Collections.Generic;
 
+internal enum TrayTerminalReceiptUiKind : byte
+{
+    About = 1,
+    Failure = 2
+}
+
 internal sealed class HostTransport : IDisposable
 {
     private sealed class PendingAction
@@ -9,24 +15,41 @@ internal sealed class HostTransport : IDisposable
         internal bool Accepted;
     }
 
+    private sealed class UiWorkItem
+    {
+        internal uint Token;
+        internal TrayTerminalReceiptUiKind Kind;
+        internal TrayActionResult Result;
+        internal bool Committed;
+        internal bool DeliveryObserved;
+    }
+
+    private const int MaximumUiWork = 8;
+    private const int MaximumTokenPostAttempts = 2;
     private readonly object _gate = new object();
     private readonly Action _presentationReady;
-    private readonly Queue<TrayActionResult> _completedAbout = new Queue<TrayActionResult>();
-    private readonly Queue<TrayActionResult> _failedActions = new Queue<TrayActionResult>();
+    private readonly Func<uint, bool> _receiptReady;
+    private readonly Dictionary<uint, UiWorkItem> _receiptUi = new Dictionary<uint, UiWorkItem>();
     private readonly Dictionary<Guid, PendingAction> _pendingActions = new Dictionary<Guid, PendingAction>();
     private readonly Queue<Guid> _recentActionOrder = new Queue<Guid>();
     private readonly HashSet<Guid> _recentActions = new HashSet<Guid>();
     private PresentationSnapshot _pendingPresentation;
+    private uint _nextReceiptToken = unchecked((uint)Guid.NewGuid().GetHashCode());
     private bool _menuOpen;
     private bool _disposed;
 
-    internal HostTransport() : this(null)
+    internal HostTransport() : this(null, null)
     {
     }
 
-    internal HostTransport(Action presentationReady)
+    internal HostTransport(Action presentationReady) : this(presentationReady, null)
+    {
+    }
+
+    internal HostTransport(Action presentationReady, Func<uint, bool> receiptReady)
     {
         _presentationReady = presentationReady;
+        _receiptReady = receiptReady;
     }
 
     internal void SetMenuOpen(bool value)
@@ -81,8 +104,9 @@ internal sealed class HostTransport : IDisposable
         }
     }
 
-    internal bool TryAcknowledgeAction(TrayActionResult result)
+    internal bool TryAcknowledgeAction(TrayActionResult result, out TrayTerminalReceipt receipt)
     {
+        receipt = null;
         if (result == null) { return false; }
         lock (_gate)
         {
@@ -97,30 +121,81 @@ internal sealed class HostTransport : IDisposable
             }
             if (result.Status != TrayActionResultStatus.Completed && result.Status != TrayActionResultStatus.Rejected && result.Status != TrayActionResultStatus.Failed) { return false; }
             if (result.Status == TrayActionResultStatus.Completed && TrayCommandPolicy.RequiresAcceptedBeforeCompleted(pending.Action.Command) && !pending.Accepted) { return false; }
-            if ((result.Status == TrayActionResultStatus.Rejected || result.Status == TrayActionResultStatus.Failed) && _failedActions.Count >= 8) { return false; }
+            receipt = new TrayTerminalReceipt(this, pending.Action.Command, result);
             _pendingActions.Remove(result.ActionId);
-            if (result.Status == TrayActionResultStatus.Completed && pending.Action.Command == TrayCommand.ShowAbout) { _completedAbout.Enqueue(result); }
-            if (result.Status == TrayActionResultStatus.Rejected || result.Status == TrayActionResultStatus.Failed) { _failedActions.Enqueue(result); }
+            return true;
+        }
+    }
+
+    internal bool TryPublishDurableReceipt(TrayTerminalReceipt receipt)
+    {
+        if (receipt == null) { return false; }
+        UiWorkItem work = null;
+        Func<uint, bool> receiptReady = _receiptReady;
+        lock (_gate)
+        {
+            if (_disposed || !receipt.TryClaimPublication(this)) { return false; }
+            TrayActionResult result = receipt.Result;
+            TrayTerminalReceiptUiKind kind;
+            if (result.Status == TrayActionResultStatus.Completed && receipt.Command == TrayCommand.ShowAbout) { kind = TrayTerminalReceiptUiKind.About; }
+            else if (result.Status == TrayActionResultStatus.Rejected || result.Status == TrayActionResultStatus.Failed) { kind = TrayTerminalReceiptUiKind.Failure; }
+            else { return true; }
+            if (receiptReady == null || _receiptUi.Count >= MaximumUiWork) { return false; }
+            uint token = NextReceiptTokenLocked();
+            if (token == 0U) { return false; }
+            work = new UiWorkItem { Token = token, Kind = kind, Result = result };
+            _receiptUi.Add(token, work);
+        }
+
+        for (int attempt = 0; attempt < MaximumTokenPostAttempts; attempt++)
+        {
+            bool posted = false;
+            try { posted = receiptReady(work.Token); }
+            catch { posted = false; }
+            if (!posted) { DropUiWork(work); return false; }
+            lock (_gate)
+            {
+                UiWorkItem current;
+                if (_disposed || !_receiptUi.TryGetValue(work.Token, out current) || !Object.ReferenceEquals(current, work)) { return false; }
+                if (!work.DeliveryObserved)
+                {
+                    work.Committed = true;
+                    return true;
+                }
+                work.DeliveryObserved = false;
+            }
+        }
+
+        DropUiWork(work);
+        return false;
+    }
+
+    internal bool TryTakeReceiptUi(uint token, out TrayTerminalReceiptUiKind kind, out TrayActionResult result)
+    {
+        kind = 0; result = null;
+        if (token == 0U) { return false; }
+        lock (_gate)
+        {
+            if (_disposed) { return false; }
+            UiWorkItem work;
+            if (!_receiptUi.TryGetValue(token, out work)) { return false; }
+            if (!work.Committed) { work.DeliveryObserved = true; return false; }
+            _receiptUi.Remove(token);
+            kind = work.Kind; result = work.Result;
             return true;
         }
     }
 
     internal bool TryTakeCompletedAbout(out TrayActionResult result)
     {
-        lock (_gate)
-        {
-            if (_completedAbout.Count == 0) { result = null; return false; }
-            result = _completedAbout.Dequeue(); return true;
-        }
+        result = null;
+        return false;
     }
 
     internal bool TryTakeFailedAction(out TrayActionResult result)
     {
-        lock (_gate)
-        {
-            if (_failedActions.Count == 0) { result = null; return false; }
-            result = _failedActions.Dequeue(); return true;
-        }
+        result = null;
+        return false;
     }
 
     public void Dispose()
@@ -129,12 +204,31 @@ internal sealed class HostTransport : IDisposable
         {
             if (_disposed) { return; }
             _disposed = true;
-            _completedAbout.Clear();
-            _failedActions.Clear();
+            _receiptUi.Clear();
             _pendingActions.Clear();
             _recentActions.Clear();
             _recentActionOrder.Clear();
             _pendingPresentation = null;
+        }
+    }
+
+    private uint NextReceiptTokenLocked()
+    {
+        for (int attempt = 0; attempt < MaximumUiWork + 2; attempt++)
+        {
+            _nextReceiptToken = unchecked(_nextReceiptToken + 1U);
+            if (_nextReceiptToken != 0U && !_receiptUi.ContainsKey(_nextReceiptToken)) { return _nextReceiptToken; }
+        }
+        return 0U;
+    }
+
+    private void DropUiWork(UiWorkItem target)
+    {
+        if (target == null) { return; }
+        lock (_gate)
+        {
+            UiWorkItem current;
+            if (_receiptUi.TryGetValue(target.Token, out current) && Object.ReferenceEquals(current, target)) { _receiptUi.Remove(target.Token); }
         }
     }
 }

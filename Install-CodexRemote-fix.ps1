@@ -62,21 +62,29 @@ function Get-CcodPortableInstallerDetectionKeys {
 function Invoke-CcodPortableInstallerDefenderGate {
     param([Parameter(Mandatory)][string]$PayloadRoot)
     try {
-        $status = Get-MpComputerStatus -ErrorAction Stop
-        if ($null -eq $status -or $null -eq $status.PSObject.Properties['AMProductVersion'] -or
-            $null -eq $status.PSObject.Properties['AntivirusSignatureVersion'] -or
-            $status.AMProductVersion -isnot [string] -or [string]::IsNullOrWhiteSpace($status.AMProductVersion) -or
-            $status.AntivirusSignatureVersion -isnot [string] -or [string]::IsNullOrWhiteSpace($status.AntivirusSignatureVersion) -or
-            $null -eq $status.PSObject.Properties['RealTimeProtectionEnabled'] -or $status.RealTimeProtectionEnabled -isnot [bool] -or
-            -not $status.RealTimeProtectionEnabled) {
-            throw 'Defender status is incomplete or real-time protection is not enabled.'
-        }
-        $before = Get-CcodPortableInstallerDetectionKeys -Records @(Get-MpThreatDetection -ErrorAction Stop)
         $started = [DateTime]::UtcNow
+        $status = Get-MpComputerStatus -ErrorAction Stop
+        if ($null -eq $status -or
+            $null -eq $status.PSObject.Properties['AMServiceEnabled'] -or $status.AMServiceEnabled -isnot [bool] -or -not $status.AMServiceEnabled -or
+            $null -eq $status.PSObject.Properties['AntivirusEnabled'] -or $status.AntivirusEnabled -isnot [bool] -or -not $status.AntivirusEnabled -or
+            $null -eq $status.PSObject.Properties['RealTimeProtectionEnabled'] -or $status.RealTimeProtectionEnabled -isnot [bool] -or -not $status.RealTimeProtectionEnabled -or
+            $null -eq $status.PSObject.Properties['AMProductVersion'] -or
+            $status.AMProductVersion -isnot [string] -or [string]::IsNullOrWhiteSpace($status.AMProductVersion) -or
+            $null -eq $status.PSObject.Properties['AMEngineVersion'] -or
+            $status.AMEngineVersion -isnot [string] -or [string]::IsNullOrWhiteSpace($status.AMEngineVersion) -or
+            $null -eq $status.PSObject.Properties['AntivirusSignatureVersion'] -or
+            $status.AntivirusSignatureVersion -isnot [string] -or [string]::IsNullOrWhiteSpace($status.AntivirusSignatureVersion) -or
+            $null -eq $status.PSObject.Properties['AntivirusSignatureLastUpdated'] -or $status.AntivirusSignatureLastUpdated -isnot [datetime]) {
+            throw 'Defender status is incomplete or protection is not enabled.'
+        }
+        $signatureUpdated = ([datetime]$status.AntivirusSignatureLastUpdated).ToUniversalTime()
+        if ($signatureUpdated -lt $started.AddHours(-72) -or $signatureUpdated -gt $started.AddMinutes(5)) { throw 'Defender signature timestamp is stale or future-dated.' }
+        $before = Get-CcodPortableInstallerDetectionKeys -Records @(Get-MpThreatDetection -ErrorAction Stop)
         $scanError = $null
         try { Start-MpScan -ScanType CustomScan -ScanPath $PayloadRoot -ErrorAction Stop }
         catch { $scanError = $_ }
         $completed = [DateTime]::UtcNow
+        if ($completed -lt $started -or $completed -gt $started.AddHours(2)) { throw 'Defender scan clock is reversed or exceeds the two-hour bound.' }
         $after = Get-CcodPortableInstallerDetectionKeys -Records @(Get-MpThreatDetection -ErrorAction Stop)
         $newDetections = @($after | Where-Object { -not $before.Contains($_) })
         if ($null -ne $scanError) {
@@ -89,10 +97,16 @@ function Invoke-CcodPortableInstallerDefenderGate {
             Throw-CcodPortableInstallerError 'CCOD_PORTABLE_DEFENDER_DETECTIONS_FOUND' 'The portable payload disappeared during its Defender scan.' $PayloadRoot
         }
         return [pscustomobject][ordered]@{
+            defenderServiceEnabled = $true
+            antivirusEnabled = $true
+            realTimeProtectionEnabled = $true
             defenderPlatformVersion = [string]$status.AMProductVersion
+            defenderEngineVersion = [string]$status.AMEngineVersion
             signatureVersion = [string]$status.AntivirusSignatureVersion
+            signatureUpdatedAtUtc = $signatureUpdated.ToString('o',[Globalization.CultureInfo]::InvariantCulture)
             scanStartedAtUtc = $started.ToString('o',[Globalization.CultureInfo]::InvariantCulture)
             scanCompletedAtUtc = $completed.ToString('o',[Globalization.CultureInfo]::InvariantCulture)
+            detectionCount = 0
         }
     } catch {
         if ($_.FullyQualifiedErrorId -match '^CCOD_PORTABLE_') { throw }
@@ -122,6 +136,29 @@ function Get-CcodPortableInstallerActiveRuntime {
     return [pscustomobject][ordered]@{ RuntimeId=$active.activeRuntime; Generation=$generation }
 }
 
+function Invoke-CcodPortableLifecycleInstaller {
+    param(
+        [Parameter(Mandatory)][string]$InstallerPath,
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$CopiedSealedPackageSha256,
+        [Parameter(Mandatory)][string]$InitialSealedPackageSha256,
+        [Parameter(Mandatory)][string]$RevalidatedSourceSealedPackageSha256,
+        [switch]$EnableCandidateCompatibleUpdates,
+        [switch]$DoNotStart
+    )
+    if ($CopiedSealedPackageSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $InitialSealedPackageSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $RevalidatedSourceSealedPackageSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $CopiedSealedPackageSha256 -cne $InitialSealedPackageSha256 -or
+        $CopiedSealedPackageSha256 -cne $RevalidatedSourceSealedPackageSha256) {
+        Throw-CcodPortableInstallerError 'CCOD_PORTABLE_PACKAGE_IDENTITY_INVALID' 'The initial, revalidated source, and copied portable payload identities differ before lifecycle activation.' $CopiedSealedPackageSha256
+    }
+    return & $InstallerPath -InstallRoot $InstallRoot `
+        -EnableCandidateCompatibleUpdates:([bool]$EnableCandidateCompatibleUpdates) `
+        -DoNotStart:([bool]$DoNotStart) `
+        -SealedPackageSha256 $CopiedSealedPackageSha256
+}
+
 $bundleRoot = Assert-CcodPortableInstallerPlainDirectory -Path $PSScriptRoot -Kind 'Portable bundle root'
 $payloadRoot = Assert-CcodPortableInstallerPlainDirectory -Path (Join-Path $bundleRoot 'payload') -Kind 'Portable payload root'
 $payloadManifestPath = Assert-CcodPortableInstallerRegularFile -Path (Join-Path $bundleRoot 'payload-manifest.json') -Kind 'Portable payload manifest'
@@ -137,7 +174,7 @@ if ($null -eq $package -or $package.version -isnot [string] -or $package.version
 
 $payload = Test-CcodPortablePayloadManifest -PayloadRoot $payloadRoot -ManifestPath $payloadManifestPath -ExpectedVersion $package.version
 $defender = Invoke-CcodPortableInstallerDefenderGate -PayloadRoot $payloadRoot
-Test-CcodPortablePayloadManifest -PayloadRoot $payloadRoot -ManifestPath $payloadManifestPath -ExpectedVersion $package.version -ExpectedGitCommit $payload.GitCommit | Out-Null
+$revalidatedPayload = Test-CcodPortablePayloadManifest -PayloadRoot $payloadRoot -ManifestPath $payloadManifestPath -ExpectedVersion $package.version -ExpectedGitCommit $payload.GitCommit
 
 $localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
 if ([string]::IsNullOrWhiteSpace($localAppData) -or -not [IO.Path]::IsPathRooted($localAppData)) {
@@ -151,7 +188,11 @@ if (-not $PSCmdlet.ShouldProcess($installRoot,'Install the verified CodexRemote-
 $copied = Copy-CcodPortablePayload -PayloadRoot $payloadRoot -ManifestPath $payloadManifestPath
 $installerPath = Assert-CcodPortableInstallerRegularFile -Path (Join-Path $copied.InstallerRoot 'Install-CodexControlOtherDevices.ps1') -Kind 'Installed lifecycle installer'
 try {
-    $installReceipt = & $installerPath -InstallRoot $installRoot -EnableCandidateCompatibleUpdates:([bool]$EnableCandidateCompatibleUpdates) -DoNotStart:([bool]$DoNotStart)
+    $installReceipt = Invoke-CcodPortableLifecycleInstaller -InstallerPath $installerPath -InstallRoot $installRoot `
+        -CopiedSealedPackageSha256 ([string]$copied.Manifest.PayloadManifestSha256) `
+        -InitialSealedPackageSha256 ([string]$payload.PayloadManifestSha256) `
+        -RevalidatedSourceSealedPackageSha256 ([string]$revalidatedPayload.PayloadManifestSha256) `
+        -EnableCandidateCompatibleUpdates:$EnableCandidateCompatibleUpdates -DoNotStart:$DoNotStart
 } catch {
     Throw-CcodPortableInstallerError 'CCOD_PORTABLE_INSTALL_FAILED' 'The verified portable payload could not activate the protected runtime.' $_
 }

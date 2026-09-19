@@ -26,6 +26,7 @@ public sealed class TrayHostStartReceipt
 
 public sealed class TrayHostParentClient : IDisposable
 {
+    private const int GracefulProcessExitMilliseconds = 1500;
     internal static Func<ProcessStartInfo, Process> TestProcessFactory = null;
     internal static Action TestBeforeReaderStopSignal = null;
     internal static Action TestBeforeWaitHandleDispose = null;
@@ -180,7 +181,11 @@ public sealed class TrayHostParentClient : IDisposable
                 ProtocolFrame frame = ReadAuthenticated();
                 if (frame.MessageType == TrayHostMessageType.PresentationAck) { EnqueueEvent(TrayHostEvent.Ack(TrayHostWire.ReadRevision(frame.Payload))); }
                 else if (frame.MessageType == TrayHostMessageType.Action) { EnqueueEvent(TrayHostEvent.Action(TrayHostWire.ReadAction(frame.Payload))); }
-                else if (frame.MessageType == TrayHostMessageType.ShutdownAck) { EnqueueEvent(TrayHostEvent.Exited()); _transport.Dispose(); SignalStopped(); return; }
+                else if (frame.MessageType == TrayHostMessageType.ShutdownAck)
+                {
+                    if (!WaitForNaturalProcessExit()) { HandleTransportFailure(new InvalidOperationException("CCOD_TRAYHOST_GRACEFUL_EXIT_FAILED")); return; }
+                    EnqueueEvent(TrayHostEvent.Exited()); _transport.Dispose(); SignalStopped(); return;
+                }
                 else if (frame.MessageType == TrayHostMessageType.Fault) { EnqueueEvent(TrayHostEvent.Fault("CCOD_TRAYHOST_REMOTE_FAULT")); }
                 else if (frame.MessageType == TrayHostMessageType.Pong) { _work.Set(); }
             }
@@ -214,6 +219,14 @@ public sealed class TrayHostParentClient : IDisposable
     private ProtocolFrame ReadAuthenticated()
     {
         return ProtocolCodec.ReadAuthenticated(_childOutput, ProtocolDirection.HostToParent, _keys.HostEpoch, _readSequence++, _keys.HostToParent);
+    }
+
+    private bool WaitForNaturalProcessExit()
+    {
+        Process process = _process;
+        if (process == null) { return false; }
+        try { return process.WaitForExit(GracefulProcessExitMilliseconds) && process.ExitCode == 0; }
+        catch { return false; }
     }
 
     private bool IsDisposing() { return Volatile.Read(ref _disposed) != 0; }

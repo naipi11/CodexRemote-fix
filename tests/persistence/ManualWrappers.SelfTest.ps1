@@ -257,7 +257,7 @@ Invoke-CcodTest 'public uninstall wrapper rejects retired direct options and del
     Assert-CcodTrue ($commands -ccontains 'Import-Module') 'Uninstall wrapper verifies the installed portable marker through its manifest-bound module'
     foreach($forbidden in @('Remove-Item','Move-Item','Copy-Item','Invoke-CcodUninstall')){Assert-CcodTrue ($commands -cnotcontains $forbidden) "Uninstall wrapper has no direct $forbidden path"}
     $source=Get-Content -LiteralPath $uninstallPath -Raw -Encoding UTF8
-    foreach($required in @('portable-release.json','Assert-CcodPortableInstalledMarker','-Mode Prepare','PortableUninstallFinalizer.ps1')){
+    foreach($required in @('portable-release.json','Assert-CcodPortableInstalledMarker','Invoke-CcodPublicUninstallPrepare','-PrepareMode Prepare -Identity $null','Invoke-CcodUninstallBootstrap -InstallerRoot $Runtime -InstallRoot $Root -Mode $PrepareMode','PortableUninstallFinalizer.ps1')){
         Assert-CcodTrue ($source -cmatch [regex]::Escape($required)) "Uninstall wrapper requires $required for the portable finalization boundary"
     }
     foreach($argument in @(@{Name='KeepCurrentSpecialSession';Value=$true},@{Name='BackupDeviceKeyStore';Value=$true},@{Name='RemoveDeviceKeyStore';Value=$true})){

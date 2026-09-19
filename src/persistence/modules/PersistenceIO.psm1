@@ -546,7 +546,8 @@ function Read-CcodStrictJson {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)]$ExpectedSchema,
-        [Parameter(Mandatory)][string]$Kind
+        [Parameter(Mandatory)][string]$Kind,
+        [ValidateRange(1,10485760)][int64]$MaxBytes = 1048576
     )
 
     if (-not [IO.File]::Exists($Path)) {
@@ -554,7 +555,31 @@ function Read-CcodStrictJson {
     }
 
     try {
-        $json = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false))
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Throw-CcodError 'CCOD_STATE_UNSAFE' "$Kind state is not a plain file" $Path
+        }
+        if ([int64]$item.Length -gt $MaxBytes) {
+            Throw-CcodError 'CCOD_STATE_TOO_LARGE' "$Kind state exceeds the bounded record size" $Path
+        }
+        $stream = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        try {
+            if ($stream.Length -gt $MaxBytes -or $stream.Length -gt [int]::MaxValue) {
+                Throw-CcodError 'CCOD_STATE_TOO_LARGE' "$Kind state exceeds the bounded record size" $Path
+            }
+            $bytes = [byte[]]::new([int]$stream.Length)
+            $offset = 0
+            while ($offset -lt $bytes.Length) {
+                $read = $stream.Read($bytes,$offset,$bytes.Length-$offset)
+                if ($read -le 0) { Throw-CcodError 'CCOD_STATE_MALFORMED' "$Kind state could not be read completely" $Path }
+                $offset += $read
+            }
+            if ($stream.ReadByte() -ne -1) { Throw-CcodError 'CCOD_STATE_TOO_LARGE' "$Kind state changed beyond the bounded record size" $Path }
+        } finally { $stream.Dispose() }
+        $json = [Text.UTF8Encoding]::new($false,$true).GetString($bytes)
+    } catch [Management.Automation.RuntimeException] {
+        if (([string]$_.FullyQualifiedErrorId -split ',')[0] -clike 'CCOD_*') { throw }
+        Throw-CcodError 'CCOD_STATE_MALFORMED' "$Kind state is not valid JSON" $Path
     } catch {
         Throw-CcodError 'CCOD_STATE_MALFORMED' "$Kind state is not valid JSON" $Path
     }

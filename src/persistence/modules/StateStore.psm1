@@ -382,14 +382,15 @@ function Write-CcodTypedState {
         [Parameter(Mandatory)][string]$Leaf,
         [Parameter(Mandatory)]$Value,
         [Parameter(Mandatory)][scriptblock]$Validator,
-        [hashtable]$Adapters
+        [hashtable]$Adapters,
+        $FileTransaction
     )
 
     if (-not (Test-CcodSchemaVersionOne -Value $Value)) {
         Throw-CcodStateError 'CCOD_SCHEMA_UNSUPPORTED' 'State writes require schema version 1' $Value
     }
     & $Validator $Value $Adapters
-    Write-CcodAtomicJson -Path (Get-CcodStatePath -StateRoot $StateRoot -Leaf $Leaf) -Value $Value
+    if($null-ne$FileTransaction){$state=New-CcodInstallDirectory -Transaction $FileTransaction -Parent $FileTransaction -Leaf 'state' -CreateIfMissing;Write-CcodInstallRecord -Transaction $FileTransaction -Parent $state -Leaf $Leaf -Record $Value|Out-Null}else{Write-CcodAtomicJson -Path (Get-CcodStatePath -StateRoot $StateRoot -Leaf $Leaf) -Value $Value}
 }
 
 function Initialize-CcodState {
@@ -412,16 +413,21 @@ function Initialize-CcodState {
     if (-not (& $adapters.DirectoryExists $receiptRoot)) { & $adapters.CreateDirectory $receiptRoot }
     Read-CcodLifecycleRequest -StateRoot $StateRoot | Out-Null
     if ($existing.Count -eq $paths.Count) {
-        return
+        return [pscustomobject][ordered]@{settings=(Read-CcodSettings -StateRoot $StateRoot -Adapters $adapters);status=(Read-CcodStatus -StateRoot $StateRoot -Adapters $adapters);verifiedPackages=(Read-CcodVerifiedPackages -StateRoot $StateRoot -Adapters $adapters);transition=(Read-CcodTypedState -StateRoot $StateRoot -Leaf 'transition.json' -Kind 'transition' -Validator ${function:Assert-CcodTransitionShape} -Adapters $adapters)}
     }
     if ($existing.Count -ne 0) {
         Throw-CcodStateError 'CCOD_STATE_ALREADY_INITIALIZED' 'State initialization refuses to overwrite existing evidence; use explicit repair' $StateRoot
     }
 
-    Write-CcodSettings -StateRoot $StateRoot -Settings (New-CcodSettings -NodeCandidates $NodeCandidates -CandidateCompatibleOptIn $CandidateCompatibleOptIn -AutomationEnabled $true -UpdatedAtUtc (Get-CcodStateTimestamp -Adapters $adapters)) -Adapters $adapters
-    Write-CcodTypedState -StateRoot $StateRoot -Leaf 'status.json' -Value (New-CcodStatusStore) -Validator ${function:Assert-CcodStatusShape} -Adapters $adapters
-    Write-CcodVerifiedPackages -StateRoot $StateRoot -VerifiedPackages (New-CcodVerifiedPackagesStore) -Adapters $adapters
-    Write-CcodTypedState -StateRoot $StateRoot -Leaf 'transition.json' -Value (New-CcodTransitionStore) -Validator ${function:Assert-CcodTransitionShape} -Adapters $adapters
+    $settings = New-CcodSettings -NodeCandidates $NodeCandidates -CandidateCompatibleOptIn $CandidateCompatibleOptIn -AutomationEnabled $true -UpdatedAtUtc (Get-CcodStateTimestamp -Adapters $adapters)
+    $status = New-CcodStatusStore
+    $verifiedPackages = New-CcodVerifiedPackagesStore
+    $transition = New-CcodTransitionStore
+    Write-CcodSettings -StateRoot $StateRoot -Settings $settings -Adapters $adapters
+    Write-CcodTypedState -StateRoot $StateRoot -Leaf 'status.json' -Value $status -Validator ${function:Assert-CcodStatusShape} -Adapters $adapters
+    Write-CcodVerifiedPackages -StateRoot $StateRoot -VerifiedPackages $verifiedPackages -Adapters $adapters
+    Write-CcodTypedState -StateRoot $StateRoot -Leaf 'transition.json' -Value $transition -Validator ${function:Assert-CcodTransitionShape} -Adapters $adapters
+    return [pscustomobject][ordered]@{settings=$settings;status=$status;verifiedPackages=$verifiedPackages;transition=$transition}
 }
 
 function Read-CcodSettings {

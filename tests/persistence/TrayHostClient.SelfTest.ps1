@@ -51,7 +51,13 @@ Invoke-CcodTest 'TrayHost starts fail-closed until the Supervisor publishes an e
 }
 
 Invoke-CcodTest 'TrayHost reuses an identical presentation revision and records only an exact acknowledgement' {
-    if($null-eq('PresentationSnapshot' -as [type])){Add-Type -Path (Join-Path $repositoryRoot 'src\trayhost\PresentationSnapshot.cs')}
+    if($null-eq('TrayActionResult' -as [type])){
+        Add-Type -Path @(
+            (Join-Path $repositoryRoot 'src\trayhost\PresentationSnapshot.cs'),
+            (Join-Path $repositoryRoot 'src\trayhost\PipeProtocol.cs'),
+            (Join-Path $repositoryRoot 'src\trayhost\TransportMessages.cs')
+        )
+    }
     Import-Module $localizationPath -Force
     $catalog=Get-CcodUiCatalog -ResourcesRoot (Join-Path $repositoryRoot 'src\persistence\resources') -LanguageMode en-US -SystemCultureName en-US
     $presentation=[pscustomobject][ordered]@{Color='Green';ConnectionState='Connected';ProtectionState='Running';RepairEnabled=$false;LanguageEnabled=$true;OpenLogsEnabled=$true;AboutEnabled=$true;ExitEnabled=$true;Busy=$false}
@@ -78,6 +84,33 @@ Invoke-CcodTest 'TrayHost reuses an identical presentation revision and records 
     Assert-CcodTrue $context.AcknowledgedPresentations.Contains('2') 'the exact host acknowledgement records the revision presentation authority'
     Assert-CcodEqual $true $context.AcknowledgedPresentations['2'].ExitEnabled 'acknowledged authority preserves the presented action capability'
     Assert-CcodTrue (-not$context.AcknowledgedPresentations.Contains('1')) 'an unrecorded revision is never inferred from a higher acknowledgement'
+}
+
+Invoke-CcodTest 'TrayHost client delivers the exact correlated terminal result to the authenticated parent client' {
+    # Production mutation caught: losing the action id, revision, status, or stable terminal code at the PowerShell-to-TrayHost boundary.
+    $received=[Collections.Generic.List[object]]::new()
+    $client=[pscustomobject]@{Received=$received}
+    $client|Add-Member -MemberType ScriptMethod -Name TryAcknowledgeAction -Value {param($Result)$this.Received.Add($Result);return $true}
+    $context=[pscustomobject]@{Client=$client}
+    $actionId=[guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeea1'
+
+    $delivered=Send-CcodTrayHostActionResult -Context $context -ActionId $actionId -Revision ([UInt64]8) -Status Rejected -ErrorCode 'CCOD_TRAY_ACTION_STALE' -TransactionId $null
+
+    Assert-CcodEqual $true $delivered 'terminal result is accepted by the authenticated parent client'
+    Assert-CcodEqual 1 $received.Count 'terminal result is delivered exactly once'
+    Assert-CcodEqual $actionId $received[0].ActionId 'terminal result preserves the action id'
+    Assert-CcodEqual ([UInt64]8) $received[0].Revision 'terminal result preserves the presentation revision'
+    Assert-CcodEqual 'Rejected' $received[0].Status.ToString() 'terminal result preserves the rejected status'
+    Assert-CcodEqual 'CCOD_TRAY_ACTION_STALE' $received[0].ErrorCode 'terminal result preserves the stable stale code'
+}
+
+Invoke-CcodTest 'production trace launches the temporary child through the normal parent client' {
+    # Production mutation caught: replacing the real child process with TestProcessFactory or bypassing TrayHostParentClient.Start.
+    $traceSource=Get-Content -LiteralPath (Join-Path $repositoryRoot 'tests\trayhost\TrayHostProductionTraceSelfTest.cs') -Raw -Encoding UTF8
+    $traceScript=Get-Content -LiteralPath (Join-Path $repositoryRoot 'tests\persistence\TrayHostProductionTrace.SelfTest.ps1') -Raw -Encoding UTF8
+    Assert-CcodTrue ($traceSource -cmatch 'TrayHostParentClient\.Start\(') 'temporary trace uses the normal parent-client start path'
+    Assert-CcodTrue ($traceSource -cnotmatch 'TestProcessFactory\s*=') 'temporary trace never assigns the parent-client test process factory'
+    Assert-CcodTrue ($traceScript -cnotmatch 'TryDispatchAuthenticatedActionResult|TryTakeFailedAction') 'PowerShell trace cannot bypass authenticated child dispatch or tokened receipt work'
 }
 
 Write-Host 'TrayHost client self-tests passed.'

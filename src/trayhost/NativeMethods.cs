@@ -77,6 +77,7 @@ internal struct TrayPoint
 
 internal interface INativeTrayPlatform
 {
+    void SetMessageHandler(Action<uint, IntPtr, IntPtr> handler);
     IntPtr CreateOwner();
     IntPtr AssociateOwnerInputContext(IntPtr owner, IntPtr context);
     IntPtr GetOwnerInputContext(IntPtr owner);
@@ -113,7 +114,7 @@ internal sealed class Win32TrayPlatform : INativeTrayPlatform
     private Action<uint, IntPtr, IntPtr> _messageHandler;
     private IntPtr _owner;
 
-    internal void SetMessageHandler(Action<uint, IntPtr, IntPtr> handler) { _messageHandler = handler; }
+    public void SetMessageHandler(Action<uint, IntPtr, IntPtr> handler) { _messageHandler = handler; }
 
     public IntPtr CreateOwner()
     {

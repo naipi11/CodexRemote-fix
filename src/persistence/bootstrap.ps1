@@ -94,6 +94,23 @@ function Get-CcodBootstrapCanonicalRoot {
     return $root
 }
 
+function Skip-CcodBootstrapJsonWhitespace {param([string]$Text,[ref]$Index)while($Index.Value-lt$Text.Length-and($Text[$Index.Value]-eq' '-or$Text[$Index.Value]-eq"`t"-or$Text[$Index.Value]-eq"`r"-or$Text[$Index.Value]-eq"`n")){$Index.Value++}}
+function Read-CcodBootstrapJsonStringToken {param([string]$Text,[ref]$Index)if($Index.Value-ge$Text.Length-or$Text[$Index.Value]-ne'"'){throw'json string'};$start=$Index.Value;$Index.Value++;while($Index.Value-lt$Text.Length){$c=$Text[$Index.Value];if($c-eq'"'){$Index.Value++;return $Text.Substring($start,$Index.Value-$start)};if([int][char]$c-lt0x20){throw'json control'};if($c-eq'\'){$Index.Value++;if($Index.Value-ge$Text.Length){throw'json escape'};$escape=$Text[$Index.Value];if($escape-eq'u'){if($Index.Value+4-ge$Text.Length-or$Text.Substring($Index.Value+1,4)-cnotmatch'^[0-9A-Fa-f]{4}$'){throw'json unicode'};$Index.Value+=5;continue};if('"\/bfnrt'.IndexOf($escape)-lt0){throw'json escape'}};$Index.Value++};throw'json string end'}
+function Read-CcodBootstrapJsonValue {
+    param([string]$Text,[ref]$Index)
+    Skip-CcodBootstrapJsonWhitespace $Text $Index
+    if($Index.Value-ge$Text.Length){throw'json value'}
+    if($Text[$Index.Value]-eq'{'){
+        $Index.Value++;Skip-CcodBootstrapJsonWhitespace $Text $Index;$keys=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        if($Index.Value-lt$Text.Length-and$Text[$Index.Value]-eq'}'){$Index.Value++;return}
+        while($true){$encoded=Read-CcodBootstrapJsonStringToken $Text $Index;$key=$encoded|ConvertFrom-Json -ErrorAction Stop;if($key-isnot[string]-or-not$keys.Add($key)){throw'json duplicate'};Skip-CcodBootstrapJsonWhitespace $Text $Index;if($Index.Value-ge$Text.Length-or$Text[$Index.Value]-ne':'){throw'json separator'};$Index.Value++;Read-CcodBootstrapJsonValue $Text $Index;Skip-CcodBootstrapJsonWhitespace $Text $Index;if($Index.Value-ge$Text.Length){throw'json end'};if($Text[$Index.Value]-eq'}'){$Index.Value++;return};if($Text[$Index.Value]-ne','){throw'json delimiter'};$Index.Value++;Skip-CcodBootstrapJsonWhitespace $Text $Index}
+    }
+    if($Text[$Index.Value]-eq'['){$Index.Value++;Skip-CcodBootstrapJsonWhitespace $Text $Index;if($Index.Value-lt$Text.Length-and$Text[$Index.Value]-eq']'){$Index.Value++;return};while($true){Read-CcodBootstrapJsonValue $Text $Index;Skip-CcodBootstrapJsonWhitespace $Text $Index;if($Index.Value-ge$Text.Length){throw'json array end'};if($Text[$Index.Value]-eq']'){$Index.Value++;return};if($Text[$Index.Value]-ne','){throw'json array delimiter'};$Index.Value++}}
+    if($Text[$Index.Value]-eq'"'){[void](Read-CcodBootstrapJsonStringToken $Text $Index);return}
+    $start=$Index.Value;$delimiters=",]} `t`r`n";while($Index.Value-lt$Text.Length-and$delimiters.IndexOf([string]$Text[$Index.Value])-lt0){$Index.Value++};if($Index.Value-eq$start){throw'json scalar'}
+}
+function Assert-CcodBootstrapJsonNoDuplicateKeys {param([string]$Text)$index=0;Read-CcodBootstrapJsonValue $Text ([ref]$index);Skip-CcodBootstrapJsonWhitespace $Text ([ref]$index);if($index-ne$Text.Length){throw'json trailing'}}
+
 function Read-CcodBootstrapJson {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -105,7 +122,9 @@ function Read-CcodBootstrapJson {
     }
     $value = $null
     try {
-        $value = ([IO.File]::ReadAllText($Path) | ConvertFrom-Json)
+        $item=Get-Item -LiteralPath $Path -Force -ErrorAction Stop;if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0-or$item.Length-lt1-or$item.Length-gt1048576){throw'invalid file'}
+        $text=[Text.UTF8Encoding]::new($false,$true).GetString([IO.File]::ReadAllBytes($Path));Assert-CcodBootstrapJsonNoDuplicateKeys $text
+        $value = ($text | ConvertFrom-Json -ErrorAction Stop)
     } catch {
         Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_STATE_MALFORMED' "$Kind is malformed" $Path
     }
@@ -124,8 +143,60 @@ function Assert-CcodBootstrapRuntimeId {
     return $RuntimeId
 }
 
+function Get-CcodBootstrapFileLinkCount {
+    param([Parameter(Mandatory)][string]$Path)
+    if($null-eq('CcodBootstrapFileIdentity' -as[type])){Add-Type -TypeDefinition @'
+using System; using System.ComponentModel; using System.IO; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
+public static class CcodBootstrapFileIdentity {
+ [StructLayout(LayoutKind.Sequential)] struct Info { public uint Attr; public System.Runtime.InteropServices.ComTypes.FILETIME C,A,W; public uint Vol,High,Low,Links,Hi,Lo; }
+ [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetFileInformationByHandle(SafeFileHandle h,out Info i);
+ public static uint Links(string p){using(FileStream s=new FileStream(p,FileMode.Open,FileAccess.Read,FileShare.Read)){Info i;if(!GetFileInformationByHandle(s.SafeFileHandle,out i))throw new Win32Exception(Marshal.GetLastWin32Error());return i.Links;}}
+}
+'@}
+    return [CcodBootstrapFileIdentity]::Links($Path)
+}
+
+function Assert-CcodBootstrapPlainSelectorFile {
+    param([Parameter(Mandatory)][string]$Path)
+    $item=Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if($item.PSIsContainer-or($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne0-or(Get-CcodBootstrapFileLinkCount $Path)-ne1){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector is not a plain single-link file' $Path}
+    $streams=@(Get-Item -LiteralPath $Path -Stream * -ErrorAction Stop)
+    if($streams.Count-ne1-or[string]$streams[0].Stream-cne':$DATA'){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector has alternate data streams' $Path}
+}
+
 function Read-CcodBootstrapActivePointer {
-    param([Parameter(Mandatory)][string]$InstallRoot)
+    param([Parameter(Mandatory)][string]$InstallRoot,[hashtable]$SelectorAdapters)
+
+    try{$stateRoot=Assert-CcodBootstrapContained -Root $InstallRoot -Path (Join-Path $InstallRoot 'state') -AllowMissingLeaf;$pointerRoot=Assert-CcodBootstrapContained -Root $InstallRoot -Path (Join-Path $InstallRoot 'state\active-generation') -AllowMissingLeaf}catch{Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector path is unsafe' (Join-Path $InstallRoot 'state\active-generation')}
+    $pointerRootItem=$null;$pointerRootAbsent=$false;$getSelectorRootItem=if($null-ne$SelectorAdapters-and$SelectorAdapters.ContainsKey('GetSelectorRootItem')){$SelectorAdapters.GetSelectorRootItem}else{{param($Path)Get-Item -LiteralPath $Path -Force -ErrorAction Stop}}
+    $stateRootItem=$null;$stateRootAbsent=$false
+    try{$stateRootItem=&$getSelectorRootItem $stateRoot;if($null-eq$stateRootItem){throw [IO.InvalidDataException]::new('state lookup returned no proof')}}catch [Management.Automation.ItemNotFoundException]{$stateRootAbsent=$true}catch{Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation state ancestor lookup failed' $stateRoot}
+    if(-not$stateRootAbsent-and(-not$stateRootItem.PSIsContainer-or(Test-CcodBootstrapReparse $stateRoot))){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation state ancestor is not a plain directory' $stateRoot}
+    if($stateRootAbsent){$pointerRootAbsent=$true}else{try{$pointerRootItem=&$getSelectorRootItem $pointerRoot;if($null-eq$pointerRootItem){throw [IO.InvalidDataException]::new('selector lookup returned no proof')}}catch [Management.Automation.ItemNotFoundException]{$pointerRootAbsent=$true}catch{Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector root lookup failed' $pointerRoot}}
+    if(-not$pointerRootAbsent-and-not$pointerRootItem.PSIsContainer){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector root is not a directory' $pointerRoot}
+    if(-not$pointerRootAbsent){
+        if(Test-CcodBootstrapReparse $pointerRoot){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector root is a reparse point' $pointerRoot}
+        $entries=@(Get-ChildItem -LiteralPath $pointerRoot -Force -ErrorAction Stop)
+        if($entries.Count-eq0){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector is empty' $pointerRoot}
+        $records=[Collections.Generic.List[object]]::new()
+        foreach($entry in $entries){
+            if($entry.PSIsContainer-or$entry.Name-cnotmatch'^\d{20}\.json$'){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector contains an unknown entry' $entry.FullName}
+            Assert-CcodBootstrapPlainSelectorFile $entry.FullName
+            try{$record=Read-CcodBootstrapJson -Path $entry.FullName -Kind 'active generation selector'}catch{Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector JSON is invalid' $entry.FullName}
+            $names=@($record.PSObject.Properties.Name)
+            if(($names-join',')-cne'schemaVersion,generation,activeRuntime,previousGeneration'-or$record.schemaVersion-isnot[int]-or$record.schemaVersion-ne1-or$record.activeRuntime-isnot[string]){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector fields are invalid' $entry.FullName}
+            $integerTypes=@([byte],[uint16],[uint32],[uint64],[int16],[int32],[int64]);$gOk=$false;$pOk=$false;foreach($t in $integerTypes){if($record.generation-is$t){$gOk=$true};if($record.previousGeneration-is$t){$pOk=$true}}
+            if(-not$gOk-or-not$pOk){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector generations are not integers' $entry.FullName}
+            try{[uint64]$g=$record.generation;[uint64]$p=$record.previousGeneration}catch{Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector generations are invalid' $entry.FullName}
+            if($g-eq0-or$p-eq[uint64]::MaxValue-or$g-ne($p+1)-or$entry.Name-cne('{0:D20}.json'-f$g)){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector record is not canonical' $entry.FullName}
+            Assert-CcodBootstrapRuntimeId $record.activeRuntime|Out-Null
+            $records.Add([pscustomobject]@{Generation=$g;PreviousGeneration=$p;ActiveRuntime=[string]$record.activeRuntime})
+        }
+        $ordered=@($records|Sort-Object Generation)
+        for($i=0;$i-lt$ordered.Count;$i++){if([uint64]$ordered[$i].Generation-ne[uint64]($i+1)-or[uint64]$ordered[$i].PreviousGeneration-ne[uint64]$i){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_POINTER_INVALID' 'Active generation selector chain has a gap or duplicate' $pointerRoot}}
+        $latest=$ordered[-1];$previous=if($latest.PreviousGeneration-gt0){[string]$ordered[[int]$latest.PreviousGeneration-1].ActiveRuntime}else{$null}
+        return [pscustomobject]@{ActiveRuntime=$latest.ActiveRuntime;PreviousRuntime=$previous;SchemaVersion=3;Generation=[uint64]$latest.Generation;Selector='AppendOnly'}
+    }
 
     $path = Assert-CcodBootstrapContained -Root $InstallRoot -Path (Join-Path $InstallRoot 'active.json') -AllowMissingLeaf
     $value = Read-CcodBootstrapJson -Path $path -Kind 'active.json'
@@ -157,6 +228,7 @@ function Read-CcodBootstrapActivePointer {
         PreviousRuntime = if ($null -eq $value.previousRuntime -or [string]::IsNullOrWhiteSpace($value.previousRuntime)) { $null } else { [string]$value.previousRuntime }
         SchemaVersion = [int]$value.schemaVersion
         Generation = $generation
+        Selector = 'Legacy'
     }
 }
 
@@ -220,12 +292,14 @@ function Get-CcodBootstrapFileRecords {
 function Get-CcodBootstrapRuntimeId {
     param(
         [Parameter(Mandatory)][string]$ProjectVersion,
-        [Parameter(Mandatory)][object[]]$Files
+        [Parameter(Mandatory)][object[]]$Files,
+        [Parameter(Mandatory)][string]$Nonce
     )
+    if($ProjectVersion-cnotmatch'^[A-Za-z0-9][A-Za-z0-9._-]{0,45}$'-or$Nonce-cnotmatch'^[0-9a-f]{32}$'){Throw-CcodBootstrapError 'CCOD_BOOTSTRAP_RUNTIME_ID_INVALID' 'Runtime identity components are invalid' $ProjectVersion}
 
     $lines = [Collections.Generic.List[string]]::new()
     foreach ($file in $Files) {
-        $lines.Add(('{0}`t{1}`t{2}' -f [string]$file.path, [int64]$file.length, [string]$file.sha256))
+        $lines.Add(("{0}`t{1}`t{2}" -f [string]$file.path, [int64]$file.length, [string]$file.sha256))
     }
     $canonical = $lines -join "`n"
     $sha256 = [Security.Cryptography.SHA256]::Create()
@@ -234,7 +308,7 @@ function Get-CcodBootstrapRuntimeId {
     } finally {
         $sha256.Dispose()
     }
-    return ('{0}-{1}' -f $ProjectVersion, ([BitConverter]::ToString($digest).Replace('-', '')).ToLowerInvariant().Substring(0, 16))
+    return ('{0}-{1}-{2}' -f $ProjectVersion, ([BitConverter]::ToString($digest).Replace('-', '')).ToLowerInvariant().Substring(0, 16),$Nonce)
 }
 
 function New-CcodBootstrapRuntimeValidation {
@@ -278,7 +352,7 @@ function Test-CcodBootstrapRuntime {
             return New-CcodBootstrapRuntimeValidation -Valid $false -Code 'CCOD_BOOTSTRAP_MANIFEST_INVALID' -RuntimeDirectory $runtimeDirectory -SupervisorPath $null
         }
         $manifestRuntimeId = [string]$manifest.runtimeId
-        if ($manifestRuntimeId -cnotmatch '^[A-Za-z0-9._-]{1,96}$' -or $manifestRuntimeId -cne $RuntimeId) {
+        if ($manifestRuntimeId -cnotmatch'^(?<version>[A-Za-z0-9][A-Za-z0-9._-]{0,45})-(?<digest>[0-9a-f]{16})-(?<nonce>[0-9a-f]{32})$'-or$Matches.version-cne[string]$manifest.projectVersion-or $manifestRuntimeId -cne $RuntimeId) {
             return New-CcodBootstrapRuntimeValidation -Valid $false -Code 'CCOD_BOOTSTRAP_RUNTIME_ID_MISMATCH' -RuntimeDirectory $runtimeDirectory -SupervisorPath $null
         }
 
@@ -323,7 +397,8 @@ function Test-CcodBootstrapRuntime {
                 return New-CcodBootstrapRuntimeValidation -Valid $false -Code 'CCOD_BOOTSTRAP_FILE_HASH_MISMATCH' -RuntimeDirectory $runtimeDirectory -SupervisorPath $null
             }
         }
-        $computedRuntimeId = Get-CcodBootstrapRuntimeId -ProjectVersion ([string]$manifest.projectVersion) -Files $actualFiles
+        $identityMatch=[regex]::Match($manifestRuntimeId,'^(?<version>[A-Za-z0-9][A-Za-z0-9._-]{0,45})-(?<digest>[0-9a-f]{16})-(?<nonce>[0-9a-f]{32})$')
+        $computedRuntimeId = Get-CcodBootstrapRuntimeId -ProjectVersion ([string]$manifest.projectVersion) -Files $actualFiles -Nonce $identityMatch.Groups['nonce'].Value
         $requiredRuntimeFiles = @('src/persistence/Supervisor.ps1')
         if ($computedRuntimeId -cne $manifestRuntimeId -or @($requiredRuntimeFiles | Where-Object { -not $manifestPaths.Contains($_) }).Count -ne 0) {
             return New-CcodBootstrapRuntimeValidation -Valid $false -Code 'CCOD_BOOTSTRAP_RUNTIME_ID_MISMATCH' -RuntimeDirectory $runtimeDirectory -SupervisorPath $null
@@ -345,7 +420,7 @@ function Import-CcodBootstrapKernelObjects {
     )
 
     $candidates = @([string]$Pointer.ActiveRuntime)
-    if ($null -ne $Pointer.PreviousRuntime -and $Pointer.PreviousRuntime -cne $Pointer.ActiveRuntime) {
+    if ($Pointer.Selector -ceq 'Legacy' -and $null -ne $Pointer.PreviousRuntime -and $Pointer.PreviousRuntime -cne $Pointer.ActiveRuntime) {
         $candidates += [string]$Pointer.PreviousRuntime
     }
 
@@ -842,7 +917,7 @@ try {
 
     $pointer = Read-CcodBootstrapActivePointer -InstallRoot $root
     $candidates = @($pointer.ActiveRuntime)
-    if ($null -ne $pointer.PreviousRuntime -and $pointer.PreviousRuntime -cne $pointer.ActiveRuntime) {
+    if ($pointer.Selector -ceq 'Legacy' -and $null -ne $pointer.PreviousRuntime -and $pointer.PreviousRuntime -cne $pointer.ActiveRuntime) {
         $candidates += $pointer.PreviousRuntime
     }
 
@@ -868,7 +943,7 @@ try {
         $launchLease = $null
         $outcome = Wait-CcodBootstrapReady -Event $readyEvent -Process $child -TimeoutSeconds $ReadyTimeoutSeconds
         if ($outcome -ceq 'Ready') {
-            if ($runtimeId -cne $pointer.ActiveRuntime) {
+            if ($pointer.Selector -ceq 'Legacy' -and $runtimeId -cne $pointer.ActiveRuntime) {
                 $updated = Invoke-CcodBootstrapFencedPointerPromotion -InstallRoot $root -Pointer $pointer -Validation $validation -NewRuntimeId $runtimeId -UserSid $userSid -SessionId $sessionId
                 Write-CcodBootstrapLog -InstallRoot $root -Message ("Runtime {0} signaled ready; active pointer switched from {1}" -f $runtimeId, $pointer.ActiveRuntime)
             }

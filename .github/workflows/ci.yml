@@ -16,13 +16,17 @@ jobs:
   validate:
     name: Windows validation
     runs-on: windows-latest
-    timeout-minutes: 20
+    # The full repository validation runs 43 persistence suites sequentially in
+    # Windows PowerShell child processes. On a hosted runner that takes about 33
+    # minutes, so the job limit must cover it with margin for the lifecycle,
+    # release-contract and TrayHost steps that follow.
+    timeout-minutes: 90
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22
 
@@ -49,3 +53,7 @@ jobs:
       - name: Run production TrayHost smoke test
         shell: pwsh
         run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionOnly
+
+      - name: Run authenticated TrayHost production trace
+        shell: pwsh
+        run: ./tests/trayhost/Invoke-TrayHostSelfTest.ps1 -ProductionTraceOnly
