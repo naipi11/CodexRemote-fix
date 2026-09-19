@@ -11,11 +11,21 @@ jobs:
   probe:
     name: Build probe
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
-      - name: Probe the build script
+      - name: Probe under PowerShell 7
+        if: always()
         shell: pwsh
-        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./tests/persistence/tmp-build-probe.ps1
+        run: |
+          pwsh -NoProfile -File ./tests/persistence/tmp-build-probe.ps1
+          exit 0
+
+      - name: Probe under Windows PowerShell 5.1
+        if: always()
+        shell: pwsh
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./tests/persistence/tmp-build-probe.ps1
+          exit 0
