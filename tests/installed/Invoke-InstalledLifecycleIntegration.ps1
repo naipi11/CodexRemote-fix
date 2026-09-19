@@ -1758,16 +1758,27 @@ function Start-CcodInstalledLifecycleVerifiedUninstall {
         $start.Arguments='-NoLogo -NoProfile -NonInteractive -File "'+$entry+'" -VerifiedUninstallChild -AllowMachineMutation -AllowCodexRestart'
         $start.UseShellExecute=$false;$start.CreateNoWindow=$true
         $start.RedirectStandardInput=$true;$start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
+        # Windows PowerShell 5.1 has no StandardInputEncoding, so the child must own
+        # its input decoding: the default stdin writer can emit a UTF-8 BOM that a
+        # legacy console input page would then decode into a corrupt first token.
         $start.StandardOutputEncoding=[Text.UTF8Encoding]::new($false)
         $start.StandardErrorEncoding=[Text.UTF8Encoding]::new($false)
         [void]$start.EnvironmentVariables.Remove('PSExecutionPolicyPreference')
         Assert-CcodInstalledLifecycleExecutionLease $sourceLease
         $process=[Diagnostics.Process]::Start($start)
         $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
-        $process.StandardInput.Write($inputJson);$process.StandardInput.Close()
+        # Write explicit UTF-8 bytes with no byte-order mark: Windows PowerShell 5.1
+        # cannot pin ProcessStartInfo.StandardInputEncoding, so the inherited console
+        # page could otherwise prepend a BOM and corrupt the child's first JSON token.
+        $inputBytes=[Text.UTF8Encoding]::new($false).GetBytes($inputJson)
+        $process.StandardInput.BaseStream.Write($inputBytes,0,$inputBytes.Length)
+        $process.StandardInput.BaseStream.Flush()
+        $process.StandardInput.Close()
         if (-not $process.WaitForExit(600000)) { throw 'verified uninstall child timeout' }
         $output=$stdout.GetAwaiter().GetResult();$errorOutput=$stderr.GetAwaiter().GetResult()
-        if ($process.ExitCode -ne 0 -or $output -cne ('CCOD_UNINSTALL_WRAPPER_COMPLETED'+[Environment]::NewLine) -or $errorOutput.Length -ne 0) { throw 'verified uninstall child result' }
+        if ($process.ExitCode -ne 0 -or $output -cne ('CCOD_UNINSTALL_WRAPPER_COMPLETED'+[Environment]::NewLine) -or $errorOutput.Length -ne 0) {
+            throw 'verified uninstall child result'
+        }
         Assert-CcodInstalledLifecycleExecutionLease $sourceLease
         return [pscustomobject]@{ExitCode=0}
     } catch { Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_INSTALLER_FAILED' 'The verified uninstall child did not complete its wrapper handoff.' $null }
@@ -2286,12 +2297,11 @@ if ($VerifiedUninstallChild) {
             Throw-CcodInstalledLifecycleError 'CCOD_INTEGRATION_MUTATION_NOT_ALLOWED' 'The uninstall child requires both explicit mutation and restart authorization.' $null
         }
         [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
-        $text=[Text.StringBuilder]::new();$buffer=[char[]]::new(4096)
-        while (($length=[Console]::In.Read($buffer,0,$buffer.Length)) -gt 0) {
-            if ($text.Length+$length -gt 1048576) { throw 'uninstall input bounds' }
-            [void]$text.Append($buffer,0,$length)
-        }
-        $json=$text.ToString()
+        # Read the wrapper input as explicit UTF-8 bytes instead of the ambient
+        # console code page, and tolerate an optional byte-order mark.
+        $reader=[IO.StreamReader]::new([Console]::OpenStandardInput(),[Text.UTF8Encoding]::new($false),$true)
+        try{$json=$reader.ReadToEnd()}finally{$reader.Dispose()}
+        if ($json.Length -gt 1048576) { throw 'uninstall input bounds' }
         if (-not (& $script:CcodInstalledLifecyclePersistenceIoModule {param($Json) Test-CcodJsonHasNoDuplicateProperties -Json $Json} $json)) { throw 'duplicate uninstall input' }
         $spec=$json|ConvertFrom-Json -ErrorAction Stop
         $expectedRoot=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'CodexControlOtherDevices'))

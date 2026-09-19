@@ -202,7 +202,7 @@ function Assert-CcodAuthenticatedTraceWorkflowContract {
 }
 
 function New-CcodPortableReleaseFixture {
-    $root = Join-Path $env:TEMP ('ccod-portable-release-workflow-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-portable-release-workflow-' + [guid]::NewGuid().ToString('N'))
     $stage = Join-Path $root 'stage'
     $payload = Join-Path $stage 'payload'
     [IO.Directory]::CreateDirectory($payload) | Out-Null

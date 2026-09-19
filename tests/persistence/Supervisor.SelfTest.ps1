@@ -656,7 +656,10 @@ Invoke-CcodTest 'SafeExit refuses UI shutdown when its correlated terminal resul
 }
 
 Invoke-CcodTest 'recovered language failure history remains readable by the installed Ready collector' {
-    $root=Join-Path $env:TEMP ('ccod-language-ready-history-'+[guid]::NewGuid().ToString('N'))
+    # $env:TEMP can be a Windows 8.3 short-name alias such as C:\Users\RUNNER~1\AppData\Local\Temp
+    # on hosted runners, and the installed Ready collector rejects noncanonical evidence paths.
+    $tempRoot = [IO.Path]::GetFullPath(([IO.Path]::GetTempPath()).TrimEnd('\'))
+    $root=Join-Path $tempRoot ('ccod-language-ready-history-'+[guid]::NewGuid().ToString('N'))
     $integration=$null
     try {
         [IO.Directory]::CreateDirectory((Join-Path $root 'logs'))|Out-Null

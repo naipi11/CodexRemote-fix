@@ -40,6 +40,51 @@ function Get-CcodTestFileSha256 {
     }
 }
 
+function Write-CcodTestProcessInput {
+    # Windows PowerShell 5.1 has no ProcessStartInfo.StandardInputEncoding, and
+    # Process.StandardInput inherits Console.InputEncoding. Under a UTF-8 console
+    # (for example chcp 65001 on a hosted runner) that writer emits a leading
+    # byte-order mark, which corrupts the first token a child reads. Write explicit
+    # UTF-8 bytes without a BOM instead.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Process,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [switch]$AddNewLine
+    )
+    $payload = if ($AddNewLine) { $Text + "`n" } else { $Text }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($payload)
+    $stream = $Process.StandardInput.BaseStream
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush()
+}
+
+function Read-CcodTestStandardInputText {
+    # Read standard input as explicit UTF-8 bytes and tolerate an optional
+    # byte-order mark, so a child handshake survives any ambient console page.
+    [CmdletBinding()]
+    param()
+    $reader = [IO.StreamReader]::new([Console]::OpenStandardInput(), [Text.UTF8Encoding]::new($false), $true)
+    try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+}
+
+function Read-CcodTestStandardInputLine {
+    # Read one standard input line without depending on the ambient console page.
+    [CmdletBinding()]
+    param()
+    $reader = [IO.StreamReader]::new([Console]::OpenStandardInput(), [Text.UTF8Encoding]::new($false), $true)
+    try { return $reader.ReadLine() } finally { $reader.Dispose() }
+}
+
+function Get-CcodTestCanonicalTempRoot {
+    # $env:TEMP can be a Windows 8.3 short-name alias such as
+    # C:\Users\RUNNER~1\AppData\Local\Temp on hosted runners. Fixture roots
+    # built from the alias are rejected by the installed lifecycle harness, which
+    # requires canonical long-form paths. Canonicalize once so every fixture root is
+    # already canonical and owned-tree cleanup still matches its allowlist.
+    return [IO.Path]::GetFullPath(([IO.Path]::GetTempPath()).TrimEnd('\'))
+}
+
 function Remove-CcodTestOwnedTree {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)

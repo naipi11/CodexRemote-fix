@@ -5,7 +5,7 @@ $repositoryRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $harnessPath = Join-Path $repositoryRoot 'tests\installed\Invoke-InstalledLifecycleIntegration.ps1'
 
 function New-CcodHarnessFixture {
-    $root = Join-Path $env:TEMP ('ccod-installed-harness-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-installed-harness-' + [guid]::NewGuid().ToString('N'))
     $null = [IO.Directory]::CreateDirectory($root)
     $installer = Join-Path $root 'CodexRemote-fix-2.5.0-setup.exe'
     [IO.File]::WriteAllBytes($installer, [byte[]](1,2,3,4,5,6,7,8))
@@ -527,7 +527,7 @@ Invoke-CcodTest 'rejects FreshRestart without current Active status Idle transit
 # Production mutation caught: querying Codex.exe instead of the Windows app root ChatGPT.exe.
 Invoke-CcodTest 'captures exactly the top-level ChatGPT root and excludes Electron type children' {
     . $harnessPath -Library
-    $root = Join-Path $env:TEMP ('ccod-installed-capture-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-installed-capture-' + [guid]::NewGuid().ToString('N'))
     try {
         $null = [IO.Directory]::CreateDirectory($root)
         $created = '2026-08-24T00:00:04.0000006Z'
@@ -549,7 +549,7 @@ Invoke-CcodTest 'captures exactly the top-level ChatGPT root and excludes Electr
 
 Invoke-CcodTest 'normalizes only supported CIM creation-time evidence for complete ChatGPT roots' {
     . $harnessPath -Library
-    $root = Join-Path $env:TEMP ('ccod-installed-cim-creation-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-installed-cim-creation-' + [guid]::NewGuid().ToString('N'))
     try {
         $null = [IO.Directory]::CreateDirectory($root)
         $commandLine = '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe"'
@@ -593,7 +593,7 @@ Invoke-CcodTest 'normalizes only supported CIM creation-time evidence for comple
 Invoke-CcodTest 'fails closed when any enumerated ChatGPT process cannot be proven root or Electron child' {
     . $harnessPath -Library
     foreach($case in @('null command line','empty command line','unparsable command line','invalid creation time','zero PID','string PID','nonstring command line','missing command line')){
-        $root=Join-Path $env:TEMP ("ccod-installed-indeterminate-$($case.Replace(' ','-'))-"+[guid]::NewGuid().ToString('N'))
+        $root=Join-Path (Get-CcodTestCanonicalTempRoot) ("ccod-installed-indeterminate-$($case.Replace(' ','-'))-"+[guid]::NewGuid().ToString('N'))
         try{
             $null=[IO.Directory]::CreateDirectory($root)
             $valid=New-CcodHarnessCimProcess -Name 'ChatGPT.exe' -ProcessId 13948 -CreationTimeUtc '2026-08-24T00:00:04.0000000Z' -CommandLine '"C:\Program Files\WindowsApps\OpenAI.Codex\ChatGPT.exe"'
@@ -619,7 +619,7 @@ Invoke-CcodTest 'fails closed when any enumerated ChatGPT process cannot be prov
 
 Invoke-CcodTest 'captures bounded current-runtime status transition and latest installer receipt facts from complete schemas' {
     . $harnessPath -Library
-    $root = Join-Path $env:TEMP ('ccod-installed-state-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-installed-state-' + [guid]::NewGuid().ToString('N'))
     try {
         $null = [IO.Directory]::CreateDirectory($root)
         New-CcodHarnessInstalledStateFixture -Root $root -ActiveRuntimeId '2.5.21-e3b0c44298fc1c14-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' -ActiveGeneration ([UInt64]8) `
@@ -651,7 +651,7 @@ Invoke-CcodTest 'captures bounded current-runtime status transition and latest i
 
 Invoke-CcodTest 'selects only an unambiguous latest current-runtime installer restart receipt' {
     . $harnessPath -Library
-    $root = Join-Path $env:TEMP ('ccod-installed-receipts-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-installed-receipts-' + [guid]::NewGuid().ToString('N'))
     try {
         $null = [IO.Directory]::CreateDirectory($root)
         New-CcodHarnessInstalledStateFixture -Root $root -ActiveRuntimeId '2.5.21-e3b0c44298fc1c14-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' -ActiveGeneration ([UInt64]8) `
@@ -678,7 +678,7 @@ Invoke-CcodTest 'selects only an unambiguous latest current-runtime installer re
 # Production mutation caught: choosing latest by runtime before filtering the active generation.
 Invoke-CcodTest 'ignores a newer wrong-generation receipt when selecting the current-generation terminal result' {
     . $harnessPath -Library
-    $root = Join-Path $env:TEMP ('ccod-installed-receipt-generation-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-installed-receipt-generation-' + [guid]::NewGuid().ToString('N'))
     try {
         $null = [IO.Directory]::CreateDirectory($root)
         New-CcodHarnessInstalledStateFixture -Root $root -ActiveRuntimeId '2.5.21-e3b0c44298fc1c14-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' -ActiveGeneration ([UInt64]8) `
@@ -698,7 +698,7 @@ Invoke-CcodTest 'ignores a newer wrong-generation receipt when selecting the cur
 
 Invoke-CcodTest 'does not treat tied wrong-generation receipts as current-generation ambiguity' {
     . $harnessPath -Library
-    $root = Join-Path $env:TEMP ('ccod-installed-receipt-generation-tie-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-installed-receipt-generation-tie-' + [guid]::NewGuid().ToString('N'))
     try {
         $null = [IO.Directory]::CreateDirectory($root)
         New-CcodHarnessInstalledStateFixture -Root $root -ActiveRuntimeId '2.5.21-e3b0c44298fc1c14-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' -ActiveGeneration ([UInt64]8) `
@@ -721,7 +721,7 @@ Invoke-CcodTest 'does not treat tied wrong-generation receipts as current-genera
 Invoke-CcodTest 'fails closed on receipt filename duplicate-property and nonterminal boundaries' {
     . $harnessPath -Library
     foreach ($case in @('filename','duplicate-json','nonterminal')) {
-        $root = Join-Path $env:TEMP ("ccod-installed-receipt-$case-" + [guid]::NewGuid().ToString('N'))
+        $root = Join-Path (Get-CcodTestCanonicalTempRoot) ("ccod-installed-receipt-$case-" + [guid]::NewGuid().ToString('N'))
         try {
             $null = [IO.Directory]::CreateDirectory($root)
             New-CcodHarnessInstalledStateFixture -Root $root -ActiveRuntimeId '2.5.21-e3b0c44298fc1c14-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' -ActiveGeneration ([UInt64]8) `
@@ -780,7 +780,7 @@ Invoke-CcodTest 'lifecycle receipt inspection rejects non-json residue and non-p
 Invoke-CcodTest 'fails closed on malformed active status and transition schemas' {
     . $harnessPath -Library
     foreach ($case in @('active','status','transition')) {
-        $root = Join-Path $env:TEMP ("ccod-installed-state-$case-" + [guid]::NewGuid().ToString('N'))
+        $root = Join-Path (Get-CcodTestCanonicalTempRoot) ("ccod-installed-state-$case-" + [guid]::NewGuid().ToString('N'))
         try {
             $null = [IO.Directory]::CreateDirectory($root)
             New-CcodHarnessInstalledStateFixture -Root $root -ActiveRuntimeId '2.5.21-e3b0c44298fc1c14-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' -ActiveGeneration ([UInt64]8) `
@@ -815,7 +815,7 @@ Invoke-CcodTest 'fails closed on malformed active status and transition schemas'
 # Production mutation caught: treating a Codex.exe-only observation as installed app process evidence.
 Invoke-CcodTest 'does not accept a Codex.exe-only fixture as Codex process evidence' {
     . $harnessPath -Library
-    $root = Join-Path $env:TEMP ('ccod-installed-capture-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-installed-capture-' + [guid]::NewGuid().ToString('N'))
     try {
         $null = [IO.Directory]::CreateDirectory($root)
         Set-CcodHarnessProcessFixture -ChatGPT @() -Codex @(
@@ -831,7 +831,7 @@ Invoke-CcodTest 'does not accept a Codex.exe-only fixture as Codex process evide
 
 Invoke-CcodTest 'sealed direct uninstall launches the active public uninstaller rather than removed Inno executable' {
     . $harnessPath -Library
-    $root=Join-Path $env:TEMP ('ccod-modern-uninstall-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-modern-uninstall-'+[guid]::NewGuid().ToString('N'))
     $originalStart=${function:Start-Process};$originalAck=${function:Read-CcodInstalledLifecycleOperatorAck}
     $originalCommand=${function:Get-CcodInstalledLifecycleUninstallCommand}
     $originalLaunch=${function:Start-CcodInstalledLifecycleVerifiedUninstall}
@@ -871,7 +871,7 @@ Invoke-CcodTest 'public finalizer launch arguments round trip through native par
     foreach($converter in $converters){. ([scriptblock]::Create($converter.Extent.Text))}
     $launchArguments=@($ast.FindAll({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left-is[Management.Automation.Language.VariableExpressionAst]-and$node.Left.VariablePath.UserPath-ceq'arguments'},$true))
     Assert-CcodEqual 2 $launchArguments.Count 'installed and portable native argument builders are uniquely identified'
-    $root=Join-Path $env:TEMP ('ccod native args '+[char]0x6d4b+[char]0x8bd5+" O'Brien "+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod native args '+[char]0x6d4b+[char]0x8bd5+" O'Brien "+[guid]::NewGuid().ToString('N'))
     $powershellPath=Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'WindowsPowerShell/v1.0/powershell.exe'
     $oldPolicy=[Environment]::GetEnvironmentVariable('PSExecutionPolicyPreference','Process')
     try {
@@ -933,7 +933,7 @@ Invoke-CcodTest 'public uninstall bootstrap invocation returns the actual functi
     Assert-CcodEqual 1 $tail.Count 'actual CLI-only entry is unambiguous'
     $calls=@($publicAst.FindAll({param($Node)$Node-is[Management.Automation.Language.AssignmentStatementAst]-and$Node.Left-is[Management.Automation.Language.VariableExpressionAst]-and$Node.Left.VariablePath.UserPath-ceq'prepared'},$true))
     Assert-CcodEqual 2 $calls.Count 'installed and portable actual caller expressions are exercised'
-    $root=Join-Path $env:TEMP ('ccod-bootstrap-receipt-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-bootstrap-receipt-'+[guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($root)|Out-Null
     try {
         $bootstrapPath=Join-Path $root 'bootstrap.ps1';$installerRoot=$root;$expectedInstallRoot=Join-Path $root 'install'
@@ -960,7 +960,7 @@ function Invoke-CcodUninstallBootstrap {
 
 Invoke-CcodTest 'direct uninstall never consumes a substituted dependency after resolution' {
     . $harnessPath -Library
-    $root=Join-Path $env:TEMP ('ccod-uninstall-consumption-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-uninstall-consumption-'+[guid]::NewGuid().ToString('N'))
     $originalFacts=${function:Get-CcodInstalledLifecycleFacts};$originalActive=${function:Read-CcodInstalledLifecycleActiveFact}
     $originalStart=${function:Start-Process};$originalAck=${function:Read-CcodInstalledLifecycleOperatorAck}
     $originalLaunch=${function:Start-CcodInstalledLifecycleVerifiedUninstall}
@@ -1009,7 +1009,7 @@ Invoke-CcodTest 'direct uninstall never consumes a substituted dependency after 
 
 Invoke-CcodTest 'verified uninstall launcher uses normal-policy native process and exact completion framing' {
     . $harnessPath -Library
-    $root=Join-Path $env:TEMP ('ccod child '+[char]0x6d4b+[char]0x8bd5+" O'Brien "+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod child '+[char]0x6d4b+[char]0x8bd5+" O'Brien "+[guid]::NewGuid().ToString('N'))
     $oldRoot=$script:CcodInstalledLifecycleRepositoryRoot
     try {
         foreach($relative in @('tests/installed','tools','src/persistence/modules')){[IO.Directory]::CreateDirectory((Join-Path $root $relative))|Out-Null}
@@ -1020,7 +1020,9 @@ Invoke-CcodTest 'verified uninstall launcher uses normal-policy native process a
 param([switch]$VerifiedUninstallChild,[switch]$AllowMachineMutation,[switch]$AllowCodexRestart)
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
-$spec=[Console]::In.ReadToEnd()|ConvertFrom-Json
+$reader=[IO.StreamReader]::new([Console]::OpenStandardInput(),[Text.UTF8Encoding]::new($false),$true)
+$raw=$reader.ReadToEnd();$reader.Dispose()
+$spec=$raw|ConvertFrom-Json
 if(-not$VerifiedUninstallChild){throw 'child mode missing'}
 if(-not[string]::IsNullOrEmpty($env:PSExecutionPolicyPreference)){throw 'inherited policy override'}
 $root=Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
@@ -1050,7 +1052,7 @@ Invoke-CcodTest 'native uninstall child requires both machine and host restart a
     Assert-CcodEqual 0 @($errors).Count 'real child entry parses'
     $tail=@($ast.EndBlock.Statements|Where-Object {$_-is[Management.Automation.Language.IfStatementAst]-and$_.Extent.Text.StartsWith('if ($VerifiedUninstallChild)')})
     Assert-CcodEqual 1 $tail.Count 'one actual native child dispatch is selected'
-    $root=Join-Path $env:TEMP ('ccod-child-consent-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-child-consent-'+[guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($root)|Out-Null
     try {
         $probe=Join-Path $root 'child.ps1'
@@ -1070,7 +1072,7 @@ function Invoke-CcodInstalledLifecycleVerifiedUninstall {param($Spec)[IO.File]::
             $child=[Diagnostics.Process]::Start($start)
             try {
                 $output=$child.StandardOutput.ReadToEndAsync();$errorOutput=$child.StandardError.ReadToEndAsync()
-                $child.StandardInput.Write(($spec|ConvertTo-Json -Compress));$child.StandardInput.Close()
+                Write-CcodTestProcessInput -Process $child -Text ($spec|ConvertTo-Json -Compress);$child.StandardInput.Close()
                 Assert-CcodTrue ($child.WaitForExit(15000)) 'inert child gate completes'
                 $authorized=$arguments-ceq' -AllowMachineMutation -AllowCodexRestart'
                 Assert-CcodEqual $authorized ([IO.File]::Exists((Join-Path $root 'consumed.txt'))) 'only both explicit consents allow reaching the consumer'
@@ -1083,7 +1085,7 @@ function Invoke-CcodInstalledLifecycleVerifiedUninstall {param($Spec)[IO.File]::
 
 Invoke-CcodTest 'native verified consumer retains dependencies until wrapper return and releases before process exit' {
     . $harnessPath -Library
-    $root=Join-Path $env:TEMP ('ccod-consumer-native-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-consumer-native-'+[guid]::NewGuid().ToString('N'))
     $child=$null
     try {
         $runtimeId='2.5.22-'+('a'*16)+'-'+('b'*32);$runtime=Join-Path $root ('runtime\'+$runtimeId)
@@ -1097,7 +1099,8 @@ try{[IO.Directory]::Move($PSScriptRoot,$PSScriptRoot+'-moved')}catch [IO.IOExcep
 . (Join-Path $PSScriptRoot 'src/persistence/UninstallBootstrap.ps1')
 if($bootstrapProof-cne'original-bootstrap'){throw 'changed bootstrap consumed'}
 [Console]::Out.WriteLine('CCOD_HELD='+$blocked);[Console]::Out.Flush()
-if([Console]::In.ReadLine()-cne'continue'){throw 'handshake failed'}
+$reader=[IO.StreamReader]::new([Console]::OpenStandardInput(),[Text.UTF8Encoding]::new($false),$true)
+if($reader.ReadLine()-cne'continue'){throw 'handshake failed'}
 [pscustomobject][ordered]@{Outcome='InstalledFinalizationStarted';TransactionId='11111111-2222-3333-4444-555555555555';FinalizerProcessId=[int]$PID;KeptDeviceKeyStore=$true}
 '@
         [IO.File]::WriteAllText($wrapper,$body,[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllText($dependency,'$bootstrapProof=''original-bootstrap''')
@@ -1131,7 +1134,7 @@ if($result.Outcome-cne'InstalledFinalizationStarted'){throw 'wrong completion'}
         Assert-CcodTrue ($line.Wait(20000)) 'real consumer reaches the explicit held checkpoint'
         Assert-CcodEqual 'CCOD_HELD=3' $line.Result 'actual child cannot rewrite wrapper dependency or ancestor while executing'
         $blocked=$false;try{[IO.File]::WriteAllText($dependency,'outside writer')}catch [IO.IOException]{$blocked=$true};Assert-CcodTrue $blocked 'parent also cannot alter held dependency'
-        $child.StandardInput.WriteLine('continue');$child.StandardInput.Close();$rest=$child.StandardOutput.ReadToEndAsync()
+        Write-CcodTestProcessInput -Process $child -Text 'continue' -AddNewLine;$child.StandardInput.Close();$rest=$child.StandardOutput.ReadToEndAsync()
         Assert-CcodTrue ($child.WaitForExit(20000)) 'actual consumer exits after dependency handoff'
         Assert-CcodEqual 0 $child.ExitCode ('real consumer failure: '+$errors.Result)
         Assert-CcodEqual ('CCOD_RELEASED_BEFORE_EXIT'+[Environment]::NewLine) $rest.Result 'directory authority is released before wrapper process exit'
@@ -1141,7 +1144,7 @@ if($result.Outcome-cne'InstalledFinalizationStarted'){throw 'wrong completion'}
 }
 
 Invoke-CcodTest 'staged uninstall dependency cannot change at its real module import boundary' {
-    $root=Join-Path $env:TEMP ('ccod-stage-load-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-stage-load-'+[guid]::NewGuid().ToString('N'))
     $module=$null;$loaded=$null
     try {
         $payload=Join-Path $root 'payload';$modules=Join-Path $payload 'src/persistence/modules'
@@ -1177,7 +1180,7 @@ Invoke-CcodTest 'staged uninstall dependency cannot change at its real module im
 }
 
 Invoke-CcodTest 'public installed finalizer retains staged bytes through native child acquisition' {
-    $root=Join-Path $env:TEMP ('ccod-finalizer-launch-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-finalizer-launch-'+[guid]::NewGuid().ToString('N'))
     $originalStart=${function:Start-Process};$process=$null
     $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repositoryRoot 'Uninstall-CodexControlOtherDevices.ps1'),[ref]$tokens,[ref]$errors)
     Assert-CcodEqual 0 @($errors).Count 'public wrapper parses'
@@ -1232,7 +1235,7 @@ try {
 }
 
 Invoke-CcodTest 'default finalizer pins its staged closure before validating the envelope' {
-    $root=Join-Path $env:TEMP ('ccod-finalizer-c-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-finalizer-c-'+[guid]::NewGuid().ToString('N'))
     $previous=[Environment]::GetEnvironmentVariable('LOCALAPPDATA','Process');$module=$null
     try {
         [Environment]::SetEnvironmentVariable('LOCALAPPDATA',$root,'Process')
@@ -1277,7 +1280,7 @@ Invoke-CcodTest 'default finalizer never treats an unavailable wrapper observati
         $identity=[pscustomobject]@{pid=[int]$current.Id;creationTimeUtc=$current.StartTime.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture);sessionId=[int]$current.SessionId;userSid=[string]$windowsIdentity.User.Value}
         $control=&$module {
             param($Identity)
-            $adapters=Get-CcodInstalledFinalizerAdapters -TransactionRoot $env:TEMP -PayloadRoot $env:TEMP -RuntimeRoot $env:TEMP -InstallRoot $env:TEMP
+            $adapters=Get-CcodInstalledFinalizerAdapters -TransactionRoot (Get-CcodTestCanonicalTempRoot) -PayloadRoot (Get-CcodTestCanonicalTempRoot) -RuntimeRoot (Get-CcodTestCanonicalTempRoot) -InstallRoot (Get-CcodTestCanonicalTempRoot)
             &$adapters.WaitWrapperExit $Identity 0
         } $identity
         Assert-CcodTrue $control.verifiedAtStart 'real current wrapper identity is observable'
@@ -1292,7 +1295,7 @@ Invoke-CcodTest 'default finalizer never treats an unavailable wrapper observati
         $child.Dispose();$child=$null
         $exited=&$module {
             param($Identity)
-            $adapters=Get-CcodInstalledFinalizerAdapters -TransactionRoot $env:TEMP -PayloadRoot $env:TEMP -RuntimeRoot $env:TEMP -InstallRoot $env:TEMP
+            $adapters=Get-CcodInstalledFinalizerAdapters -TransactionRoot (Get-CcodTestCanonicalTempRoot) -PayloadRoot (Get-CcodTestCanonicalTempRoot) -RuntimeRoot (Get-CcodTestCanonicalTempRoot) -InstallRoot (Get-CcodTestCanonicalTempRoot)
             &$adapters.WaitWrapperExit $Identity 1000
         } $exitedIdentity
         Assert-CcodTrue ($exited.verifiedAtStart-and$exited.exited) 'exact native process-not-found proves the already exited wrapper is absent'
@@ -1314,7 +1317,7 @@ Invoke-CcodTest 'default finalizer never treats an unavailable wrapper observati
                 try {
                     $result=&$module {
                         param($Identity)
-                        $adapters=Get-CcodInstalledFinalizerAdapters -TransactionRoot $env:TEMP -PayloadRoot $env:TEMP -RuntimeRoot $env:TEMP -InstallRoot $env:TEMP
+                        $adapters=Get-CcodInstalledFinalizerAdapters -TransactionRoot (Get-CcodTestCanonicalTempRoot) -PayloadRoot (Get-CcodTestCanonicalTempRoot) -RuntimeRoot (Get-CcodTestCanonicalTempRoot) -InstallRoot (Get-CcodTestCanonicalTempRoot)
                         &$adapters.WaitWrapperExit $Identity 1000
                     } $identity
                 } catch {$failure=$_}
@@ -1359,7 +1362,7 @@ Invoke-CcodTest 'actual product module naming warning does not pollute the verif
 
 Invoke-CcodTest 'sealed uninstall resolver requires active manifest file identity' {
     . $harnessPath -Library
-    $root=Join-Path $env:TEMP ('ccod-uninstall-resolver-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-uninstall-resolver-'+[guid]::NewGuid().ToString('N'))
     $originalFacts=${function:Get-CcodInstalledLifecycleFacts};$originalActive=${function:Read-CcodInstalledLifecycleActiveFact}
     try {
         $runtimeId='2.5.22-'+('a'*16)+'-'+('b'*32);$runtime=Join-Path $root ('runtime\'+$runtimeId)
@@ -1389,7 +1392,7 @@ Invoke-CcodTest 'sealed uninstall resolver requires active manifest file identit
 
 Invoke-CcodTest 'sealed payload comparison validates generated shortcuts rather than ignoring extras' {
     . $harnessPath -Library
-    $root=Join-Path $env:TEMP ('ccod-product-proof-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-product-proof-'+[guid]::NewGuid().ToString('N'))
     $original=${function:Get-CcodInstalledLifecycleProductState}
     try {
         $payload=@([pscustomobject][ordered]@{path='package.json';length=[long]25;sha256=('a'*64)})
@@ -1410,7 +1413,7 @@ Invoke-CcodTest 'sealed payload comparison validates generated shortcuts rather 
 Invoke-CcodTest 'installed runtime validator agrees with the actual manifest producer digest' {
     . $harnessPath -Library
     $module=Import-Module (Join-Path $repositoryRoot 'src/persistence/modules/RuntimeManifest.psm1') -PassThru -Force
-    $root=Join-Path $env:TEMP ('ccod-producer-digest-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-producer-digest-'+[guid]::NewGuid().ToString('N'))
     try {
         [IO.Directory]::CreateDirectory($root)|Out-Null
         [IO.File]::WriteAllText((Join-Path $root 'payload.txt'),'actual producer fixture')
@@ -1429,7 +1432,7 @@ Invoke-CcodTest 'installed runtime validator agrees with the actual manifest pro
 Invoke-CcodTest 'installed runtime ordering matches mixed-case producer paths across cultures' {
     . $harnessPath -Library
     $module=Import-Module (Join-Path $repositoryRoot 'src/persistence/modules/RuntimeManifest.psm1') -PassThru -Force
-    $root=Join-Path $env:TEMP ('ccod-producer-order-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-producer-order-'+[guid]::NewGuid().ToString('N'))
     $originalCulture=[Threading.Thread]::CurrentThread.CurrentCulture
     try {
         [IO.Directory]::CreateDirectory((Join-Path $root 'bin'))|Out-Null
@@ -1459,7 +1462,7 @@ Invoke-CcodTest 'installed runtime ordering matches mixed-case producer paths ac
 
 Invoke-CcodTest 'sealed runtime metadata does not depend on the obsolete Inno directory' {
     . $harnessPath -Library
-    $root=Join-Path $env:TEMP ('ccod-modern-app-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-modern-app-'+[guid]::NewGuid().ToString('N'))
     $originalManifest=${function:Assert-CcodInstalledLifecycleRuntimeManifest}
     $originalOptional=${function:Get-CcodInstalledLifecycleOptionalDirectoryState};$previousHome=$env:CODEX_HOME
     try {
@@ -1490,7 +1493,7 @@ Invoke-CcodTest 'sealed runtime metadata does not depend on the obsolete Inno di
 
 Invoke-CcodTest 'native CIM timestamps are preserved for installed supervisor and tray' {
     . $harnessPath -Library
-    $root = Join-Path $env:TEMP ('ccod-installed-native-cim-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-installed-native-cim-' + [guid]::NewGuid().ToString('N'))
     $hadCodexHome = Test-Path -LiteralPath Env:CODEX_HOME
     $previousCodexHome = $env:CODEX_HOME
     try {
@@ -1570,7 +1573,7 @@ Invoke-CcodTest 'actual local process retains native precision through CIM corre
 
 Invoke-CcodTest 'installed tray observation selects active runtime bin rather than top-level decoy' {
     . $harnessPath -Library
-    $root=Join-Path $env:TEMP ('ccod-tray-runtime-path-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-tray-runtime-path-'+[guid]::NewGuid().ToString('N'))
     $previousHome=$env:CODEX_HOME
     try {
         [IO.Directory]::CreateDirectory($root)|Out-Null
@@ -1600,7 +1603,7 @@ Invoke-CcodTest 'installed tray observation selects active runtime bin rather th
 
 Invoke-CcodTest 'legacy readiness uses protected event and exact current process identities without new logs' {
     . $harnessPath -Library
-    $root=Join-Path $env:TEMP ('ccod-legacy-ready-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-legacy-ready-'+[guid]::NewGuid().ToString('N'))
     $kernel=Import-Module (Join-Path $repositoryRoot 'src/persistence/modules/KernelObjects.psm1') -PassThru -Force
     $event=$null
     $originalNative=${function:Get-CcodInstalledLifecycleNativeProcessCreationTimeUtc}
@@ -1664,7 +1667,7 @@ Invoke-CcodTest 'legacy readiness uses protected event and exact current process
 
 Invoke-CcodTest 'installed readiness selects current Ready across valid supervisor history' {
     . $harnessPath -Library
-    $root = Join-Path $env:TEMP ('ccod-installed-ready-history-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-installed-ready-history-' + [guid]::NewGuid().ToString('N'))
     try {
         [IO.Directory]::CreateDirectory((Join-Path $root 'logs')) | Out-Null
         $log = Join-Path $root 'logs\supervisor.log'
@@ -1696,7 +1699,7 @@ Invoke-CcodTest 'installed readiness selects current Ready across valid supervis
 
 Invoke-CcodTest 'expected debug ports survive the installed lifecycle facts boundary' {
     . $harnessPath -Library
-    $root = Join-Path $env:TEMP ('ccod-installed-expected-ports-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-installed-expected-ports-' + [guid]::NewGuid().ToString('N'))
     $originalNetTcp = ${function:Get-NetTCPConnection}
     $originalDirectoryProbe = ${function:Get-CcodInstalledLifecycleOptionalDirectoryState}
     $originalFileProbe = ${function:Get-CcodInstalledLifecycleOptionalRegularFileState}
@@ -1745,7 +1748,7 @@ Invoke-CcodTest 'expected debug ports survive the installed lifecycle facts boun
 
 Invoke-CcodTest 'rejects non-integer debug port facts before endpoint observation' {
     . $harnessPath -Library
-    $root = Join-Path $env:TEMP ('ccod-installed-noninteger-port-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-installed-noninteger-port-' + [guid]::NewGuid().ToString('N'))
     $originalNetTcp = ${function:Get-NetTCPConnection}
     $originalStatusReader = ${function:Read-CcodInstalledLifecycleStatusFact}
     try {
@@ -1793,7 +1796,7 @@ Invoke-CcodTest 'uses absolute end anchors for lifecycle candidate and version v
 
 Invoke-CcodTest 'rejects expected debug ports detached from the current runtime declaration' {
     . $harnessPath -Library
-    $root = Join-Path $env:TEMP ('ccod-installed-port-binding-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-installed-port-binding-' + [guid]::NewGuid().ToString('N'))
     $originalStatusReader = ${function:Read-CcodInstalledLifecycleStatusFact}
     $originalNetTcp = ${function:Get-NetTCPConnection}
     try {
@@ -1826,7 +1829,7 @@ Invoke-CcodTest 'rejects expected debug ports detached from the current runtime 
 
 Invoke-CcodTest 'rejects fractional expected debug ports before endpoint observation' {
     . $harnessPath -Library
-    $root = Join-Path $env:TEMP ('ccod-installed-port-type-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-installed-port-type-' + [guid]::NewGuid().ToString('N'))
     $originalNetTcp = ${function:Get-NetTCPConnection}
     try {
         $null = [IO.Directory]::CreateDirectory($root)
@@ -1850,7 +1853,7 @@ Invoke-CcodTest 'rejects fractional expected debug ports before endpoint observa
 
 Invoke-CcodTest 'rejects listener endpoint fields whose scalar types are not exact integers' {
     . $harnessPath -Library
-    $root = Join-Path $env:TEMP ('ccod-installed-listener-type-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-installed-listener-type-' + [guid]::NewGuid().ToString('N'))
     $originalNetTcp = ${function:Get-NetTCPConnection}
     $global:InstalledLifecycleListenerObserved = 0
     try {
@@ -1916,7 +1919,7 @@ Invoke-CcodTest 'rejects listener endpoint fields whose scalar types are not exa
 
 Invoke-CcodTest 'verifies FreshRestart only with one correlated ChatGPT root and Completed current-runtime installer receipt' {
     . $harnessPath -Library
-    $root = Join-Path $env:TEMP ('ccod-installed-success-' + [guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-installed-success-' + [guid]::NewGuid().ToString('N'))
     try {
         $null = [IO.Directory]::CreateDirectory($root)
         New-CcodHarnessInstalledStateFixture -Root $root -ActiveRuntimeId '2.5.21-e3b0c44298fc1c14-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' -ActiveGeneration ([UInt64]8) `

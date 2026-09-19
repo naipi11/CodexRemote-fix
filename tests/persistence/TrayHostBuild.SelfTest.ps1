@@ -9,8 +9,8 @@ Invoke-CcodTest 'TrayHost artifact validation binds the manifest and embedded PE
     $package = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw | ConvertFrom-Json
     $version = [string]$package.version
     $nativeVersion = "$version.0"
-    $artifact = Join-Path $env:TEMP ('ccod-native-version-artifact-' + [Guid]::NewGuid().ToString('N'))
-    $fixtureRoot = Join-Path $env:TEMP ('ccod-native-version-repository-' + [Guid]::NewGuid().ToString('N'))
+    $artifact = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-native-version-artifact-' + [Guid]::NewGuid().ToString('N'))
+    $fixtureRoot = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-native-version-repository-' + [Guid]::NewGuid().ToString('N'))
     try {
         Invoke-CcodTrayHostBuild -RepositoryRoot $repositoryRoot -Version $version -OutputDirectory $artifact -GitCommit ('b' * 40) -BuildTimestampUtc '2026-08-28T00:00:00.0000000Z' | Out-Null
         [IO.Directory]::CreateDirectory((Join-Path $fixtureRoot 'src')) | Out-Null
@@ -56,7 +56,7 @@ Invoke-CcodTest 'TrayHost artifact validation binds the manifest and embedded PE
 
 Invoke-CcodTest 'native build entrypoints reject mismatched package AssemblyInfo and manifest versions before compilation' {
     Import-Module (Join-Path $repositoryRoot 'build\TrayHostBuild.psm1') -Force
-    $root = Join-Path $env:TEMP ('ccod-native-version-contract-' + [Guid]::NewGuid().ToString('N'))
+    $root = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-native-version-contract-' + [Guid]::NewGuid().ToString('N'))
     try {
         [IO.Directory]::CreateDirectory($root) | Out-Null
         $cases = @(
@@ -124,7 +124,7 @@ Invoke-CcodTest 'TrayHost build lock pins the Microsoft net48 reference package'
 
 Invoke-CcodTest 'TrayHost resolver returns only the locked reference directory and rejects a mutated lock' {
     Import-Module (Join-Path $repositoryRoot 'build\TrayHostReferencePack.psm1') -Force
-    $cache=Join-Path $env:TEMP 'ccod-trayhost-reference-pack'
+    $cache=Join-Path (Get-CcodTestCanonicalTempRoot) 'ccod-trayhost-reference-pack'
     $resolved=Resolve-CcodTrayHostReferencePack -LockPath $lockPath -CacheRoot $cache
     Assert-CcodTrue ([IO.Path]::GetFullPath($resolved.ReferenceRoot).StartsWith([IO.Path]::GetFullPath($cache),[StringComparison]::OrdinalIgnoreCase)) 'resolver stays under its cache root'
     foreach($leaf in @('mscorlib.dll','System.dll','System.Core.dll','System.Drawing.dll')){Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $resolved.ReferenceRoot $leaf) -PathType Leaf) "locked reference exists: $leaf"}
@@ -143,7 +143,7 @@ Invoke-CcodTest 'TrayHost build emits one source-auditable artifact and rejects 
     $modulePath=Join-Path $repositoryRoot 'build\TrayHostBuild.psm1'
     Assert-CcodTrue (Test-Path -LiteralPath $modulePath -PathType Leaf) 'TrayHost build module exists'
     Import-Module $modulePath -Force
-    $artifact=Join-Path $env:TEMP ('ccod-trayhost-artifact-'+[Guid]::NewGuid().ToString('N'))
+    $artifact=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-trayhost-artifact-'+[Guid]::NewGuid().ToString('N'))
     try{
         $result=Invoke-CcodTrayHostBuild -RepositoryRoot $repositoryRoot -Version '2.5.22' -OutputDirectory $artifact
         Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $artifact 'CodexRemote.TrayHost.exe') -PathType Leaf) 'TrayHost executable exists'
@@ -204,8 +204,8 @@ Invoke-CcodTest 'TrayHost build embeds the product ICO instead of relying on a r
 
 Invoke-CcodTest 'portable launcher build emits a tamper-bound double-click entrypoint' {
     Import-Module (Join-Path $repositoryRoot 'build\TrayHostBuild.psm1') -Force
-    $artifact = Join-Path $env:TEMP ('ccod-portable-launcher-artifact-' + [Guid]::NewGuid().ToString('N'))
-    $fixtureRoot = Join-Path $env:TEMP ('ccod-portable-launcher-repository-' + [Guid]::NewGuid().ToString('N'))
+    $artifact = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-portable-launcher-artifact-' + [Guid]::NewGuid().ToString('N'))
+    $fixtureRoot = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-portable-launcher-repository-' + [Guid]::NewGuid().ToString('N'))
     try {
         $result = Invoke-CcodPortableLauncherBuild -RepositoryRoot $repositoryRoot -Version '2.5.22' -OutputDirectory $artifact
         Assert-CcodTrue (Test-Path -LiteralPath (Join-Path $artifact 'CodexRemote.Portable.exe') -PathType Leaf) 'portable launcher executable exists'

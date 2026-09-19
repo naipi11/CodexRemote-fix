@@ -19,7 +19,7 @@ $results+=Invoke-CcodTest 'generation reclamation runtime IDs use canonical TAB 
 }
 
 $results+=Invoke-CcodTest 'bounded product residue cleanup removes only the verified disposable product root' {
-    $root=Join-Path $env:TEMP ('ccod-product-tail-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-product-tail-'+[guid]::NewGuid().ToString('N'))
     $install=Join-Path $root 'CodexControlOtherDevices'
     try {
         [IO.Directory]::CreateDirectory((Join-Path $install 'state/active-generation'))|Out-Null
@@ -39,7 +39,7 @@ $results+=Invoke-CcodTest 'bounded product residue cleanup removes only the veri
     } finally {if(Test-Path $root){Remove-CcodTestOwnedTree -Path $root}}
 }
 $results+=Invoke-CcodTest 'bounded product residue cleanup accepts real initialized state and retained manifest files' {
-    $root=Join-Path $env:TEMP ('ccod-product-state-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-product-state-'+[guid]::NewGuid().ToString('N'))
     $install=Join-Path $root 'CodexControlOtherDevices'
     $modules=@()
     try {
@@ -68,7 +68,7 @@ $results+=Invoke-CcodTest 'bounded product residue cleanup accepts real initiali
 
 foreach($mutation in @('UnknownFile','UnknownDirectory','DeviceKey','Reparse','Hardlink','Ads','OpenFile','EpochDrift')){
     $results+=Invoke-CcodTest "bounded product residue rejects $mutation without deleting any file" {
-        $root=Join-Path $env:TEMP ('ccod-product-hostile-'+[guid]::NewGuid().ToString('N'))
+        $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-product-hostile-'+[guid]::NewGuid().ToString('N'))
         $install=Join-Path $root 'CodexControlOtherDevices';$held=$null
         try {
             [IO.Directory]::CreateDirectory((Join-Path $install 'state/active-generation'))|Out-Null
@@ -99,7 +99,7 @@ foreach($mutation in @('UnknownFile','UnknownDirectory','DeviceKey','Reparse','H
 }
 
 $results+=Invoke-CcodTest 'bounded cleanup accepts the actual installer state-plane writer output' {
-    $root=Join-Path $env:TEMP ('ccod-product-install-plane-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-product-install-plane-'+[guid]::NewGuid().ToString('N'))
     $install=Join-Path $root 'CodexControlOtherDevices';$fileTransaction=$null;$installModule=$null;$fileModule=$null
     try {
         [IO.Directory]::CreateDirectory((Join-Path $install 'state/active-generation'))|Out-Null
@@ -120,7 +120,7 @@ $results+=Invoke-CcodTest 'bounded cleanup accepts the actual installer state-pl
 
 function Invoke-CcodFullInstallerResidueCase {
     param([switch]$LegacyUpgrade)
-    $root=Join-Path $env:TEMP ('ccod-product-full-'+[guid]::NewGuid().ToString('N').Substring(0,8))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-product-full-'+[guid]::NewGuid().ToString('N').Substring(0,8))
     $install=Join-Path $root 'CodexControlOtherDevices';$source=Join-Path $root 'source';$nodeRoot=Join-Path $root 'node'
     try {
         Import-Module (Join-Path $repositoryRoot 'src/persistence/modules/InstallLifecycle.psm1') -Force -DisableNameChecking
@@ -157,7 +157,7 @@ $results+=Invoke-CcodTest 'bounded cleanup consumes the full actual installer ou
 $results+=Invoke-CcodTest 'bounded cleanup consumes the historical v2521 upgrade output without retaining product files' {Invoke-CcodFullInstallerResidueCase -LegacyUpgrade}
 
 $results+=Invoke-CcodTest 'an existing cleanup journal cannot authorize an unknown user file' {
-    $root=Join-Path $env:TEMP ('ccod-product-journal-forgery-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-product-journal-forgery-'+[guid]::NewGuid().ToString('N'))
     $install=Join-Path $root 'CodexControlOtherDevices';$native=$null
     try {
         [IO.Directory]::CreateDirectory((Join-Path $install 'state/active-generation'))|Out-Null
@@ -181,7 +181,7 @@ $results+=Invoke-CcodTest 'an existing cleanup journal cannot authorize an unkno
 
 function Invoke-CcodResiduePartialRetryCase {
     param([ValidateSet('None','AddedFile','ReplacementRoot','JournalMutation')][string]$Attack='None')
-    $root=Join-Path $env:TEMP ('ccod-product-partial-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-product-partial-'+[guid]::NewGuid().ToString('N'))
     $install=Join-Path $root 'CodexControlOtherDevices'
     try {
         [IO.Directory]::CreateDirectory((Join-Path $install 'state/active-generation'))|Out-Null
@@ -219,7 +219,7 @@ foreach($retryAttack in @('AddedFile','ReplacementRoot','JournalMutation')){
 }
 
 $results+=Invoke-CcodTest 'bounded cleanup accepts real epoch initialization and supervisor log writers' {
-    $root=Join-Path $env:TEMP ('ccod-product-observation-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-product-observation-'+[guid]::NewGuid().ToString('N'))
     $install=Join-Path $root 'CodexControlOtherDevices'
     try {
         [IO.Directory]::CreateDirectory((Join-Path $install 'state/active-generation'))|Out-Null
@@ -243,7 +243,7 @@ $results+=Invoke-CcodTest 'bounded cleanup accepts real epoch initialization and
 }
 
 $results+=Invoke-CcodTest 'protected user data is rejected before opening or hashing its contents' {
-    $root=Join-Path $env:TEMP ('ccod-product-protected-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-product-protected-'+[guid]::NewGuid().ToString('N'))
     $install=Join-Path $root 'CodexControlOtherDevices';$held=$null
     try {
         [IO.Directory]::CreateDirectory((Join-Path $install 'state/device-key'))|Out-Null
@@ -256,7 +256,7 @@ $results+=Invoke-CcodTest 'protected user data is rejected before opening or has
 }
 
 $results+=Invoke-CcodTest 'bounded cleanup accepts actual terminal lifecycle receipts and transaction archive output' {
-    $root=Join-Path $env:TEMP ('ccod-product-terminal-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-product-terminal-'+[guid]::NewGuid().ToString('N'))
     $install=Join-Path $root 'CodexControlOtherDevices';$state=Join-Path $install 'state'
     try {
         [IO.Directory]::CreateDirectory((Join-Path $state 'active-generation'))|Out-Null
@@ -290,7 +290,7 @@ $results+=Invoke-CcodTest 'bounded cleanup accepts actual terminal lifecycle rec
 }
 
 $results+=Invoke-CcodTest 'bounded cleanup accepts real session and legacy install diagnostic writers' {
-    $root=Join-Path $env:TEMP ('ccod-product-session-log-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-product-session-log-'+[guid]::NewGuid().ToString('N'))
     $install=Join-Path $root 'CodexControlOtherDevices'
     try {
         [IO.Directory]::CreateDirectory((Join-Path $install 'state/active-generation'))|Out-Null
@@ -313,7 +313,7 @@ $results+=Invoke-CcodTest 'bounded cleanup accepts real session and legacy insta
 }
 
 $results+=Invoke-CcodTest 'bounded cleanup accepts the exact abandoned-lease warning produced by Supervisor' {
-    $root=Join-Path $env:TEMP ('ccod-product-warning-'+[guid]::NewGuid().ToString('N'))
+    $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-product-warning-'+[guid]::NewGuid().ToString('N'))
     $install=Join-Path $root 'CodexControlOtherDevices'
     try {
         [IO.Directory]::CreateDirectory((Join-Path $install 'state/active-generation'))|Out-Null

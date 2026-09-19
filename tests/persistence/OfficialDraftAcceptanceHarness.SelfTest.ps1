@@ -1297,7 +1297,7 @@ try {
     }
 
     Invoke-CcodTest 'default capture preserves exact native tray readiness and collector rejection' {
-        $root=Join-Path $env:TEMP ('ccod-native-ready-capture-'+[guid]::NewGuid().ToString('N'))
+        $root=Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-native-ready-capture-'+[guid]::NewGuid().ToString('N'))
         $logs=Join-Path $root 'logs';$log=Join-Path $logs 'supervisor.log';$module=$null;$integration=$null
         try {
             [IO.Directory]::CreateDirectory($logs)|Out-Null
@@ -2346,7 +2346,7 @@ try {
             Assert-CcodEqual 'CCOD_OPERATION_LEASE_HELD' $line.Result 'child reached actual native lease'
             Remove-Module $module.Name -Force;$module=Import-Module $modulePath -Force -PassThru -DisableNameChecking
             Assert-CcodThrows {&$module {param($Root)Open-CcodOfficialDraftOperationLease -EvidenceRoot $Root} $evidence|Out-Null} 'CCOD_ACCEPTANCE_OPERATION_BUSY'
-            $process.StandardInput.WriteLine('release');$process.StandardInput.Flush()
+            Write-CcodTestProcessInput -Process $process -Text 'release' -AddNewLine
             Assert-CcodTrue ($process.WaitForExit(15000)) 'owned inert child exits after explicit release'
             Assert-CcodEqual 0 $process.ExitCode 'child lease release succeeds'
             Assert-CcodEqual '' $errors.Result 'native child has no hidden lock error'
