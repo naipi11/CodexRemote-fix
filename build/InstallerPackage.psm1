@@ -82,13 +82,20 @@ function Assert-CcodInstallerPackageRegularFile {
     return $full
 }
 
+function Test-CcodInstallerPackageJsonInteger {
+    # ConvertFrom-Json yields [long] for JSON integers under PowerShell 7 and [int]
+    # under Windows PowerShell 5.1, so accept both shapes at one exact value.
+    param($Value,[long]$Expected=0)
+    return ($Value-is[int]-or$Value-is[long])-and[decimal]$Value-eq[decimal][long]$Value-and[long]$Value-eq$Expected
+}
+
 function Read-CcodInstallerPayloadManifest {
     param([Parameter(Mandatory)][byte[]]$Bytes,[Parameter(Mandatory)][string]$ExpectedVersion)
     try { $text=[Text.UTF8Encoding]::new($false,$true).GetString($Bytes);$manifest=$text|ConvertFrom-Json -ErrorAction Stop }
     catch { Throw-CcodInstallerPackageError 'CCOD_INSTALLER_PACKAGE_INVALID' 'Payload manifest JSON is invalid' $null }
     foreach($name in @('schemaVersion','projectVersion','files')){if((Get-CcodInstallerPackageTopLevelJsonPropertyCount $text $name)-ne 1){Throw-CcodInstallerPackageError 'CCOD_INSTALLER_PACKAGE_INVALID' 'Payload manifest contains duplicate or missing fields' $name}}
     if($manifest-isnot[pscustomobject]-or(@($manifest.PSObject.Properties.Name)-join',')-cne'schemaVersion,projectVersion,files'-or
-       $manifest.schemaVersion-isnot[int]-or$manifest.schemaVersion-ne 1-or$manifest.projectVersion-isnot[string]-or$manifest.projectVersion-cne$ExpectedVersion){
+       -not(Test-CcodInstallerPackageJsonInteger $manifest.schemaVersion 1)-or$manifest.projectVersion-isnot[string]-or$manifest.projectVersion-cne$ExpectedVersion){
         Throw-CcodInstallerPackageError 'CCOD_INSTALLER_PACKAGE_INVALID' 'Payload manifest metadata is invalid' $null
     }
     $records=@($manifest.files);if($records.Count-eq 0){Throw-CcodInstallerPackageError 'CCOD_INSTALLER_PACKAGE_INVALID' 'Payload manifest is empty' $null}
@@ -111,7 +118,7 @@ function Read-CcodInstallerPackageManifest {
     try{$text=[Text.UTF8Encoding]::new($false,$true).GetString($Bytes);$manifest=$text|ConvertFrom-Json -ErrorAction Stop}catch{Throw-CcodInstallerPackageError 'CCOD_INSTALLER_PACKAGE_INVALID' 'Installer package manifest JSON is invalid' $null}
     foreach($name in @('schemaVersion','product','version','gitCommit','payloadManifest','files')){if((Get-CcodInstallerPackageTopLevelJsonPropertyCount $text $name)-ne 1){Throw-CcodInstallerPackageError 'CCOD_INSTALLER_PACKAGE_INVALID' 'Installer package manifest contains duplicate or missing fields' $name}}
     if($manifest-isnot[pscustomobject]-or(@($manifest.PSObject.Properties.Name)-join',')-cne'schemaVersion,product,version,gitCommit,payloadManifest,files'-or
-       $manifest.schemaVersion-isnot[int]-or$manifest.schemaVersion-ne 1-or$manifest.product-isnot[string]-or$manifest.product-cne'CodexRemote-fix'-or
+       -not(Test-CcodInstallerPackageJsonInteger $manifest.schemaVersion 1)-or$manifest.product-isnot[string]-or$manifest.product-cne'CodexRemote-fix'-or
        $manifest.version-isnot[string]-or$manifest.version-cne$ExpectedVersion-or$manifest.gitCommit-isnot[string]-or$manifest.gitCommit-cne$ExpectedGitCommit-or
        $manifest.payloadManifest-isnot[pscustomobject]-or(@($manifest.payloadManifest.PSObject.Properties.Name)-join',')-cne'name,length,sha256'-or
        $manifest.payloadManifest.name-isnot[string]-or$manifest.payloadManifest.name-cne'installer-payload.manifest.json'-or

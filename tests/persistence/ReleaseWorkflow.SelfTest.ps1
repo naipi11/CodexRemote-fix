@@ -3399,7 +3399,7 @@ Invoke-CcodTest 'package scripts build provenance and workflows retain the relea
 $iss = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw
 $buildSource = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
 Assert-CcodTrue ($buildSource -match 'CodexRemote\.Portable\.exe' -and $buildSource -match 'Copy-CcodBuildPayloadFile' -and $buildSource -match 'New-CcodInstallerPackage') 'build places the portable launcher only in the manifest-listed sealed package'
-Assert-CcodTrue ($buildSource -cnotmatch 'GetNewClosure') 'the temporary Setup action stays a plain scriptblock so script-local functions stay resolvable'
+Assert-CcodTrue ($buildSource -cnotmatch '\.GetNewClosure\(\)') 'the temporary Setup action stays a plain scriptblock so script-local functions stay resolvable'
 Assert-CcodTrue ($iss -cnotmatch 'CodexRemote\.Portable\.exe|PortableArtifactDirectory') 'Inno never copies a product launcher outside the sealed package transaction'
 Invoke-CcodTest 'temporary setup scope resolves script-local functions under PowerShell 7' {
     # The release workflow runs build/build.ps1 from pwsh. PowerShell 7 gives a

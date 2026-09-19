@@ -264,7 +264,7 @@ function New-CcodSetupBuildProvenance {
     $compiler = Assert-CcodSetupRegularFile -Path $CompilerPath -Kind 'Inno compiler'
     try { $payloadRecord = [IO.File]::ReadAllText($payload,[Text.UTF8Encoding]::new($false)) | ConvertFrom-Json -ErrorAction Stop }
     catch { Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Installer payload manifest is invalid JSON' $payload }
-    if ($payloadRecord.schemaVersion -isnot [int] -or $payloadRecord.schemaVersion -ne 1 -or
+    if (-not (Test-CcodSetupArtifactJsonInteger $payloadRecord.schemaVersion 1) -or
         $payloadRecord.projectVersion -isnot [string] -or $payloadRecord.projectVersion -cne $Version -or
         @($payloadRecord.files).Count -eq 0) { Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Installer payload manifest metadata is invalid' $payload }
     $payloadHash = Get-CcodSetupArtifactHash -Path $payload
@@ -330,7 +330,7 @@ function Test-CcodSetupBuildProvenance {
     $timestampText = if ($timestampMatches.Count -eq 1) { [string]$timestampMatches[0].Groups['value'].Value } else { $null }
     $fields = @('schemaVersion','product','version','gitCommit','buildTimestampUtc','payloadManifest','buildInputs','peContract')
     if ($record -isnot [pscustomobject] -or ((@($record.PSObject.Properties.Name | Sort-Object) -join '|') -cne (@($fields | Sort-Object) -join '|')) -or
-        ($record.schemaVersion -isnot [int] -and $record.schemaVersion -isnot [long]) -or [int64]$record.schemaVersion -ne 1 -or $record.product -isnot [string] -or $record.product -cne 'CodexRemote-fix' -or
+        -not (Test-CcodSetupArtifactJsonInteger $record.schemaVersion 1) -or $record.product -isnot [string] -or $record.product -cne 'CodexRemote-fix' -or
         $record.version -isnot [string] -or $record.version -cne $ExpectedVersion -or $record.gitCommit -isnot [string] -or $record.gitCommit -cne $ExpectedGitCommit -or
         -not (Test-CcodSetupCanonicalUtc $timestampText) -or
         (-not [string]::IsNullOrWhiteSpace($ExpectedBuildTimestampUtc) -and $timestampText -cne $ExpectedBuildTimestampUtc) -or
@@ -370,7 +370,7 @@ function New-CcodSealedSetupBuildProvenance {
     if (-not (Test-CcodSetupCanonicalUtc $BuildTimestampUtc)) { Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Sealed Setup provenance timestamp is invalid' $BuildTimestampUtc }
     $package=Assert-CcodSetupRegularFile $PackagePath 'Installer package';$manifest=Assert-CcodSetupRegularFile $PackageManifestPath 'Installer package manifest';$bootstrap=Assert-CcodSetupRegularFile $ActivationBootstrapPath 'Activation bootstrap';$template=Assert-CcodSetupRegularFile $InnoTemplatePath 'Inno template';$inventory=Assert-CcodSetupRegularFile $DestinationInventoryPath 'Destination inventory';$compiler=Assert-CcodSetupRegularFile $CompilerPath 'Inno compiler'
     try{$manifestRecord=ConvertFrom-CcodSetupArtifactJson -Json ([IO.File]::ReadAllText($manifest,[Text.UTF8Encoding]::new($false)))}catch{Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Installer package manifest JSON is invalid' $manifest}
-    if($manifestRecord.schemaVersion-isnot[int]-or$manifestRecord.schemaVersion-ne 1-or$manifestRecord.product-cne'CodexRemote-fix'-or$manifestRecord.version-cne$Version-or$manifestRecord.gitCommit-cne$GitCommit-or@($manifestRecord.files).Count-eq0){Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Installer package manifest identity is invalid' $manifest}
+    if(-not(Test-CcodSetupArtifactJsonInteger $manifestRecord.schemaVersion 1)-or$manifestRecord.product-cne'CodexRemote-fix'-or$manifestRecord.version-cne$Version-or$manifestRecord.gitCommit-cne$GitCommit-or@($manifestRecord.files).Count-eq0){Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Installer package manifest identity is invalid' $manifest}
     $packageHash=Get-CcodSetupArtifactHash $package;$manifestHash=Get-CcodSetupArtifactHash $manifest;$bootstrapHash=Get-CcodSetupArtifactHash $bootstrap;$compilerInfo=[Diagnostics.FileVersionInfo]::GetVersionInfo($compiler)
     $record=[ordered]@{
         schemaVersion=2;product='CodexRemote-fix';version=$Version;gitCommit=$GitCommit;buildTimestampUtc=$BuildTimestampUtc
@@ -441,13 +441,13 @@ function Test-CcodSealedSetupBuildProvenance {
     $packageLength=[long](Get-Item $package -Force).Length
     $manifestLength=[long](Get-Item $manifest -Force).Length
     $bootstrapLength=[long](Get-Item $bootstrap -Force).Length
-    if($record.schemaVersion-isnot[int]-or$record.schemaVersion-ne 2-or
+    if(-not(Test-CcodSetupArtifactJsonInteger $record.schemaVersion 2)-or
        -not(Test-CcodExactString $record.product 'CodexRemote-fix')-or
        -not(Test-CcodExactString $record.version $ExpectedVersion)-or
        -not(Test-CcodExactString $record.gitCommit $ExpectedGitCommit)-or
        -not(Test-CcodExactString $record.buildTimestampUtc $ExpectedBuildTimestampUtc)-or
        -not(Test-CcodSetupCanonicalUtc $record.buildTimestampUtc)-or
-       $packageManifest.schemaVersion-isnot[int]-or$packageManifest.schemaVersion-ne 1-or
+       -not(Test-CcodSetupArtifactJsonInteger $packageManifest.schemaVersion 1)-or
        -not(Test-CcodExactString $packageManifest.product 'CodexRemote-fix')-or
        -not(Test-CcodExactString $packageManifest.version $ExpectedVersion)-or
        -not(Test-CcodExactString $packageManifest.gitCommit $ExpectedGitCommit)-or
@@ -460,7 +460,7 @@ function Test-CcodSealedSetupBuildProvenance {
        -not(Test-CcodExactString $record.installerPackageManifest.name 'installer-package.manifest.json')-or
        -not(Test-CcodJsonInteger $record.installerPackageManifest.length)-or[long]$record.installerPackageManifest.length-ne$manifestLength-or
        -not(Test-CcodExactString $record.installerPackageManifest.sha256 $ExpectedPackageManifestSha256)-or$record.installerPackageManifest.sha256-cne(Get-CcodSetupArtifactHash $manifest)-or
-       $record.installerPackageManifest.fileCount-isnot[int]-or$record.installerPackageManifest.fileCount-ne@($packageManifest.files).Count-or
+       -not(Test-CcodSetupArtifactJsonInteger $record.installerPackageManifest.fileCount @($packageManifest.files).Count)-or
        -not(Test-CcodExactString $record.installerPackageManifest.payloadManifestSha256 ([string]$packageManifest.payloadManifest.sha256))-or
        $packageManifest.payloadManifest.sha256-isnot[string]-or$packageManifest.payloadManifest.sha256-cnotmatch'^[0-9a-f]{64}$'-or
        -not(Test-CcodExactString $record.activationBootstrap.name 'Activate-CcodRemoteFix.ps1')-or
