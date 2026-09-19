@@ -3414,8 +3414,13 @@ $ErrorActionPreference = 'Stop'
 $build = $env:CCOD_BUILD_PROBE_PATH
 . $build -Library
 $root = $env:CCOD_BUILD_PROBE_ROOT
-$result = Invoke-CcodBuildTemporarySetupScope -BuildRoot $root -InstallerPayloadDirectory (Join-Path $root 'payload-stage') -DestinationInventoryPath (Join-Path $root 'inventory.iss') -Action ({ ,([string](Get-Command Copy-CcodBuildPayloadFile -ErrorAction SilentlyContinue).Name) })
+$id = [guid]::NewGuid().ToString('N')
+$payloadStage = Join-Path $root ('.installer-payload-stage-' + $id)
+$inventory = Join-Path $root ('.installer-destination-inventory-' + $id + '.iss')
+[IO.Directory]::CreateDirectory($payloadStage) | Out-Null
+$result = Invoke-CcodBuildTemporarySetupScope -BuildRoot $root -InstallerPayloadDirectory $payloadStage -DestinationInventoryPath $inventory -Action ({ ,([string](Get-Command Copy-CcodBuildPayloadFile -ErrorAction SilentlyContinue).Name) })
 if ([string]::IsNullOrWhiteSpace([string]$result)) { [Console]::Error.WriteLine('CCOD_BUILD_ACTION_UNRESOLVED'); exit 41 }
+if ([IO.Directory]::Exists($payloadStage)) { [Console]::Error.WriteLine('CCOD_BUILD_ACTION_LEAK'); exit 42 }
 [Console]::WriteLine('CCOD_BUILD_ACTION_OK=' + $result)
 '@
     $probeRoot = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-action-probe-' + [guid]::NewGuid().ToString('N'))
