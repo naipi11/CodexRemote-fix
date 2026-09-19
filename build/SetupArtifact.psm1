@@ -7,6 +7,13 @@ $ErrorActionPreference = 'Stop'
 # behavior (dates stay text) identical across both shells.
 $script:CcodSetupArtifactJsonKeepsDateText = @((Get-Command ConvertFrom-Json).Parameters.Keys) -contains 'DateKind'
 
+function Test-CcodSetupArtifactJsonInteger {
+    # ConvertFrom-Json yields [long] for JSON integers under PowerShell 7 and [int]
+    # under Windows PowerShell 5.1, so accept both shapes at one exact value.
+    param($Value,[long]$Expected=0)
+    return ($Value-is[int]-or$Value-is[long])-and[decimal]$Value-eq[decimal][long]$Value-and[long]$Value-eq$Expected
+}
+
 function ConvertFrom-CcodSetupArtifactJson {
     [CmdletBinding()]
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Json)
