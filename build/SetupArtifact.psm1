@@ -1,6 +1,19 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# PowerShell 7.5+ materializes ISO-8601 JSON strings as [datetime]. These modules
+# validate provenance timestamps as canonical UTC text, so read every JSON document
+# with -DateKind String when the shell offers it and keep the Windows PowerShell 5.1
+# behavior (dates stay text) identical across both shells.
+$script:CcodSetupArtifactJsonKeepsDateText = @((Get-Command ConvertFrom-Json).Parameters.Keys) -contains 'DateKind'
+
+function ConvertFrom-CcodSetupArtifactJson {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Json)
+    if ($script:CcodSetupArtifactJsonKeepsDateText) { return $Json | ConvertFrom-Json -DateKind String -ErrorAction Stop }
+    return $Json | ConvertFrom-Json -ErrorAction Stop
+}
+
 function Throw-CcodSetupArtifactError {
     param([Parameter(Mandatory)][string]$Id,[Parameter(Mandatory)][string]$Message,$Target)
     throw [Management.Automation.ErrorRecord]::new(
@@ -307,11 +320,11 @@ function Test-CcodSetupBuildProvenance {
     $inventory = Assert-CcodSetupRegularFile -Path $DestinationInventoryPath -Kind 'Destination inventory'
     $compiler = Assert-CcodSetupRegularFile -Path $CompilerPath -Kind 'Inno compiler'
     $payload = Assert-CcodSetupRegularFile -Path $PayloadManifestPath -Kind 'Installer payload manifest'
-    try { $payloadRaw = [IO.File]::ReadAllText($payload,[Text.UTF8Encoding]::new($false)); $payloadRecord = $payloadRaw | ConvertFrom-Json -ErrorAction Stop }
+    try { $payloadRaw = [IO.File]::ReadAllText($payload,[Text.UTF8Encoding]::new($false)); $payloadRecord = ConvertFrom-CcodSetupArtifactJson -Json $payloadRaw }
     catch { Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Canonical installer payload manifest is invalid' $payload }
     $actualPayloadHash = Get-CcodSetupArtifactHash -Path $payload
     $actualCompilerVersion = ([string][Diagnostics.FileVersionInfo]::GetVersionInfo($compiler).FileVersion).Trim()
-    try { $raw = [IO.File]::ReadAllText($path,[Text.UTF8Encoding]::new($false)); $record = $raw | ConvertFrom-Json -ErrorAction Stop }
+    try { $raw = [IO.File]::ReadAllText($path,[Text.UTF8Encoding]::new($false)); $record = ConvertFrom-CcodSetupArtifactJson -Json $raw }
     catch { Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Setup provenance is invalid JSON' $path }
     $timestampMatches = [regex]::Matches($raw,'"buildTimestampUtc"\s*:\s*"(?<value>[^"\\]+)"')
     $timestampText = if ($timestampMatches.Count -eq 1) { [string]$timestampMatches[0].Groups['value'].Value } else { $null }
@@ -356,7 +369,7 @@ function New-CcodSealedSetupBuildProvenance {
     )
     if (-not (Test-CcodSetupCanonicalUtc $BuildTimestampUtc)) { Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Sealed Setup provenance timestamp is invalid' $BuildTimestampUtc }
     $package=Assert-CcodSetupRegularFile $PackagePath 'Installer package';$manifest=Assert-CcodSetupRegularFile $PackageManifestPath 'Installer package manifest';$bootstrap=Assert-CcodSetupRegularFile $ActivationBootstrapPath 'Activation bootstrap';$template=Assert-CcodSetupRegularFile $InnoTemplatePath 'Inno template';$inventory=Assert-CcodSetupRegularFile $DestinationInventoryPath 'Destination inventory';$compiler=Assert-CcodSetupRegularFile $CompilerPath 'Inno compiler'
-    try{$manifestRecord=[IO.File]::ReadAllText($manifest,[Text.UTF8Encoding]::new($false))|ConvertFrom-Json -ErrorAction Stop}catch{Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Installer package manifest JSON is invalid' $manifest}
+    try{$manifestRecord=ConvertFrom-CcodSetupArtifactJson -Json ([IO.File]::ReadAllText($manifest,[Text.UTF8Encoding]::new($false)))}catch{Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Installer package manifest JSON is invalid' $manifest}
     if($manifestRecord.schemaVersion-isnot[int]-or$manifestRecord.schemaVersion-ne 1-or$manifestRecord.product-cne'CodexRemote-fix'-or$manifestRecord.version-cne$Version-or$manifestRecord.gitCommit-cne$GitCommit-or@($manifestRecord.files).Count-eq0){Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Installer package manifest identity is invalid' $manifest}
     $packageHash=Get-CcodSetupArtifactHash $package;$manifestHash=Get-CcodSetupArtifactHash $manifest;$bootstrapHash=Get-CcodSetupArtifactHash $bootstrap;$compilerInfo=[Diagnostics.FileVersionInfo]::GetVersionInfo($compiler)
     $record=[ordered]@{
@@ -388,10 +401,10 @@ function Test-CcodSealedSetupBuildProvenance {
     try {
         $raw=[IO.File]::ReadAllText($path,[Text.UTF8Encoding]::new($false))
         Assert-CcodSetupUniqueJsonMembers -Json $raw -Target $path
-        $record=$raw|ConvertFrom-Json -ErrorAction Stop
+        $record=ConvertFrom-CcodSetupArtifactJson -Json $raw
         $manifestRaw=[IO.File]::ReadAllText($manifest,[Text.UTF8Encoding]::new($false))
         Assert-CcodSetupUniqueJsonMembers -Json $manifestRaw -Target $manifest
-        $packageManifest=$manifestRaw|ConvertFrom-Json -ErrorAction Stop
+        $packageManifest=ConvertFrom-CcodSetupArtifactJson -Json $manifestRaw
     } catch { Throw-CcodSetupArtifactError 'CCOD_SETUP_PROVENANCE_INVALID' 'Sealed Setup provenance or package manifest JSON is invalid' $path }
 
     function Test-CcodExactObjectProperties {

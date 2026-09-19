@@ -1,6 +1,19 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 
+# PowerShell 7.5+ materializes ISO-8601 JSON strings as [datetime]. These modules
+# validate provenance timestamps as canonical UTC text, so read every JSON document
+# with -DateKind String when the shell offers it and keep the Windows PowerShell 5.1
+# behavior (dates stay text) identical across both shells.
+$script:CcodTrayHostJsonKeepsDateText = @((Get-Command ConvertFrom-Json).Parameters.Keys) -contains 'DateKind'
+
+function ConvertFrom-CcodTrayHostJson {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Json)
+    if ($script:CcodTrayHostJsonKeepsDateText) { return $Json | ConvertFrom-Json -DateKind String -ErrorAction Stop }
+    return $Json | ConvertFrom-Json -ErrorAction Stop
+}
+
 function Get-CcodTrayHostHash {
     param([Parameter(Mandatory)][string]$Path)
     $sha=[Security.Cryptography.SHA256]::Create()
@@ -137,7 +150,7 @@ function Test-CcodTrayHostArtifact {
     $versionContract=Assert-CcodNativeVersionContract -RepositoryRoot $repo -Version $Version -Component trayhost
     $exe=Join-Path $out 'CodexRemote.TrayHost.exe';$config=Join-Path $out 'CodexRemote.TrayHost.exe.config';$provenancePath=Join-Path $out 'trayhost-build-provenance.json'
     foreach($path in @($exe,$config,$provenancePath)){if(-not(Test-Path -LiteralPath $path -PathType Leaf)){throw 'CCOD_TRAYHOST_ARTIFACT_MISSING'}}
-    $provenance=Get-Content -LiteralPath $provenancePath -Raw|ConvertFrom-Json
+    $provenance=ConvertFrom-CcodTrayHostJson -Json (Get-Content -LiteralPath $provenancePath -Raw)
     $commit=$provenance.PSObject.Properties['gitCommit'];$timestamp=$provenance.PSObject.Properties['buildTimestampUtc']
     if([int]$provenance.schemaVersion -ne 1 -or [string]$provenance.version -cne $Version -or [string]$provenance.targetFramework -cne 'net48' -or $null -eq $commit -or $null -eq $timestamp -or $commit.Value -isnot [string] -or $commit.Value -cnotmatch '^[0-9a-f]{40}$' -or $timestamp.Value -isnot [string] -or -not(Test-CcodTrayHostCanonicalUtc $timestamp.Value) -or (-not [string]::IsNullOrWhiteSpace($ExpectedGitCommit) -and $commit.Value -cne $ExpectedGitCommit)){throw 'CCOD_TRAYHOST_PROVENANCE_INVALID'}
     $icon=Join-Path $repo 'assets\codexremote-fix\codexremote-fix.ico';$sourceConfig=Join-Path $versionContract.SourceRoot 'CodexRemote.TrayHost.exe.config'
@@ -218,7 +231,7 @@ function Test-CcodPortableLauncherArtifact {
     $versionContract=Assert-CcodNativeVersionContract -RepositoryRoot $repo -Version $Version -Component portable
     $exe=Join-Path $out 'CodexRemote.Portable.exe';$config=Join-Path $out 'CodexRemote.Portable.exe.config';$provenancePath=Join-Path $out 'portable-launcher-provenance.json'
     foreach($path in @($exe,$config,$provenancePath)){if(-not(Test-Path -LiteralPath $path -PathType Leaf)){throw 'CCOD_PORTABLE_LAUNCHER_ARTIFACT_MISSING'}}
-    try{$provenance=Get-Content -LiteralPath $provenancePath -Raw|ConvertFrom-Json}catch{throw 'CCOD_PORTABLE_LAUNCHER_PROVENANCE_INVALID'}
+    try{$provenance=ConvertFrom-CcodTrayHostJson -Json (Get-Content -LiteralPath $provenancePath -Raw)}catch{throw 'CCOD_PORTABLE_LAUNCHER_PROVENANCE_INVALID'}
     $commit=$provenance.PSObject.Properties['gitCommit'];$timestamp=$provenance.PSObject.Properties['buildTimestampUtc'];$compiler=$provenance.PSObject.Properties['compiler']
     if([int]$provenance.schemaVersion -ne 1 -or [string]$provenance.product -cne 'CodexRemote-fix' -or
         [string]$provenance.version -cne $Version -or [string]$provenance.targetFramework -cne 'net48' -or

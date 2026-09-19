@@ -1,6 +1,19 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# PowerShell 7.5+ materializes ISO-8601 JSON strings as [datetime]. These modules
+# validate provenance timestamps as canonical UTC text, so read every JSON document
+# with -DateKind String when the shell offers it and keep the Windows PowerShell 5.1
+# behavior (dates stay text) identical across both shells.
+$script:CcodReleaseContractJsonKeepsDateText = @((Get-Command ConvertFrom-Json).Parameters.Keys) -contains 'DateKind'
+
+function ConvertFrom-CcodReleaseContractJson {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Json)
+    if ($script:CcodReleaseContractJsonKeepsDateText) { return $Json | ConvertFrom-Json -DateKind String -ErrorAction Stop }
+    return $Json | ConvertFrom-Json -ErrorAction Stop
+}
+
 # BEGIN CCOD TRUSTED IMPORT BOOTSTRAP
 # Embedded in each independently trusted entrypoint; an unheld helper import
 # cannot bootstrap its own protection. Keep copies identical (self-test enforced).
@@ -532,7 +545,7 @@ function Read-CcodReleaseContractJsonStringToken {
         if ($character -eq [char]34) {
             $end = $index + 1
             $raw = $Json.Substring($Offset,$end-$Offset)
-            $decoded = $raw | ConvertFrom-Json -ErrorAction Stop
+            $decoded = ConvertFrom-CcodReleaseContractJson -Json $raw
             if ($decoded -isnot [string]) { throw 'json string type' }
             return [pscustomobject]@{Value=$decoded;End=$end}
         }
@@ -610,7 +623,7 @@ function Read-CcodReleaseContractJson {
         if ($item.Length -le 0 -or $item.Length -gt $MaximumBytes) { throw 'length' }
         $raw = [IO.File]::ReadAllText($Path,[Text.UTF8Encoding]::new($false,$true))
         Assert-CcodReleaseContractJsonLexicalShape -Json $raw
-        $value = $raw | ConvertFrom-Json -ErrorAction Stop
+        $value = ConvertFrom-CcodReleaseContractJson -Json $raw
         if ($null -eq $value -or $value -isnot [pscustomobject]) { throw 'shape' }
         return [pscustomobject]@{ Raw=$raw; Value=$value }
     } catch {
@@ -621,7 +634,7 @@ function Read-CcodReleaseContractJson {
 function Read-CcodReleaseContractPinnedJson {
     param([Parameter(Mandatory)]$Authority,[Parameter(Mandatory)][string]$ErrorId,[int64]$MaximumBytes=4194304)
     try{
-        Assert-CcodReleaseAuthorityCurrent $Authority $ErrorId -CheckBytes|Out-Null;$bytes=Get-CcodReleaseAuthorityStreamBytes $Authority.Stream $MaximumBytes;$raw=[Text.UTF8Encoding]::new($false,$true).GetString($bytes);Assert-CcodReleaseContractJsonLexicalShape $raw;$value=$raw|ConvertFrom-Json -ErrorAction Stop;if($value-isnot[pscustomobject]){throw 'json shape'};Assert-CcodReleaseAuthorityCurrent $Authority $ErrorId -CheckBytes|Out-Null;return [pscustomobject]@{Raw=$raw;Value=$value;Bytes=$bytes}
+        Assert-CcodReleaseAuthorityCurrent $Authority $ErrorId -CheckBytes|Out-Null;$bytes=Get-CcodReleaseAuthorityStreamBytes $Authority.Stream $MaximumBytes;$raw=[Text.UTF8Encoding]::new($false,$true).GetString($bytes);Assert-CcodReleaseContractJsonLexicalShape $raw;$value=ConvertFrom-CcodReleaseContractJson -Json $raw;if($value-isnot[pscustomobject]){throw 'json shape'};Assert-CcodReleaseAuthorityCurrent $Authority $ErrorId -CheckBytes|Out-Null;return [pscustomobject]@{Raw=$raw;Value=$value;Bytes=$bytes}
     }catch{Throw-CcodReleaseContractError $ErrorId 'Pinned release JSON is malformed, changed, or outside its bound.' $Authority.Path}
 }
 
