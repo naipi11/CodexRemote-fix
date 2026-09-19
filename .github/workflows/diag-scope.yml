@@ -1,0 +1,45 @@
+name: DIAG scope probe
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Scope probe
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Relative path invocation (ci style)
+        if: always()
+        shell: pwsh
+        run: |
+          ./tests/persistence/tmp-scope-lib.ps1
+          exit 0
+
+      - name: Call operator with relative path
+        if: always()
+        shell: pwsh
+        run: |
+          & ./tests/persistence/tmp-scope-lib.ps1
+          exit 0
+
+      - name: Call operator with absolute path
+        if: always()
+        shell: pwsh
+        run: |
+          & (Join-Path $PWD 'tests/persistence/tmp-scope-lib.ps1')
+          exit 0
+
+      - name: Child pwsh file invocation
+        if: always()
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File ./tests/persistence/tmp-scope-lib.ps1
+          exit 0
