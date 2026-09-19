@@ -2350,7 +2350,7 @@ try {
             Write-CcodTestProcessInput -Process $process -Text 'release' -AddNewLine
             Assert-CcodTrue ($process.WaitForExit(15000)) 'owned inert child exits after explicit release'
             Assert-CcodEqual 0 $process.ExitCode 'child lease release succeeds'
-            Assert-CcodEqual '' $errors.Result 'native child has no hidden lock error'
+            Assert-CcodEqual '' $errors.Result ('native child has no hidden lock error; stderr=[' + $errors.Result.Replace("`r",'<CR>').Replace("`n",'<LF>') + ']')
             $first=&$module {param($Root)Open-CcodOfficialDraftOperationLease -EvidenceRoot $Root} $evidence
             Assert-CcodTrue ($null-ne$first) 'new acquisition after child exit proves release'
             $blocked=$false;try{[IO.Directory]::Move($evidence,$evidence+'.moved')}catch [IO.IOException]{$blocked=$true}

@@ -910,7 +910,8 @@ $ErrorActionPreference='Stop'
             $stdout=Join-Path $root ($mode+'.stdout');$stderr=Join-Path $root ($mode+'.stderr')
             $child=Start-Process -FilePath $powershellPath -ArgumentList $normalArguments -RedirectStandardOutput $stdout -RedirectStandardError $stderr -NoNewWindow -PassThru -Wait -ErrorAction Stop
             try{Assert-CcodEqual 0 $child.ExitCode ($mode+' inert child actually executes')}finally{$child.Dispose()}
-            Assert-CcodEqual '' ([IO.File]::ReadAllText($stderr)) ($mode+' inert child produces no error')
+            $stderrText=[IO.File]::ReadAllText($stderr)
+            Assert-CcodEqual '' $stderrText ($mode+' inert child produces no error; stderr=[' + $stderrText.Replace("`r",'<CR>').Replace("`n",'<LF>') + ']')
             $value=[IO.File]::ReadAllText($stdout)|ConvertFrom-Json
             Assert-CcodEqual $prepared.transactionId $value.transactionId 'actual child retains transaction'
             Assert-CcodEqual $expectedInstallRoot $value.installRoot 'actual child retains spaced trailing-slash path'
@@ -1115,6 +1116,9 @@ if($reader.ReadLine()-cne'continue'){throw 'handshake failed'}
         $text=@'
 param([string]$IntegrationPath)
 $ErrorActionPreference='Stop';$WarningPreference='SilentlyContinue'
+# The parent asserts this child's stderr is byte-empty, so non-error streams must be
+# silent: a progress record would otherwise be serialized to stderr as CLIXML.
+$ProgressPreference='SilentlyContinue'
 . $IntegrationPath -Library
 $script:FixtureFacts=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'facts.json'))|ConvertFrom-Json
 $spec=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'spec.json'))|ConvertFrom-Json
@@ -1139,7 +1143,7 @@ if($result.Outcome-cne'InstalledFinalizationStarted'){throw 'wrong completion'}
         Assert-CcodTrue ($child.WaitForExit(20000)) 'actual consumer exits after dependency handoff'
         Assert-CcodEqual 0 $child.ExitCode ('real consumer failure: '+$errors.Result)
         Assert-CcodEqual ('CCOD_RELEASED_BEFORE_EXIT'+[Environment]::NewLine) $rest.Result 'directory authority is released before wrapper process exit'
-        Assert-CcodEqual '' $errors.Result 'child has no hidden errors'
+        Assert-CcodEqual '' $errors.Result ('child has no hidden errors; stderr=[' + $errors.Result.Replace("`r",'<CR>').Replace("`n",'<LF>') + ']')
         [IO.Directory]::Move($runtime,$runtime+'-reclaimed')
     } finally {if($null-ne$child){if(-not$child.HasExited){$child.StandardInput.Close();if(-not$child.WaitForExit(15000)){$child.Kill();$child.WaitForExit()}};$child.Dispose()};if(Test-Path $root){Remove-Item $root -Recurse -Force}}
 }

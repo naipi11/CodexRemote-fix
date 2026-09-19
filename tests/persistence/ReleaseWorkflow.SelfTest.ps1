@@ -4152,7 +4152,7 @@ Invoke-CcodTask6Test 'fix1-fresh-process-module-boundary' 'draft release wrapper
                 Assert-CcodTrue ($child.WaitForExit(60000)) 'fresh wrapper process completes within the timeout'
                 $output=$stdout.GetAwaiter().GetResult();$errorOutput=$stderr.GetAwaiter().GetResult()
                 Assert-CcodEqual 0 $child.ExitCode "fresh PowerShell import uses normal process policy with parent override '$inherited'"
-                Assert-CcodEqual '' $errorOutput 'normal-policy module import has no stderr failure'
+                Assert-CcodEqual '' $errorOutput ('normal-policy module import has no stderr failure; stderr=[' + $errorOutput.Replace("`r",'<CR>').Replace("`n",'<LF>') + ']')
                 Assert-CcodTrue $output.Contains('CCOD_DRAFT_WRAPPER_OK') 'fresh PowerShell import exports the expected public command'
                 $policyLines=@($output.Split([char]10)|Where-Object {$_.StartsWith('CCOD_DRAFT_WRAPPER_POLICY=',[StringComparison]::Ordinal)})
                 Assert-CcodEqual 1 $policyLines.Count 'the real child reports exactly one effective policy'
