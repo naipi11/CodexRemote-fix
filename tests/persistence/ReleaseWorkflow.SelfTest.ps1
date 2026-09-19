@@ -3399,7 +3399,58 @@ Invoke-CcodTest 'package scripts build provenance and workflows retain the relea
 $iss = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\CodexControlOtherDevices.iss') -Raw
 $buildSource = Get-Content -LiteralPath (Join-Path $repositoryRoot 'build\build.ps1') -Raw
 Assert-CcodTrue ($buildSource -match 'CodexRemote\.Portable\.exe' -and $buildSource -match 'Copy-CcodBuildPayloadFile' -and $buildSource -match 'New-CcodInstallerPackage') 'build places the portable launcher only in the manifest-listed sealed package'
+Assert-CcodTrue ($buildSource -cnotmatch 'GetNewClosure') 'the temporary Setup action stays a plain scriptblock so script-local functions stay resolvable'
 Assert-CcodTrue ($iss -cnotmatch 'CodexRemote\.Portable\.exe|PortableArtifactDirectory') 'Inno never copies a product launcher outside the sealed package transaction'
+Invoke-CcodTest 'temporary setup scope resolves script-local functions under PowerShell 7' {
+    # The release workflow runs build/build.ps1 from pwsh. PowerShell 7 gives a
+    # GetNewClosure() scriptblock a fresh dynamic module that cannot resolve the
+    # script's own functions, while Windows PowerShell 5.1 resolves them. Exercise
+    # the real action through pwsh so the defect cannot return unnoticed.
+    $pwsh = (Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($null -eq $pwsh) { return }
+    $buildPath = Join-Path $repositoryRoot 'build\build.ps1'
+    $probe = @'
+$ErrorActionPreference = 'Stop'
+$build = $env:CCOD_BUILD_PROBE_PATH
+. $build -Library
+$root = $env:CCOD_BUILD_PROBE_ROOT
+$result = Invoke-CcodBuildTemporarySetupScope -BuildRoot $root -InstallerPayloadDirectory (Join-Path $root 'payload-stage') -DestinationInventoryPath (Join-Path $root 'inventory.iss') -Action ({ ,([string](Get-Command Copy-CcodBuildPayloadFile -ErrorAction SilentlyContinue).Name) })
+if ([string]::IsNullOrWhiteSpace([string]$result)) { [Console]::Error.WriteLine('CCOD_BUILD_ACTION_UNRESOLVED'); exit 41 }
+[Console]::WriteLine('CCOD_BUILD_ACTION_OK=' + $result)
+'@
+    $probeRoot = Join-Path (Get-CcodTestCanonicalTempRoot) ('ccod-action-probe-' + [guid]::NewGuid().ToString('N'))
+    $probePath = Join-Path $probeRoot 'action-probe.ps1'
+    try {
+        [IO.Directory]::CreateDirectory($probeRoot) | Out-Null
+        [IO.File]::WriteAllText($probePath,$probe,[Text.UTF8Encoding]::new($false))
+        $start = [Diagnostics.ProcessStartInfo]::new()
+        $start.FileName = $pwsh.Source
+        $start.Arguments = '-NoLogo -NoProfile -NonInteractive -File "' + $probePath + '"'
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        $start.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+        $start.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+        $start.EnvironmentVariables['CCOD_BUILD_PROBE_PATH'] = $buildPath
+        $start.EnvironmentVariables['CCOD_BUILD_PROBE_ROOT'] = $probeRoot
+        $child = [Diagnostics.Process]::Start($start)
+        try {
+            $stdout = $child.StandardOutput.ReadToEndAsync()
+            $stderr = $child.StandardError.ReadToEndAsync()
+            if (-not $child.WaitForExit(120000)) { throw 'pwsh action probe did not complete' }
+            Assert-CcodEqual 0 $child.ExitCode ('pwsh action probe failed: ' + $stderr.Result.Replace("`r",' ').Replace("`n",' | '))
+            Assert-CcodTrue ($stdout.Result -match 'CCOD_BUILD_ACTION_OK=Copy-CcodBuildPayloadFile') 'pwsh resolves a script-local build function from the temporary setup action'
+        } finally {
+            if (-not $child.HasExited) { $child.Kill(); $child.WaitForExit() }
+            $child.Dispose()
+        }
+    } finally {
+        if ([IO.File]::Exists($probePath)) { [IO.File]::Delete($probePath) }
+        if ([IO.Directory]::Exists($probeRoot)) { Remove-CcodTestOwnedTree -Path $probeRoot }
+    }
+}
+
 Invoke-CcodTest 'release notes extraction emits only the target release English section' {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('ccod-release-notes-fixture-' + [guid]::NewGuid().ToString('N'))
     try {

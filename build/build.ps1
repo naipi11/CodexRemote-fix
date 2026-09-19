@@ -567,4 +567,11 @@ Write-Host ("  SHA-256:  {0}" -f $setupChecksum)
 Write-Host ("  Provenance: {0}" -f $setupProvenance)
 Write-Host ("  Manifest: {0}" -f $setupReleaseManifest)
 Write-Host ''
-}.GetNewClosure())
+})
+
+# NOTE: this action must stay a plain scriptblock. PowerShell 7 gives
+# GetNewClosure() a fresh dynamic module whose command resolution cannot see the
+# functions defined in this script, so wrapping the action would break every
+# local call such as Copy-CcodBuildPayloadFile. Windows PowerShell 5.1 happens to
+# resolve those names, so the defect only appears under the pwsh used by the
+# release workflow.
