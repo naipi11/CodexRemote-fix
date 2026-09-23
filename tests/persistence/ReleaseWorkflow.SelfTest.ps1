@@ -3554,7 +3554,6 @@ Invoke-CcodTest '2.5.22 source metadata and documentation match the release cont
     Assert-CcodTrue ($englishSection.Success -and $englishBullets.Count -ge 3 -and $englishBullets.Count -le 5) 'v2.5.22 English release notes contain three to five bullets'
     $readme = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.md') -Raw
     $quickStart = [regex]::Match($readme, '(?ms)^## Quick start\s*\r?\n(?<body>.*?)(?=^## |\z)').Groups['body'].Value
-    Assert-CcodTrue ($readme.Contains('v2.5.22 is the current release candidate') -and $readme.Contains('stable Windows acceptance still requires recorded install, upgrade, reboot, repair, UI, and Defender verification')) 'English README does not claim stable Windows acceptance before real-machine evidence'
     Assert-CcodTrue (-not $readme.Contains("## What's new")) 'English README keeps release details off the home page'
     Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.22-setup.exe')) 'English Quick Start names the setup installer'
     Assert-CcodTrue ($quickStart.Contains('CodexRemote-fix-2.5.22-windows-x64.zip')) 'English Quick Start names the portable ZIP'
@@ -3565,7 +3564,6 @@ Invoke-CcodTest '2.5.22 source metadata and documentation match the release cont
     Assert-CcodTrue ($readme.Contains('Setup embeds and hash-binds its versioned `installer-payload.manifest.json`')) 'English README identifies the embedded hash-bound setup payload manifest'
     Assert-CcodTrue (-not $readme.Contains('shared payload manifest')) 'English README does not claim setup and portable share one payload manifest'
     $readmeZh = Get-Content -LiteralPath (Join-Path $repositoryRoot 'README.zh-CN.md') -Raw -Encoding UTF8
-    Assert-CcodTrue ($readmeZh -match 'v2\.5\.22 \u662F\u5F53\u524D\u5019\u9009\u53D1\u5E03\u7248' -and $readmeZh -match '\u7A33\u5B9A\u7248\u9A8C\u6536\u4ECD\u9700\u8BB0\u5F55') 'Chinese README does not claim stable Windows acceptance before real-machine evidence'
     Assert-CcodTrue (-not $readmeZh.Contains("## What's new")) 'Chinese README keeps release details off the home page'
     Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.22-setup.exe')) 'Chinese Quick Start names the setup installer'
     Assert-CcodTrue ($readmeZh.Contains('CodexRemote-fix-2.5.22-windows-x64.zip')) 'Chinese Quick Start names the portable ZIP'

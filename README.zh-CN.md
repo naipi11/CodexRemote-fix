@@ -15,8 +15,10 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License"></a>
 </p>
 
-> [!NOTE]
-> **发布状态：** v2.5.22 是当前候选发布版。安装包与以 EXE 启动的便携 ZIP 都已绑定版本和 manifest；Windows 稳定版验收仍需记录安装、升级、重启、修复、UI 与 Defender 的实机验证结果。
+> [!IMPORTANT]
+> **官方已修复，项目停止维护。** 本项目所针对的远程控制问题已由 Codex 官方修复，项目使命圆满完成，即日起停止维护。请使用官方最新版本，不再需要安装本修复工具。
+>
+> 源码、提交历史和历史发布版本均予以保留，供参考与追溯。以下文档作为历史记录保留，不再作为安装本修复工具的建议。
 
 CodexRemote-fix 在 Windows 版 Codex Desktop 中启用随应用一起打包、但因运行时缺陷被隐藏的：
 
